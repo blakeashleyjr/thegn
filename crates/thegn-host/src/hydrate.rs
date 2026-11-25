@@ -4421,6 +4421,7 @@ fn classify_db_open_error(error: &anyhow::Error) -> StateDbAvailability {
             observed: *observed,
             build: *supported,
         },
+        _ if crate::stale_daemon::detect(error).is_some() => StateDbAvailability::OldDaemonRunning,
         _ => StateDbAvailability::Unavailable {
             detail: error.to_string(),
         },

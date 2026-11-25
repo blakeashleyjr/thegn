@@ -321,6 +321,7 @@ mod ssh_seed;
 mod ssh_shim;
 mod stage_prompt;
 mod stage_worker_hold;
+mod stale_daemon;
 mod startup_heal;
 mod state_gc;
 mod worktree_discovery;
@@ -1077,6 +1078,16 @@ fn main() -> std::process::ExitCode {
             } else {
                 cmd::EXIT_ERROR
             };
+            if let Some(stale) = stale_daemon::detect(&error) {
+                return match stale_daemon::report(&stale) {
+                    stale_daemon::Outcome::Stopped => {
+                        std::process::ExitCode::from(cmd::EXIT_RETRYABLE as u8)
+                    }
+                    stale_daemon::Outcome::NotStopped => {
+                        std::process::ExitCode::from(cmd::EXIT_ERROR as u8)
+                    }
+                };
+            }
             thegn_core::msg::error(&format!("{error:#}"));
             std::process::ExitCode::from(code as u8)
         }

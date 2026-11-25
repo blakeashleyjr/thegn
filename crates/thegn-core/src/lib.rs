@@ -112,6 +112,7 @@ mod db_automation;
 pub mod db_automation_rules;
 mod db_autopilot;
 mod db_aux;
+pub mod db_backup;
 mod db_cache;
 mod db_calendar;
 mod db_ci;

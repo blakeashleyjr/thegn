@@ -29819,7 +29819,7 @@ fn retain_model_for_hydration_failure(
     use crate::chrome::StateDbAvailability;
     match &incoming.state_db {
         StateDbAvailability::Available => false,
-        StateDbAvailability::SchemaRefused { .. } => {
+        StateDbAvailability::SchemaRefused { .. } | StateDbAvailability::OldDaemonRunning => {
             current.state_db = incoming.state_db.clone();
             true
         }

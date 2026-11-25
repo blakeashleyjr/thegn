@@ -335,6 +335,11 @@ pub enum MigrationAccessError {
         observed: i64,
         required: i64,
     },
+    /// This build must migrate an older database, but another thegn process
+    /// (almost always the background daemon an upgrade left running) still holds
+    /// the old schema's shared lease. Typed so the host can explain it and offer
+    /// `thegn daemon stop` instead of showing a bare refusal.
+    OldSchemaInUse { database: PathBuf },
 }
 
 impl std::fmt::Display for MigrationAccessError {
@@ -356,11 +361,25 @@ impl std::fmt::Display for MigrationAccessError {
                 "refusing to migrate canonical shared database {} from schema v{observed} to v{required}: no database migration policy is installed; an explicit migration grant is required. Launch the configured controller after rebuilding it",
                 database.display()
             ),
+            Self::OldSchemaInUse { database } => write!(
+                f,
+                "refusing database schema migration for {}: another thegn process is still using the old schema. An older thegn (usually its background daemon, which keeps your panes alive) is still running after the upgrade. Run `{STOP_DAEMON_COMMAND}` (this ends that instance's panes), then start thegn again",
+                database.display()
+            ),
         }
     }
 }
 
 impl std::error::Error for MigrationAccessError {}
+
+/// The shell command that clears an [`MigrationAccessError::OldSchemaInUse`] refusal.
+pub const STOP_DAEMON_COMMAND: &str = "thegn daemon stop";
+
+/// The state database file this process would open (for diagnostics and
+/// read-only discovery when a migration is refused).
+pub fn state_db_path() -> PathBuf {
+    db_path()
+}
 
 /// The kind of database access an operation requires from a compatibility
 /// handle.  This is deliberately separate from migration authority: being
@@ -708,9 +727,7 @@ fn try_shared_lock(file: &std::fs::File, database: &Path) -> Result<()> {
 fn try_exclusive_lock(file: &std::fs::File, database: &Path) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            anyhow::bail!("{}", old_schema_lease_refusal(database))
-        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(old_schema_in_use(database)),
         Err(std::fs::TryLockError::Error(e)) => {
             anyhow::bail!(
                 "take exclusive schema lease for {}: {e}",
@@ -726,11 +743,11 @@ const SCHEMA_BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_mil
 /// Delay between attempts to acquire the bootstrap lease.
 const SCHEMA_BOOTSTRAP_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-fn old_schema_lease_refusal(database: &Path) -> String {
-    format!(
-        "refusing database schema migration for {}: another thegn process is still using the old schema. Stop/restart the running host and daemon after rebuilding, then retry",
-        database.display()
-    )
+fn old_schema_in_use(database: &Path) -> anyhow::Error {
+    MigrationAccessError::OldSchemaInUse {
+        database: database.to_path_buf(),
+    }
+    .into()
 }
 
 /// Result of waiting for the schema lease on a new database.
@@ -771,7 +788,7 @@ fn wait_for_bootstrap_lease(
                     if let Err(error) = file.unlock() {
                         tracing::debug!(%error, "could not release bootstrap schema lease");
                     }
-                    anyhow::bail!("{}", old_schema_lease_refusal(database));
+                    return Err(old_schema_in_use(database));
                 }
                 if let Err(error) = file.unlock() {
                     tracing::debug!(%error, "could not release empty bootstrap schema lease");
@@ -1922,6 +1939,32 @@ impl Db {
                 conn,
                 schema_mismatch: None,
             });
+        }
+        // Forward migration of an existing database: keep a verified, rotated copy
+        // next to it first (the schema is forward-only). A failed backup warns but
+        // never blocks startup.
+        if ver > 0
+            && let Some(file) = conn.path().filter(|p| !p.is_empty())
+        {
+            match crate::db_backup::backup_before_migration(
+                &conn,
+                Path::new(file),
+                ver,
+                chrono::Utc::now(),
+            ) {
+                Ok(backup) => tracing::info!(
+                    target: "thegn::db",
+                    from = ver,
+                    to = SCHEMA_VERSION,
+                    backup = %backup.display(),
+                    "backed up the state database before migrating"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "thegn::db",
+                    %error,
+                    "could not back up the state database before migrating; continuing"
+                ),
+            }
         }
         // The v2→v3 remap has no faithful transform — drop & recreate. Guard it
         // to `ver < 3` so later, purely-additive bumps (v3→v4: new `tab_layout`
