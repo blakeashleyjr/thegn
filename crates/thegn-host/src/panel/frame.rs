@@ -12,6 +12,9 @@ use crate::seg::{Line, Seg, Tok, clip_end, seg, sp};
 use super::sections::{self, PanelRow, SectionCtx};
 use super::{PanelHit, PanelTab, PanelUi, budget};
 
+/// A tab-label compaction level: the separator and the label for each tab.
+type TabLevel = (&'static str, fn(PanelTab) -> &'static str);
+
 /// The fully-assembled panel: one entry per visible row, plus the full
 /// view's rail hit spans (empty in Normal/Half).
 #[derive(Debug, Clone, Default)]
@@ -441,7 +444,7 @@ fn tab_plan(active: PanelTab, cols: usize) -> TabPlan {
     };
     // Leave room for the width chip's smallest form only when it is free;
     // the tabs themselves must fit the whole row.
-    let levels: [(&'static str, fn(PanelTab) -> &'static str); 3] = [
+    let levels: [TabLevel; 3] = [
         ("  ", |t| t.label()),
         (" ", |t| short_tab_label(t, false)),
         (" ", |t| short_tab_label(t, true)),

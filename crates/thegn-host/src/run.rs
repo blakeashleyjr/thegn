@@ -18816,7 +18816,6 @@ async fn event_loop<T: Terminal>(
                         {
                             g.active_tab = i;
                             tab_lift = Some(i);
-                            mouse_left_down = true;
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
@@ -28340,7 +28339,6 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     persist_session_layout(&mut session, &panes);
                                     need_relayout = true;
-                                    dirty = true;
                                 }
                             }
                             Action::BreakPaneToTab => {
@@ -28349,12 +28347,10 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     persist_session_layout(&mut session, &panes);
                                     need_relayout = true;
-                                    dirty = true;
                                 } else {
                                     model.status =
                                         "Pane is the tab's only pane — nothing to break out"
                                             .to_string();
-                                    dirty = true;
                                 }
                             }
                             Action::MovePaneToPrevTab | Action::MovePaneToNextTab => {
@@ -28366,10 +28362,8 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     persist_session_layout(&mut session, &panes);
                                     need_relayout = true;
-                                    dirty = true;
                                 } else {
                                     model.status = "No tab there to move the pane to".to_string();
-                                    dirty = true;
                                 }
                             }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`

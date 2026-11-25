@@ -234,7 +234,7 @@ mod tests {
     /// badges next, alarms last, keepers never.
     #[test]
     fn shed_order_matches_the_documented_ladder() {
-        let order = [
+        let order = vec![
             widget("loc", "L"),
             widget("tests", "T"),
             widget("pr", "P"),
