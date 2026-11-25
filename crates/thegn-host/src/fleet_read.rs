@@ -462,7 +462,9 @@ mod tests {
         let mut cost =
             fleet_cost::fleet_cost(&view, fleet_cost::BUNDLED_PRICES, &BTreeMap::new(), 0);
         fleet_cost::apply_sprites_usage(&mut cost, &view, &[usage]);
-        let burn = (0.07 + 2.0 * 0.04375) / 2.0;
+        let burn = (fleet_cost::SPRITES_CPU_USD_PER_HOUR
+            + 2.0 * fleet_cost::SPRITES_GB_USD_PER_HOUR)
+            / 2.0;
         assert!((cost.total_hourly - burn).abs() < 1e-6);
         assert!(cost.today > 0.0 && cost.mtd > cost.today);
     }

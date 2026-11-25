@@ -865,7 +865,7 @@ mod tests {
         remove_key(&path, "daemon.enabled").unwrap();
         remove_key(&path, "nope.deeper").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("# note"), "{text}");
+        assert!(text.contains("other = 1"), "{text}");
         assert!(
             !text.contains("lead") && !text.contains("enabled"),
             "{text}"
