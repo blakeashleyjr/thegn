@@ -1845,6 +1845,46 @@
         }
       ],
       "summary": "Continuously prove staged workers can commit without escaping configured containment."
+    },
+    {
+      "change": "add-safe-upgrade",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Explain a stale daemon that blocks a schema migration, offer a safe restart, and back up the database before every forward migration."
+    },
+    {
+      "change": "ship-release-bridge",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Ship the static Linux musl resident bridge with every release archive and package so Sprites and Vercel panes work from a release install."
+    },
+    {
+      "change": "ship-sprites-vercel-on-stable",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Make Sprites and Vercel environments and selected-runner jobs available on the stable channel; other providers stay dev-only."
+    },
+    {
+      "change": "stable-fleet-and-env-wizard",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Stable-channel fleet list/cost/inspect for Sprites and Vercel, and a new-environment wizard that offers only channel-allowed providers."
+    },
+    {
+      "change": "vercel-egress-deny-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Vercel sandboxes deny network egress by default, with a registries preset, allow-all, explicit allow lists, and a setup-wizard choice."
     }
   ]
 }
