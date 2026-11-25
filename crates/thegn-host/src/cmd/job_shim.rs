@@ -357,7 +357,7 @@ fn context(cfg: &Config, worktree: &Path) -> ShimContext {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    let root = worktree.canonicalize().ok();
+    let root = Some(worktree).and_then(|path| path.canonicalize().ok());
     ShimContext {
         inside_job: selected_job::inside_selected_job(),
         force_local: env_flag(LOCAL_ENV),
@@ -583,7 +583,7 @@ pub(crate) fn inject_pane_env(cfg: &Config, repo_root: &Path, env: &mut Vec<(Str
         ),
     }
     #[cfg(not(unix))]
-    let _ = env;
+    let _unused_off_unix = env;
 }
 
 /// `thegn job match`: show the coverage of one shell line.
