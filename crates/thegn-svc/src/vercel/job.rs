@@ -1871,7 +1871,7 @@ impl VercelSelectedRunner {
                 Ok((settled, false)) if settled.cleanup == Cleanup::Pending => {
                     ReconcileOutcome::StillPending
                 }
-                Ok(_) => ReconcileOutcome::Cleaned,
+                Ok((_, false)) => ReconcileOutcome::Cleaned,
                 Err(error) => {
                     tracing::warn!(
                         target: "thegn::vercel::job",
