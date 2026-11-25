@@ -15,7 +15,7 @@ it is not true yet.
 
 - `standard` leaves `~/.ssh`, cloud credentials, the `gh` token and agent
   logins readable, and the network open.
-- `sealed` hides `$HOME` and the network but shares writable toolchain caches.
+- `sealed` hides `$HOME` and the network but shares toolchain caches read-only.
 - Interactive worktree panes are sandboxed. Headless agent runs, the queue, the
   merge gate, tests and language servers run on the host (see the table below).
 - Network allow and block lists are advisory except on Sprites and Vercel (dev
