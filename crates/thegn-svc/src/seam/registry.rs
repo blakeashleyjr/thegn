@@ -874,7 +874,8 @@ mod tests {
             probes_with_detail(&enabled, IdentityDetail::Redacted),
             "probes() must delegate with IdentityDetail::Redacted"
         );
-        let row = probes(&enabled)
+        let rows = probes(&enabled);
+        let row = rows
             .iter()
             .find(|r| r.seam == "host_discovery")
             .expect("host_discovery row present");

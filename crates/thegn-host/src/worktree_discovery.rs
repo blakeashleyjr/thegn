@@ -83,7 +83,7 @@ pub(crate) struct CreationClaim {
 
 /// Claim `path` for a live creation worker (see [`creation_claims`]).
 pub(crate) fn claim_creation_path(path: &Path) -> CreationClaim {
-    let claims = creation_claims()
+    let mut claims = creation_claims()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *claims.entry(path.to_path_buf()).or_insert(0) += 1;
@@ -94,7 +94,7 @@ pub(crate) fn claim_creation_path(path: &Path) -> CreationClaim {
 
 impl Drop for CreationClaim {
     fn drop(&mut self) {
-        let claims = creation_claims()
+        let mut claims = creation_claims()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match claims.get_mut(&self.path) {

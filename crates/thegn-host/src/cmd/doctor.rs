@@ -7458,8 +7458,8 @@ mod tests {
             ("GITHUB_TOKEN", ""),
         ]);
         let cfg = Config::default();
-        assert!(run(&cfg, false, Config::path(), None, &[]).is_ok());
-        assert!(run(&cfg, true, Config::path(), None, &[]).is_ok());
+        assert!(run(&cfg, false, false, Config::path(), None, &[]).is_ok());
+        assert!(run(&cfg, true, false, Config::path(), None, &[]).is_ok());
     }
 
     /// THE-70. The three states must read differently — "unknown" in

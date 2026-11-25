@@ -1446,7 +1446,7 @@ pub fn run_worker(
     // row itself on submit or rolls the checkout back on cancel, and a
     // mid-flight adoption would render a `tg/…` sidebar row that outlives
     // the rollback. Held until the worker exits, on every path.
-    let mut claim = crate::worktree_discovery::claim_creation_path(&path);
+    let mut _claim = crate::worktree_discovery::claim_creation_path(&path);
     // Display label for the hook's `$THEGN_WORKSPACE` only. The AUTHORITATIVE
     // slug (the tab key) is resolved later from the worker's own DB handle:
     // opening a second connection here would make an unrelated busy/locked
@@ -1637,7 +1637,7 @@ pub fn run_worker(
                         // the checkout across the rename: the fresh claim is
                         // inserted before this assignment drops the old one,
                         // so no window exists without one.
-                        claim = crate::worktree_discovery::claim_creation_path(&new_path);
+                        _claim = crate::worktree_discovery::claim_creation_path(&new_path);
                         path = new_path;
                         // A sandbox container is keyed by the worktree path —
                         // re-ensure for the moved path (cheap next to a checkout).
