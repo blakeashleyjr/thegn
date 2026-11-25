@@ -3294,8 +3294,13 @@ fn provision_provider_env_inner(
                     // Nothing to forward: skip a pointless question.
                     consent_settled = true;
                     None
-                } else if name_override.is_some() || matches!(&mode, ProvisionMode::Deferred(_)) {
+                } else if name_override.is_some() {
                     return Ok(ProvisionOutcome::not_provisioned());
+                } else if matches!(&mode, ProvisionMode::Deferred(_)) {
+                    // The foreground phase already asked (or consumed a
+                    // one-shot "not now"). Withhold and finish the deferred
+                    // steps rather than abandoning them.
+                    None
                 } else {
                     return Err(ModelCredentialConsentRequired {
                         env_name: env_name.to_string(),
