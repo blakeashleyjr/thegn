@@ -703,6 +703,41 @@ async fn a_nonzero_exit_is_reported_with_the_stderr_tail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launcher_failure_records_its_exit_and_stderr_tail_in_the_ledger() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (mock, _fs) = start(script(vec![
+        stderr_line("E: unable to reach the mirror\n"),
+        stderr_line("thegn-job-launch-failed: no C linker (cc): installing gcc with dnf failed\n"),
+        exit_line(125),
+    ]));
+    let (_dir, store) = store();
+    let runner = runner(&mock, store.clone());
+    let content = content();
+
+    let receipt = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.completion, SelectedCompletion::Indeterminate);
+    assert!(receipt.stderr_tail.contains("no C linker"));
+    assert!(receipt.log_tail.contains("unable to reach the mirror"));
+    let record = store.read(1).unwrap().unwrap();
+    assert_eq!(record.state, AttemptState::Indeterminate);
+    let error = record.error.expect("the launcher failure is explained");
+    assert!(error.contains("exit 125"), "{error}");
+    assert!(error.contains("installing gcc with dnf failed"), "{error}");
+    assert!(error.contains("unable to reach the mirror"), "{error}");
+    assert_eq!(record.cleanup, Cleanup::Done);
+    mock.assert_custody();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deadline_kills_the_command_stops_the_sandbox_and_fences_outputs() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let (mock, _fs) = start(Script {
