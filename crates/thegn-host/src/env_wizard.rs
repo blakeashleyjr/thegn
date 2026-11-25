@@ -38,6 +38,31 @@ const KINDS: &[&str] = &[
     "vercel",
 ];
 
+/// Whether the env wizard (and the host picker's "set up …" rows) may offer
+/// `kind` in `channel`. `local` is always available; `ssh` is the `remote`
+/// feature; a provider kind is stable only for Sprites and Vercel
+/// (`EnvProviderKind::stable_channel`), the rest are dev-only.
+pub(crate) fn kind_allowed_in(kind: &str, channel: thegn_core::channel::Channel) -> bool {
+    use thegn_core::channel::{Channel, Feature};
+    match kind {
+        "local" => true,
+        "ssh" => Feature::Remote.allowed_in(channel),
+        other => {
+            channel == Channel::Dev
+                || thegn_core::config::EnvProviderKind::of(other).stable_channel()
+        }
+    }
+}
+
+/// The wizard's kinds for `channel`, in cycle order.
+fn kinds_for(channel: thegn_core::channel::Channel) -> Vec<&'static str> {
+    KINDS
+        .iter()
+        .copied()
+        .filter(|kind| kind_allowed_in(kind, channel))
+        .collect()
+}
+
 /// Read-only note shown for the vercel kind. The wizard never writes
 /// `model_credentials`; the user sets it in their own config.
 const VERCEL_MODEL_CREDENTIALS_NOTE: [&str; 2] = [
@@ -115,6 +140,8 @@ pub fn apply_outcome(
 
 pub struct EnvWizard {
     kind_sel: usize,
+    /// The kinds this channel allows, in cycle order (`kinds_for`).
+    kinds: Vec<&'static str>,
     focus: Field,
     name: String,
     token: String,
@@ -137,6 +164,12 @@ pub struct EnvWizard {
 
 impl EnvWizard {
     pub fn new(cfg: &Config) -> Self {
+        Self::new_in(cfg, crate::channel_state::current())
+    }
+
+    /// [`EnvWizard::new`] for an explicit release channel.
+    fn new_in(cfg: &Config, channel: thegn_core::channel::Channel) -> Self {
+        let kinds = kinds_for(channel);
         let sandbox_rows = crate::palette::build_sandbox_palette(cfg)
             .into_iter()
             .map(|i| {
@@ -145,7 +178,13 @@ impl EnvWizard {
             })
             .collect();
         EnvWizard {
-            kind_sel: 2, // default to the first cloud kind (fly) — the common case
+            // Default to the first cloud kind (fly on dev, sprites on stable)
+            // — the common case; `local` when the channel offers no cloud kind.
+            kind_sel: kinds
+                .iter()
+                .position(|k| !matches!(*k, "local" | "ssh"))
+                .unwrap_or(0),
+            kinds,
             focus: Field::Kind,
             name: String::new(),
             token: String::new(),
@@ -164,15 +203,19 @@ impl EnvWizard {
     /// Like [`EnvWizard::new`] but pre-seeded to `kind` (a host-picker
     /// "+ set up `<kind>`…" row). Unknown kinds keep the default selection.
     pub fn with_kind(cfg: &Config, kind: &str) -> Self {
-        let mut w = Self::new(cfg);
-        if let Some(i) = KINDS.iter().position(|k| *k == kind) {
+        Self::with_kind_in(cfg, kind, crate::channel_state::current())
+    }
+
+    fn with_kind_in(cfg: &Config, kind: &str, channel: thegn_core::channel::Channel) -> Self {
+        let mut w = Self::new_in(cfg, channel);
+        if let Some(i) = w.kinds.iter().position(|k| *k == kind) {
             w.kind_sel = i;
         }
         w
     }
 
     fn kind(&self) -> &'static str {
-        KINDS.get(self.kind_sel).copied().unwrap_or("local")
+        self.kinds.get(self.kind_sel).copied().unwrap_or("local")
     }
 
     fn is_cloud(&self) -> bool {
@@ -277,7 +320,7 @@ impl EnvWizard {
     fn cycle(&mut self, delta: i32) {
         match self.focus {
             Field::Kind => {
-                let n = KINDS.len() as i32;
+                let n = self.kinds.len().max(1) as i32;
                 self.kind_sel = (((self.kind_sel as i32 + delta) % n + n) % n) as usize;
                 // Focus stays on Kind; the field list re-derives on the next render.
             }
@@ -462,8 +505,48 @@ impl EnvWizard {
 mod tests {
     use super::*;
 
+    use thegn_core::channel::Channel;
+
     fn wiz() -> EnvWizard {
-        EnvWizard::new(&Config::default())
+        EnvWizard::new_in(&Config::default(), Channel::Dev)
+    }
+
+    #[test]
+    fn stable_wizard_offers_only_stable_kinds() {
+        let w = EnvWizard::new_in(&Config::default(), Channel::Stable);
+        assert_eq!(w.kinds, vec!["local", "sprites", "vercel"]);
+        // Defaults to the first allowed cloud kind.
+        assert_eq!(w.kind(), "sprites");
+        for dev_only in [
+            "ssh",
+            "fly",
+            "digitalocean",
+            "hetzner",
+            "daytona",
+            "machine0",
+        ] {
+            assert!(!kind_allowed_in(dev_only, Channel::Stable), "{dev_only}");
+            assert!(kind_allowed_in(dev_only, Channel::Dev), "{dev_only}");
+        }
+    }
+
+    #[test]
+    fn stable_wizard_cycles_within_allowed_kinds_and_ignores_dev_seeds() {
+        let mut w = EnvWizard::new_in(&Config::default(), Channel::Stable);
+        let mut seen = Vec::new();
+        for _ in 0..w.kinds.len() {
+            seen.push(w.kind());
+            w.cycle(1);
+        }
+        assert_eq!(seen, vec!["sprites", "vercel", "local"]);
+        assert_eq!(w.kind(), "sprites");
+        w.cycle(-1);
+        assert_eq!(w.kind(), "local");
+        // A dev-only seed ("+ set up fly…") keeps the default selection.
+        let seeded = EnvWizard::with_kind_in(&Config::default(), "fly", Channel::Stable);
+        assert_eq!(seeded.kind(), "sprites");
+        let vercel = EnvWizard::with_kind_in(&Config::default(), "vercel", Channel::Stable);
+        assert_eq!(vercel.kind(), "vercel");
     }
 
     fn typ(w: &mut EnvWizard, s: &str) {
@@ -509,7 +592,7 @@ mod tests {
     #[test]
     fn vercel_kind_asks_for_team_and_project() {
         let mut w = wiz();
-        w.kind_sel = KINDS.iter().position(|k| *k == "vercel").unwrap();
+        w.kind_sel = w.kinds.iter().position(|k| *k == "vercel").unwrap();
         assert!(w.fields().contains(&Field::TeamId));
         assert!(w.fields().contains(&Field::ProjectId));
         w.focus = Field::Name;
@@ -531,9 +614,9 @@ mod tests {
     #[test]
     fn ssh_and_local_kinds_change_fields() {
         let mut w = wiz();
-        w.kind_sel = 1; // ssh
+        w.kind_sel = w.kinds.iter().position(|k| *k == "ssh").unwrap();
         assert_eq!(w.fields(), vec![Field::Kind, Field::Name, Field::SshHost]);
-        w.kind_sel = 0; // local
+        w.kind_sel = w.kinds.iter().position(|k| *k == "local").unwrap();
         assert_eq!(w.fields(), vec![Field::Kind, Field::Name, Field::Sandbox]);
     }
 

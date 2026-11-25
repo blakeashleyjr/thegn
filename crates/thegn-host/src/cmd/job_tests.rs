@@ -75,7 +75,13 @@ fn job_is_a_stable_channel_verb() {
         crate::experimental_command(cli.command.as_ref().unwrap()),
         None
     );
-    // The managed pool and fleet verbs stay dev-only.
+    // Fleet list/cost/inspect are stable (Sprites and Vercel envs only).
+    let fleet = parse(&["fleet", "list"]).unwrap();
+    assert_eq!(
+        crate::experimental_command(fleet.command.as_ref().unwrap()),
+        None
+    );
+    // The managed pool stays dev-only.
     let host = parse(&["host", "list"]).unwrap();
     assert_eq!(
         crate::experimental_command(host.command.as_ref().unwrap()),

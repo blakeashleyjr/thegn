@@ -581,7 +581,8 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - remote worktrees over SSH and named environments over SSH or managed
   providers other than Sprites and Vercel,
 - the other cloud execution providers (Fly, DigitalOcean, Hetzner, Machine0,
-  Daytona), the managed pool and `thegn fleet`,
+  Daytona) and the managed pool (`thegn fleet` covers Sprites and Vercel
+  only),
 - the placement engine,
 - voice mode.
 

@@ -137,16 +137,30 @@ pub(crate) fn gather(cfg: &Config, only_env: Option<&str>) -> Result<FleetView> 
     gather_where(cfg, |name, _| only_env.is_none_or(|only| only == name))
 }
 
+/// Whether `thegn fleet` (and the masthead widget) may read an env whose
+/// `provider` is named `provider` in `channel`: every provider on dev, only the
+/// stable ones (Sprites and Vercel) on stable. The config clamp already drops
+/// the other envs from a stable config; this is the read path's own guard.
+pub(crate) fn fleet_provider_allowed(
+    channel: thegn_core::channel::Channel,
+    provider: &str,
+) -> bool {
+    channel == thegn_core::channel::Channel::Dev
+        || thegn_core::config::EnvProviderKind::of(provider).stable_channel()
+}
+
 /// [`gather`] over the API-provider envs `keep` selects.
 fn gather_where(
     cfg: &Config,
     keep: impl Fn(&str, &thegn_core::config::EnvConfig) -> bool,
 ) -> Result<FleetView> {
     use thegn_core::config::EnvProviderKind;
+    let channel = crate::channel_state::current();
     let slots: Vec<Slot> = cfg
         .env
         .iter()
         .filter(|(name, envc)| keep(name.as_str(), envc))
+        .filter(|(_, envc)| fleet_provider_allowed(channel, &envc.provider.provider))
         .filter(|(_, envc)| {
             !matches!(
                 EnvProviderKind::of(&envc.provider.provider),
@@ -312,6 +326,28 @@ fn recorded_for(cfg: &Config, worktree: &str) -> Option<RecordedSandbox> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn stable_fleet_reads_only_sprites_and_vercel() {
+        use thegn_core::channel::Channel;
+        for stable in ["sprites", "vercel"] {
+            assert!(fleet_provider_allowed(Channel::Stable, stable), "{stable}");
+        }
+        for dev_only in [
+            "fly",
+            "digitalocean",
+            "hetzner",
+            "daytona",
+            "machine0",
+            "custom",
+        ] {
+            assert!(
+                !fleet_provider_allowed(Channel::Stable, dev_only),
+                "{dev_only}"
+            );
+            assert!(fleet_provider_allowed(Channel::Dev, dev_only), "{dev_only}");
+        }
+    }
 
     #[test]
     fn env_inventory_shapes_each_read() {

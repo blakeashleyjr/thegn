@@ -13,8 +13,11 @@ contexts: [panel:environments]
 Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
 
 Sprites and [[vercel-sandbox]] environments are supported on the stable
-channel. SSH, Kubernetes, every other cloud provider, `[host.*]` and
-`thegn fleet` are dev channel only (see [[release-channels]]). Where this page
+channel, including `thegn fleet list`, `cost` and `inspect` for them and the
+**New environment…** wizard. SSH, Kubernetes, every other cloud provider and
+`[host.*]` are dev channel only (see [[release-channels]]); on the stable
+channel `thegn fleet` shows Sprites and Vercel environments only, and the
+wizard offers only `local`, `sprites` and `vercel`. Where this page
 says "on the dev channel" about provider behaviour, the same behaviour applies
 to Sprites and Vercel environments on the stable channel.
 
@@ -24,7 +27,8 @@ Named `[env.<name>]` execution environments (local, container, or a cloud
 provider) appear in the panel's **system → environments** section — `↵`
 (re)binds the cursor env to the active worktree, `t` tests its provider
 token (the outcome pops as a toast and is logged), `n` opens the add
-wizard, and `x`
+wizard (on the stable channel it offers `local`, `sprites` and `vercel`; the
+other kinds appear on the dev channel), and `x`
 removes it after a confirm (removal also forgets the stored token). On a
 [[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
 the sandbox) and the row shows `results not pulled` until a pull succeeds. An
@@ -388,8 +392,8 @@ stay plan-only without the spend flags.
 
 ### Retry, inspect, drain and provision
 
-Unverified live. `thegn fleet inspect` needs the dev channel; the rest works on
-both channels for Sprites and Vercel environments.
+Unverified live. All of this works on both channels for Sprites and Vercel
+environments.
 
 - **Retry failed pull-backs.** The palette action "Retry failed pull-backs"
   (`retry-pullbacks`, no default chord) runs the same code as
