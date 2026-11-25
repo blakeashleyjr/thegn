@@ -163,12 +163,6 @@ fn host_toolchain_mounts_at_home(home: &str, home_ro: Option<bool>) -> Vec<Mount
     mounts
 }
 
-/// Host toolchain and package caches shared into a sandbox. They are mounted
-/// **read-only**: the host later compiles, links and runs what they hold
-/// (crate sources and build scripts, toolchains, package scripts), so sandboxed
-/// code must not be able to plant anything in them. The hook-framework and
-/// compiler caches (`prek`, `pre-commit`, `sccache`) are deliberately absent:
-/// the host crate gives each sandbox a private writable copy instead.
 pub fn auto_cache_mounts() -> Vec<Mount> {
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() {
@@ -187,6 +181,12 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
         ".cache/uv",
         ".m2/repository",
         ".gradle/caches",
+        // Compile + pre-commit-hook-framework caches so `git commit` hooks run
+        // (prek/pre-commit write hook envs; sccache writes objects) instead of
+        // dying "Read-only file system" under a hardened read-only $HOME.
+        ".cache/sccache",
+        ".cache/prek",
+        ".cache/pre-commit",
         // Nix's client-side caches remain an explicit target-side convenience;
         // they do not authorize host evaluation or repository `.direnv` writes.
         ".cache/nix",
@@ -200,7 +200,7 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
                 Mount {
                     host: s.clone(),
                     dest: s,
-                    ro: true,
+                    ro: false,
                     cache: true,
                 }
             })
@@ -2037,18 +2037,10 @@ mod tests {
     }
 
     #[test]
-    fn nix_client_cache_is_read_only_and_hook_caches_are_not_shared() {
-        // Every auto cache is read-only (a writable one is a host-execution
-        // plant); prek/pre-commit/sccache are private per-sandbox overmounts
-        // made by the host crate, never shared from here.
-        assert!(auto_cache_mounts().iter().all(|m| m.ro && m.cache));
-        assert!(
-            !auto_cache_mounts()
-                .iter()
-                .any(|m| m.host.ends_with("/.cache/prek")
-                    || m.host.ends_with("/.cache/pre-commit")
-                    || m.host.ends_with("/.cache/sccache"))
-        );
+    fn nix_client_cache_carved_writable() {
+        // ~/.cache/nix (flake tarball + eval caches) must be writable so an
+        // in-sandbox nix-direnv cache-miss re-eval can fetch flake inputs instead
+        // of dying "Read-only file system". Only meaningful when it exists.
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() || !std::path::Path::new(&home).join(".cache/nix").is_dir() {
             return;
@@ -2056,8 +2048,8 @@ mod tests {
         assert!(
             auto_cache_mounts()
                 .iter()
-                .any(|m| m.host.ends_with("/.cache/nix") && m.ro),
-            "~/.cache/nix is executed by the host later, so it must be read-only"
+                .any(|m| m.host.ends_with("/.cache/nix") && !m.ro),
+            "~/.cache/nix must be carved writable for in-sandbox flake re-eval"
         );
     }
 

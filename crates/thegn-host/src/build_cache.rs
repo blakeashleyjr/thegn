@@ -48,58 +48,6 @@ fn compiler_cache_state_dir() -> std::path::PathBuf {
     }
 }
 
-/// Root of the per-sandbox private caches. A cache the sandbox may write must
-/// never be one the host later executes (hook environments, build outputs,
-/// compiler-cache objects), so each sandbox gets its own directory here and the
-/// host's real cache is not mounted writable at all.
-fn isolated_cache_root(sandbox: &str) -> std::path::PathBuf {
-    let seg = |raw: &str| -> String {
-        let s: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if s.is_empty() || s.chars().all(|c| c == '.') {
-            "_".to_string()
-        } else {
-            s
-        }
-    };
-    #[cfg(test)]
-    let base =
-        std::env::temp_dir().join(format!("thegn-sandbox-caches-test-{}", std::process::id()));
-    #[cfg(not(test))]
-    let base = thegn_core::util::thegn_dir().join("state/sandbox-caches");
-    base.join(seg(sandbox))
-}
-
-/// Rewrite a writable cache mount so its host source is the sandbox-private copy
-/// of `dest`; the in-sandbox path is unchanged.
-fn isolate_cache_mount(mut m: Mount, sandbox: &str) -> Mount {
-    let key: String = m
-        .dest
-        .trim_start_matches('/')
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    m.host = isolated_cache_root(sandbox)
-        .join(key)
-        .to_string_lossy()
-        .into_owned();
-    m
-}
-
 fn fallback_log_path() -> std::path::PathBuf {
     compiler_cache_state_dir().join("fallback.log")
 }
@@ -436,17 +384,14 @@ where
         };
     };
 
+    let _ = std::fs::create_dir_all(&cache_dir); // best-effort: the contained write probe decides readiness
     let mount_count_before_cache_policy = spec.mounts.len();
-    let mount = isolate_cache_mount(
-        Mount {
-            host: cache_dir.clone(),
-            dest: cache_dir.clone(),
-            ro: false,
-            cache: true,
-        },
-        &spec.name,
-    );
-    let _ = std::fs::create_dir_all(&mount.host); // best-effort: the contained write probe decides readiness
+    let mount = Mount {
+        host: cache_dir.clone(),
+        dest: cache_dir.clone(),
+        ro: false,
+        cache: true,
+    };
     if thegn_core::sandbox_mounts::keep_cfg_mount(&spec.mounts, &mount) {
         spec.mounts.push(mount);
     }
@@ -618,15 +563,15 @@ fn sandbox_cache_mounts_at_home(
 /// `$HOME` bind in the already-resolved spec, so we never add a redundant mount
 /// where `$HOME` is already writable.
 pub(crate) fn inject_cache_mounts(spec: &mut SandboxSpec, cfg: &Config, repo_root: &Path) {
-    overmount_caches(&mut spec.mounts, cfg, repo_root, &spec.name);
+    overmount_caches(&mut spec.mounts, cfg, repo_root);
 }
 
 /// Core of [`inject_cache_mounts`], on the raw mount list so it's testable
 /// without a full `SandboxSpec`. No-op unless the list already binds `$HOME`
 /// read-only.
-fn overmount_caches(mounts: &mut Vec<Mount>, cfg: &Config, repo_root: &Path, sandbox: &str) {
+fn overmount_caches(mounts: &mut Vec<Mount>, cfg: &Config, repo_root: &Path) {
     let inherited_home = std::env::var("HOME").unwrap_or_default();
-    overmount_caches_at_home(mounts, cfg, repo_root, &inherited_home, sandbox);
+    overmount_caches_at_home(mounts, cfg, repo_root, &inherited_home);
 }
 
 // The live wrapper supplies its unchanged inherited home. Keeping this owned
@@ -636,7 +581,6 @@ fn overmount_caches_at_home(
     cfg: &Config,
     repo_root: &Path,
     inherited_home: &str,
-    sandbox: &str,
 ) {
     let home_ro =
         !inherited_home.is_empty() && mounts.iter().any(|m| m.host == inherited_home && m.ro);
@@ -644,8 +588,6 @@ fn overmount_caches_at_home(
         return;
     }
     for m in sandbox_cache_mounts_at_home(cfg, repo_root, Some(inherited_home)) {
-        // Sandbox-private source: the host's own cache is never writable here.
-        let m = isolate_cache_mount(m, sandbox);
         // best-effort: bwrap needs the bind source to exist; create a cold cache
         // dir before overmounting it (keep_cfg_mount also requires it to be a
         // real directory to overmount the read-only parent).
@@ -792,7 +734,7 @@ mod tests {
     fn overmount_caches_noop_without_a_readonly_home() {
         // No read-only $HOME bind (open/all profile) → nothing overmounted.
         let mut mounts: Vec<Mount> = Vec::new();
-        overmount_caches(&mut mounts, &Config::default(), Path::new("/repo"), "t");
+        overmount_caches(&mut mounts, &Config::default(), Path::new("/repo"));
         assert!(mounts.is_empty());
     }
 
@@ -804,20 +746,6 @@ mod tests {
         let home = private_home.to_str().unwrap();
         let config = Config::default();
         let cache_paths = ["prek", "pre-commit"].map(|name| private_home.join(".cache").join(name));
-        let isolated: Vec<_> = cache_paths
-            .iter()
-            .map(|p| {
-                isolate_cache_mount(
-                    Mount {
-                        host: p.to_string_lossy().into_owned(),
-                        dest: p.to_string_lossy().into_owned(),
-                        ro: false,
-                        cache: true,
-                    },
-                    "iso-test",
-                )
-            })
-            .collect();
         let home_mount = |ro| Mount {
             host: home.into(),
             dest: home.into(),
@@ -829,52 +757,30 @@ mod tests {
         // including an explicitly writable home bind.
         for mut mounts in [Vec::new(), vec![home_mount(false)]] {
             let count = mounts.len();
-            overmount_caches_at_home(&mut mounts, &config, fixture.path(), home, "iso-test");
+            overmount_caches_at_home(&mut mounts, &config, fixture.path(), home);
             assert_eq!(mounts.len(), count);
             assert!(cache_paths.iter().all(|path| !path.exists()));
         }
 
         let mut mounts = vec![home_mount(true)];
-        overmount_caches_at_home(&mut mounts, &config, fixture.path(), home, "iso-test");
+        overmount_caches_at_home(&mut mounts, &config, fixture.path(), home);
         assert_eq!(mounts.len(), 3);
         assert!(mounts[0].ro, "the parent remains read-only");
-        for (path, iso) in cache_paths.iter().zip(&isolated) {
+        for path in cache_paths {
             assert!(
-                Path::new(&iso.host).is_dir(),
-                "cold private cache must be created"
-            );
-            assert!(
-                !path.exists(),
-                "the host cache must not be created or mounted"
+                path.is_dir(),
+                "cold cache must be created inside the fixture"
             );
             assert!(
                 mounts.iter().any(|mount| {
-                    mount.host == iso.host
-                        && Path::new(&mount.dest) == path.as_path()
+                    Path::new(&mount.host) == path.as_path()
+                        && mount.dest == mount.host
                         && !mount.ro
                         && mount.cache
                 }),
-                "private cache needs a path-preserving writable overmount from a sandbox-private source"
+                "private cache needs a path-preserving writable overmount"
             );
-            assert!(mounts.iter().all(|m| Path::new(&m.host) != path.as_path()));
         }
-    }
-
-    #[test]
-    fn isolated_cache_sources_differ_per_sandbox_and_never_equal_dest() {
-        let m = || Mount {
-            host: "/home/u/.cache/prek".into(),
-            dest: "/home/u/.cache/prek".into(),
-            ro: false,
-            cache: true,
-        };
-        let a = isolate_cache_mount(m(), "a");
-        let b = isolate_cache_mount(m(), "b");
-        assert_ne!(a.host, b.host);
-        assert_ne!(a.host, a.dest);
-        assert_eq!(a.dest, "/home/u/.cache/prek");
-        let weird = isolate_cache_mount(m(), "../..");
-        assert!(!weird.host.contains("/../"));
     }
 
     #[test]
@@ -958,9 +864,11 @@ mod tests {
                 .iter()
                 .any(|key| key == "SCCACHE_IGNORE_SERVER_IO_ERROR")
         );
-        assert!(spec.mounts.iter().any(|m| {
-            m.dest == "/tmp/thegn-sccache-policy-test" && m.host != m.dest && !m.ro && m.cache
-        }));
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| { m.host == "/tmp/thegn-sccache-policy-test" && !m.ro && m.cache })
+        );
     }
 
     #[test]
