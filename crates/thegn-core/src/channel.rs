@@ -85,8 +85,10 @@ pub enum Feature {
     /// placements (`[env.*] placement = "k8s"`). The ssh-CLI path
     /// works but the surface is young.
     Remote,
-    /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
-    /// managed-sprite pool (`[host.*]`).
+    /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona / custom)
+    /// and the managed-sprite pool (`[host.*]`). Sprites and Vercel `[env.*]`
+    /// environments graduated out of this gate and are stable
+    /// (`EnvProviderKind::stable_channel`; the clamp keeps them).
     Providers,
     /// The Observe dashboards + fleet-view app tab (`[observe]`).
     Observe,

@@ -397,7 +397,9 @@ pub fn section_gate(
         Section::PrQueue if !cfg.pr_queue.enabled => {
             SectionGate::Off("set [pr_queue] enabled = true")
         }
-        Section::Hosts | Section::Environments if !Feature::Providers.allowed_in(channel) => {
+        // Environments lists the (channel-clamped) `[env.*]` table, which keeps
+        // Sprites and Vercel on stable; the `[host.*]` pool stays dev-only.
+        Section::Hosts if !Feature::Providers.allowed_in(channel) => {
             SectionGate::Off("dev-channel only — run with THEGN_CHANNEL=dev")
         }
         Section::Media if !cfg.media.enabled => SectionGate::Off("set [media] enabled = true"),
@@ -2665,12 +2667,13 @@ mod tests {
     }
 
     #[test]
-    fn hosts_and_envs_hidden_on_stable() {
+    fn hosts_hidden_on_stable_but_environments_shown() {
         use thegn_core::channel::Channel;
         let cfg = thegn_core::config::Config::default();
         let stable = resolve_order_in(&cfg, Channel::Stable);
         assert!(!stable.contains(&Section::Hosts));
-        assert!(!stable.contains(&Section::Environments));
+        // Sprites and Vercel envs are stable, so their section is too.
+        assert!(stable.contains(&Section::Environments));
         let dev = resolve_order_in(&cfg, Channel::Dev);
         assert!(dev.contains(&Section::Hosts));
         assert!(dev.contains(&Section::Environments));

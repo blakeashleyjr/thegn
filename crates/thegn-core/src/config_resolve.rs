@@ -1159,9 +1159,17 @@ impl Config {
                     let was = !self.host.is_empty();
                     self.host.clear();
                     let env_count = self.env.len();
+                    // Sprites and Vercel envs graduated to stable
+                    // (`EnvProviderKind::stable_channel`); every other provider
+                    // env (Fly / DO / Hetzner / Machine0 / Daytona / custom) and
+                    // the `[host.*]` pool stay dev-only.
                     self.env.retain(|_, env| {
-                        env.placement != crate::config::PlacementMode::Provider
-                            && env.provider.provider.trim().is_empty()
+                        let names_provider = env.placement
+                            == crate::config::PlacementMode::Provider
+                            || !env.provider.provider.trim().is_empty();
+                        !names_provider
+                            || crate::config::EnvProviderKind::of(&env.provider.provider)
+                                .stable_channel()
                     });
                     was || self.env.len() != env_count
                 }

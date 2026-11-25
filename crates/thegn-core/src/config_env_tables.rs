@@ -575,6 +575,15 @@ impl EnvProviderKind {
         )
     }
 
+    /// Graduated to the **stable** release channel: Sprites and Vercel Sandbox
+    /// environments (interactive worktrees and `thegn job run` selected
+    /// runners). Every other provider — and the managed `[host.*]` pool —
+    /// stays behind the dev-only [`crate::channel::Feature::Providers`] gate,
+    /// so `Config::clamp_to_channel` keeps exactly these kinds on stable.
+    pub fn stable_channel(self) -> bool {
+        matches!(self, Self::Sprites | Self::Vercel)
+    }
+
     /// Self-suspends on idle without thegn's help (the warm-pool policy's
     /// "don't also age it out" case).
     pub fn self_suspends(self) -> bool {

@@ -22,13 +22,13 @@ To keep a dev instance beside your stable one, see [[two-instances]].
 If you read about one of these elsewhere in this help and cannot find it,
 this is why:
 
-| Feature     | Covers                                                                     | Config                                                     |
-| ----------- | -------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `remote`    | worktrees on another machine over SSH/mosh, and Kubernetes placement       | `[sandbox.remote]`, `[env.*] placement = "ssh"` or `"k8s"` |
-| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs                        |
-| `placement` | the multi-host placement engine                                            | `[placement]`                                              |
-| `voice`     | command-backed voice mode                                                  | `[voice]`                                                  |
-| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                    | `[lead]`                                                   |
+| Feature     | Covers                                                                                                                                                | Config                                                     |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `remote`    | worktrees on another machine over SSH/mosh, and Kubernetes placement                                                                                  | `[sandbox.remote]`, `[env.*] placement = "ssh"` or `"k8s"` |
+| `providers` | cloud execution other than Sprites and Vercel (Fly / DO / Hetzner / Machine0 / Daytona / custom), the managed pool, `thegn fleet` for those providers | `[host.*]`, other `[env.*]` provider envs                  |
+| `placement` | the multi-host placement engine                                                                                                                       | `[placement]`                                              |
+| `voice`     | command-backed voice mode                                                                                                                             | `[voice]`                                                  |
+| `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                                                                                               | `[lead]`                                                   |
 
 ### Sandbox and remote programme features (not yet implemented)
 
@@ -50,14 +50,28 @@ programme is built.
 | `private_copy`     | private-copy workspaces (`workspace.mode = "private-copy"`)              | not yet implemented |
 | `escalation`       | in-pane escalation requests                                              | not yet implemented |
 
-On the stable channel, SSH, Kubernetes and provider `[env.*]` environments are removed
-when the config loads. If a worktree's `[sandbox] default_env` or selection
+On the stable channel, SSH, Kubernetes and provider `[env.*]` environments
+other than Sprites and Vercel are removed when the config loads. If a worktree's `[sandbox] default_env` or selection
 names one, its pane halts by default with a hint to set `THEGN_CHANNEL=dev`;
 `failover = "ask"` prompts instead. With `failover = "auto"`, the pane falls
 back to the host.
 
 Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
 channels. GitHub PR viewing is also stable. See [[review-a-pr]].
+
+## Sprites and Vercel are stable
+
+Sprites environments (`provider = "sprites"`, see [[environments]]) and Vercel
+Sandbox environments (`provider = "vercel"`, see [[vercel-sandbox]]) are
+supported on the stable channel: interactive worktrees, `thegn env` verbs, and
+`thegn job run` with a Sprites or Vercel runner. The panel's system →
+environments section is shown on both channels. The stable clamp keeps exactly
+these two provider kinds. In `thegn doctor` the `providers` feature still reads
+dev-only, because it names what remains gated: every other provider, the
+managed `[host.*]` pool and the `thegn host` and `thegn placement` verbs.
+`thegn fleet list`, `cost` and `inspect` run on stable and show Sprites and
+Vercel environments only. The **New environment…** wizard offers only the
+kinds the channel allows (stable: `local`, `sprites`, `vercel`).
 
 ## Stable features that start off or are easy to miss
 
@@ -76,9 +90,10 @@ Plugin processes are native and unsandboxed; see [[plugins]] and [[sandboxing]].
 Everything else. The AI-free terminal shell — git, panes, the [[sidebar]], the
 [[panel]], [[daemon-and-sessions]], the merge queue and `land`/`integrate`, the
 [[sandboxing]] backends, issue trackers, Observe and plugin app tabs, and every
-[[cli]] verb except `thegn host` and `thegn placement` — is stable and is never
-channel-gated. Those two verbs refuse on the stable channel with a pointer to
-the dev channel.
+[[cli]] verb except `thegn host` and `thegn placement` — is stable and is
+never channel-gated. Those two verbs refuse on the stable channel with a
+pointer to the dev channel. Sprites and Vercel environments, `thegn fleet`
+(for them) and `thegn job run` are stable (see above).
 
 ## How the gate behaves
 

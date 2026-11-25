@@ -557,8 +557,10 @@ On the dev channel, scale-down also keeps and warns by name about an engine
 host whose tenant count or last use cannot be read, or whose creation time and
 use are both unrecorded; it never treats that missing age as idle.
 
-On the dev channel, `thegn fleet list [--env <name>] [--json]` lists every
-sandbox the configured `[env.<name>]` providers report, one row per sandbox
+`thegn fleet list [--env <name>] [--json]` lists every
+sandbox the configured `[env.<name>]` providers report (on the stable channel
+that is Sprites and Vercel environments only; the other providers need the dev
+channel), one row per sandbox
 with its state, size, region, age, hourly rate, accrued cost and owning
 worktree. A sandbox no worktree records is marked `ORPHAN`; a sandbox a
 worktree records but the provider no longer lists appears under "Recorded, not
@@ -590,7 +592,7 @@ set, provisioning first reads that provider's fleet and refuses with "cannot
 verify fleet budget" when the read fails or is incomplete. `fleet list --env`
 reads one env only, so its JSON `cost.budget` is always empty.
 
-On the dev channel, `thegn job run [--runner <env>] [--deadline <secs>]
+On both channels, `thegn job run [--runner <env>] [--deadline <secs>]
 <cargo-build|cargo-test>` runs a typed recipe on one explicitly selected
 runner and exits with the job's exit code. The runner is `--runner`, else
 `[jobs] runner`: an `[env.<name>]` whose provider is `sprites` (its `id` names

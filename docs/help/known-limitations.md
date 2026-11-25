@@ -93,5 +93,9 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 
 - **Remote, providers, placement, and voice are dev-channel only.** Treat them
   as experimental rather than product promises; see [[release-channels]].
+  Sprites and Vercel environments (and `thegn job run` on them) are the
+  exception: they are supported on the stable channel. Neither has a recorded
+  paid live run on this release yet; see [[environments]] and
+  [[vercel-sandbox]].
 - **Observe and plugin app tabs are stable.** Use the stable channel for these
   features; see [[release-channels]].

@@ -11,7 +11,9 @@ parent: sandboxing
 
 An environment with `provider = "vercel"` runs a worktree in a Vercel Sandbox
 microVM. thegn drives it through Vercel's HTTP API and a hidden `thegn
-vercel-exec` bridge; there is no SSH.
+vercel-exec` bridge; there is no SSH. Vercel environments are supported on the
+stable channel, including `thegn job run` with a Vercel runner (see
+[[release-channels]]).
 
 ## Setup
 

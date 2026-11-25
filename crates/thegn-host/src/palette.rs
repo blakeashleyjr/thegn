@@ -869,6 +869,15 @@ pub(crate) fn build_sandbox_palette(
 pub(crate) fn build_env_palette(
     cfg: &thegn_core::config::Config,
 ) -> Vec<crate::palette::PaletteItem> {
+    build_env_palette_in(cfg, crate::channel_state::current())
+}
+
+/// [`build_env_palette`] for an explicit release channel: the "+ set up …"
+/// discovery rows offer only the kinds the channel allows.
+fn build_env_palette_in(
+    cfg: &thegn_core::config::Config,
+    channel: thegn_core::channel::Channel,
+) -> Vec<crate::palette::PaletteItem> {
     use thegn_core::config::PlacementMode as P;
     let def = {
         let d = cfg.sandbox.default_env.trim();
@@ -916,7 +925,10 @@ pub(crate) fn build_env_palette(
     // trailing "+ set up <kind>…" sentinel (`env-setup:<kind>`). Enter on one
     // opens the env wizard pre-seeded to that kind — the picker doubles as the
     // map of what thegn can run on, not just what is already configured.
-    for kind in ENV_SETUP_KINDS {
+    for kind in ENV_SETUP_KINDS
+        .iter()
+        .filter(|kind| crate::env_wizard::kind_allowed_in(kind, channel))
+    {
         let configured = cfg
             .env
             .values()
@@ -1440,7 +1452,7 @@ mod tests {
             },
         );
 
-        let items = build_env_palette(&cfg);
+        let items = build_env_palette_in(&cfg, thegn_core::channel::Channel::Dev);
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
         // Configured kind gets no setup row; every unconfigured kind gets one.
         assert!(!keys.contains(&"env-setup:sprites"));
@@ -1463,6 +1475,18 @@ mod tests {
         let setup = items.iter().find(|i| i.key == "env-setup:hetzner").unwrap();
         assert!(setup.label.contains("set up hetzner"));
         assert!(setup.label.contains("[not configured]"));
+    }
+
+    #[test]
+    fn build_env_palette_offers_only_stable_setup_rows_on_stable() {
+        let cfg = thegn_core::config::Config::default();
+        let items = build_env_palette_in(&cfg, thegn_core::channel::Channel::Stable);
+        let setup: Vec<&str> = items
+            .iter()
+            .map(|i| i.key.as_str())
+            .filter(|k| k.starts_with("env-setup:"))
+            .collect();
+        assert_eq!(setup, vec!["env-setup:sprites", "env-setup:vercel"]);
     }
 
     #[test]

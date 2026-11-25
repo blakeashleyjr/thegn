@@ -3631,6 +3631,65 @@ fn clamp_removes_k8s_envs_in_stable() {
 }
 
 #[test]
+fn stable_clamp_keeps_sprites_and_vercel_envs_but_not_other_providers() {
+    use crate::channel::{Channel, Feature};
+    use crate::config::EnvProviderKind;
+
+    let source = "\
+[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\
+[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n\
+[env.fly]\nplacement = \"provider\"\n[env.fly.provider]\nprovider = \"fly\"\n\
+[env.m0]\nplacement = \"provider\"\n[env.m0.provider]\nprovider = \"machine0\"\n\
+[env.bare]\nplacement = \"provider\"\n\
+[env.box]\nplacement = \"ssh\"\n[env.box.provider]\nprovider = \"sprites\"\n\
+[env.here]\nplacement = \"local\"\n";
+    let mut stable: Config = toml::from_str(source).expect("config parses");
+    let clamped = stable.clamp_to_channel(Channel::Stable);
+    assert_eq!(
+        stable.env.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["here", "spr", "vsb"]
+    );
+    // The other providers (and the managed pool) are still dev-only.
+    assert!(clamped.contains(&Feature::Providers), "{clamped:?}");
+    assert!(clamped.contains(&Feature::Remote), "{clamped:?}");
+    assert!(!Feature::Providers.allowed_in(Channel::Stable));
+
+    let stable_kinds = [
+        EnvProviderKind::Custom,
+        EnvProviderKind::Daytona,
+        EnvProviderKind::Sprites,
+        EnvProviderKind::Hetzner,
+        EnvProviderKind::DigitalOcean,
+        EnvProviderKind::Fly,
+        EnvProviderKind::Machine0,
+        EnvProviderKind::Vercel,
+    ]
+    .into_iter()
+    .filter(|kind| kind.stable_channel())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        stable_kinds,
+        [EnvProviderKind::Sprites, EnvProviderKind::Vercel]
+    );
+
+    let mut dev: Config = toml::from_str(source).expect("config parses");
+    assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev.env.len(), 7);
+}
+
+#[test]
+fn stable_clamp_with_only_sprites_and_vercel_reports_nothing() {
+    use crate::channel::Channel;
+
+    let source = "\
+[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\
+[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n";
+    let mut stable: Config = toml::from_str(source).expect("config parses");
+    assert!(stable.clamp_to_channel(Channel::Stable).is_empty());
+    assert_eq!(stable.env.len(), 2);
+}
+
+#[test]
 fn clamp_keeps_k8s_envs_in_dev() {
     use crate::channel::Channel;
     let mut cfg = k8s_only_config();
