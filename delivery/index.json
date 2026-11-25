@@ -1388,6 +1388,14 @@
       "archive_path": "openspec/changes/archive/2026-09-30-preserve-winning-host-environment/"
     },
     {
+      "change": "redact-tailnet-identity-in-doctor",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Doctor redacts the tailnet name and control URL by default (shared redaction placeholder, reveal note names the flag), with `thegn doctor --full` (alias `--unredacted`) printing them verbatim; `doctor bundle` archives the redacted view."
+    },
+    {
       "change": "reduce-process-monitor-idle-work",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
