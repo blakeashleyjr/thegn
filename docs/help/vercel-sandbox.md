@@ -318,6 +318,22 @@ download. If the image cannot fetch one (no `curl`, or no network), the attempt
 stops with a `thegn-job-launch-failed` message on stderr naming the missing
 toolchain and reports as indeterminate rather than exit 127.
 
+Rust links through a C compiler, and the default image ships none. When `cc` is
+missing the launcher installs one before the recipe starts, with the image's
+package manager (`apt-get`: `gcc libc6-dev`; `dnf`/`microdnf`: `gcc`; `apk`:
+`gcc musl-dev`), using `sudo -n` when it is not root. If that fails the attempt
+stops with `thegn-job-launch-failed: no C linker (...)`. Both installs run in
+every attempt's fresh sandbox, so each attempt pays the download and install
+time (typically under a minute) before the recipe's own clock matters.
+
+A job sandbox is created with your env's egress list plus these hosts, so a
+deny-by-default env still works for cargo recipes: `sh.rustup.rs`,
+`static.rust-lang.org`, `index.crates.io`, `static.crates.io`, `crates.io`, and
+the OS mirrors `archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com`,
+`deb.debian.org`, `security.debian.org`, `cdn.amazonlinux.com` and
+`dl-cdn.alpinelinux.org`. Add any other host through `egress_allow`; an
+`allow-all` env stays allow-all. Interactive sandboxes are not widened.
+
 Each attempt gets its own fresh sandbox, so a fresh sandbox is enough to
 finish. The steps, in order:
 
