@@ -2611,8 +2611,8 @@ mod tests {
             );
             if profile_sel == 0 {
                 assert!(
-                    frame.contains("credentials"),
-                    "standard explains readable credentials: {frame}"
+                    frame.contains("Hides"),
+                    "standard explains what it hides: {frame}"
                 );
             } else {
                 assert!(
