@@ -37,6 +37,10 @@ accordion — four tabs, one open section at a time:
 - **help** — this documentation, docked (a scrollable reader alongside the
   `F1` overlay)
 
+When the panel is narrow the tab strip compacts its labels first (`gt wk sy
+hp`, then `g w s h`) and only then hides tabs, marking the hidden ones with a
+trailing `+`. The active tab and `work` are never hidden.
+
 With `[lead]` configured, a pinned Lead footer takes up to 3 rows at the bottom
 of the panel at every width; see [[lead]].
 

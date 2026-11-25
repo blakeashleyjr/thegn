@@ -31,8 +31,10 @@ The brand block and the app-tab chips on the left, and the
 the bar focused, `←/→` walks the stats and `↵` opens the stat's history popup
 — `Esc`, `q`, or a click outside dismisses it. Clicking the empty right half
 of the bar cycles the `[stats] refresh_rates` cadence. The cluster sheds
-stats softest-first as the terminal narrows, `date` first, then `weather`,
-then `fleet`, and `clock` among the last to go — so the
+stats softest-first as the terminal narrows, in this order: `date`,
+`weather`, `fleet`, `uptime`, `load`, `freq`, `swap`, `temp`, `disk`, `gpu`,
+`battery`, `net`, `clock`, `mem`, `cpu` — so `cpu`, `mem` and `clock` are
+the last to go and the
 calendar stays reachable from the bar even on a cramped terminal; the brand
 and the active app chip always keep their cells.
 
@@ -148,8 +150,11 @@ always counted. Clicking the widget performs the same files-drawer toggle as
   affordance rather than an alert.
 
 When the bar is too narrow for everything, the free-text status message is
-clipped first, then widgets and the quieter badges are shed — the `✋`,
-`LOCKED` and daemon chips are never the ones to go.
+clipped first, then items are shed in this order: the `loc`, `tests`, `pr`
+and `disk` widgets, `status`, other widgets, then the quieter badges (media,
+ingress, disk warning, network, usage, notifications, PR queue, merge queue,
+CI, zoom, maximized, sync, attention) — the `✋`, `LOCKED`, help and daemon
+chips are never the ones to go.
 
 The `loc` and `disk` widgets are **measured in the background**, not computed
 per frame: a `du` and a `tokei` walk are both far too slow to sit on the render
