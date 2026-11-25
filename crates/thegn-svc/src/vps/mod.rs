@@ -2105,7 +2105,7 @@ mod tests {
         }
 
         let capped = collect_inventory(
-            |page| Box::pin(async move { Ok(hetzner_page(&[], page, true, 0)) }),
+            |page| Box::pin(async move { Ok(hetzner_page(&[i64::from(page)], page, true, 0)) }),
             hetzner::parse_server_page,
             |row: &VpsInstance| row.id.clone(),
         )

@@ -750,8 +750,7 @@ async fn cancel_when_running(store: AttemptStore, token: CancelToken) {
     for _ in 0..500 {
         let running = store
             .read(1)
-            .ok()
-            .flatten()
+            .expect("read attempt row")
             .is_some_and(|record| record.state == AttemptState::Running);
         if running {
             break;
@@ -1503,11 +1502,11 @@ async fn reconcile_pending_reports_a_row_settled_during_the_pass_as_superseded()
             && req.method == "GET"
             && req.path().starts_with("/v2/sandboxes/")
             && !req.path().contains("/sessions/")
-            && let Some(mut row) = hook_store.read(1).ok().flatten()
+            && let Some(mut row) = hook_store.read(1).expect("read attempt row")
         {
             row.cleanup = Cleanup::Done;
             row.sandbox_deleted = true;
-            let _ = hook_store.mark(&row);
+            hook_store.mark(&row).expect("mark attempt row");
         }
         inner(req)
     });
