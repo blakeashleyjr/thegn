@@ -1859,6 +1859,14 @@
       "summary": "Sidebar groups fold to 7 entries with protected rows, batch rows, no repeated title line, a continuous guide and state-toned names; live verification open."
     },
     {
+      "change": "sprite-exec-stream-reattach",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Sprites exec sockets ping every 15 s and drop a silent peer; non-tty sprite-exec reattaches with output_offset after a drop (THE-2710)."
+    },
+    {
       "change": "stabilize-process-monitor-refresh",
       "archive_path": "openspec/changes/archive/2026-10-19-stabilize-process-monitor-refresh/",
       "lifecycle": "archived",

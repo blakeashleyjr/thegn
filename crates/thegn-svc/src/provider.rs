@@ -3694,6 +3694,14 @@ const EXEC_EXIT_DRAIN: Duration = Duration::from_secs(2);
 const EXEC_PROBE_AFTER: Duration = Duration::from_secs(5);
 /// A Ping with no inbound frame this long ends the session as dropped.
 const EXEC_PROBE_DEAD: Duration = Duration::from_secs(5);
+/// Every exec socket sends a WebSocket Ping this often, input or not, so an
+/// idle intermediary never reaps a quiet long-running command's stream
+/// (THE-2710; the Sprites Go SDK pings every 15 s for the same reason).
+const EXEC_KEEPALIVE_EVERY: Duration = Duration::from_secs(15);
+/// A peer that has answered a Ping before and then sends nothing at all for
+/// this long is gone: the session ends as dropped so the caller can reattach.
+/// A peer that never answers pings is never judged by silence.
+const EXEC_KEEPALIVE_DEAD: Duration = Duration::from_secs(45);
 /// Item capacity of the provider output channels.
 const EXEC_CHANNEL_CAPACITY: usize = 256;
 /// Largest provider output item queued at once; with EXEC_CHANNEL_CAPACITY
@@ -3906,6 +3914,26 @@ fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) 
         q.append_pair("cols", &cols.to_string());
         q.append_pair("rows", &rows.to_string());
     }
+    Ok(url.to_string())
+}
+
+/// Build the Sprites NON-tty reattach WSS URL:
+/// `wss://…/sprites/{id}/exec/{session}?output_offset=N`, where `N` counts the
+/// stdout and stderr payload bytes already delivered, so the server resumes the
+/// output instead of replaying it (the Sprites Go SDK's `SetOutputOffset`).
+fn attach_stream_ws_url(
+    api_base: &str,
+    id: &str,
+    session: &str,
+    output_offset: u64,
+) -> Result<String> {
+    checked_sprite_name(id)?;
+    let session = checked_exec_session(session)?;
+    let base = ws_scheme(api_base);
+    let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec/{session}"))
+        .context("sprites: bad attach url")?;
+    url.query_pairs_mut()
+        .append_pair("output_offset", &output_offset.to_string());
     Ok(url.to_string())
 }
 
@@ -4164,6 +4192,32 @@ impl SpritesProvider {
         let session = Box::pin(self.connect_exec(url, true, false, None, None)).await?;
         send_initial_size(&session, cols, rows);
         Ok(session)
+    }
+
+    /// Reattach to a NON-tty exec session whose stream dropped without an exit
+    /// (THE-2710). `output_offset` is the stdout plus stderr payload bytes the
+    /// caller already received, so the server resumes rather than replays. The
+    /// returned stream keeps feeding `stderr`, so the tail and its total span
+    /// every attachment. One attempt, like [`attach_exec`](Self::attach_exec):
+    /// the caller owns the backoff.
+    pub async fn attach_exec_streaming(
+        &self,
+        id: &str,
+        session: &str,
+        output_offset: u64,
+        stderr: &ExecStderr,
+    ) -> Result<StreamingExec> {
+        let url = attach_stream_ws_url(self.base()?, id, session, output_offset)?;
+        let sink = Arc::clone(&stderr.0);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let session =
+            Box::pin(self.connect_exec(url, false, false, Some(Arc::clone(&sink)), Some(done_tx)))
+                .await?;
+        Ok(StreamingExec {
+            session,
+            stderr: ExecStderr(sink),
+            verdict: done_rx,
+        })
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
@@ -4527,6 +4581,8 @@ where
     let mut probe_disabled_logged = false;
     let mut control_closed = false;
     let mut fault = None;
+    let mut keepalive_at = tokio::time::Instant::now() + EXEC_KEEPALIVE_EVERY;
+    let mut last_inbound = tokio::time::Instant::now();
 
     macro_rules! protocol_fault {
         ($error:expr) => {{
@@ -4609,6 +4665,25 @@ where
                     break;
                 }
             },
+            () = tokio::time::sleep_until(keepalive_at), if exited.is_none() => {
+                let now = tokio::time::Instant::now();
+                if pong_seen && now.duration_since(last_inbound) >= EXEC_KEEPALIVE_DEAD {
+                    tracing::debug!(
+                        target: "thegn::provider",
+                        silent_s = now.duration_since(last_inbound).as_secs(),
+                        "exec socket silent through keepalive pings; treating as dropped"
+                    );
+                    break;
+                }
+                if write
+                    .send(Message::Ping(b"thegn".to_vec().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                keepalive_at = tokio::time::Instant::now() + EXEC_KEEPALIVE_EVERY;
+            },
             ctrl = control_rx.recv(), if !control_closed => {
                 if exited.is_some() {
                     match ctrl {
@@ -4684,6 +4759,7 @@ where
                 if matches!(&msg, Some(Ok(_))) {
                     probe_at = None;
                     probed = false;
+                    last_inbound = tokio::time::Instant::now();
                 }
                 match msg {
                 Some(Ok(Message::Binary(b))) => {
@@ -5748,6 +5824,23 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.attach_exec(id, session, cols, rows).await,
             _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
+        }
+    }
+
+    /// Reattach to a dropped non-tty streaming exec, resuming its output after
+    /// `output_offset` payload bytes. Sprites only.
+    pub async fn attach_exec_streaming(
+        &self,
+        id: &str,
+        session: &str,
+        output_offset: u64,
+        stderr: &ExecStderr,
+    ) -> Result<StreamingExec> {
+        match self {
+            Provider::Sprites(p) => {
+                Box::pin(p.attach_exec_streaming(id, session, output_offset, stderr)).await
+            }
+            _ => Err(anyhow!("provider '{}' has no streaming exec", self.name())),
         }
     }
 }
@@ -7642,6 +7735,19 @@ mod tests {
         assert_eq!(error.to_string(), "sprites: invalid exec session id");
     }
 
+    #[test]
+    fn attach_stream_ws_url_carries_only_the_output_offset() {
+        assert_eq!(
+            attach_stream_ws_url("https://api.sprites.dev/v1", "dev", "1847", 8).unwrap(),
+            "wss://api.sprites.dev/v1/sprites/dev/exec/1847?output_offset=8"
+        );
+        for session in ["a/b", "..", "a?b", ""] {
+            let error =
+                attach_stream_ws_url("https://api.sprites.dev/v1", "dev", session, 0).unwrap_err();
+            assert_eq!(error.to_string(), "sprites: invalid exec session id");
+        }
+    }
+
     #[tokio::test]
     async fn with_destroy_confirm_sets_the_budget() {
         let _state = thegn_core::testenv::IsolatedState::new();
@@ -8281,7 +8387,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drive_exec_non_tty_never_arms_probe() {
+    async fn drive_exec_non_tty_sends_only_keepalive_pings_while_idle() {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
@@ -8312,17 +8418,89 @@ mod tests {
             Message::Binary(vec![0, b'x'].into())
         );
 
-        let observed = tokio::time::timeout(Duration::from_secs(60), server.next());
-        tokio::pin!(observed);
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60)).await;
+        // The server keeps reading (so tungstenite answers each Ping): a quiet
+        // non-tty command sees only keepalive pings and stays up.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server_task = tokio::spawn(async move {
+            while let Some(Ok(message)) = server.next().await {
+                server_seen.lock().unwrap().push(message);
+            }
+        });
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
         assert!(
-            observed.await.is_err(),
-            "non-tty exec armed a liveness probe"
+            !driver.is_finished(),
+            "an answering idle socket was dropped"
         );
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen.len() >= 3, "keepalive pings: {seen:?}");
+            assert!(
+                seen.iter()
+                    .all(|message| matches!(message, Message::Ping(_))),
+                "non-tty idle traffic is keepalive only: {seen:?}"
+            );
+        }
 
         control_tx.send(ExecControl::Close).await.unwrap();
         assert_eq!(driver.await.unwrap(), None);
+        server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_exec_keepalive_drops_a_socket_that_went_silent() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(
+            client, false, frames_tx, control_rx, sid_tx, None, None,
+        ));
+
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Ping(_)
+        ));
+        server
+            .send(Message::Pong(b"thegn".to_vec().into()))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // The peer answered once, then never again (a half-open socket).
+        for _ in 0..2 {
+            tokio::time::advance(EXEC_KEEPALIVE_EVERY).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(!driver.is_finished(), "dropped before the silence bound");
+        tokio::time::advance(EXEC_KEEPALIVE_EVERY).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            driver.is_finished(),
+            "a silent socket outlived the keepalive bound"
+        );
+        assert_eq!(driver.await.unwrap(), None);
+        drop(server);
     }
 
     #[tokio::test]

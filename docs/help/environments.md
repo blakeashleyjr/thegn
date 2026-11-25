@@ -709,6 +709,10 @@ Interactive remote transports share one rule, and a new one should adopt it.
 - **Self-calibrating.** It acts only on a connection that has already answered
   a ping, and only for interactive panes. A server that never answers pings is
   left alone, so a quiet but healthy session is never cut.
+- **Idle keepalive.** Every exec socket, interactive or not, also sends a
+  WebSocket ping every 15 s so a proxy never reaps a quiet stream (a build
+  printing nothing for minutes). A connection that has answered a ping and then
+  sends nothing for 45 s is treated as dropped and reattached.
 - **`TCP_NODELAY`** is set on the exec and proxy sockets, so a keystroke is not
   held back to be batched.
 
@@ -859,6 +863,14 @@ stderr (stdout no longer carries the stderr tail or the 1 MiB marker) and
 forwards a non-terminal stdin. TTY mode runs only when stdin and stdout are
 both terminals. Provisioning (`run_exec`) is unchanged.
 
+When a non-tty stream drops without an exit status, `sprite-exec` reattaches to
+the session the server announced, after 1, 2, 4, 8 and 15 s, printing one line
+per attempt on stderr. It asks the server to resume after the stdout and stderr
+bytes already received, so stdout is not repeated, and it never runs the command
+again. Stdin a dropped session did not take is sent to the next one. When every
+attempt fails it exits with `exec stream ended without an exit status` and the
+last reattach error.
+
 ## Parity run summary
 
 `test/remote-parity.sh` ends with a `RUN SUMMARY` block listing each step's
@@ -870,6 +882,8 @@ Not confirmed against a live provider:
 
 - the guest has the `C.UTF-8` locale;
 - the shape of the server's replay on reattach;
+- whether a non-tty session outlives a dropped socket long enough to reattach,
+  and how the server honours `output_offset`;
 - the largest WebSocket message the server accepts;
 - whether an open, idle exec keeps a sprite awake;
 - whether Sprites applies the cols and rows in the exec URL itself (the explicit
