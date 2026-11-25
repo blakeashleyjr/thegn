@@ -1115,6 +1115,51 @@ impl SpritesProvider {
         }
     }
 
+    /// Recover a sprite another thegn instance created: read its creation
+    /// marker and, when [`crate::sprites::marker::decide`] allows, record it as
+    /// ours (the ledger refuses any existing record, so a sprite recorded by
+    /// another controller, account or provider is never taken). Read-only on
+    /// the sprite apart from the best-effort marker refresh.
+    async fn adopt_marked(
+        &self,
+        dir: &std::path::Path,
+        scope: &crate::sprites::ledger::OwnerScope,
+        name: &str,
+    ) -> Result<()> {
+        let bytes = ProviderFiles::read(self, name, crate::sprites::marker::MARKER_PATH)
+            .await
+            .context("no creation marker")?;
+        crate::sprites::marker::decide(&bytes, scope, name, thegn_core::util::now())
+            .map_err(|reason| anyhow!(reason))?;
+        let (dir, scope_owned, owned_name, cap) = (
+            dir.to_path_buf(),
+            scope.clone(),
+            name.to_string(),
+            self.max_instances,
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::sprites::ledger::adopt_at(&dir, &scope_owned, &owned_name, cap)
+        })
+        .await
+        .context("sprites: ledger worker failed")??;
+        self.write_marker(name).await;
+        Ok(())
+    }
+
+    /// Stamp (or refresh the lease on) the creation marker. Best effort: a
+    /// failure only means another instance cannot auto-adopt this sprite.
+    pub(crate) async fn write_marker(&self, name: &str) {
+        let Some(scope) = self.scope.as_ref() else {
+            return;
+        };
+        let bytes = crate::sprites::marker::encode(scope, name, thegn_core::util::now());
+        if let Err(error) =
+            ProviderFiles::write(self, name, crate::sprites::marker::MARKER_PATH, &bytes).await
+        {
+            tracing::debug!(target: "thegn::sprites", sprite = %name, "cannot write the creation marker: {error:#}");
+        }
+    }
+
     /// A listed sprite is used only when this instance's ledger proves it
     /// created it: provisioning uploads login files into it. Refuses with the
     /// `thegn env adopt` hint otherwise. Never sends a mutating request.
@@ -1127,11 +1172,24 @@ impl SpritesProvider {
         let dir = self.ledger_dir();
         let error_name = name.to_string();
         let (ledger, name, legacy) = (dir, error_name.clone(), self.legacy_ids.clone());
-        let proof = tokio::task::spawn_blocking(move || {
-            crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
-        })
-        .await
-        .context("sprites: ledger worker failed")?;
+        let proof = {
+            let (ledger, scope, name) = (ledger.clone(), scope.clone(), name.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::sprites::ledger::prove_owned_at(&ledger, &scope, &name, &legacy)
+            })
+            .await
+            .context("sprites: ledger worker failed")?
+        };
+        let proof = match proof {
+            Ok(proof) => Ok(proof),
+            Err(refusal) => match self.adopt_marked(&ledger, &scope, &name).await {
+                Ok(()) => Ok(crate::sprites::ledger::Proof::Ledger),
+                Err(reason) => {
+                    tracing::debug!(target: "thegn::sprites", sprite = %name, "auto-adopt declined: {reason:#}");
+                    Err(refusal)
+                }
+            },
+        };
         proof.map(|_| ()).map_err(|refusal| {
             tracing::debug!(target: "thegn::sprites", sprite = %error_name, "reuse refused: {refusal:#}");
             anyhow!(
@@ -5162,10 +5220,14 @@ impl Provider {
             }
             if let Provider::Sprites(provider) = self {
                 provider.prove_listed_sprite(name).await?;
+                provider.write_marker(name).await;
             }
             return Ok(false);
         }
         self.create().await?;
+        if let Provider::Sprites(provider) = self {
+            provider.write_marker(name).await;
+        }
         Ok(true)
     }
 

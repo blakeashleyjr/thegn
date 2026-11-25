@@ -1085,10 +1085,72 @@ fn ensure_exists_refuses_a_listed_unrecorded_sprite() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("thegn env adopt"), "{err:#}");
 
+    // The inventory GET and the creation-marker read are the only requests.
     let reqs = mock.recorded.lock().unwrap().clone();
-    assert_eq!(reqs.len(), 1, "only the inventory GET is allowed: {reqs:?}");
-    assert_eq!(reqs[0].method, "GET");
+    assert!(
+        reqs.iter().all(|r| r.method == "GET"),
+        "a refusal must not mutate: {reqs:?}"
+    );
     assert_eq!(reqs[0].path, "/v1/sprites");
+}
+
+/// Stamp `name`'s creation marker on the mock as `owner` at time `at`.
+fn stamp_marker(base: &str, name: &str, owner: &str, at: i64) {
+    let other = OwnerScope {
+        owner: owner.into(),
+        account: scope().account,
+    };
+    let writer = SpritesProvider::new(base, "tok", name);
+    let bytes = thegn_svc::sprites::marker::encode(&other, name, at);
+    rt().block_on(ProviderFiles::write(
+        &writer,
+        name,
+        thegn_svc::sprites::marker::MARKER_PATH,
+        &bytes,
+    ))
+    .unwrap();
+}
+
+#[test]
+fn ensure_exists_adopts_a_sprite_marked_by_another_instance_once_its_lease_lapsed() {
+    let mock = start_mock();
+    stamp_marker(&mock.base_url, "tgtest1", "ctl-other-instance", 0);
+    let (provider, ledger) = scoped(&mock.base_url, "tgtest1");
+    let created = rt()
+        .block_on(Provider::Sprites(provider).ensure_exists("tgtest1"))
+        .unwrap();
+    assert!(!created, "reattach, never a create");
+    assert!(
+        thegn_svc::sprites::ledger::prove_owned_at(ledger.path(), &scope(), "tgtest1", &[]).is_ok(),
+        "the sprite is now recorded as ours"
+    );
+    let reqs = mock.recorded.lock().unwrap().clone();
+    assert!(
+        reqs.iter()
+            .all(|r| r.method != "POST" && r.method != "DELETE"),
+        "{reqs:?}"
+    );
+}
+
+#[test]
+fn ensure_exists_refuses_a_sprite_whose_marker_lease_is_live() {
+    let mock = start_mock();
+    stamp_marker(
+        &mock.base_url,
+        "tgtest1",
+        "ctl-other-instance",
+        thegn_core::util::now(),
+    );
+    let (provider, ledger) = scoped(&mock.base_url, "tgtest1");
+    let err = rt()
+        .block_on(Provider::Sprites(provider).ensure_exists("tgtest1"))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("thegn env adopt"), "{err:#}");
+    assert!(
+        thegn_svc::sprites::ledger::prove_owned_at(ledger.path(), &scope(), "tgtest1", &[])
+            .is_err(),
+        "nothing was recorded"
+    );
 }
 
 #[test]
