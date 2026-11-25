@@ -43,8 +43,8 @@ provider = "auto"
 
 [usage]
 # The AI-account usage gauge may call its provider with a token already on
-# disk; false is offline. Default: true.
-allow_network = true
+# disk; false is offline. Opt-in: Default: false.
+allow_network = false
 
 [weather]
 # Weather is disabled until you opt in. Default: false.

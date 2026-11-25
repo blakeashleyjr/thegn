@@ -98,10 +98,10 @@ counters.
 
 **Claude** and **Antigravity** publish no window state to disk. Their windows
 require one lightweight authenticated request per account, using the OAuth token
-already sitting in the credential home. That is why `[usage] allow_network`
-defaults to `true` — set it to `false` and no request is ever made, but every
-Claude account will read _unavailable_ because there is genuinely nothing local
-to read.
+already sitting in the credential home. Because that uses your existing login,
+`[usage] allow_network` defaults to `false`: no request is made until you set it
+to `true`, and until then every Claude account reads _unavailable_ because there
+is genuinely nothing local to read.
 
 A row that can't be read says why: _not logged in_, _token expired_, _network
 off_, _no sessions_. Accounts are independent, so one failing never hides the

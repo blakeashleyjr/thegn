@@ -1805,10 +1805,11 @@ pub struct UsageConfig {
     /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
     /// Antigravity quota summary) using the on-disk OAuth token.
     ///
-    /// **On by default**, because Claude publishes no window state to disk: with
-    /// this off the feature has nothing to show for a Claude account and every
-    /// row reads "unavailable". `false` restricts it to offline sources (Codex
-    /// rollup files) — the shell itself stays offline either way.
+    /// **Off by default**: thegn does not use an existing Claude (or
+    /// Antigravity) login until the user opts in. Claude publishes no window
+    /// state to disk, so with this off its rows read "unavailable"; Codex
+    /// rollup files are still read offline. The shell itself stays offline
+    /// either way.
     pub allow_network: bool,
     /// Show the statusbar badge. The badge is the always-on affordance; turn it
     /// off to keep the overlay and panel section without spending bar width.
@@ -1855,7 +1856,7 @@ impl Default for UsageConfig {
     fn default() -> Self {
         UsageConfig {
             enabled: true,
-            allow_network: true,
+            allow_network: false,
             statusbar: true,
             warn_percent: crate::usage::DEFAULT_WARN_PERCENT,
             crit_percent: crate::usage::DEFAULT_CRIT_PERCENT,
@@ -7966,6 +7967,22 @@ mod agent_error_signatures_tests {
         };
         let errors = cfg.validate();
         assert!(errors.iter().any(|error| error.contains("more than 64")));
+    }
+}
+
+#[cfg(test)]
+mod usage_default_tests {
+    use super::*;
+
+    #[test]
+    fn usage_network_polling_is_opt_in() {
+        let cfg = UsageConfig::default();
+        assert!(
+            !cfg.allow_network,
+            "no credentialed fetch until the user opts in"
+        );
+        // Offline sources (Codex rollups) and the feature itself stay on.
+        assert!(cfg.enabled);
     }
 }
 
