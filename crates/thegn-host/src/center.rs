@@ -271,6 +271,31 @@ impl CenterTree {
         }
     }
 
+    /// Adopt `new_id` (a pane moved in from another tab) beside `target`: a
+    /// normal split when `target` is a plain leaf, otherwise (the target sits in
+    /// a stack, or is absent) the whole tree is wrapped in a root row split so
+    /// the adopted pane is never lost.
+    pub fn adopt_beside(&mut self, target: PaneId, new_id: PaneId) -> bool {
+        if self.split(target, Dir::Row, new_id) {
+            return true;
+        }
+        let old = std::mem::replace(self, CenterTree::Leaf(new_id));
+        *self = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: old,
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(new_id),
+                },
+            ],
+        };
+        true
+    }
+
     /// Remove `target` from the tree, collapsing a now-single-child split into
     /// that child. A nested stack emptied by the removal is dropped from its
     /// parent split. Returns `true` if removed. Returns `false` (tree untouched)

@@ -2568,6 +2568,10 @@ visible = true
 # Fraction of the screen the Half (first `e`) width takes (clamped 0.30–0.90;
 # default 0.5). Never narrower than the Normal width.
 # half_ratio = 0.5
+# Show a compact "Layout keys" block (split, swap, resize, zoom, move tab, break
+# pane, move pane, lock) at the bottom of the panel when there is room. The
+# chords follow your keybinds. Set false to hide it.
+# layout_hints = true
 
 # In-pane scrollback / copy-mode search AND the workspace-wide Search & Replace
 # surface (Ctrl+Shift+H — streamed, cancellable, with per-match preview and a

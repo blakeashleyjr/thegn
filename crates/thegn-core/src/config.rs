@@ -5299,6 +5299,11 @@ pub struct PanelConfig {
     /// Fraction of the window the Half width claims. Unset = 0.5. Clamped to
     /// 0.3–0.9 at apply time; never below the resting width.
     pub half_ratio: Option<f32>,
+    /// Show the compact "Layout keys" hint block (split, swap, resize, zoom,
+    /// tab / pane moves, lock) in the blank tail of the right panel. The
+    /// chords are read from the live keymap. `false` hides it.
+    #[serde(default = "default_true")]
+    pub layout_hints: bool,
 }
 
 impl Default for PanelConfig {
@@ -5308,6 +5313,7 @@ impl Default for PanelConfig {
             collapse_on_escape: true,
             width: None,
             half_ratio: None,
+            layout_hints: true,
         }
     }
 }

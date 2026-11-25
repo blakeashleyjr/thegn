@@ -1257,6 +1257,15 @@ fn panel_sections_parse_and_default_empty() {
 }
 
 #[test]
+fn panel_layout_hints_defaults_true_and_parses() {
+    assert!(PanelConfig::default().layout_hints);
+    let cfg: Config = toml::from_str("").unwrap();
+    assert!(cfg.panel.layout_hints);
+    let cfg: Config = toml::from_str("[panel]\nlayout_hints = false\n").unwrap();
+    assert!(!cfg.panel.layout_hints);
+}
+
+#[test]
 fn panel_collapse_on_escape_defaults_true_and_parses() {
     // Default (both the Rust `Default` and the absent-table serde path).
     assert!(PanelConfig::default().collapse_on_escape);

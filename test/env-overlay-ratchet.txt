@@ -333,6 +333,7 @@ palette.file_max_results
 palette.symbol_max_results
 panel.collapse_on_escape
 panel.half_ratio
+panel.layout_hints
 panel.sections
 panel.width
 pins.args

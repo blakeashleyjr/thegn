@@ -3161,6 +3161,7 @@ pub(crate) fn build_model(
         sidebar_db_terminals,
         disk_warn_threshold_gb: app_cfg.disk.warn_threshold_gb,
         procs_disabled: !app_cfg.monitor.processes,
+        layout_hints_off: !app_cfg.panel.layout_hints,
         active_worktree_disk: sidebar_status
             .disk_sizes
             .get(cwd.to_string_lossy().as_ref())

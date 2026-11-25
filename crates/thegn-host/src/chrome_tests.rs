@@ -2945,6 +2945,68 @@ fn dense_panel_shows_no_navigation_footer() {
     );
 }
 
+fn layout_hint_model() -> FrameModel {
+    let mut model = panel_model();
+    for (id, _) in crate::panel::layout_hints::ROWS {
+        model
+            .chord_hints
+            .insert((*id).to_string(), format!("chord-{id}"));
+    }
+    model
+}
+
+#[test]
+fn panel_shows_layout_keys_block_and_follows_a_rebind() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    let mut model = layout_hint_model();
+    model.chord_hints.insert("zoom".into(), "Ctrl-q".into());
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("LAYOUT KEYS"), "title missing: {text:?}");
+    assert!(
+        text.contains("Ctrl-q"),
+        "rebound zoom chord missing: {text:?}"
+    );
+    assert!(
+        text.contains("pane to own tab"),
+        "break row missing: {text:?}"
+    );
+}
+
+#[test]
+fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
+    use crate::panel::PanelUi;
+    let mut model = layout_hint_model();
+    model.layout_hints_off = true;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
+    // Enabled, but a rect the panel body fills leaves no room for it.
+    let model = layout_hint_model();
+    let tiny = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 8,
+    };
+    let mut s = Surface::new(44, 8);
+    draw_panel(&mut s, tiny, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
+}
+
 #[test]
 fn panel_hits_expose_all_sections_at_distinct_rows() {
     use crate::panel::{PanelHit, PanelUi};

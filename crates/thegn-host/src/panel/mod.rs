@@ -26,6 +26,7 @@ pub mod gitfull;
 pub mod gitui;
 pub mod graph;
 pub mod hints;
+pub(crate) mod layout_hints;
 pub(crate) mod lead_bar;
 pub(crate) mod media;
 pub mod rollback;

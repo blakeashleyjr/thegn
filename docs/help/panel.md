@@ -40,6 +40,14 @@ accordion — four tabs, one open section at a time:
 With `[lead]` configured, a pinned Lead footer takes up to 3 rows at the bottom
 of the panel at every width; see [[lead]].
 
+When the section list leaves blank rows, a dim **Layout keys** block sits at
+the bottom of the panel, just above the Lead footer (the Lead keeps priority).
+It lists split, swap, resize, zoom, lock keys, move tab left / right, pane to
+its own tab and pane to previous / next tab — one chord and a short label per
+row, read from your live keybinds so a rebind shows up. On a short or narrow
+panel the lowest-priority rows drop and long text is cut; set
+`[panel] layout_hints = false` to hide it. See [[terminal-and-panes]].
+
 ## Keys
 
 - `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten
@@ -142,6 +150,7 @@ those workflows.
 - **Auto-widen (DWIM)** — an action that needs a wider view (for example,
   `s` squash at resting width) widens the panel and performs the action in
   one press instead of printing a "widen first" note.
+- **`[panel] layout_hints`** — show (default) or hide the Layout keys block.
 - **`[panel] width` / `half_ratio`** — the resting column count and the
   half-screen fraction are configurable (see the configuration reference).
 - **Drag** — at the resting width, drag the panel's left separator to resize;
