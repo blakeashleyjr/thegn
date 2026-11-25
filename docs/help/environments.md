@@ -212,6 +212,18 @@ A sprites env (`provider = "sprites"`, `placement = "provider"`) is paid, so
 thegn is strict about what it creates and deletes. Nothing in this section has
 been verified live against the real Sprites API yet.
 
+- **First `env up` timing.** A first create on a fresh account takes about
+  one to two minutes before everything is done, and your shell is usable after
+  about 20 seconds. `thegn env up` prints each phase with its elapsed time
+  (for example `Install coding agents — done (51.2 s)`) and a total at the end;
+  the loading card shows the same phases with a hint under the slow ones.
+  Typical phases: boot 0.4 s, workspace and repository seed 3 s, setup 12 s,
+  coding-agent install 45 to 60 s (the agent CLIs download in parallel), agent
+  logins 10 s, snapshot 4 s. Later opens are fast: a sprite that is asleep wakes
+  in under a second, and `thegn env snapshot` keeps a checkpoint you can
+  `thegn env restore` instead of installing again. Use `env up --shell-ready`
+  to return as soon as a shell opens and let the installs finish in the
+  background.
 - **Ledger before create.** thegn writes a `creating` record to its local
   ledger before it asks Sprites to create a sprite, and `ready` after. thegn
   deletes a sprite only when this host recorded it. Sprites that existed

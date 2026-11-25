@@ -1528,12 +1528,20 @@ fn provision_reporting(
     provision: impl FnOnce(&mut dyn FnMut(&[ProvisionStepView])) -> Result<bool>,
 ) -> Result<bool> {
     let mut reporter = StepReporter::default();
+    let t0 = Instant::now();
     let mut on_progress = |steps: &[ProvisionStepView]| {
         for line in reporter.changed(steps) {
             msg::info(&line);
         }
     };
-    provision(&mut on_progress)
+    let result = provision(&mut on_progress);
+    if matches!(result, Ok(true)) {
+        msg::info(&format!(
+            "provision: finished in {:.1} s",
+            t0.elapsed().as_secs_f64()
+        ));
+    }
+    result
 }
 
 /// Turns the loading screen's full step snapshots into one line per step state

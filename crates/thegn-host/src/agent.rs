@@ -2917,6 +2917,20 @@ mod env_selection_tests {
     }
 }
 
+/// The sub-line shown under a step that is known to take a while on a first
+/// create, so the wait reads as work in progress rather than a hang. `None`
+/// for steps that finish in seconds.
+fn slow_step_hint(step_id: &str) -> Option<&'static str> {
+    match step_id {
+        "agents_install" => {
+            Some("first run only: downloads the agent CLIs (about 1 min); later opens skip this")
+        }
+        "nix" | "toolchain" => Some("first run only: later opens restore the snapshot"),
+        "checkpoint" => Some("saving a snapshot so the next open is fast"),
+        _ => None,
+    }
+}
+
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
 /// **declared** environment inside it (see `thegn_core::envplan`): clone the
 /// repo, install the declared toolchain (Nix devShell / mise / runtimes), sync
@@ -3774,6 +3788,9 @@ fn provision_provider_env_inner(
                 std::cmp::Ordering::Equal => ProvisionState::Active, // spinner
                 std::cmp::Ordering::Greater => ProvisionState::Pending, // dot
             };
+        }
+        if let Some(hint) = slow_step_hint(&step.id) {
+            views[i].detail = Some(hint.to_string());
         }
         progress(&views);
         let step_t0 = std::time::Instant::now();
