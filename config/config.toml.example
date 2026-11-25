@@ -4926,6 +4926,8 @@ failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ 
 # it). `thegn job route` shows the effective runner and why.
 # [project.my-repo.jobs]
 # runner = ""
+# route = "off"   # "auto": a terminal agent's bare `cargo build`/`cargo test` runs
+#                 # on the runner via the `thegn job shim-install` wrapper
 
 # ── Issue autopilot (opt-in) ────────────────────────────────────────────────
 # Pick up issues returned by the provider's authenticated "my issues" query,

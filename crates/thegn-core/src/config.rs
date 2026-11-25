@@ -5328,7 +5328,7 @@ pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
 };
-pub use crate::config_jobs::{JobsConfig, JobsOverlay, RunnerChoice, RunnerSource};
+pub use crate::config_jobs::{JobsConfig, JobsOverlay, RouteMode, RunnerChoice, RunnerSource};
 pub use crate::config_model_proxy::{
     BudgetBreach, BudgetConfig, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
     RouteBackend, RouteEntry, RoutingStrategy,
@@ -7524,6 +7524,22 @@ impl Config {
                 env: global.to_owned(),
                 source: RunnerSource::Global,
             }
+        }
+    }
+
+    /// Whether this project's qualified build/test commands are routed
+    /// automatically (`[workspace.<slug>.jobs] route = "auto"`). Opt-in per
+    /// trusted project block only: a repo overlay, an unconfigured project and
+    /// an ambiguous block are all [`RouteMode::Off`].
+    pub fn repo_job_route(&self, repo_root: &Path) -> RouteMode {
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. } => overlay
+                .jobs
+                .route
+                .as_deref()
+                .and_then(RouteMode::parse)
+                .unwrap_or_default(),
+            _ => RouteMode::Off,
         }
     }
 

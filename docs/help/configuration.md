@@ -211,6 +211,13 @@ repo-root `.thegn.*` file cannot set it. `thegn job route` shows the effective
 runner and why. If the project's block is ambiguous nothing applies, not even
 the global key.
 
+`[project.<slug>.jobs] route = "auto"` opts that project into the automatic
+route: a stock terminal agent's bare `cargo build` / `cargo test` runs on the
+project's runner through the `thegn job shim` wrapper (`"off"`, the default,
+intercepts nothing). It is per project only, has no global spelling, and does
+nothing without a runner; `thegn job route` shows it as `automatic`. See
+`thegn help cli` (automatic route) for what is covered.
+
 The runner uses that env's own provider settings and token reference. A
 Sprites env needs `id` set to the one Sprite bound to the project (not a
 `{worktree}` template). A Vercel env needs `team_id` and `project_id`, and

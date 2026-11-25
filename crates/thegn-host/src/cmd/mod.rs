@@ -50,6 +50,7 @@ pub(crate) mod integrate_order;
 pub mod issue;
 pub mod issue_tracker;
 pub mod job;
+pub mod job_shim;
 pub mod kaneo;
 pub mod keys;
 pub mod land;

@@ -4162,6 +4162,29 @@ fn workspace_slug_is_the_repo_directory_name_slugified() {
 }
 
 #[test]
+fn repo_job_route_is_opt_in_per_project() {
+    let a = tmpdir("route-a");
+    let b = tmpdir("route-b");
+    let mut cfg = Config::default();
+    assert_eq!(cfg.repo_job_route(&a), RouteMode::Off);
+    cfg.workspace.insert(
+        workspace_slug(&a),
+        WorkspaceConfig {
+            jobs: JobsOverlay {
+                runner: Some("sprite-a".into()),
+                route: Some("auto".into()),
+            },
+            ..WorkspaceConfig::default()
+        },
+    );
+    assert_eq!(cfg.repo_job_route(&a), RouteMode::Auto);
+    // A second project on the same config stays off.
+    assert_eq!(cfg.repo_job_route(&b), RouteMode::Off);
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
 fn repo_job_runner_prefers_the_project_binding_over_the_global_key() {
     let a = tmpdir("jobs-a");
     let b = tmpdir("jobs-b");
@@ -4178,6 +4201,7 @@ fn repo_job_runner_prefers_the_project_binding_over_the_global_key() {
         WorkspaceConfig {
             jobs: JobsOverlay {
                 runner: Some(" sprite-a ".into()),
+                ..Default::default()
             },
             ..WorkspaceConfig::default()
         },

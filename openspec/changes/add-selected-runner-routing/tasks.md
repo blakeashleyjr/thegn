@@ -112,3 +112,24 @@
 - [x] 3.3 Per-project runner binding (`[project.<slug>.jobs] runner`, resolved by
       `Config::repo_job_runner`) and the `thegn job route [--json]` inspector.
       Interception of stock agent commands (shell adapter) remains out of scope.
+
+## 5. Automatic route (THE-2416 slice B)
+
+- [x] 5.1 `[project.<slug>.jobs] route = "off"|"auto"` (opt-in per project, no
+      global key), resolved by `Config::repo_job_route`, validated, and shown
+      as `automatic` by `thegn job route`.
+- [x] 5.2 Matcher for direct, `&&`-compound and piped lines over the closed
+      recipes, with fixture tests; unmodelled shell syntax is reported as outside
+      coverage (`thegn job match`).
+- [x] 5.3 `thegn job shim` / `shim-install`: PATH wrapper, per-call decision,
+      real-tool passthrough without the shim directory, recursion guard,
+      fail-closed on refusal, explicit `THEGN_JOB_LOCAL=1` escape.
+- [ ] 5.4 Inject the shim directory into an agent pane's environment at launch
+      (today `eval "$(thegn job shim-install --dir D)"` in the terminal).
+- [ ] 5.5 Bounded admission wait for a transiently unavailable runner (today a
+      refusal fails immediately).
+- [ ] 5.6 Stock-harness probe on the Mac builder: record the pinned harness,
+      OS and recipe that passed, and compare the explicit and automatic
+      receipts. An explicit `job run` alone does not qualify the route.
+- [ ] 5.7 Run `cargo nextest run -p thegn-host job_shim` and `-p thegn-core
+config_jobs repo_job_route` on the Mac builder.

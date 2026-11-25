@@ -25,7 +25,7 @@ programs grouping repos):
 | Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                                                   |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
-| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `job run` · `job route` · `debug` · `mcp` · `plugin`                                        |
+| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `job run` · `job route` · `job match` · `debug` · `mcp` · `plugin`                          |
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `usage [--json] [--tokens]` · `db` · `setup` · `completions`                                         |
@@ -610,7 +610,8 @@ fallback to another runner. The recipe runs with a scrubbed environment and
 `thegn job route [--json]` prints where this project's recipes run and why
 (the project's `[project.<slug>.jobs] runner`, the global `[jobs] runner`, or
 local when neither is set) without dispatching anything. `--json` prints one
-document with `project`, `destination`, `env`, `source`, `reason` and `status`.
+document with `project`, `destination`, `env`, `source`, `reason`, `status` and
+`automatic` (`auto` or `off`).
 Provider tokens stay on this machine and never reach the recipe. `--deadline`
 (default 1800, at most 86400) is clamped to the runner's own limit.
 
@@ -625,6 +626,44 @@ unproven run may have executed, so check the ledger before retrying. The
 daemon settles attempts a crash left behind for the configured `[jobs] runner`
 when it starts. Not yet forwarded: custom argv, working directory and per-step
 deadlines.
+
+#### Automatic route for a stock terminal agent
+
+A project that sets `[project.<slug>.jobs] route = "auto"` (and has a runner)
+sends its agent's bare `cargo build` and `cargo test` through the same request
+as `thegn job run`; everything else runs locally, untouched. `thegn job
+shim-install --dir <dir>` writes a `cargo` wrapper there and prints the `export`
+lines that put it first on `PATH` (`eval "$(thegn job shim-install --dir
+~/.local/share/thegn-shims)"` in the agent's terminal). The wrapper calls
+`thegn job shim -- cargo <args>`, which decides per call; the shell runs
+compound and piped lines command by command, so each `cargo` is judged alone.
+
+| Line                                                            | Result                                                               |
+| --------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `cargo build`, `cargo test`                                     | remote, at the worktree root, no extra arguments                     |
+| `cargo build && cargo test`                                     | each command remote                                                  |
+| `cargo test \| tail -n 20`                                      | `cargo test` remote, its output piped to `tail`                      |
+| `yes \| cargo build`                                            | local: a remote job takes no stdin                                   |
+| `cargo build --release`, `cargo test -p x`                      | local, with a notice: the recipe is closed and forwards no arguments |
+| `cargo fmt`, `git status`, edits                                | local, silent                                                        |
+| `;`, `\|\|`, `&`, redirects, `$(…)`, globs, `FOO=1 cargo build` | outside coverage, local                                              |
+
+`thegn job match "<line>" [--json]` prints that classification for any line.
+A qualified command also stays local, with a notice, when it is not run at the
+worktree root or when `RUSTFLAGS`, `CARGO_TARGET_DIR`, `CARGO_BUILD_*`,
+`CARGO_PROFILE_*` and similar are set (the recipe forwards no environment). The
+deadline is the default (1800 s); stdin, a TTY, a local socket and a later step
+that runs the built executable are not supported, because the build happens
+remotely and leaves no local `target/`.
+
+A qualified command that cannot reach its runner (denied, runner or capability
+missing, unavailable, or a lost acknowledgement) fails with the reason and a
+non-zero exit. It never falls back to a local compiler. `THEGN_JOB_LOCAL=1
+cargo build` is the explicit, visible way to run one command locally. Inside a
+selected job (`THEGN_SELECTED_JOB=1`) the wrapper passes straight through, so
+nothing routes recursively. Which agent harness, OS and recipe passed live
+qualification is recorded separately; the explicit `job run` alone does not
+qualify the automatic route.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller

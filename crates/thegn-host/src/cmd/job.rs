@@ -22,7 +22,7 @@ use crate::selected_runner::{self, AttemptSummary};
 
 /// Default wall clock for a recipe, in seconds (the executors clamp it to their
 /// own limit).
-const DEFAULT_DEADLINE_SECS: u64 = 1800;
+pub(crate) const DEFAULT_DEADLINE_SECS: u64 = 1800;
 /// The longest `--deadline` accepted (24 hours).
 const MAX_DEADLINE_SECS: u64 = 86_400;
 const INTERRUPT_POLL: Duration = Duration::from_millis(100);
@@ -39,6 +39,16 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Wrapper entry point: run a qualified `cargo build` / `cargo test` on the
+    /// project's runner when it opted in (`route = "auto"`), otherwise run the
+    /// real tool untouched. Use `-- cargo <args>`.
+    Shim(super::job_shim::ShimArgs),
+    /// Write PATH wrappers for the shim and print the shell lines that enable
+    /// them.
+    ShimInstall(super::job_shim::ShimInstallArgs),
+    /// Show which commands of a shell line the automatic route would send to
+    /// the runner and which stay local, and why.
+    Match(super::job_shim::MatchArgs),
 }
 
 /// The closed set of recipes `job run` can submit.
@@ -51,7 +61,7 @@ pub enum RecipeArg {
 }
 
 impl RecipeArg {
-    fn recipe(self) -> Recipe {
+    pub(crate) fn recipe(self) -> Recipe {
         match self {
             Self::CargoBuild => Recipe::CargoBuild,
             Self::CargoTest => Recipe::CargoTest,
@@ -83,6 +93,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Run(args) => run_recipe(cfg, &args),
         Action::Route { json } => route(cfg, json),
+        Action::Shim(args) => super::job_shim::shim(cfg, &args),
+        Action::ShimInstall(args) => super::job_shim::install(&args),
+        Action::Match(args) => super::job_shim::match_line(&args),
     }
 }
 
@@ -99,6 +112,9 @@ struct RouteReport {
     reason: String,
     /// `ready`, `local` or `invalid: <why>`. Never resolves a token.
     status: String,
+    /// `auto` when the shell shim routes this project's qualified recipes,
+    /// else `off`.
+    automatic: &'static str,
 }
 
 fn route_report(cfg: &Config, repo_root: &std::path::Path, project: &str) -> RouteReport {
@@ -111,6 +127,7 @@ fn route_report(cfg: &Config, repo_root: &std::path::Path, project: &str) -> Rou
         RunnerSource::Refused(_) => "refused",
     };
     let reason = choice.reason();
+    let automatic = cfg.repo_job_route(repo_root).as_str();
     if choice.env.is_empty() {
         return RouteReport {
             project: project.to_owned(),
@@ -119,6 +136,7 @@ fn route_report(cfg: &Config, repo_root: &std::path::Path, project: &str) -> Rou
             source,
             reason,
             status: "local".to_owned(),
+            automatic,
         };
     }
     let provider = cfg
@@ -146,6 +164,7 @@ fn route_report(cfg: &Config, repo_root: &std::path::Path, project: &str) -> Rou
         source,
         reason,
         status,
+        automatic,
     }
 }
 
@@ -156,8 +175,8 @@ fn render_route(report: &RouteReport) -> String {
         format!(" (env {})", report.env)
     };
     format!(
-        "project: {}\nroute: {}{env}\nreason: {}\nstatus: {}",
-        report.project, report.destination, report.reason, report.status
+        "project: {}\nroute: {}{env}\nreason: {}\nstatus: {}\nautomatic: {}",
+        report.project, report.destination, report.reason, report.status, report.automatic
     )
 }
 
@@ -195,7 +214,7 @@ fn refuse_recursion(inside: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
+pub(crate) fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
     refuse_recursion(selected_job::inside_selected_job())?;
     let worktree = super::resolve_worktree(None);
     let repo_root = thegn_core::repo::main_worktree(&worktree).ok_or_else(|| {

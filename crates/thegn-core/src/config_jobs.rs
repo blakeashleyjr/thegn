@@ -52,19 +52,61 @@ pub struct JobsOverlay {
     /// Wins over the global `[jobs] runner` for this project only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// Automatic routing of a stock terminal agent's `cargo build` / `cargo
+    /// test` through this project's runner (`"auto"`), or not (`"off"`, the
+    /// default). Opt-in per project; there is no global spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+/// Whether a project's qualified build/test commands are routed automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteMode {
+    /// Nothing is intercepted; `thegn job run` is the only way in.
+    #[default]
+    Off,
+    /// The shell shim forwards qualified recipes to the project's runner.
+    Auto,
+}
+
+impl RouteMode {
+    /// Parse the config spelling; `None` for anything unknown.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "" | "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 impl JobsOverlay {
     pub fn is_empty(&self) -> bool {
-        self.runner.is_none()
+        self.runner.is_none() && self.route.is_none()
     }
 
-    /// Semantic checks, same rule as the global key.
+    /// Semantic checks, same rule as the global key for `runner`; `route` must
+    /// be `"off"` or `"auto"`.
     pub fn validate(&self, prefix: &str, envs: &BTreeMap<String, EnvConfig>) -> Vec<String> {
-        JobsConfig {
+        let mut errs = JobsConfig {
             runner: self.runner.clone().unwrap_or_default(),
         }
-        .validate(prefix, envs)
+        .validate(prefix, envs);
+        if let Some(route) = self.route.as_deref()
+            && RouteMode::parse(route).is_none()
+        {
+            errs.push(format!(
+                "{prefix}.route: \"{route}\" is not valid; use \"off\" or \"auto\""
+            ));
+        }
+        errs
     }
 }
 
@@ -135,10 +177,33 @@ mod tests {
         assert!(JobsOverlay::default().validate("p.jobs", &envs).is_empty());
         let bad = JobsOverlay {
             runner: Some("fl".into()),
+            ..Default::default()
         };
         let errs = bad.validate("workspace.x.jobs", &envs);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("workspace.x.jobs.runner"), "{errs:?}");
+    }
+
+    #[test]
+    fn the_route_key_is_off_or_auto() {
+        assert_eq!(RouteMode::parse("auto"), Some(RouteMode::Auto));
+        assert_eq!(RouteMode::parse(" off "), Some(RouteMode::Off));
+        assert_eq!(RouteMode::parse(""), Some(RouteMode::Off));
+        assert_eq!(RouteMode::parse("always"), None);
+        let envs = BTreeMap::new();
+        let ok = JobsOverlay {
+            route: Some("auto".into()),
+            ..Default::default()
+        };
+        assert!(ok.validate("p.jobs", &envs).is_empty());
+        assert!(!ok.is_empty());
+        let bad = JobsOverlay {
+            route: Some("sometimes".into()),
+            ..Default::default()
+        };
+        let errs = bad.validate("project.x.jobs", &envs);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("project.x.jobs.route"), "{errs:?}");
     }
 
     #[test]

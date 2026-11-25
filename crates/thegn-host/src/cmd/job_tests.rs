@@ -235,6 +235,7 @@ fn the_route_report_reads_project_then_global_then_local() {
         WorkspaceConfig {
             jobs: thegn_core::config::JobsOverlay {
                 runner: Some("missing".into()),
+                ..Default::default()
             },
             ..Default::default()
         },
