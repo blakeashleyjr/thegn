@@ -114,6 +114,14 @@
       "delivered_at": "2026-11-23"
     },
     {
+      "change": "add-first-run-tour",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Owner brief of 24 November 2026 for the 30 November public launch. No Linear issue was supplied for the first-run tour.",
+      "summary": "Full-screen first-run welcome tour: workspace model, live theme, honest sandbox tiers, default agent, key drill and a config diff on finish."
+    },
+    {
       "change": "add-fleet-view",
       "lifecycle": "archived",
       "disposition": "superseded-retire",
