@@ -50,11 +50,13 @@ const MAX_QUEUED_JOBS: usize = 4096;
 const MAX_QUEUED_JOBS: usize = 8;
 
 /// How long the writer keeps its connection open with nothing to do. Kept well
-/// under the idle bench's 20 s settle cap: startup writes trail into the settle,
-/// and a 20 s close could leave the writer's main/WAL/shm handles (3 fds) open
-/// at the sample (THE-2630: 17 > 16).
+/// under the idle bench's 3.5 s sample: startup writes trail into the settle,
+/// and a longer close could leave the writer's main/WAL/shm handles (3 fds) open
+/// at the sample (THE-2630: 18 > 16). A reopen costs one pragma pass, so one
+/// second is cheap against the descriptor budget.
+const PRODUCTION_IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(not(test))]
-const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(5);
+const IDLE_CLOSE: std::time::Duration = PRODUCTION_IDLE_CLOSE;
 #[cfg(test)]
 const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -521,6 +523,13 @@ mod tests {
         let (ack_tx, ack_rx) = sync_channel(0);
         writer.tx.send(Msg::Flush(ack_tx)).unwrap();
         ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn production_idle_close_is_under_the_idle_bench_sample() {
+        // The idle bench samples db fds 3.5 s after launch; the writer must
+        // have closed its connection by then once startup writes stop.
+        assert!(PRODUCTION_IDLE_CLOSE <= Duration::from_secs(2));
     }
 
     #[test]
