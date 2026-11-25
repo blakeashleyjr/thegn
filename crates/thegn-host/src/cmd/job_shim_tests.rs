@@ -240,6 +240,9 @@ fn blocking_environment_names_are_recognised() {
 
 #[test]
 fn the_real_tool_is_found_outside_the_shim_directory() {
+    if !crate::platform::JOB_SHIM_SUPPORTED {
+        return;
+    }
     let shim = tempfile::tempdir().unwrap();
     let real = tempfile::tempdir().unwrap();
     for dir in [shim.path(), real.path()] {
@@ -342,6 +345,9 @@ fn the_pane_path_falls_back_to_the_base_when_the_env_has_none() {
 
 #[test]
 fn writing_the_wrappers_twice_is_idempotent() {
+    if !crate::platform::JOB_SHIM_SUPPORTED {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("shim");
     let first = write_wrappers(&target).unwrap();
