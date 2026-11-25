@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use thegn_core::config::DatabaseConfig;
 use thegn_core::db::{Db, MigrationActor, SCHEMA_VERSION, install_migration_policy};
 
-const RUNGS: &[&str] = &["alpha.100", "alpha.120", "alpha.131"];
+const RUNGS: &[&str] = &["alpha.119", "alpha.125", "alpha.131"];
 /// Tables whose rows are the user's own work: they must exist, and be non-empty
 /// in the snapshot, whenever the old release had them.
 const KEY_TABLES: &[&str] = &["worktrees", "sessions", "layouts"];

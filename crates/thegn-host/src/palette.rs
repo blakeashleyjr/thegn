@@ -954,16 +954,10 @@ pub(crate) const ENV_SETUP_KINDS: &[&str] = &[
     "machine0",
     "vercel",
 ];
-/// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
-/// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
-/// the Enter handler routes it to a launch, not a command dispatch).
-pub(crate) fn build_agent_palette(
-    cfg: &thegn_core::config::Config,
-) -> Vec<crate::palette::PaletteItem> {
-    build_agent_palette_for(cfg, crate::agent::choices(cfg))
-}
-
-/// Like [`build_agent_palette`] for an already-chosen (e.g. host-filtered) list.
+/// Build the agent-picker palette items from an already-chosen (e.g.
+/// host-filtered) list: one row per agent/tool, plus a literal shell. The key
+/// is the bare choice name (the `PendingAgent` gate in the Enter handler routes
+/// it to a launch, not a command dispatch).
 pub(crate) fn build_agent_palette_for(
     _cfg: &thegn_core::config::Config,
     choices: Vec<String>,
