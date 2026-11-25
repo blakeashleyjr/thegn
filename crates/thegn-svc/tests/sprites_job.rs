@@ -2690,7 +2690,7 @@ async fn a_fresh_sprite_gets_its_marker_directory_made_before_the_owner_marker()
     let runner = runner(&mock, store, outputs_options(DEADLINE));
     let content = content();
 
-    let _ = runner
+    let _outcome = runner
         .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
         .await;
 

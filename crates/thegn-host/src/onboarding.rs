@@ -1384,7 +1384,7 @@ impl OnboardingWizard {
                 ) {
                     let explanation = thegn_core::sandbox_pin::explain(profile);
                     lines.push(note(explanation.one_liner));
-                    lines.extend(explanation.hides.iter().map(|text| note(*text)));
+                    lines.extend(explanation.hides.iter().map(|text| note(text)));
                 }
                 lines.extend([
                     blank(),
