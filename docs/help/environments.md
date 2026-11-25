@@ -226,6 +226,9 @@ been verified live against the real Sprites API yet.
   about 20 seconds. `thegn env up` prints each phase with its elapsed time
   (for example `Install coding agents — done (51.2 s)`) and a total at the end;
   the loading card shows the same phases with a hint under the slow ones.
+  The repository seed and the Nix and direnv installs run at the same time, so
+  two phases can be running at once; the dev shell build and your setup start
+  when both are done, and a failed seed or Nix check still stops the create.
   Typical phases: boot 0.4 s, workspace and repository seed 3 s, setup 12 s,
   coding-agent install 45 to 60 s (the agent CLIs download in parallel), agent
   logins 10 s, snapshot 4 s. Later opens are fast: a sprite that is asleep wakes

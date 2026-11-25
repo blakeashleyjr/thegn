@@ -1,0 +1,5 @@
+- [x] 1. `envplan::overlap_window` finds the repository lane and the Nix/direnv lane
+- [x] 2. The provider applier runs the two lanes concurrently with fatal-stop semantics
+- [x] 3. Unit tests for the window, lane order, overlap timing and fatal stop
+- [x] 4. Help page: two phases can run at once
+- [ ] 5. Measure a first `env up` against the live Sprites API and record the new shell-ready time

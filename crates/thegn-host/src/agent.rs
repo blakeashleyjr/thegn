@@ -3188,7 +3188,7 @@ mod env_selection_tests {
 /// The sub-line shown under a step that is known to take a while on a first
 /// create, so the wait reads as work in progress rather than a hang. `None`
 /// for steps that finish in seconds.
-fn slow_step_hint(step_id: &str) -> Option<&'static str> {
+pub(crate) fn slow_step_hint(step_id: &str) -> Option<&'static str> {
     match step_id {
         "agents_install" => {
             Some("first run only: downloads the agent CLIs (about 1 min); later opens skip this")
@@ -4088,78 +4088,11 @@ fn provision_provider_env_inner(
         Ok((lease, journaled, busy))
     };
 
-    let mut tail_done = false;
-    let mut bg_failed = false;
-    let mut cancelled = false;
-    let mut deferred_failure: Option<(String, String)> = None;
-
-    for (i, step) in steps.iter().enumerate() {
-        if i == fg_len && !deferred_only && !tail_done {
-            let (lease, journaled, busy) = fg_tail(base_checkpoint.as_deref())?;
-            if phase == Phase::Foreground && journaled {
-                return Ok(ProvisionOutcome {
-                    provisioned: true,
-                    checkpoint: None,
-                    deferred: Some(DeferredHandoff {
-                        sandbox: id.clone(),
-                        lease,
-                    }),
-                });
-            }
-            if busy {
-                anyhow::bail!(
-                    "{id}: another thegn process is finishing this sandbox's background setup; retry when it is done"
-                );
-            }
-            _held = lease;
-            if shown < steps.len() {
-                views.extend(steps[shown..].iter().map(|step| ProvisionStepView {
-                    label: step.label.clone(),
-                    state: ProvisionState::Pending,
-                    detail: None,
-                }));
-            }
-            tail_done = true;
-        }
-        if i >= fg_len {
-            if journal::read(&id)
-                .is_some_and(|journal| journal.state == journal::DeferredState::Cancelled)
-            {
-                cancelled = true;
-                break;
-            }
-            if step.id == "checkpoint" && bg_failed {
-                views[i].state = ProvisionState::Failed;
-                views[i].detail = Some("skipped: an earlier background step failed".into());
-                progress(&views);
-                continue;
-            }
-        }
-        for (j, v) in views.iter_mut().enumerate() {
-            v.state = match j.cmp(&i) {
-                // A best-effort step that already failed stays Failed (with its
-                // detail) — don't relabel a completed-with-warning step as Done.
-                std::cmp::Ordering::Less if v.state == ProvisionState::Failed => {
-                    ProvisionState::Failed
-                }
-                std::cmp::Ordering::Less => ProvisionState::Done, // check
-                std::cmp::Ordering::Equal => ProvisionState::Active, // spinner
-                std::cmp::Ordering::Greater => ProvisionState::Pending, // dot
-            };
-        }
-        if let Some(hint) = slow_step_hint(&step.id) {
-            views[i].detail = Some(hint.to_string());
-        }
-        progress(&views);
-        let step_t0 = std::time::Instant::now();
-        tracing::info!(target: "thegn::startup", step = %step.id, "provision step start");
-
-        // Defence in depth behind the strip above: a credential-bearing step
-        // never runs against a credential-free provider.
-        if let Some(refusal) = credential_step_refusal(credential_free, step) {
-            return Err(refusal);
-        }
-        let result: anyhow::Result<()> = match &step.kind {
+    // Run one plan step against the sandbox. `Ok(Some(id))` is the base
+    // checkpoint a Checkpoint step took. Shared by the serial loop and the
+    // concurrent repository/tool lanes (THE-2708), so it only borrows.
+    let run_step = |step: &thegn_core::envplan::ProvisionStep| -> anyhow::Result<Option<String>> {
+        let done: anyhow::Result<()> = match &step.kind {
             StepKind::Exec(script) => {
                 // `/bin/sh -lc` + PATH-prefix + `2>&1` — see `provision_recover`.
                 let argv = crate::provision_recover::exec_login_argv(script);
@@ -4268,10 +4201,12 @@ fn provision_provider_env_inner(
                 crate::provider_git::seed_from_bundle(&provider, &id, wt, wd, b, &exec_env)
             }
             StepKind::Checkpoint => {
-                with_provision_timeout("checkpoint", std::time::Duration::from_secs(600), || {
-                    provider.checkpoint(&id, Some("thegn-provisioned"))
-                })
-                .map(|cp| base_checkpoint = Some(cp))
+                return with_provision_timeout(
+                    "checkpoint",
+                    std::time::Duration::from_secs(600),
+                    || provider.checkpoint(&id, Some("thegn-provisioned")),
+                )
+                .map(Some);
             }
             StepKind::HomeClosurePush(roots) => {
                 // Host-executed: sign the host closure and push it over the WSS
@@ -4304,6 +4239,141 @@ fn provision_provider_env_inner(
                 }
             }
         };
+        done.map(|()| None)
+    };
+    // The repository lane and the Nix/direnv lane touch disjoint state, so a
+    // foreground run overlaps them (THE-2708). Never across the deferred split.
+    let overlap = if deferred_only {
+        None
+    } else {
+        envplan::overlap_window(&steps[..fg_len])
+    };
+
+    let mut tail_done = false;
+    let mut bg_failed = false;
+    let mut cancelled = false;
+    let mut deferred_failure: Option<(String, String)> = None;
+
+    for (i, step) in steps.iter().enumerate() {
+        if i == fg_len && !deferred_only && !tail_done {
+            let (lease, journaled, busy) = fg_tail(base_checkpoint.as_deref())?;
+            if phase == Phase::Foreground && journaled {
+                return Ok(ProvisionOutcome {
+                    provisioned: true,
+                    checkpoint: None,
+                    deferred: Some(DeferredHandoff {
+                        sandbox: id.clone(),
+                        lease,
+                    }),
+                });
+            }
+            if busy {
+                anyhow::bail!(
+                    "{id}: another thegn process is finishing this sandbox's background setup; retry when it is done"
+                );
+            }
+            _held = lease;
+            if shown < steps.len() {
+                views.extend(steps[shown..].iter().map(|step| ProvisionStepView {
+                    label: step.label.clone(),
+                    state: ProvisionState::Pending,
+                    detail: None,
+                }));
+            }
+            tail_done = true;
+        }
+        if i >= fg_len {
+            if journal::read(&id)
+                .is_some_and(|journal| journal.state == journal::DeferredState::Cancelled)
+            {
+                cancelled = true;
+                break;
+            }
+            if step.id == "checkpoint" && bg_failed {
+                views[i].state = ProvisionState::Failed;
+                views[i].detail = Some("skipped: an earlier background step failed".into());
+                progress(&views);
+                continue;
+            }
+        }
+        if let Some(window) = overlap.as_ref() {
+            if i == window.repo.start {
+                let lanes = &steps[window.repo.start..window.tools.end];
+                if let Some(refusal) = lanes
+                    .iter()
+                    .find_map(|s| credential_step_refusal(credential_free, s))
+                {
+                    return Err(refusal);
+                }
+                for v in views.iter_mut().take(i) {
+                    if v.state != ProvisionState::Failed {
+                        v.state = ProvisionState::Done;
+                    }
+                }
+                progress(&views);
+                let exec = |s: &thegn_core::envplan::ProvisionStep| run_step(s).map(|_| ());
+                let on_restart = || {
+                    tracing::warn!(target: "thegn::startup", "step may have restarted the sandbox; waiting for it to become ready before continuing");
+                    // Advisory re-wait: the next step reports its own connect error.
+                    if let Err(error) = block_on_provider(|| async {
+                        provider
+                            .wait_ready(&id, std::time::Duration::from_secs(90))
+                            .await
+                    }) {
+                        tracing::debug!(target: "thegn::startup", %error, "sandbox re-wait failed");
+                    }
+                };
+                crate::provision_overlap::run_window(
+                    &steps,
+                    window,
+                    &exec,
+                    &on_restart,
+                    slow_step_hint,
+                    |event| {
+                        let view = &mut views[event.index];
+                        view.state = event.state;
+                        // A finished step keeps its hint, as in the serial loop.
+                        if event.detail.is_some() {
+                            view.detail = event.detail;
+                        }
+                        progress(&views);
+                    },
+                )?;
+                continue;
+            }
+            if window.repo.contains(&i) || window.tools.contains(&i) {
+                continue;
+            }
+        }
+        for (j, v) in views.iter_mut().enumerate() {
+            v.state = match j.cmp(&i) {
+                // A best-effort step that already failed stays Failed (with its
+                // detail) — don't relabel a completed-with-warning step as Done.
+                std::cmp::Ordering::Less if v.state == ProvisionState::Failed => {
+                    ProvisionState::Failed
+                }
+                std::cmp::Ordering::Less => ProvisionState::Done, // check
+                std::cmp::Ordering::Equal => ProvisionState::Active, // spinner
+                std::cmp::Ordering::Greater => ProvisionState::Pending, // dot
+            };
+        }
+        if let Some(hint) = slow_step_hint(&step.id) {
+            views[i].detail = Some(hint.to_string());
+        }
+        progress(&views);
+        let step_t0 = std::time::Instant::now();
+        tracing::info!(target: "thegn::startup", step = %step.id, "provision step start");
+
+        // Defence in depth behind the strip above: a credential-bearing step
+        // never runs against a credential-free provider.
+        if let Some(refusal) = credential_step_refusal(credential_free, step) {
+            return Err(refusal);
+        }
+        let result = run_step(step).map(|cp| {
+            if let Some(cp) = cp {
+                base_checkpoint = Some(cp);
+            }
+        });
 
         if let Err(e) = result {
             if i >= fg_len {
