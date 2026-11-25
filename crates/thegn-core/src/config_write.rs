@@ -66,6 +66,8 @@ pub struct EnvSpec {
     pub max_instances: Option<i64>,
     pub max_lifetime_secs: Option<i64>,
     pub auto_provision: Option<bool>,
+    /// Vercel sandbox network egress: `deny` | `registries` | `allow-all`.
+    pub egress: Option<String>,
     // ssh placement
     pub ssh_host: Option<String>,
     // local placement
@@ -385,6 +387,7 @@ pub fn upsert_env(config_path: &Path, spec: &EnvSpec) -> Result<()> {
             if let Some(b) = spec.auto_provision {
                 p.insert("auto_provision", value(b));
             }
+            put_str(p, "egress", spec.egress.as_ref());
         }
         "ssh" => {
             let s = subtable(et, "ssh");
@@ -1112,6 +1115,7 @@ mod tests {
         assert_eq!(prov["region"].as_str(), Some("iad"));
         assert_eq!(prov["max_instances"].as_integer(), Some(5));
         assert_eq!(prov["auto_provision"].as_bool(), Some(true));
+        assert!(prov.get("egress").is_none());
 
         // edit: change size only, other fields stay.
         let edit = EnvSpec {

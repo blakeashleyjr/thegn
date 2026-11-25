@@ -4266,6 +4266,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # auto_provision = false                # create the sandbox on first open if missing
 # model_credentials = "none"   # none | upload (vercel: tmpfs login; sprites: forward creds; unset sprites = forward) | proxy, inject (refused)
 # interactive_host_suffixes = []   # empty = vercel.run, vercel.sh, vercel.com
+# egress = "deny"   # vercel sandbox network: deny (default) | registries (deny + crates.io, npm, PyPI, GitHub) | allow-all
+# egress_allow = []   # extra hosts for deny/registries, e.g. ["example.com", "*.cdn.example.org"]
 # # login_homes = { claude = "/srv/agent-logins/claude" }   # with model_credentials =
 # #                                       #   "upload": upload the login in this host dir
 # #                                       #   (a dedicated account) instead of the live

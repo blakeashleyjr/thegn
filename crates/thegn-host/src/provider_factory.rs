@@ -515,6 +515,8 @@ fn vercel_provider_from(
         max_lifetime_secs: policy::max_lifetime_secs(pc.max_lifetime_secs),
         interactive_host_suffixes: pc.interactive_host_suffixes.clone(),
         model_credentials: pc.model_credentials,
+        egress: thegn_core::vercel::egress::resolve(pc.egress, &pc.egress_allow)
+            .map_err(|e| format!("provider.{}: {}", e.field, e.reason))?,
     })
     .map_err(|_| "the vercel provider could not be built (check api_base)".to_string())
 }

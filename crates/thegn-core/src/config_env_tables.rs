@@ -29,6 +29,16 @@ config_enum! {
 }
 
 config_enum! {
+    /// Vercel only; default `deny`. What network egress a sandbox gets:
+    /// `deny` blocks everything, `registries` adds a built-in allow-list of
+    /// package registries and git hosts, `allow-all` leaves egress open.
+    /// `egress_allow` entries are added on top of `deny`/`registries`.
+    pub enum SandboxEgress: "sandbox egress" {
+        Deny = "deny", Registries = "registries", AllowAll = "allow-all",
+    } default = Deny;
+}
+
+config_enum! {
     /// Which Nix installer the provisioner runs in a fresh sandbox:
     /// - `official` — the upstream `nixos.org/nix/install --no-daemon`
     ///   (single-user; the safe default + fallback).
@@ -292,6 +302,14 @@ pub struct EnvProviderConfig {
     /// `vercel.app` (and anything under it) is never accepted.
     #[serde(default)]
     pub interactive_host_suffixes: Vec<String>,
+    /// Vercel only: the sandbox's network egress. Default `deny`; see
+    /// [`SandboxEgress`] and docs/help/sandbox-network.md.
+    #[serde(default)]
+    pub egress: SandboxEgress,
+    /// Vercel only: extra hosts a `deny`/`registries` sandbox may reach, in
+    /// the egress host-pattern grammar (`x.com`, `*.x.com`).
+    #[serde(default)]
+    pub egress_allow: Vec<String>,
     /// Sprites only, opt-in: destroy proven sprites older than `max_lifetime_secs`
     /// in the background (never a `running` one). Off by default.
     #[serde(default)]
@@ -353,6 +371,8 @@ impl EnvProviderConfig {
             && self.model_credentials == ModelCredentials::None
             && !self.model_credentials_explicit
             && self.interactive_host_suffixes.is_empty()
+            && self.egress == SandboxEgress::Deny
+            && self.egress_allow.is_empty()
             && !self.lifetime_reap
             && self.login_homes.is_empty()
     }
@@ -1065,6 +1085,30 @@ mod tests {
             ..Default::default()
         };
         assert!(!hosts.is_default());
+    }
+
+    #[test]
+    fn egress_defaults_to_deny_and_round_trips() {
+        let pc: EnvProviderConfig = toml::from_str("").unwrap();
+        assert_eq!(pc.egress, SandboxEgress::Deny);
+        assert!(pc.egress_allow.is_empty());
+        assert!(pc.is_default());
+        for mode in SandboxEgress::ALL {
+            let pc: EnvProviderConfig = toml::from_str(&format!(
+                "egress = {:?}\negress_allow = [\"a.com\"]\n",
+                mode.as_str()
+            ))
+            .unwrap();
+            assert_eq!(pc.egress, *mode);
+            assert!(!pc.is_default());
+            assert!(toml::to_string(&pc).unwrap().contains("egress_allow"));
+        }
+        assert!(SandboxEgress::from_str_validated("open").is_err());
+        let pc = EnvProviderConfig {
+            egress: SandboxEgress::Registries,
+            ..Default::default()
+        };
+        assert!(!pc.is_default());
     }
 
     #[test]

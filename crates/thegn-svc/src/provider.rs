@@ -7105,6 +7105,7 @@ mod tests {
                 max_lifetime_secs: 0,
                 interactive_host_suffixes: Vec::new(),
                 model_credentials: thegn_core::config::ModelCredentials::default(),
+                egress: Vec::new(),
             })
             .expect("a well-formed vercel spec is admitted offline"),
         );

@@ -503,6 +503,7 @@ fn provider_with(mock: &Mock, max_lifetime_secs: u64) -> VercelProvider {
         max_lifetime_secs,
         interactive_host_suffixes: Vec::new(),
         model_credentials: thegn_core::config::ModelCredentials::None,
+        egress: Vec::new(),
     })
     .unwrap()
 }

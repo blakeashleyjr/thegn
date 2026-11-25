@@ -45,6 +45,27 @@ const VERCEL_MODEL_CREDENTIALS_NOTE: [&str; 2] = [
     "To change: config model_credentials; F1 vercel-sandbox",
 ];
 
+/// The vercel sandbox network choices: `(config value, label, one-line
+/// explanation)`. The first row is the recommended default; `allow-all` is
+/// always an explicit pick.
+const VERCEL_EGRESS_CHOICES: [(&str, &str, &str); 3] = [
+    (
+        "deny",
+        "deny (recommended)",
+        "network access for sandboxes: none; nothing leaves the sandbox",
+    ),
+    (
+        "registries",
+        "package registries only",
+        "network access: crates.io, npm, PyPI and GitHub only",
+    ),
+    (
+        "allow-all",
+        "allow all",
+        "network access: unrestricted; code in the sandbox can reach any host",
+    ),
+];
+
 /// Probe keyring availability on a detached thread, returning the shared
 /// tri-state the wizard reads (0 = probing, 1 = available, 2 = unavailable).
 /// The probe is a synchronous D-Bus round-trip that can stall for ~25s on a
@@ -79,6 +100,7 @@ pub enum Field {
     Template,
     SshHost,
     Sandbox,
+    Egress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +149,8 @@ pub struct EnvWizard {
     /// `(backend_key, label)` cycle rows for a `local` env.
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
+    /// Index into [`VERCEL_EGRESS_CHOICES`] (vercel only; 0 = deny).
+    egress_sel: usize,
     /// Keyring availability, resolved off-loop: 0 = probing, 1 = available,
     /// 2 = unavailable. The probe (`keyring_available`) does a synchronous D-Bus
     /// Secret Service round-trip that can block for ~25s on a locked keyring, so
@@ -157,6 +181,7 @@ impl EnvWizard {
             ssh_host: String::new(),
             sandbox_rows,
             sandbox_sel: 0,
+            egress_sel: 0,
             keyring: spawn_keyring_probe(),
         }
     }
@@ -192,6 +217,7 @@ impl EnvWizard {
                 Field::Region,
                 Field::Size,
                 Field::Template,
+                Field::Egress,
             ]),
             _ => f.extend([Field::Token, Field::Region, Field::Size, Field::Template]),
         }
@@ -242,7 +268,7 @@ impl EnvWizard {
             return Outcome::Cancel;
         }
         // Inline-cycle fields (Kind, Sandbox): ←/→ change the value.
-        let is_cycle = matches!(self.focus, Field::Kind | Field::Sandbox);
+        let is_cycle = matches!(self.focus, Field::Kind | Field::Sandbox | Field::Egress);
         match key {
             KeyCode::UpArrow => self.move_focus(-1),
             KeyCode::DownArrow => self.move_focus(1),
@@ -285,6 +311,10 @@ impl EnvWizard {
                 let max = self.sandbox_rows.len().saturating_sub(1) as i32;
                 self.sandbox_sel = (self.sandbox_sel as i32 + delta).clamp(0, max) as usize;
             }
+            Field::Egress => {
+                let max = VERCEL_EGRESS_CHOICES.len() as i32 - 1;
+                self.egress_sel = (self.egress_sel as i32 + delta).clamp(0, max) as usize;
+            }
             _ => {}
         }
     }
@@ -315,6 +345,8 @@ impl EnvWizard {
             team_id: Self::opt(&self.team_id),
             project_id: Self::opt(&self.project_id),
             template: Self::opt(&self.template),
+            egress: (self.kind() == "vercel")
+                .then(|| VERCEL_EGRESS_CHOICES[self.egress_sel].0.to_string()),
             max_instances: None,
             max_lifetime: None,
             auto_provision: false,
@@ -332,7 +364,7 @@ impl EnvWizard {
             title: "new environment".to_string(),
             badge: Some(" env ".into()),
             cols: 60,
-            rows: fields.len() + 2 + if self.kind() == "vercel" { 2 } else { 0 },
+            rows: fields.len() + 2 + if self.kind() == "vercel" { 3 } else { 0 },
             anchor: Anchor::Center,
             ..LayerSpec::default()
         };
@@ -353,6 +385,11 @@ impl EnvWizard {
                         .unwrap_or("auto");
                     Line::segs(self.cycle_row("sandbox ", focused, label))
                 }
+                Field::Egress => Line::segs(self.cycle_row(
+                    "network ",
+                    focused,
+                    VERCEL_EGRESS_CHOICES[self.egress_sel].1,
+                )),
                 _ => self.text_row(*f, focused),
             };
             seg::draw_line(surface, inner.x, y, inner.cols, &line, panel);
@@ -368,6 +405,17 @@ impl EnvWizard {
                     panel,
                 );
             }
+            seg::draw_line(
+                surface,
+                inner.x,
+                inner.y + fields.len() + VERCEL_MODEL_CREDENTIALS_NOTE.len(),
+                inner.cols,
+                &Line::segs(vec![seg(
+                    Tok::Slot(S::Faint),
+                    VERCEL_EGRESS_CHOICES[self.egress_sel].2.to_string(),
+                )]),
+                panel,
+            );
         }
         // Footer: token-storage hint (cloud kinds) + key legend.
         let store_hint = if self.is_cloud() {
@@ -526,6 +574,29 @@ mod tests {
             }
             _ => panic!("expected submit"),
         }
+    }
+
+    #[test]
+    fn vercel_egress_defaults_to_deny_and_allow_all_is_explicit() {
+        let mut w = EnvWizard::with_kind(&Config::default(), "vercel");
+        assert!(w.fields().contains(&Field::Egress));
+        w.focus = Field::Name;
+        typ(&mut w, "vx");
+        let egress = |w: &EnvWizard| match w.submit() {
+            Outcome::Submit(a) => a.egress,
+            _ => panic!("expected submit"),
+        };
+        assert_eq!(egress(&w).as_deref(), Some("deny"));
+        w.focus = Field::Egress;
+        w.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        assert_eq!(egress(&w).as_deref(), Some("registries"));
+        w.handle_key(&KeyCode::RightArrow, Modifiers::NONE);
+        assert_eq!(egress(&w).as_deref(), Some("allow-all"));
+        // Other kinds never carry an egress choice.
+        let mut f = wiz();
+        f.focus = Field::Name;
+        typ(&mut f, "fx");
+        assert!(matches!(f.submit(), Outcome::Submit(a) if a.egress.is_none()));
     }
 
     #[test]
