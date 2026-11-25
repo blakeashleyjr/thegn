@@ -438,6 +438,167 @@ pub fn short_duration(secs: u64) -> String {
     }
 }
 
+/// Samples kept per sandbox for the Observe sparklines.
+pub const HISTORY_LEN: usize = 60;
+
+/// The newest health facts for one sandbox, as the surfaces read them: the
+/// latest sample, a bounded history for sparklines, the current warning line
+/// and the provider's lifetime left. Slice B's sampler fills it (through
+/// [`HealthCache::record`]); the sidebar, fleet popup and Observe tab only read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HealthReading {
+    /// The latest sample; `None` when no probe has succeeded yet.
+    pub sample: Option<HealthSample>,
+    /// Up to [`HISTORY_LEN`] samples, oldest first, newest last.
+    pub history: Vec<HealthSample>,
+    /// When the latest probe finished (unix ms).
+    pub taken_ms: i64,
+    /// The newest restart / OOM warning line, if one is unacknowledged.
+    pub warning: Option<String>,
+    /// Seconds of provider lifetime left as of `taken_ms`.
+    pub lifetime_left_secs: Option<u64>,
+    /// Why the last probe failed (shown verbatim; the level is `Unknown`).
+    pub error: Option<String>,
+}
+
+impl HealthReading {
+    /// The dot: the sample's level, raised to `Warn` by an unacknowledged
+    /// warning or a lifetime under an hour.
+    pub fn level(&self) -> HealthLevel {
+        let base = level(self.sample.as_ref());
+        let short = self
+            .lifetime_left_secs
+            .is_some_and(|s| i64::try_from(s).is_ok_and(|s| s < LIFETIME_WARN_SECS));
+        if self.warning.is_some() || (short && base != HealthLevel::Unknown) {
+            HealthLevel::Warn
+        } else {
+            base
+        }
+    }
+
+    /// Lifetime left at `now_ms`, counting down from the sample time.
+    pub fn lifetime_left_at(&self, now_ms: i64) -> Option<u64> {
+        let left = self.lifetime_left_secs?;
+        let elapsed = (now_ms.saturating_sub(self.taken_ms)).max(0) as u64 / 1000;
+        Some(left.saturating_sub(elapsed))
+    }
+
+    /// The text the surfaces show next to the dot: the warning, else a probe
+    /// error, else nothing.
+    pub fn note(&self) -> Option<&str> {
+        self.warning.as_deref().or(self.error.as_deref())
+    }
+
+    /// CPU load per CPU, 0..=1, oldest first (`-` samples as 0).
+    pub fn cpu_series(&self) -> Vec<f32> {
+        self.history
+            .iter()
+            .map(|s| match (s.load, s.cpus) {
+                (Some(l), Some(c)) if c > 0 => (l[0] / f64::from(c)).clamp(0.0, 1.0) as f32,
+                (Some(l), None) => l[0].clamp(0.0, 1.0) as f32,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    /// Memory used fraction, 0..=1, oldest first.
+    pub fn mem_series(&self) -> Vec<f32> {
+        self.history
+            .iter()
+            .map(|s| {
+                s.memory_percent()
+                    .map_or(0.0, |p| p.min(100) as f32 / 100.0)
+            })
+            .collect()
+    }
+
+    /// Disk used fraction, 0..=1, oldest first.
+    pub fn disk_series(&self) -> Vec<f32> {
+        self.history
+            .iter()
+            .map(|s| s.disk_percent().map_or(0.0, |p| p.min(100) as f32 / 100.0))
+            .collect()
+    }
+}
+
+/// Where the surfaces read health from, keyed by the worktree path the
+/// sandbox belongs to. A trait so slice B's sampler (or a test) can supply
+/// readings without the UI knowing the store.
+pub trait HealthSource {
+    fn reading(&self, key: &str) -> Option<HealthReading>;
+}
+
+/// The in-memory latest-reading store. Cheap to read (one lock, no I/O).
+#[derive(Debug, Default)]
+pub struct HealthCache {
+    map: std::sync::Mutex<std::collections::HashMap<String, HealthReading>>,
+}
+
+impl HealthCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, HealthReading>> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Store a successful probe: replaces the latest sample, appends to the
+    /// bounded history and takes the sampler's warning / lifetime facts.
+    pub fn record(
+        &self,
+        key: &str,
+        sample: HealthSample,
+        taken_ms: i64,
+        warning: Option<String>,
+        lifetime_left_secs: Option<u64>,
+    ) {
+        let mut map = self.lock();
+        let entry = map.entry(key.to_string()).or_default();
+        entry.history.push(sample.clone());
+        if entry.history.len() > HISTORY_LEN {
+            let drop = entry.history.len() - HISTORY_LEN;
+            entry.history.drain(..drop);
+        }
+        entry.sample = Some(sample);
+        entry.taken_ms = taken_ms;
+        entry.warning = warning;
+        entry.lifetime_left_secs = lifetime_left_secs;
+        entry.error = None;
+    }
+
+    /// Store a failed probe: the sample is dropped (never fabricated), the
+    /// history stays so the graphs keep their shape.
+    pub fn record_error(&self, key: &str, error: String, taken_ms: i64) {
+        let mut map = self.lock();
+        let entry = map.entry(key.to_string()).or_default();
+        entry.sample = None;
+        entry.taken_ms = taken_ms;
+        entry.error = Some(error);
+    }
+
+    /// Forget a sandbox (env down).
+    pub fn remove(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
+    /// The level and note only: what the sidebar needs, without cloning the
+    /// history.
+    pub fn badge(&self, key: &str) -> Option<(HealthLevel, Option<String>)> {
+        let map = self.lock();
+        let r = map.get(key)?;
+        Some((r.level(), r.note().map(str::to_string)))
+    }
+}
+
+impl HealthSource for HealthCache {
+    fn reading(&self, key: &str) -> Option<HealthReading> {
+        self.lock().get(key).cloned()
+    }
+}
+
+/// The process-wide cache the host sampler feeds and the surfaces read.
+pub fn global() -> &'static HealthCache {
+    static CACHE: std::sync::OnceLock<HealthCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(HealthCache::default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +844,70 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
             event_kind(&HealthEvent::OomKilled { kills: Vec::new() }),
             "oom_kill"
         );
+    }
+
+    fn sample(load: f64, mem_pct: u64) -> HealthSample {
+        HealthSample {
+            load: Some([load, 0.0, 0.0]),
+            cpus: Some(4),
+            mem_total_kib: Some(1000),
+            mem_available_kib: Some(1000 - mem_pct * 10),
+            disk_total_kib: Some(100),
+            disk_used_kib: Some(50),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_records_history_bounded_and_levels() {
+        let c = HealthCache::default();
+        assert!(c.reading("w").is_none());
+        for i in 0..(HISTORY_LEN + 5) {
+            c.record("w", sample(1.0, 10), i as i64, None, Some(7200));
+        }
+        let r = c.reading("w").unwrap();
+        assert_eq!(r.history.len(), HISTORY_LEN);
+        assert_eq!(r.level(), HealthLevel::Ok);
+        assert_eq!(r.cpu_series().len(), HISTORY_LEN);
+        assert!((r.cpu_series()[0] - 0.25).abs() < 1e-6);
+        assert!((r.mem_series()[0] - 0.10).abs() < 1e-6);
+        assert!((r.disk_series()[0] - 0.50).abs() < 1e-6);
+        c.record(
+            "w",
+            sample(1.0, 95),
+            9,
+            Some("sprite restarted".into()),
+            Some(7200),
+        );
+        assert_eq!(c.badge("w").unwrap().0, HealthLevel::Warn);
+        assert_eq!(c.badge("w").unwrap().1.as_deref(), Some("sprite restarted"));
+    }
+
+    #[test]
+    fn short_lifetime_warns_and_counts_down() {
+        let c = HealthCache::default();
+        c.record("w", sample(0.1, 10), 1_000, None, Some(3_700));
+        let r = c.reading("w").unwrap();
+        assert_eq!(r.level(), HealthLevel::Ok);
+        assert_eq!(r.lifetime_left_at(1_000 + 200_000), Some(3_500));
+        c.record("w", sample(0.1, 10), 1_000, None, Some(600));
+        assert_eq!(c.badge("w").unwrap().0, HealthLevel::Warn);
+        assert_eq!(
+            c.reading("w").unwrap().lifetime_left_at(10_000_000),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn probe_error_is_unknown_and_keeps_history() {
+        let c = HealthCache::default();
+        c.record("w", sample(0.1, 10), 1, None, None);
+        c.record_error("w", "exec refused".into(), 2);
+        let r = c.reading("w").unwrap();
+        assert_eq!(r.level(), HealthLevel::Unknown);
+        assert_eq!(r.note(), Some("exec refused"));
+        assert_eq!(r.history.len(), 1);
+        c.remove("w");
+        assert!(c.reading("w").is_none());
     }
 }
