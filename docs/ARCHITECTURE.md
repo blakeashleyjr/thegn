@@ -100,12 +100,12 @@ the proxy).
 
 The in-process host and daemon worker families, their wake sources, visibility
 gates, cancellation paths, and event-ingress drain budgets are source-inventoried
-in [`worker-inventory-2026-11.md`](audits/worker-inventory-2026-11.md). The
+in the private dated worker inventory (2026-11). The
 performance rules that distinguish admission, coalescing, delivery, idle polling,
 and process-wide resource ceilings live in
 [`performance-metrics.md`](performance-metrics.md).
 
-## 2. The event loop (0% idle)
+## 2. The event loop (no polling when idle)
 
 When idle the loop blocks on termwiz `poll_input(None)` — no tick, no timeout.
 While work is already in hand (a dirty frame, queued input, an exhausted

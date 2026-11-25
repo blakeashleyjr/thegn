@@ -15,12 +15,25 @@
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
 One session: each git repo is a **project**, and each git **worktree** gets
-its own tabs. The chrome — a left sidebar tree, a right diff/PR panel, masthead,
-statusbar, and a pinned-program strip — is rendered in-process by a native
-compositor. It has no external multiplexer; `[[plugins]]` extensions run as
-native, unsandboxed processes (see the [plugins help page](docs/help/plugins.md)).
-(thegn was originally built on zellij; that architecture was fully stripped
-and it is now a from-scratch native compositor.)
+its own tabs — a shell, or any configured `[[agents]]` / `[[tools]]` entry
+(claude, aider, …) launched as an ordinary command. The chrome — a left
+sidebar tree, a right diff/PR panel, masthead, statusbar, and a pinned-program
+strip — is rendered in-process by a native compositor, and a **local merge
+queue** is built in and on by default (`[merge_queue] enabled = true`; it is
+only useful once you set a `gate_command` — see the
+[merge queue help page](docs/help/merge-queue.md)). It has no external
+multiplexer; `[[plugins]]` extensions run as native, unsandboxed processes
+(see the [plugins help page](docs/help/plugins.md)). (thegn was originally
+built on zellij; that architecture was fully stripped and it is now a
+from-scratch native compositor.)
+
+Worktree panes run **sandboxed by default**: an **accident guard**, not a
+boundary against a hostile agent — home stays readable and the network is
+direct. The opt-in `sealed` profile is the hardened tier that hides `$HOME`
+and disables network access. What is protected, what is not, and which
+launches still run on the host is in the
+[sandbox security model](docs/help/sandbox-security-model.md); see also the
+sandbox-and-credentials note under [First run](#3-first-run).
 
 ## Quickstart (Linux x86_64)
 
@@ -129,8 +142,8 @@ never a session change.
 - **Worktree tabs.** `Alt-w` creates a new git worktree off the base branch,
   opens a tab named after the branch, and prompts for what to run there — a
   plain shell, or any configured `[[agents]]` / `[[tools]]` entry (claude,
-  aider, …) launched as an ordinary command — optionally inside a sandbox
-  (see below).
+  aider, …) launched as an ordinary command — inside a sandbox by default
+  (see below; you can opt out per worktree).
 - **Right panel.** For the focused worktree: the git diff and the branch's PR —
   state, CI check rollup, review decision — plus CI runs, the merge and PR
   queues, notifications, and shares, organized in panel tabs.
@@ -390,6 +403,11 @@ not quarantined, so neither hits that. The reasoning is in
 [`RELEASING.md`](RELEASING.md), which also covers the release process and the
 crates.io / `cargo binstall` status.
 
+**The macOS sandbox is best-effort:** a sandboxed pane needs Apple
+`container`, podman or docker installed, and the `sealed` profile needs
+podman or docker — the `apple` backend cannot run a sealed, offline sandbox
+(see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)).
+
 [releases]: https://github.com/blakeashleyjr/thegn/releases
 
 ### Standalone
@@ -471,9 +489,11 @@ and diff-flushes to your terminal. Panes are owned by a background **pane
 daemon**, so quitting the UI detaches your sessions and the next launch
 reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
 enabled = false`). A bundled SQLite store keeps repo history, worktree state,
-session layout, and a PR cache. These are design targets, not measured results;
-no benchmark is published. Contributors can measure with `just bench` and
-`just bench-idle`.
+session layout, and a PR cache. These are design targets, not measured
+results; no benchmark is published yet — measured numbers, with the machines
+and commands that produced them, live in
+[performance results](docs/performance-results.md). Contributors can measure
+with `just bench` and `just bench-idle`.
 
 - **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
   layered config, SQLite, keymap registry, theme, sandbox backends),
@@ -485,7 +505,8 @@ no benchmark is published. Contributors can measure with `just bench` and
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
   a bounded diff, not a chrome recompose. Idle cost is therefore near zero
-  (a design goal checked with `just bench-idle`; not a published measurement).
+  (a design goal checked with `just bench-idle`; no published measurement
+  yet — see [performance results](docs/performance-results.md)).
 - **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL): repos,
   workspaces, worktrees, PR cache, layouts, session state. **git is the source
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
@@ -567,10 +588,14 @@ environment and exactly which features are enabled vs degraded.
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs
-inside a container or sandbox using the `standard` profile. Files outside the
-worktree are read-only apart from a few carved-back state directories, and
-`$HOME` remains readable, credentials included. The opt-in `sealed` profile
-hides `$HOME` and disables network access (see the
+inside a container or sandbox using the `standard` profile. Only
+**interactive panes** are sandboxed: headless `thegn agent run`, the agent
+queue and Autopilot, the merge gate, tests, lifecycle scripts and language
+servers run on the host in this alpha — the ⚠ table in the
+[sandbox security model](docs/help/sandbox-security-model.md) lists each
+launch. Files outside the worktree are read-only apart from a few carved-back
+state directories, and `$HOME` remains readable, credentials included. The
+opt-in `sealed` profile hides `$HOME` and disables network access (see the
 [sandboxing help page](docs/help/sandboxing.md)). The worktree stays on the
 host and is **bind-mounted at its real path**, so host-side git reads (sidebar,
 panel, PR) keep working.

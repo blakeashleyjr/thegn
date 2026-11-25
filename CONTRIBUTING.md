@@ -242,12 +242,16 @@ fails the run.
 - **Any terminal works.** `thegn` / `tg-tui` run in whatever terminal you
   use (Ghostty, iTerm2, Terminal.app, …). Alacritty is only needed for the
   `tg` dedicated-window launcher, and is optional.
-- **Sandboxing degrades gracefully.** The worktree-sandbox probe order is
-  `podman → docker → apple → bwrap → host`. `apple` is Apple's `container`
-  CLI (each container gets its own Linux VM — the strongest isolation any
-  backend offers) and is probed only on macOS; `bwrap`/`systemd-run` are
-  Linux-only. With no container runtime installed everything still works —
-  panes just run directly on the host.
+- **Sandboxing needs a backend, and says so when it has none.** With
+  `backend = "auto"` the chain is `podman-rootless` → `podman-rootful` →
+  `docker` → `apple` → `bwrap` → `jobobject`. `apple` is Apple's `container`
+  CLI, probed only on macOS; each container gets its own Linux VM, the
+  strongest isolation class of any backend, but the backend is unverified on
+  a device and has no automated runtime coverage (see
+  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). `bwrap`/`systemd-run` are
+  Linux-only. With no usable backend a sandboxed launch is refused (the
+  default isolation floor refuses the host fallback); opt out with
+  `[sandbox] enabled = false`, `backend = "none"`, or `isolation_floor = "off"`.
 - **Cross-checks are partial — mind the gap.** `just check-cross` type-checks
   every crate that builds without a darwin cross C toolchain
   (`thegn-metrics`, `thegn-media`, `thegn-proc`, `tg-kit`, `gtui-core`, `gtui-render`,

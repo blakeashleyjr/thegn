@@ -6,10 +6,9 @@ Linear on 2026-09-09 (America/Los_Angeles). Linear owns workflow state and full
 acceptance criteria; this file owns the durable cross-links and architectural
 context that must remain reviewable with the code.
 
-The pre-reconciliation evidence and issue-by-issue audit is preserved in
-[`docs/audits/linear-reconciliation-2026-09-08.md`](audits/linear-reconciliation-2026-09-08.md).
-The ongoing lifecycle and closure rules are in
-[`docs/delivery-governance.md`](delivery-governance.md).
+The pre-reconciliation evidence and issue-by-issue audit is preserved in the
+private 2026-09-08 linear-reconciliation record. The ongoing lifecycle and
+closure rules are in [`docs/delivery-governance.md`](delivery-governance.md).
 
 ## Portfolio at a glance
 
@@ -188,8 +187,8 @@ behavior and implementation to agree.
 
 These counts are a dated verification record, not a hand-maintained green
 badge. Re-run `openspec list --json` and `just openspec-validate` for the live
-state. The complete remaining-change classification is
-[`docs/audits/openspec-active-portfolio-2026-09-08.md`](audits/openspec-active-portfolio-2026-09-08.md).
+state. The complete remaining-change classification is in the private dated
+openspec-portfolio audit record (2026-09-08).
 
 ## Reconciliation record
 

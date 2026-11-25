@@ -42,7 +42,7 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
 `openspec/specs/<capability>/spec.md`; how-to-add recipes are
 `docs/extending/`. The hard invariants, because every edit must respect them:
 
-- **0% idle.** The loop blocks on `poll_input(None)`; only work-in-hand polls
+- **No idle polling.** The loop blocks on `poll_input(None)`; only work-in-hand polls
   (8 ms batching, or a deferred frame's remainder — `idle_poll::poll_timeout`).
   Off-thread producers send on a channel **and pulse the `TerminalWaker`**.
   Never blocking I/O (git, DB, subprocess, D-Bus, network) on the loop or
@@ -67,6 +67,11 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
 ## Performance invariants
 
 "Everything is instant": sub-300ms launch → first frame, <16ms render, 0% idle.
+These are **design targets**, not measured claims — no published benchmark
+exists yet; measured numbers land in
+[performance results](docs/performance-results.md), and the
+[benchmark protocol](docs/performance-benchmark-protocol.md) records how to
+produce them.
 
 - **The render-decision invariants are ENFORCED in `just ci`** (not just measured).
   Wall-clock benchmarks are machine-dependent and excluded from CI; instead the

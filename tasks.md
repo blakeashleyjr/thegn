@@ -28,7 +28,7 @@ harness 505/506 resurfaces scoped as AR 581).
 verified against the codebase. See `docs/ARCHITECTURE.md` for architecture.
 
 **September 13 live-build remediation:** THE-614 tracks the bounded fixes and
-review gates in [the remediation record](docs/audits/remediation-2026-09-13.md).
+review gates in the 2026-09-13 remediation record (a private audit record).
 The active OpenSpec changes cover session recovery/teardown, diagnostics/forge,
 performance/log following, build Git identity, and the existing merge/upgrade
 safety work. These are repairs to existing roadmap capabilities; canonical
@@ -169,8 +169,7 @@ initiative and five Linear projects:
 The reconciliation found 29 non-completed Linear issues: 14 had delivered or
 decision-complete scope on `main`, 10 were partial or scope-diverged, and 5 were
 unambiguously outstanding as written. Detailed evidence and the pre-mutation
-snapshot are in
-[`docs/audits/linear-reconciliation-2026-09-08.md`](docs/audits/linear-reconciliation-2026-09-08.md).
+snapshot are in the private 2026-09-08 linear-reconciliation audit record.
 The live post-reconciliation portfolio is
 [`docs/PORTFOLIO.md`](docs/PORTFOLIO.md).
 
