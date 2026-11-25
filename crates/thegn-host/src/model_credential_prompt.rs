@@ -1,7 +1,7 @@
 //! The one-time model-credential question and its answers.
 //!
 //! The prompt is raised by the spec drain when
-//! [`crate::agent::provision_provider_env_inner`] refuses an unset Sprites env:
+//! `agent::provision_provider_env_inner` refuses an unset Sprites env:
 //! the drain cannot ask (it is off the loop), so it lowers the typed error and
 //! the focused tab's batch shows this menu. Answers are per project+provider;
 //! "not now" is a one-shot in-process veto. Durable writes ride the DB writer
