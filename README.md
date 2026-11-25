@@ -378,9 +378,9 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 thegn "$HOME/.local/bin/thegn"
 ```
 
-The musl build is statically linked. The GNU build needs glibc at least as new
-as the `ubuntu-latest` runner used to build it; users on older distributions
-should use the musl archive. The archive contains only `thegn` at its root, so
+The musl build is statically linked and works on any Linux distribution. The
+GNU build needs glibc 2.28 or newer (Debian 10+, Ubuntu 18.10+, RHEL 8+); on
+anything older, use the musl archive. The archive contains only `thegn` at its root, so
 run `thegn` (the flake package and `./install.sh` also provide the `tg` alias).
 Put `$HOME/.local/bin` on `PATH` if it is not already there. The `.sha256`
 sidecar checks the archive digest, and
