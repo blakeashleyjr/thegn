@@ -446,10 +446,28 @@ pub fn filter_candidates(
         .collect()
 }
 
+/// How much identifying detail the doctor-probe notes carry. `thegn doctor`
+/// output gets pasted into issues, so the default is [`IdentityDetail::Redacted`]:
+/// the tailnet name and the control URL become [`crate::redact::PLACEHOLDER`]
+/// (both identify the user and their control server), and the notes name the
+/// flag that prints them verbatim. [`IdentityDetail::Full`] is the explicit
+/// `thegn doctor --full` (alias `--unredacted`) opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityDetail {
+    /// Identifying names become the redaction placeholder; a trailing note
+    /// names the flag that reveals them.
+    Redacted,
+    /// Identifying names print verbatim.
+    Full,
+}
+
 /// The doctor-probe summary for a parsed status, derived purely so the seam's
 /// `Probe` impl is a thin subprocess wrapper over this. `control_url` is the
 /// authoritative value the probe fetched from `tailscale debug prefs` (falling
-/// back to any URL the status itself carried).
+/// back to any URL the status itself carried). `detail` decides whether the
+/// tailnet name and the control URL print verbatim ([`IdentityDetail::Full`])
+/// or become the redaction placeholder ([`IdentityDetail::Redacted`] — the
+/// paste-safe default; nothing identifying survives the default view).
 ///
 /// - `Ready` — logged in and at least one peer advertises Tailscale SSH (or SSH
 ///   advertisement is unknown on this client version).
@@ -459,6 +477,7 @@ pub fn filter_candidates(
 pub fn probe_summary(
     status: &TailnetStatus,
     control_url: Option<&str>,
+    detail: IdentityDetail,
 ) -> (Availability, Vec<String>) {
     if !status.backend_state.logged_in() {
         let reason = match status.backend_state {
@@ -474,15 +493,28 @@ pub fn probe_summary(
 
     let (adv, no, unk) = status.ssh_counts();
     let mut notes = Vec::new();
+    let mut redacted_any = false;
     if !status.version.is_empty() {
         notes.push(format!("client {}", status.version));
     }
     if let Some(name) = &status.tailnet_name {
-        notes.push(format!("tailnet: {name}"));
+        notes.push(match detail {
+            IdentityDetail::Full => format!("tailnet: {name}"),
+            IdentityDetail::Redacted => {
+                redacted_any = true;
+                format!("tailnet: {}", crate::redact::PLACEHOLDER)
+            }
+        });
     }
     // The control URL surfaces headscale deployments; honest when unknown.
     match control_url.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(url) => notes.push(format!("control URL: {url}")),
+        Some(url) => notes.push(match detail {
+            IdentityDetail::Full => format!("control URL: {url}"),
+            IdentityDetail::Redacted => {
+                redacted_any = true;
+                format!("control URL: {}", crate::redact::PLACEHOLDER)
+            }
+        }),
         None => notes.push(
             "control URL: unknown (not exposed by `status`; see `tailscale debug prefs`)".into(),
         ),
@@ -491,6 +523,16 @@ pub fn probe_summary(
     notes.push(format!(
         "Tailscale SSH: {adv} advertised, {no} plain-sshd only, {unk} unknown"
     ));
+    // The reveal is discoverable, not hidden: the row says how to print what it
+    // withheld. Only when something actually was withheld — a row that carried
+    // no identity must not claim a redaction.
+    if redacted_any {
+        notes.push(
+            "tailnet identity redacted by default — `thegn doctor --full` (alias `--unredacted`) \
+             prints the tailnet name and control URL"
+                .into(),
+        );
+    }
 
     // Degraded only when SOMETHING is known and none of it advertises SSH; if
     // every peer is unknown (old client) or advertising is present, stay Ready.
@@ -840,7 +882,11 @@ mod tests {
     #[test]
     fn probe_summary_ready_when_ssh_advertised() {
         let st = parse(TAILSCALE_STATUS);
-        let (avail, notes) = probe_summary(&st, Some("https://controlplane.tailscale.com"));
+        let (avail, notes) = probe_summary(
+            &st,
+            Some("https://controlplane.tailscale.com"),
+            IdentityDetail::Full,
+        );
         assert!(avail.is_ready(), "one peer advertises SSH ⇒ Ready");
         assert!(notes.iter().any(|n| n.contains("tailnet: blake@github")));
         assert!(
@@ -853,13 +899,72 @@ mod tests {
     }
 
     #[test]
+    fn probe_summary_redacts_identity_by_default() {
+        // The paste-safe default (THE-2682): neither the tailnet name nor the
+        // control URL survives the default view, the triage facts do, and the
+        // row names the flag that reveals what it withheld.
+        let st = parse(TAILSCALE_STATUS);
+        let (avail, notes) = probe_summary(
+            &st,
+            Some("https://controlplane.tailscale.com"),
+            IdentityDetail::Redacted,
+        );
+        assert!(avail.is_ready(), "redaction never changes availability");
+        let flat = notes.join("\n");
+        assert!(flat.contains("tailnet: ***redacted***"), "{flat}");
+        assert!(flat.contains("control URL: ***redacted***"), "{flat}");
+        assert!(!flat.contains("blake@github"), "{flat}");
+        assert!(!flat.contains("controlplane.tailscale.com"), "{flat}");
+        assert!(flat.contains("client 1.78.1-tabcdef"), "{flat}");
+        assert!(flat.contains("3 peer(s)"), "{flat}");
+        assert!(flat.contains("1 advertised"), "{flat}");
+        assert!(flat.contains("thegn doctor --full"), "{flat}");
+        assert!(flat.contains("--unredacted"), "{flat}");
+    }
+
+    #[test]
+    fn probe_summary_redacts_and_reveals_a_headscale_login() {
+        // The headscale capture names its org in both places (`Name` and
+        // `ControlURL`) — the default must redact both, `--full` shows both.
+        let st = parse(HEADSCALE_STATUS);
+        let (_, redacted) = probe_summary(&st, st.control_url.as_deref(), IdentityDetail::Redacted);
+        let flat = redacted.join("\n");
+        assert!(flat.contains("tailnet: ***redacted***"), "{flat}");
+        assert!(flat.contains("control URL: ***redacted***"), "{flat}");
+        assert!(!flat.contains("example.com"), "{flat}");
+        assert!(flat.contains("1 peer(s)"), "{flat}");
+
+        let (_, full) = probe_summary(&st, st.control_url.as_deref(), IdentityDetail::Full);
+        let flat = full.join("\n");
+        assert!(flat.contains("tailnet: example.com"), "{flat}");
+        assert!(
+            flat.contains("control URL: https://headscale.example.com"),
+            "{flat}"
+        );
+        assert!(!flat.contains("redacted"), "{flat}");
+    }
+
+    #[test]
+    fn probe_summary_without_identity_to_redact_claims_no_redaction() {
+        // No tailnet name and no control URL ⇒ nothing identifying was
+        // withheld, so the default view must not claim a redaction.
+        let st = parse(r#"{ "BackendState": "Running", "Peer": {} }"#);
+        let (avail, notes) = probe_summary(&st, None, IdentityDetail::Redacted);
+        assert!(avail.is_ready());
+        let flat = notes.join("\n");
+        assert!(!flat.contains("redacted"), "{flat}");
+        assert!(flat.contains("control URL: unknown"), "{flat}");
+        assert!(flat.contains("0 peer(s)"), "{flat}");
+    }
+
+    #[test]
     fn probe_summary_degraded_when_nothing_advertises_ssh() {
         // Logged in, one peer that explicitly advertises no SSH, none unknown.
         let st = parse(
             r#"{ "BackendState": "Running", "CurrentTailnet": {"Name":"t"},
             "Peer": { "k": { "HostName": "x", "DNSName": "x.ts.net.", "sshHostKeys": [] } } }"#,
         );
-        let (avail, notes) = probe_summary(&st, None);
+        let (avail, notes) = probe_summary(&st, None, IdentityDetail::Full);
         match avail {
             Availability::Degraded(why) => assert!(why.contains("plain sshd")),
             other => panic!("{other:?}"),
@@ -875,25 +980,29 @@ mod tests {
             r#"{ "BackendState": "Running",
             "Peer": { "k": { "HostName": "x", "DNSName": "x.ts.net." } } }"#,
         );
-        let (avail, _) = probe_summary(&st, None);
+        let (avail, _) = probe_summary(&st, None, IdentityDetail::Full);
         assert!(avail.is_ready());
     }
 
     #[test]
     fn probe_summary_unavailable_when_logged_out_or_stopped() {
-        let (avail, notes) = probe_summary(&parse(LOGGED_OUT_STATUS), None);
+        let (avail, notes) = probe_summary(&parse(LOGGED_OUT_STATUS), None, IdentityDetail::Full);
         match avail {
             Availability::Unavailable(why) => assert!(why.contains("logged out")),
             other => panic!("{other:?}"),
         }
         assert!(notes.is_empty());
-        let (avail, _) = probe_summary(&parse(STOPPED_STATUS), None);
+        let (avail, _) = probe_summary(&parse(STOPPED_STATUS), None, IdentityDetail::Full);
         match avail {
             Availability::Unavailable(why) => assert!(why.contains("stopped")),
             other => panic!("{other:?}"),
         }
         // An unmodeled non-logged-in state names itself.
-        let (avail, _) = probe_summary(&parse(r#"{"BackendState":"NoState"}"#), None);
+        let (avail, _) = probe_summary(
+            &parse(r#"{"BackendState":"NoState"}"#),
+            None,
+            IdentityDetail::Full,
+        );
         assert!(avail.is_unavailable());
     }
 

@@ -31,6 +31,11 @@ thegn makes no network calls.
   and the file is restricted to your account (0600). The database also holds
   some live bearer credentials (iroh pair secrets), so treat copies and backups
   as sensitive.
+- **Doctor report:** `thegn doctor` redacts identifying tailnet detail —
+  the tailnet name and the control URL print as `***redacted***` — because
+  its output is regularly pasted into issues. `thegn doctor --full` (alias
+  `--unredacted`) prints them verbatim; `thegn doctor bundle` always
+  archives the redacted view. See [[debugging]].
 - **Doctor bundles:** `thegn doctor bundle --out FILE` creates a local gzip
   archive with a doctor report, redacted config, retained crash reports and
   bounded log tails (up to 500 lines per log). It does not upload the archive.

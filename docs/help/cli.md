@@ -526,8 +526,9 @@ remote-host candidates, credential-free. `--promote <name|fqdn>` saves one
 as a `[host.<name>]` target with no stored secret — Tailscale SSH (tailnet
 ACLs) or the target's own sshd authorizes at connect time. It reads nothing
 but the local client and runs only when you invoke it; `thegn doctor` shows
-the `host_discovery`/`tailnet` probe. This is unrelated to `[sandbox.vpn]`
-(a sandbox's own egress tunnel).
+the `host_discovery`/`tailnet` probe with the tailnet name and control URL
+redacted (`thegn doctor --full`, alias `--unredacted`, prints them). This is
+unrelated to `[sandbox.vpn]` (a sandbox's own egress tunnel).
 
 `thegn host add <target> --name <alias> --replace` takes over an alias with
 stale recorded state from a host no longer defined in configuration and clears
@@ -774,7 +775,10 @@ does not run this prune.
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]] and [[debugging]].
   Its sandbox section also reports how sandboxed panes see git metadata; the
-  same exposure appears in `--json` output.
+  same exposure appears in `--json` output. The `host_discovery` row redacts
+  the tailnet name and control URL by default; `thegn doctor --full` (alias
+  `--unredacted`) prints them, and `doctor bundle` archives the redacted
+  view.
 - `thegn keys list` — every effective binding, from all three sources.
   The same set [[keybindings]] shows.
 - `thegn keys validate` — non-zero on a chord conflict, so it works in a

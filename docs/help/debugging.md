@@ -29,6 +29,15 @@ means this build is too old), or `unavailable` with an error. Host sections
 below may be incomplete when the database cannot be read. `doctor --json`
 reports this as `worktree_identity.state_db` (`ok` when read).
 
+Doctor output is designed to be pasted into an issue: the
+`host_discovery`/`tailnet` probe prints `***redacted***` where your tailnet
+name and control URL would appear, and the row's note names the opt-in. The
+peer count, Tailscale-SSH advertisement and client version stay — everything
+a triager needs and nothing that identifies you. `thegn doctor --full`
+(alias `--unredacted`) prints the tailnet name and control URL verbatim, in
+both the text report and `--json`. `thegn doctor bundle` always archives the
+redacted view: the bundle is made for sharing.
+
 The **Provider dev-env cache** section prints host-cache `scope` and
 `require_sigs` (`yes (explicit)` or `yes (nix default)`) beside the signer;
 `doctor --json` carries these as `scope`, `require_sigs`, and

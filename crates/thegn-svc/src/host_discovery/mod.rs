@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use thegn_core::config::{HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig};
 use thegn_core::seam::{Availability, BoxFuture, ErrorClass, ProbeReport, SeamError};
-use thegn_core::tailnet::{self, BackendState, HostCandidate, TailnetStatus};
+use thegn_core::tailnet::{self, BackendState, HostCandidate, IdentityDetail, TailnetStatus};
 
 use crate::seam::JoinFailure;
 
@@ -91,8 +91,17 @@ pub trait HostDiscovery: Send + Sync {
     /// Enumerate remote-host candidates. Runs off the runtime's worker threads
     /// (blocking subprocess on the blocking pool). Logged-out ⇒ `NotConfigured`.
     fn discover(&self) -> BoxFuture<'_, Result<Vec<HostCandidate>, DiscoveryError>>;
-    /// The `thegn doctor` self-description (cheap, local — no network).
-    fn probe(&self) -> ProbeReport;
+    /// The `thegn doctor` self-description (cheap, local — no network) with
+    /// explicit identity detail: [`IdentityDetail::Redacted`] is the paste-safe
+    /// default (doctor output gets pasted into issues); [`IdentityDetail::Full`]
+    /// is the explicit `thegn doctor --full`/`--unredacted` opt-in.
+    fn probe_with(&self, detail: IdentityDetail) -> ProbeReport;
+    /// The doctor probe with the paste-safe default (
+    /// `self.probe_with(IdentityDetail::Redacted)`), so a surface that prints
+    /// probes without a user opt-in can never leak the tailnet identity.
+    fn probe(&self) -> ProbeReport {
+        self.probe_with(IdentityDetail::Redacted)
+    }
 }
 
 /// Build the provider a loaded config selects, or `None` for a reserved kind.
@@ -156,8 +165,8 @@ impl HostDiscovery for TailnetDiscovery {
         })
     }
 
-    fn probe(&self) -> ProbeReport {
-        probe_tailnet(&self.bin())
+    fn probe_with(&self, detail: IdentityDetail) -> ProbeReport {
+        probe_tailnet(&self.bin(), detail)
     }
 }
 
@@ -225,7 +234,9 @@ fn transient_message(stderr: &str) -> String {
 
 /// The doctor probe for the tailnet kind. Cheap + local: a `which`, then two
 /// bounded local calls (`status`, `debug prefs`) only if the client is present.
-fn probe_tailnet(bin: &str) -> ProbeReport {
+/// `detail` decides whether the notes may carry the tailnet name and control
+/// URL verbatim (`thegn doctor --full`) or must redact them (the default).
+fn probe_tailnet(bin: &str, detail: IdentityDetail) -> ProbeReport {
     if !binary_present(bin) {
         return ProbeReport::new(
             SEAM,
@@ -239,7 +250,7 @@ fn probe_tailnet(bin: &str) -> ProbeReport {
         Ok(status) => {
             // The authoritative control URL (surfaces headscale) — best-effort.
             let control_url = fetch_control_url(bin);
-            let (avail, notes) = tailnet::probe_summary(&status, control_url.as_deref());
+            let (avail, notes) = tailnet::probe_summary(&status, control_url.as_deref(), detail);
             let mut report = ProbeReport::new(SEAM, "tailnet", avail);
             for note in notes {
                 report = report.note(note);
@@ -395,6 +406,29 @@ mod tests {
         match report.availability {
             Availability::Unavailable(why) => assert!(why.contains("tailscale-xyz")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_detail_default_is_redacted_and_full_is_explicit() {
+        // The trait default is the redacted view; the detail only rewrites note
+        // text once a status can be parsed, so with a missing client the
+        // default and the explicit redacted view report the same row (no
+        // subprocess — hermetic).
+        let d = TailnetDiscovery::new(TailnetDiscoveryConfig {
+            tailscale_bin: "/nonexistent/tailscale-xyz".into(),
+            ..TailnetDiscoveryConfig::default()
+        });
+        for report in [d.probe(), d.probe_with(IdentityDetail::Redacted)] {
+            assert_eq!(report.seam, SEAM);
+            assert_eq!(report.id, "tailnet");
+            match &report.availability {
+                Availability::Unavailable(why) => {
+                    assert!(why.contains("tailscale-xyz"), "{report:?}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(report.notes.is_empty(), "{report:?}");
         }
     }
 

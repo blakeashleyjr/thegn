@@ -16,6 +16,7 @@ use thegn_core::placement::{Placement, RuntimeProbe};
 use thegn_core::sandbox::Backend;
 use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
+use thegn_core::tailnet::IdentityDetail;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
 use super::config_health::ConfigHealth;
@@ -1116,10 +1117,14 @@ fn format_xdg_omissions(omissions: &[thegn_core::sandbox_mounts::XdgOmissionEntr
 
 /// Every provider the loaded config selects, with its probe (the
 /// provider-seams registry). Reserved kinds show up as unavailable with the
-/// reason, so "why is CI empty?" has a one-line answer.
-fn providers_json(cfg: &Config) -> serde_json::Value {
+/// reason, so "why is CI empty?" has a one-line answer. `detail` threads the
+/// doctor identity mode: the tailnet row's tailnet name and control URL print
+/// verbatim only under `IdentityDetail::Full` (`thegn doctor --full`); the
+/// default and `doctor bundle` use the redacted view.
+fn providers_json(cfg: &Config, detail: IdentityDetail) -> serde_json::Value {
     let mut providers =
-        serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default();
+        serde_json::to_value(thegn_svc::seam::registry::probes_with_detail(cfg, detail))
+            .unwrap_or_default();
     let credential_rows = ci_credential_placement_rows(cfg)
         .into_iter()
         .map(|row| row.json())
@@ -1231,11 +1236,14 @@ fn toolchain_report(cfg: &Config) {
 }
 
 /// Text twin of [`providers_json`]. Never affects the exit status: a missing
-/// optional binary is information, not a doctor failure.
-fn providers_report(cfg: &Config) {
+/// optional binary is information, not a doctor failure. The tailnet row
+/// redacts the tailnet name and control URL unless `detail` is
+/// [`IdentityDetail::Full`] (`thegn doctor --full`, alias `--unredacted`);
+/// the redacted view's note names the flag, so the reveal is discoverable.
+fn providers_report(cfg: &Config, detail: IdentityDetail) {
     use thegn_core::seam::Availability;
     outln!("Providers (seam → provider: availability)");
-    for r in thegn_svc::seam::registry::probes(cfg) {
+    for r in thegn_svc::seam::registry::probes_with_detail(cfg, detail) {
         let (state, why) = match &r.availability {
             Availability::Ready => ("ready", String::new()),
             Availability::Degraded(w) => ("degraded", format!(" — {w}")),
@@ -3356,25 +3364,38 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 }
 
 /// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
-/// terminal detection so it is standalone. This compatibility wrapper keeps
-/// the existing bundle/tests API for callers that use the default path.
+/// terminal detection so it is standalone. The bundle is a support archive
+/// meant for pasting, so it always uses the redacted identity view
+/// ([`IdentityDetail::Redacted`]); `thegn doctor --full` is the interactive
+/// opt-in. This compatibility wrapper keeps the existing bundle/tests API for
+/// callers that use the default (redacted) path.
 #[cfg(test)]
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     let path = thegn_core::config::Config::path();
     let health = super::config_health::collect(&path, None);
-    doctor_json_with_health_and_overrides_and_legacy(cfg, &health, &[], Some("absent"))
+    doctor_json_with_health_and_overrides_and_legacy(
+        cfg,
+        &health,
+        &[],
+        Some("absent"),
+        IdentityDetail::Redacted,
+    )
 }
 
+/// The redacted [`IdentityDetail::Redacted`] view, used by `thegn doctor
+/// bundle`: the archive is written to be shared, so it never carries the
+/// tailnet name or control URL verbatim.
 pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
-    doctor_json_with_health_and_overrides(cfg, health, &[])
+    doctor_json_with_health_and_overrides(cfg, health, &[], IdentityDetail::Redacted)
 }
 
 fn doctor_json_with_health_and_overrides(
     cfg: &Config,
     health: &ConfigHealth,
     cli_overrides: &[String],
+    detail: IdentityDetail,
 ) -> serde_json::Value {
-    doctor_json_with_health_and_overrides_and_legacy(cfg, health, cli_overrides, None)
+    doctor_json_with_health_and_overrides_and_legacy(cfg, health, cli_overrides, None, detail)
 }
 
 fn doctor_json_with_health_and_overrides_and_legacy(
@@ -3382,6 +3403,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
     health: &ConfigHealth,
     cli_overrides: &[String],
     legacy_state_override: Option<&str>,
+    detail: IdentityDetail,
 ) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
@@ -3454,7 +3476,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "managed_tools": managed_tools_json(cfg),
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
-        "providers": providers_json(cfg),
+        "providers": providers_json(cfg, detail),
         "sound": crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound),
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
@@ -3907,13 +3929,21 @@ fn reaper_holds_json(holds: &[ReaperHold]) -> serde_json::Value {
 pub fn run(
     cfg: &Config,
     json: bool,
+    full: bool,
     config_path: std::path::PathBuf,
     repo_context: Option<std::path::PathBuf>,
     cli_overrides: &[String],
 ) -> Result<()> {
+    // THE-2682: doctor output gets pasted into issues, so identifying tailnet
+    // detail (tailnet name, control URL) is opt-in via `--full`/`--unredacted`.
+    let detail = if full {
+        IdentityDetail::Full
+    } else {
+        IdentityDetail::Redacted
+    };
     let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
-        let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides);
+        let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides, detail);
         report["plugins"] = plugins_trust_json(cfg, &config_path);
         report["voice"] = super::voice::status(&cfg.voice);
         report["batteries"] =
@@ -4033,7 +4063,7 @@ pub fn run(
     }
 
     outln!("");
-    providers_report(cfg);
+    providers_report(cfg, detail);
 
     outln!("");
     toolchain_report(cfg);
@@ -7320,6 +7350,30 @@ mod tests {
     #[test]
     fn doctor_json_carries_the_worktree_sandbox_pins_key() {
         assert_eq!(super::pins::json(&[]), serde_json::json!([]));
+    }
+
+    #[test]
+    fn doctor_json_tailnet_detail_never_disturbs_non_identity_rows() {
+        // THE-2682: `--full` threads into the provider registry, but only the
+        // tailnet row's note text may carry identity. With the client binary
+        // absent there is no identity to reveal (hermetic — `which` fails, no
+        // subprocess), so both detail modes must render byte-equal rows and
+        // the redacted view is what the default doctor/bundle path uses.
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.tailscale_bin = "/nonexistent/thegn-no-tailscale-xyz".into();
+        let full = providers_json(&cfg, thegn_core::tailnet::IdentityDetail::Full);
+        let redacted = providers_json(&cfg, thegn_core::tailnet::IdentityDetail::Redacted);
+        assert_eq!(full, redacted, "detail rewrites note text only");
+        let tailnet = redacted
+            .as_array()
+            .expect("provider rows")
+            .iter()
+            .find(|r| r["seam"] == "host_discovery")
+            .expect("host_discovery row");
+        assert_eq!(tailnet["id"], "tailnet");
+        assert_eq!(tailnet["availability"]["state"], "unavailable");
+        let reason = tailnet["availability"]["reason"].as_str().expect("reason");
+        assert!(reason.contains("thegn-no-tailscale-xyz"), "{reason}");
     }
 
     #[test]

@@ -747,6 +747,11 @@ pub enum Command {
         /// Emit machine-readable JSON instead of the text report.
         #[arg(long)]
         json: bool,
+        /// Print the tailnet name and control URL verbatim. Doctor redacts them
+        /// by default (`***redacted***`) because its output gets pasted into
+        /// issues; this flag (alias `--unredacted`) opts into identifying detail.
+        #[arg(long, alias = "unredacted")]
+        full: bool,
         /// A doctor sub-verb (e.g. `bundle`). With none, print the report.
         #[command(subcommand)]
         action: Option<DoctorAction>,
@@ -1696,11 +1701,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
         Command::Db { action } => cmd::db::run(action),
-        Command::Doctor { json, action } => match action {
+        Command::Doctor { json, full, action } => match action {
             Some(DoctorAction::Bundle { args }) => {
                 cmd::bundle::run(&cfg, args, config_path, repo_context.clone())
             }
-            None => cmd::doctor::run(&cfg, json, config_path, repo_context, &cli.overrides),
+            None => cmd::doctor::run(&cfg, json, full, config_path, repo_context, &cli.overrides),
         },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
