@@ -1217,10 +1217,104 @@ fn map_dispatch_base(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::Ag
     })
 }
 
+/// Split a collapsed-repeat message `"<base> (×N)"` into `(base, N)`; a plain
+/// message is `(message, 1)`.
+pub fn split_repeat_count(message: &str) -> (&str, u32) {
+    if let Some(stripped) = message.strip_suffix(')')
+        && let Some(idx) = stripped.rfind(" (\u{d7}")
+        && let Ok(n) = stripped[idx + " (\u{d7}".len()..].parse::<u32>()
+    {
+        return (&stripped[..idx], n.max(1));
+    }
+    (message, 1)
+}
+
+/// Render a message with its repeat count (`count <= 1` is the bare message).
+pub fn with_repeat_count(base: &str, count: u32) -> String {
+    if count <= 1 {
+        base.to_string()
+    } else {
+        format!("{base} (\u{d7}{count})")
+    }
+}
+
+impl Db {
+    /// Collapse a repeated identical notification into the newest unread row of
+    /// the same `(kind, worktree_path)`: when that row's base message equals
+    /// `message`, bump its `(×N)` count, refresh its time and return its id.
+    /// `None` means no such row exists and the caller should insert normally.
+    pub fn collapse_repeat_notification(
+        &self,
+        kind: &str,
+        worktree_path: &str,
+        message: &str,
+    ) -> Result<Option<i64>> {
+        let newest: Option<(i64, String)> = self
+            .conn()
+            .query_row(
+                "SELECT id,message FROM notifications WHERE kind=?1 AND worktree_path=?2 AND read=0 \
+                 ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                params![kind, worktree_path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, existing)) = newest else {
+            return Ok(None);
+        };
+        let (base, count) = split_repeat_count(&existing);
+        let (incoming_base, _) = split_repeat_count(message);
+        if base != incoming_base {
+            return Ok(None);
+        }
+        self.conn().execute(
+            "UPDATE notifications SET message=?2, created_at_ms=?3 WHERE id=?1",
+            params![id, with_repeat_count(base, count + 1), util::now()],
+        )?;
+        Ok(Some(id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::NotificationStore;
+
+    #[test]
+    fn repeated_identical_notification_collapses_with_count() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            db.collapse_repeat_notification("process_failed", "/wt", "boom")
+                .unwrap(),
+            None
+        );
+        let id = db
+            .put_notification("process_failed", "p", "boom", "/wt")
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                db.collapse_repeat_notification("process_failed", "/wt", "boom")
+                    .unwrap(),
+                Some(id)
+            );
+        }
+        let rows = db.get_all_notifications(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message, "boom (\u{d7}3)");
+        // A different message, or a read row, does not collapse.
+        assert_eq!(
+            db.collapse_repeat_notification("process_failed", "/wt", "other")
+                .unwrap(),
+            None
+        );
+        db.mark_notification_read(id).unwrap();
+        assert_eq!(
+            db.collapse_repeat_notification("process_failed", "/wt", "boom")
+                .unwrap(),
+            None
+        );
+        assert_eq!(split_repeat_count("a (\u{d7}4)"), ("a", 4));
+        assert_eq!(split_repeat_count("a"), ("a", 1));
+    }
 
     #[test]
     fn usage_alert_claim_updates_without_unreading_and_suppresses_deleted_rows() {
