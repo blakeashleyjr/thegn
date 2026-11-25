@@ -1492,3 +1492,17 @@ pairs whose values are absent from the host environment (for example
 - **WHEN** a stdin-delivered env payload contains an invalid name, a CR/LF in a
   value, too many variables, or too many bytes
 - **THEN** the launch is refused with an error that names no secret value
+
+### Requirement: Interactive env up opens before background setup finishes
+
+`thegn env up` on a provider env run from a terminal SHALL return once a shell can open and SHALL finish the deferred steps (agent install, agent logins, history sync, snapshot) in a detached `env up --wait`, whose failure is recorded in the deferred journal and shown by `env show`. `--wait` and any non-terminal run SHALL wait for every step; `--shell-ready` SHALL return without starting the background run.
+
+#### Scenario: Bare env up in a terminal
+
+- **WHEN** a user runs `thegn env up` with a terminal attached
+- **THEN** the command returns after the foreground steps and a log path for the background run is printed
+
+#### Scenario: Script run
+
+- **WHEN** `thegn env up` runs without a terminal or with `--wait`
+- **THEN** it returns only after every step finished

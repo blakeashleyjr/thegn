@@ -21,9 +21,9 @@
 - [x] 2.1 Contract tests cover the selected build route, refusal without
       fallback, deadline forwarding, unhonoured-field rejection,
       lost-after-submit, timeout/signal completion and truncated output.
-- [ ] 2.2 Run `cargo nextest run -p thegn-job-spec` in the dev shell and record
-      the result in the issue handoff.
-- [ ] 2.3 Run `just ci` (includes `openspec-validate`).
+- [x] 2.2 Run `cargo nextest run -p thegn-job-spec` in the dev shell and record
+      the result in the issue handoff. Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
+- [x] 2.3 Run `just ci` (includes `openspec-validate`). Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
 
 ## 3. Follow-up (not this change)
 
@@ -52,8 +52,8 @@
 - [x] 4.2 Verify the checkout against the REAPI root digest, with per-attempt
       cleanup, a separate transfer budget, one project per Sprite and a
       scrubbed per-attempt environment.
-- [ ] 4.3 Run `cargo nextest run -p thegn-svc --test sprites_job` and the
-      `sprites::job` unit tests on the Mac builder.
+- [x] 4.3 Run `cargo nextest run -p thegn-svc --test sprites_job` and the
+      `sprites::job` unit tests on the Mac builder. Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
 - [x] 4.4 User cancel: a `CancelToken` on a running attempt issues the same
       owned-tree kill as the deadline, records `Cancelled` (distinct from
       `TimedOut`), fences outputs, releases the hold and marks cleanup `Done` on
@@ -67,7 +67,7 @@
 - [x] 4.6 Reattach by session handle: follow the stream while the provider still
       holds it, otherwise reconcile to `Indeterminate`; never redispatch. (`sprites/job.rs` `reattach`, scheduled by
       `selected_runner.rs` `reattach_orphans`.)
-- [ ] 4.9 Route wiring: `submit` (the `SelectedRunner` trait) takes a
+- [x] 4.9 Route wiring: `submit` (the `SelectedRunner` trait) takes a
       `CancelToken` so a user cancel before or during dispatch reaches the
       runner and reads back as `Cancelled` on the route (today a pre-dispatch
       cancel surfaces as `RunnerUnavailable`); schedule `reconcile_pending` and
@@ -77,13 +77,15 @@
       reads back as `Cancelled` on both executors and mid-run on both (Vercel
       kills the command and stops the sandbox through the deadline path). The
       executors are now built from provider config (task 3.1), and the daemon
-      runs one background `reconcile_pending` pass at start for the configured
-      `[jobs] runner` (Vercel gained a `reconcile_pending` wrapper over its
+      runs one background `reconcile_pending` pass at start over every Sprites and
+      Vercel env, the configured `[jobs] runner` first, so ledgers left by an env
+      whose runner changed or by another project's runner are settled too; an env
+      whose provider config or credentials no longer resolve is skipped with a
+      warn log (Vercel gained a `reconcile_pending` wrapper over its
       per-attempt `reconcile`; the pass scans only ledgers with unsettled rows,
       so an idle ledger resolves no secret). The same pass then calls Sprites
       `reattach` for `Running` rows with a session handle and no live owner
-      lease (live leases are never touched), off the event loop. Still open:
-      reconciling ledgers of envs other than the configured runner.
+      lease (live leases are never touched), off the event loop.
 - [x] 4.10 Owner lease on non-terminal rows (pid, boot id from
       `/proc/sys/kernel/random/boot_id`, process start time, heartbeat) so
       recovery skips a live owner. Shared `OwnerLease` in `sprites::job`, used
@@ -99,8 +101,8 @@
       ledger cannot read an in-flight (non-terminal) row written by a newer one
       (terminal rows clear the lease); and a row whose owning task panicked in a
       still-running process stays unrecovered until that process exits.
-- [ ] 4.7 Run the new cancel, reconcile and reattach tests in
-      `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
+- [x] 4.7 Run the new cancel, reconcile and reattach tests in
+      `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder. Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
 - [ ] 4.8 Not in this slice: the credential broker and a budgeted live run. The
       CLI verb landed with task 3.1; it has not yet run against a real provider.
 - [x] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
@@ -134,5 +136,5 @@ admission_timeout_secs` (default 30, 0 = no wait) for an unavailable runner,
 - [ ] 5.6 Stock-harness probe on the Mac builder: record the pinned harness,
       OS and recipe that passed, and compare the explicit and automatic
       receipts. An explicit `job run` alone does not qualify the route.
-- [ ] 5.7 Run `cargo nextest run -p thegn-host job_shim` and `-p thegn-core
+- [x] 5.7 Run `cargo nextest run -p thegn-host job_shim` and `-p thegn-core Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
 config_jobs repo_job_route` on the Mac builder.

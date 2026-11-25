@@ -239,7 +239,7 @@ AGENT_RUN_SECONDS=0
 COST_PRE_STATE=""
 COST_PRE_WAIT_TIMED_OUT=0
 # shellcheck disable=SC2034 # read by test/lib/live.sh
-LIVE_STARTUP=("3=cold create (env up)" "6=first interactive output (sprite-exec under script)" "10w=wake from cold (sprite-exec -- true)")
+LIVE_STARTUP=("3=cold create to first shell (env up --shell-ready)" "3a=background setup (env up)" "6=first interactive output (sprite-exec under script)" "10w=wake from cold (sprite-exec -- true)")
 
 live_on_pass() { if [ "$1" = 11 ]; then STEP_11_PASSED=1; fi; }
 
@@ -1227,7 +1227,11 @@ step 1b "env test" "$THEGN_BIN" "${MIN_RAM_SET[@]}" env test "$env_name"
 step 2 "no sprites ledger record before create" ledger_empty
 in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env set "$env_name" >/dev/null
 CREATED=1
-step 3 "provision sprite (env up)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up
+# Time-to-first-shell first (THE-2674: target well under 60 s), then the
+# background setup (agents, history, checkpoint) separately, so the run reports
+# where the cold start goes.
+step 3 "provision sprite (env up --shell-ready)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up --shell-ready
+step 3a "background setup finishes (env up --wait)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up --wait
 step 3b "exactly one ready sprites ledger record (plan step 3)" name_from_ledger
 echo "sprite: $SPRITE_NAME"
 step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches

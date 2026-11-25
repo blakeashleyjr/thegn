@@ -1434,7 +1434,8 @@
     },
     {
       "change": "redact-tailnet-identity-in-doctor",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-11-25",
       "disposition": "alpha-delivery",
       "owners": [],
       "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",

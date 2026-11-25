@@ -18,9 +18,9 @@
 
 ## 2. Verification
 
-- [ ] 2.1 Run `just quick thegn-host` and the focused nextest filters
-      (`drain_specs`, `recorded_daemon_sessions`).
+- [x] 2.1 Run `just quick thegn-host` and the focused nextest filters
+      (`drain_specs`, `recorded_daemon_sessions`). Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.
 - [ ] 2.2 Reproduce the clip flow live: launch `thegn`, run the tick loop,
       quit (`Ctrl+Q`, `y`), relaunch `thegn` — the restored tab shows one
       pane per recorded session, same tree shape, no duplicate pane.
-- [ ] 2.3 Run `just ci` (includes openspec-validate).
+- [x] 2.3 Run `just ci` (includes openspec-validate). Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.

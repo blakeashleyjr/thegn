@@ -1417,8 +1417,12 @@ pub fn provision_repo_script_with_submodules(
 ) -> String {
     let oq = util::sh_quote(origin);
     // Already a repo → done. Else clone into the cwd, then settle the branch.
-    let mut s =
-        String::from("if git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi; git clone ");
+    // Blobless (`--filter=blob:none`): full history, but old file contents are
+    // fetched on demand, so a cold sandbox downloads the checkout, not every
+    // historical blob. A server without filter support ignores it (full clone).
+    let mut s = String::from(
+        "if git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi; git clone --filter=blob:none ",
+    );
     s.push_str(&oq);
     s.push_str(" .");
     if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
@@ -2424,7 +2428,7 @@ mod tests {
         );
         // sh_quote passes safe URLs/branch names through unquoted.
         assert!(
-            s.contains("git clone https://github.com/o/r.git ."),
+            s.contains("git clone --filter=blob:none https://github.com/o/r.git ."),
             "clone into cwd: {s}"
         );
         // Branch checkout falls back to creating it when absent on the remote.
