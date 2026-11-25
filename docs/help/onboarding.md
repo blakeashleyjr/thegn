@@ -37,7 +37,7 @@ saved until the last one.
    Aider, Antigravity). The one you pick becomes the first `[[agents]]` entry.
    An agent that is not installed cannot be picked.
 6. **Remote offload.** Sprites, Vercel and ssh hosts, and how to set them up
-   later. The tour never asks for a token. See [[environments]] and
+   later. These are dev channel only (`THEGN_CHANNEL=dev`). The tour never asks for a token. See [[environments]] and
    [[vercel-sandbox]].
 7. **Keys you'll use daily.** Press the real chords for new worktree, split,
    palette and close. The diagram reacts; nothing is created. The chords come

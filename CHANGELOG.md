@@ -7,8 +7,44 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.132] — 2026-11-24
+
+Restart thegn after upgrading. If an older daemon still holds the database,
+thegn now says so and offers to restart it; the database is backed up before
+any schema migration.
+
+### Fixed
+
+- Upgrading no longer fails with a bare "refusing database schema migration":
+  thegn explains that an older daemon is still running, offers a safe restart
+  from the terminal, and keeps the last three timestamped database backups.
+- A first run makes no TCP connections: the music-player (MPD) probe only runs
+  when you configure an MPD socket or set `MPD_HOST`. The idle database writer
+  closes its connection when unused.
+- Startup moves help-registry and merge-guard work off the first-frame path and
+  logs per-phase timings.
+- The first `env up` on Sprites installs agent CLIs in parallel and reports a
+  total time; the shell is usable after about 20 seconds.
+
+- Stable-channel messages for remotes and client/server: `thegn doctor` shows the
+  remote row as partly stable (ssh/mosh remotes and client/server stable;
+  Kubernetes and direct iroh dev-only), a missing `mosh-server` gets an install
+  hint, `serve --iroh-direct`/`pair direct` name `thegn serve` + `thegn pair new`,
+  and a dropped Kubernetes env says it is dev-channel only.
+
 ### Added
 
+- Vercel sandboxes now deny network egress by default. `[env.<n>.provider]
+egress = "registries"` allows only package registries and git hosts,
+  `"allow-all"` opens it, and `egress_allow` adds hosts. The policy is applied
+  on create and on every resume; the new-environment wizard and
+  `thegn env create --egress` offer the choice.
+- Every release archive (Linux gnu and musl, macOS) and the Homebrew, AUR, deb
+  and rpm packages now ship the static x86_64-linux-musl resident bridge as
+  `thegn-musl` beside `thegn`, so Sprites and Vercel panes work from a release
+  install without a Nix build. The host finds it next to its own executable
+  (`THEGN_BRIDGE_BINARY` still overrides), and `thegn doctor` explains how to
+  fix a missing one.
 - The first launch opens a full-screen welcome tour: the workspace model on a
   small live diagram, a theme you see applied as you scroll, an honest table of
   what each sandbox tier protects with the backends that work on this machine,
@@ -17,6 +53,22 @@ All notable changes to **thegn** are documented here. The format follows
   nothing is saved until the last screen shows the exact changes. Reopen it
   from the palette with **Welcome tour…**; `thegn setup` still opens the
   classic setup wizard.
+
+### Changed
+
+- Sprites and Vercel Sandbox environments are supported on the stable channel:
+  their `[env.*]` tables survive the stable config clamp, worktrees can open on
+  them, the panel shows the environments section, and `thegn job run` with a
+  Sprites or Vercel runner is no longer refused; `thegn fleet` lists, costs and
+  inspects Sprites and Vercel instances, and the New-environment wizard offers
+  only providers your channel supports. Every other cloud provider, the managed
+  `[host.*]` pool, Kubernetes placement, `thegn host` and `thegn placement` stay
+  dev-channel only.
+- SSH/mosh remote workspaces (`[sandbox.remote]`, `[env.*] placement = "ssh"`)
+  and client/server mode (`thegn serve`, `attach`, `pair`, `session`, `events`)
+  are supported on the stable channel. Kubernetes placement and the direct-iroh
+  listener (`serve --iroh-direct`, `pair direct`) stay dev-channel only. The
+  New-environment wizard offers `ssh` on stable.
 
 ## [0.1.0-alpha.131] — 2026-11-24
 

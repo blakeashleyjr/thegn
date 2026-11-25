@@ -445,6 +445,15 @@
       "summary": "Daemon-owned semantic session architecture has no implementation yet."
     },
     {
+      "change": "add-safe-upgrade",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Explain a stale daemon that blocks a schema migration, offer a safe restart, and back up the database before every forward migration.",
+      "delivered_at": "2026-11-24"
+    },
+    {
       "change": "add-sandbox-policy-engine",
       "lifecycle": "proposed",
       "disposition": "strategic-unstarted",
@@ -1691,6 +1700,31 @@
       "archive_path": "openspec/changes/archive/2026-09-30-serialize-validate-frp-configuration/"
     },
     {
+      "change": "ship-release-bridge",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Ship the static Linux musl resident bridge with every release archive and package so Sprites and Vercel panes work from a release install.",
+      "delivered_at": "2026-11-24"
+    },
+    {
+      "change": "ship-sprites-vercel-on-stable",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Make Sprites and Vercel environments and selected-runner jobs available on the stable channel; other providers stay dev-only."
+    },
+    {
+      "change": "ship-ssh-clientserver-on-stable",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Make SSH/mosh remote workspaces and client/server mode available on the stable channel; Kubernetes placement and direct iroh stay dev-only."
+    },
+    {
       "change": "sidebar-short-worktree-list",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -1718,6 +1752,15 @@
         }
       ],
       "summary": "THE-640 sort direction fix delivered to local main fdcefcb6 after 14 focused native passes, three intended old-comparator failures, independent review, scoped strict lint and source gates. Shared THE-628 process-refresh/performance acceptance remains separate."
+    },
+    {
+      "change": "stable-fleet-and-env-wizard",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Stable-channel fleet list/cost/inspect for Sprites and Vercel, and a new-environment wizard that offers only channel-allowed providers.",
+      "delivered_at": "2026-11-24"
     },
     {
       "change": "strict-host-definition-snapshots",
@@ -1782,6 +1825,14 @@
       ],
       "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport. Reviewed and verified with 107 distinct native tests and a 24-case redirect supplement; source/artifact mapping and limitations are in the maintenance08 audit.",
       "archive_path": "openspec/changes/archive/2026-09-30-validate-tracker-identifiers/"
+    },
+    {
+      "change": "vercel-egress-deny-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Vercel sandboxes deny network egress by default, with a registries preset, allow-all, explicit allow lists, and a setup-wizard choice."
     },
     {
       "change": "vercel-sandbox-agent-credentials",

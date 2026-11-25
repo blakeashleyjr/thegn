@@ -95,7 +95,11 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   `log_trace::install`.
 - `just bench` (hyperfine) measures process baseline + real launch→first-frame
   via `THEGN_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
-  perf commits should record before/after deltas.
+  perf commits should record before/after deltas. Per-phase launch timing:
+  `THEGN_LOG=info` then grep `thegn::startup` (`since_process_ms` on the
+  `config admitted` and `first frame submitted` lines covers the pre-runtime
+  work; probe/session/db/theme/help lines carry their own `*_ms`). The bench
+  hook skips the outer-terminal probe (a pty has no emulator to answer it).
 - **Perf suite** (`docs/superpowers/specs/perf-suite.md`): runtime self-profiler
   (`THEGN_PERF=1` → `thegn::perf` rollup with wake-source + per-subsystem-CPU
   attribution + wake-storm warning), steady-state idle harness (`just bench-idle`,

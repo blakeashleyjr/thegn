@@ -2582,9 +2582,9 @@ check "the refusal names the dev channel" \
   "{ env THEGN_CHANNEL=stable '$SZ' host list 2>&1 || true; } | grep -q 'dev-channel feature'"
 check "dev channel allows the same verb" \
   "env THEGN_CHANNEL=dev '$SZ' host list >/dev/null 2>&1"
-check "doctor reports the stable channel + disabled remote" \
+check "doctor reports the stable channel + dev-only remote extras (k8s, iroh-direct) off" \
   "env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -q '\"channel\": \"stable\"' && env THEGN_CHANNEL=stable '$SZ' doctor --json | sed -n '/\"features\"/,/}/p' | grep -q '\"remote\": false'"
-check "doctor reports the dev channel + enabled remote" \
+check "doctor reports the dev channel + dev-only remote extras on" \
   "env THEGN_CHANNEL=dev '$SZ' doctor --json | sed -n '/\"features\"/,/}/p' | grep -q '\"remote\": true'"
 # The provider-seams registry: every configured seam reports a probe, and
 # the text twin prints the same section.

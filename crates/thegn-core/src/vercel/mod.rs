@@ -5,6 +5,7 @@
 pub mod admit;
 pub mod api;
 pub mod creds;
+pub mod egress;
 pub mod policy;
 pub mod token;
 pub mod usage;

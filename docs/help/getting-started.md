@@ -83,7 +83,11 @@ explains how settings are layered.
 
 By default, worktree panes run in a sandbox. The `standard` profile makes files
 outside the worktree read-only, while your home directory and its credentials
-remain readable; `sealed` hides `$HOME`. Native plugins run unsandboxed. If no
+remain readable, as do `~/.ssh`, cloud credentials and the network, so
+`standard` is an accident guard, not a security boundary. `sealed` hides `$HOME`
+and the network but shares writable toolchain caches. Only interactive panes
+are sandboxed: headless agent runs, the queue, the merge gate, tests and
+language servers run on the host. Native plugins run unsandboxed. If no
 sandbox backend is usable, the launch is refused; set `[sandbox] enabled = false`
 to opt out. See [[sandboxing]], and [[sandbox-profiles]] to choose a profile
 per worktree.

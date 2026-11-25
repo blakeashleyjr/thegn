@@ -3434,13 +3434,16 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 
     // Every gated master toggle is forced off.
     assert!(!cfg.placement.enabled);
-    assert!(cfg.sandbox.remote.host.is_empty());
+    // SSH remotes ship on stable, so `[sandbox.remote]` survives the clamp.
+    assert_eq!(cfg.sandbox.remote.host, "box.example");
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
     assert!(cfg.lead.is_none());
     assert!(clamped.contains(&Feature::Lead));
-    // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), 5);
+    // Every gated feature that changed reports as clamped; SSH remotes are
+    // stable now, so `Remote` has nothing to drop here.
+    assert!(!clamped.contains(&Feature::Remote));
+    assert_eq!(clamped.len(), 4);
     assert!(!clamped.contains(&Feature::Observe));
     assert!(!clamped.contains(&Feature::PluginApps));
 
@@ -3490,7 +3493,7 @@ fn clamp_to_channel_keeps_plugin_app_tabs_in_stable() {
 }
 
 #[test]
-fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
+fn clamp_to_channel_drops_k8s_and_provider_envs_in_stable() {
     use crate::channel::{Channel, Feature};
     use crate::config::{EnvConfig, PlacementMode};
 
@@ -3547,8 +3550,9 @@ fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
     let clamped = cfg.clamp_to_channel(Channel::Stable);
     assert_eq!(
         cfg.env.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["plain"]
+        ["box", "plain"]
     );
+    // Plain ssh/mosh envs are stable; the Kubernetes pod is not.
     assert!(clamped.contains(&Feature::Remote));
     assert!(clamped.contains(&Feature::Providers));
     // The Providers arm clears `[host.*]` (WS09-P1-05 relies on it).
@@ -3628,6 +3632,71 @@ fn clamp_removes_k8s_envs_in_stable() {
         cfg.env.keys().collect::<Vec<_>>()
     );
     assert!(clamped.contains(&Feature::Remote), "{clamped:?}");
+}
+
+#[test]
+fn stable_clamp_keeps_sprites_and_vercel_envs_but_not_other_providers() {
+    use crate::channel::{Channel, Feature};
+    use crate::config::EnvProviderKind;
+
+    let source = "\
+[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\
+[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n\
+[env.fly]\nplacement = \"provider\"\n[env.fly.provider]\nprovider = \"fly\"\n\
+[env.m0]\nplacement = \"provider\"\n[env.m0.provider]\nprovider = \"machine0\"\n\
+[env.bare]\nplacement = \"provider\"\n\
+[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n\
+[env.sshfly]\nplacement = \"ssh\"\n[env.sshfly.provider]\nprovider = \"fly\"\n\
+[env.pod]\nplacement = \"k8s\"\n\
+[env.here]\nplacement = \"local\"\n\
+[sandbox.remote]\nhost = \"ssh.example\"\n";
+    let mut stable: Config = toml::from_str(source).expect("config parses");
+    let clamped = stable.clamp_to_channel(Channel::Stable);
+    // Plain ssh/mosh envs and `[sandbox.remote]` are stable; Kubernetes, other
+    // providers (also over ssh) and bare provider envs are dropped.
+    assert_eq!(
+        stable.env.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["box", "here", "spr", "vsb"]
+    );
+    assert_eq!(stable.sandbox.remote.host, "ssh.example");
+    // The other providers (and the managed pool) are still dev-only.
+    assert!(clamped.contains(&Feature::Providers), "{clamped:?}");
+    assert!(clamped.contains(&Feature::Remote), "{clamped:?}");
+    assert!(!Feature::Providers.allowed_in(Channel::Stable));
+
+    let stable_kinds = [
+        EnvProviderKind::Custom,
+        EnvProviderKind::Daytona,
+        EnvProviderKind::Sprites,
+        EnvProviderKind::Hetzner,
+        EnvProviderKind::DigitalOcean,
+        EnvProviderKind::Fly,
+        EnvProviderKind::Machine0,
+        EnvProviderKind::Vercel,
+    ]
+    .into_iter()
+    .filter(|kind| kind.stable_channel())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        stable_kinds,
+        [EnvProviderKind::Sprites, EnvProviderKind::Vercel]
+    );
+
+    let mut dev: Config = toml::from_str(source).expect("config parses");
+    assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev.env.len(), 9);
+}
+
+#[test]
+fn stable_clamp_with_only_sprites_and_vercel_reports_nothing() {
+    use crate::channel::Channel;
+
+    let source = "\
+[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\
+[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n";
+    let mut stable: Config = toml::from_str(source).expect("config parses");
+    assert!(stable.clamp_to_channel(Channel::Stable).is_empty());
+    assert_eq!(stable.env.len(), 2);
 }
 
 #[test]

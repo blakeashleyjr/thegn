@@ -1693,7 +1693,7 @@ fn agents_install_script(agents: &[String]) -> String {
         "log=\"$HOME/.cache/thegn-agent-install.log\"".to_string(),
         "mkdir -p \"$HOME/.cache\" 2>/dev/null".to_string(),
         "true 2>/dev/null >\"$log\" || log=/dev/null".to_string(),
-        "npm_g() { if ! have npm; then echo \"npm not found: cannot install $*\" >>\"$log\"; return 1; fi; npm install -g \"$@\" >>\"$log\" 2>&1; }".to_string(),
+        "npm_g() { if ! have npm; then echo \"npm not found: cannot install $*\" >>\"$log\"; return 1; fi; npm install -g --no-audit --no-fund --no-update-notifier --prefer-offline --loglevel=error \"$@\" >>\"$log\" 2>&1; }".to_string(),
         "t0=$(date +%s 2>/dev/null || echo 0)".to_string(),
         "pkgs=\"\"".to_string(),
         "hermes_pid=\"\"".to_string(),
@@ -1725,7 +1725,12 @@ fn agents_install_script(agents: &[String]) -> String {
         lines.push(line);
     }
     // shellcheck disable=SC2086: package names are intentionally word-split.
-    lines.push("if [ -n \"$pkgs\" ]; then t1=$(date +%s 2>/dev/null || echo 0); npm_g $pkgs || for p in $pkgs; do npm_g \"$p\" || true; done; echo \"thegn-agent-install: npm$pkgs $(( $(date +%s) - t1 ))s\" >>\"$log\"; fi".into());
+    // One npm per package, all at once: the three CLIs share nothing but the
+    // global prefix, and a cold sprite spends most of the install on network
+    // fetches, so the wall time drops to the slowest package. Any failure
+    // (including a prefix race) falls back to the old sequential install, so
+    // the worst case is the previous behaviour.
+    lines.push("if [ -n \"$pkgs\" ]; then t1=$(date +%s 2>/dev/null || echo 0); pids=\"\"; for p in $pkgs; do npm_g \"$p\" & pids=\"$pids $!\"; done; failed=0; for pid in $pids; do wait \"$pid\" || failed=1; done; if [ \"$failed\" = 1 ]; then npm_g $pkgs || for p in $pkgs; do npm_g \"$p\" || true; done; fi; echo \"thegn-agent-install: npm$pkgs $(( $(date +%s) - t1 ))s\" >>\"$log\"; fi".into());
     lines.push("[ -z \"$hermes_pid\" ] || wait \"$hermes_pid\"".into());
     for program in known_programs {
         lines.push(format!("have {program} || missing=\"$missing {program}\""));

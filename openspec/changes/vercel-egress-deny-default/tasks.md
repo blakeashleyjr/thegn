@@ -1,0 +1,6 @@
+- [x] 1. `SandboxEgress` config enum, `egress_allow`, admission
+- [x] 2. Registry preset and resolver in `thegn_core::vercel::egress`
+- [x] 3. Create body always carries a network policy; resume re-applies it
+- [x] 4. Wizard choice, `env create --egress`
+- [x] 5. Help pages and config example
+- [ ] 6. Verify create and resume against the live Vercel API

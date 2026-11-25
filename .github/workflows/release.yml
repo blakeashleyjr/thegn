@@ -191,12 +191,51 @@ jobs:
               exit 1
             fi
           fi
+  # The resident bridge: a static x86_64-linux-musl `thegn` that the host pushes
+  # into Sprites/Vercel sandboxes (both x86_64 Linux). Built once here and
+  # packaged as `thegn-musl` beside the host binary in EVERY target archive —
+  # macOS hosts drive Linux sandboxes too. The artifact is deliberately not named
+  # `release-*`, so the upload broker's `release-*` download never sees it as an
+  # asset; it ships only inside the archives.
+  bridge:
+    if: github.event_name == 'push' || inputs.operation == 'build'
+    needs: [admit, create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.admit.outputs.sha }}
+          persist-credentials: false
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the static musl bridge
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl \
+            -p thegn-host --bin thegn
+          mkdir -p "$RUNNER_TEMP/bridge"
+          install -m755 target/x86_64-unknown-linux-musl/release/thegn \
+            "$RUNNER_TEMP/bridge/thegn-musl"
+          file "$RUNNER_TEMP/bridge/thegn-musl" | grep -qE 'statically linked|static-pie linked' || {
+            echo "::error::bridge is not a static binary"
+            exit 1
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-binary
+          path: ${{ runner.temp }}/bridge/thegn-musl
+          if-no-files-found: error
   # The matrix builds and stages archives with read-only permissions. The upload
   # broker below accepts only the complete, verified artifact set.
   build:
     if: github.event_name == 'push' || inputs.operation == 'build'
     name: ${{ matrix.target }}
-    needs: [admit, create-release]
+    needs: [admit, create-release, bridge]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -235,6 +274,13 @@ jobs:
       - name: Install musl tools
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Fetch the resident bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-binary
+          path: ${{ github.workspace }}/bridge
+      - name: Mark the bridge executable
+        run: chmod 755 "$GITHUB_WORKSPACE/bridge/thegn-musl"
       - id: upload
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
@@ -245,9 +291,11 @@ jobs:
           # Release binaries include the optional call-home transport (THE-672).
           features: iroh
           archive: thegn-$tag-$target
-          # Both licenses and the README are included. Keep the binary at the archive
-          # root: the Homebrew formula installs it with `bin.install "thegn"`.
-          include: LICENSE-MIT,LICENSE-APACHE,README.md
+          # Both licenses and the README are included, plus the resident bridge as
+          # `thegn-musl` (include copies by basename). Keep both binaries at the
+          # archive root: the Homebrew formula installs them with `bin.install`, and
+          # the host finds `thegn-musl` beside its own executable.
+          include: LICENSE-MIT,LICENSE-APACHE,README.md,bridge/thegn-musl
           checksum: sha256
           # Build against the committed Cargo.lock.
           locked: true

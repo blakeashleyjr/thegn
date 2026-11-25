@@ -230,10 +230,30 @@ pub(crate) fn remote_features_clamped() -> bool {
 pub(crate) fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
     if channel_clamped {
         format!(
-            "env '{name}' is not available on the stable channel (ssh and provider environments are dev-only: set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
+            "env '{name}' is not available on the stable channel: Kubernetes ([env.{name}] placement = \"k8s\") and cloud-provider environments other than Sprites and Vercel are dev-channel only, so thegn dropped it (ssh and mosh environments are stable; to use this one set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
         )
     } else {
         format!("env '{name}' is not defined ([env.{name}] missing); its selection was dropped")
+    }
+}
+
+/// Install hint when a halt reason says `mosh-server` is absent on the remote
+/// host. `None` for any other reason.
+pub(crate) fn mosh_server_hint(reason: &str) -> Option<&'static str> {
+    let r = reason.to_ascii_lowercase();
+    (r.contains("mosh-server")
+        && (r.contains("not found") || r.contains("missing") || r.contains("absent")))
+    .then_some(
+        "install mosh-server on the remote host (Debian/Ubuntu: `sudo apt-get install mosh`; Fedora: `sudo dnf install mosh`; macOS: `brew install mosh`; Nix: `nix profile install nixpkgs#mosh`), or set transport = \"ssh\" on the env",
+    )
+}
+
+/// [`remedy_text`] plus a `mosh-server` install hint when the halt reason names it.
+pub(crate) fn remedy_text_for(class: HaltClass, env_name: &str, reason: &str) -> String {
+    let base = remedy_text(class, env_name);
+    match mosh_server_hint(reason) {
+        Some(hint) => format!("{hint}; {base}"),
+        None => base,
     }
 }
 
@@ -418,10 +438,25 @@ mod tests {
     }
 
     #[test]
+    fn mosh_server_missing_gets_an_install_hint() {
+        let reason = "mosh-server: command not found on the remote host";
+        let text = super::remedy_text_for(HaltClass::Remote, "box", reason);
+        assert!(text.contains("apt-get install mosh"), "{text}");
+        assert!(text.contains("`thegn env test box`"), "{text}");
+        assert!(super::mosh_server_hint("connection refused").is_none());
+        assert_eq!(
+            super::remedy_text_for(HaltClass::Remote, "box", "timeout"),
+            remedy_text(HaltClass::Remote, "box")
+        );
+    }
+
+    #[test]
     fn unresolved_reason_names_the_stable_channel_when_clamped() {
         let stable = unresolved_env_reason("box", true);
         assert!(stable.contains("stable channel"));
         assert!(stable.contains("THEGN_CHANNEL=dev"));
+        assert!(stable.contains("Kubernetes"));
+        assert!(stable.contains("dev-channel only"));
         assert_eq!(
             unresolved_env_reason("box", false),
             "env 'box' is not defined ([env.box] missing); its selection was dropped"

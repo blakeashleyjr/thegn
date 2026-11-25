@@ -332,6 +332,11 @@ pub const CATALOG: &[Slot] = &[
     slot("merge add", "worktrees", SourceKind::Worktree),
     slot(
         "env create",
+        "egress",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "env create",
         "project_id",
         SourceKind::Reserved(Reserved::Freeform),
     ),

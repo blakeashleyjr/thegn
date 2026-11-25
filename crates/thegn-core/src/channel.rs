@@ -81,12 +81,16 @@ pub enum Stability {
 /// enumerated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`) and Kubernetes
-    /// placements (`[env.*] placement = "k8s"`). The ssh-CLI path
-    /// works but the surface is young.
+    /// The remaining experimental remote surface: Kubernetes placements
+    /// (`[env.*] placement = "k8s"`) and the direct-iroh control listener
+    /// (`serve --iroh-direct`, `pair direct`). Remote worktrees over SSH/mosh
+    /// (`[sandbox.remote]`, `[env.*] placement = "ssh"`) graduated out of this
+    /// gate and are stable; the clamp keeps them and drops only the rest.
     Remote,
-    /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
-    /// managed-sprite pool (`[host.*]`).
+    /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona / custom)
+    /// and the managed-sprite pool (`[host.*]`). Sprites and Vercel `[env.*]`
+    /// environments graduated out of this gate and are stable
+    /// (`EnvProviderKind::stable_channel`; the clamp keeps them).
     Providers,
     /// The Observe dashboards + fleet-view app tab (`[observe]`).
     Observe,

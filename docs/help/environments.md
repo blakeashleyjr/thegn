@@ -12,13 +12,30 @@ contexts: [panel:environments]
 
 Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
 
+Sprites and Vercel panes push a static `thegn-musl` bridge into the sandbox. Release
+archives and Homebrew ship it next to `thegn` and the host finds it automatically;
+set `THEGN_BRIDGE_BINARY` to override, and run `thegn doctor` if it reports
+`artifact none`.
+
+Sprites and [[vercel-sandbox]] environments are supported on the stable
+channel, including `thegn fleet list`, `cost` and `inspect` for them and the
+**New environment…** wizard. SSH and mosh remotes are stable too (see
+Remote worktrees below). Kubernetes, every other cloud provider and
+`[host.*]` are dev channel only (see [[release-channels]]); on the stable
+channel `thegn fleet` shows Sprites and Vercel environments only (an ssh env
+is not a provider env and is not listed), and the wizard offers only `local`,
+`ssh`, `sprites` and `vercel`. Where this page
+says "on the dev channel" about provider behaviour, the same behaviour applies
+to Sprites and Vercel environments on the stable channel.
+
 ## Environments
 
 Named `[env.<name>]` execution environments (local, container, or a cloud
 provider) appear in the panel's **system → environments** section — `↵`
 (re)binds the cursor env to the active worktree, `t` tests its provider
 token (the outcome pops as a toast and is logged), `n` opens the add
-wizard, and `x`
+wizard (on the stable channel it offers `local`, `sprites` and `vercel`; the
+other kinds appear on the dev channel), and `x`
 removes it after a confirm (removal also forgets the stored token). On a
 [[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
 the sandbox) and the row shows `results not pulled` until a pull succeeds. An
@@ -202,6 +219,18 @@ A sprites env (`provider = "sprites"`, `placement = "provider"`) is paid, so
 thegn is strict about what it creates and deletes. Nothing in this section has
 been verified live against the real Sprites API yet.
 
+- **First `env up` timing.** A first create on a fresh account takes about
+  one to two minutes before everything is done, and your shell is usable after
+  about 20 seconds. `thegn env up` prints each phase with its elapsed time
+  (for example `Install coding agents — done (51.2 s)`) and a total at the end;
+  the loading card shows the same phases with a hint under the slow ones.
+  Typical phases: boot 0.4 s, workspace and repository seed 3 s, setup 12 s,
+  coding-agent install 45 to 60 s (the agent CLIs download in parallel), agent
+  logins 10 s, snapshot 4 s. Later opens are fast: a sprite that is asleep wakes
+  in under a second, and `thegn env snapshot` keeps a checkpoint you can
+  `thegn env restore` instead of installing again. Use `env up --shell-ready`
+  to return as soon as a shell opens and let the installs finish in the
+  background.
 - **Ledger before create.** thegn writes a `creating` record to its local
   ledger before it asks Sprites to create a sprite, and `ready` after. thegn
   deletes a sprite only when this host recorded it. Sprites that existed
@@ -382,7 +411,8 @@ stay plan-only without the spend flags.
 
 ### Retry, inspect, drain and provision
 
-Dev channel, unverified live.
+Unverified live. All of this works on both channels for Sprites and Vercel
+environments.
 
 - **Retry failed pull-backs.** The palette action "Retry failed pull-backs"
   (`retry-pullbacks`, no default chord) runs the same code as
@@ -405,7 +435,9 @@ Dev channel, unverified live.
 
 ### Adopt, the daily loop and release
 
-Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
+Everything below is unverified live. It works on both channels for Sprites and
+Vercel environments; the Fly and machine0 parts need the dev channel
+(`THEGN_CHANNEL=dev`).
 
 - **Adopt.** `thegn env adopt <sprite> --env <S> [--yes] [--json]` records a
   sprite you made elsewhere so thegn may manage it. It reads the sprite (a 404
@@ -568,7 +600,7 @@ lists the sandbox. A partial listing proves nothing.
 
 A project can bind one Sprite as the runner for pinned `cargo build` and
 `cargo test` jobs. Set `[jobs] runner = "<env name>"` and run
-`thegn job run cargo-test` (dev channel; see [[cli]]). Each attempt runs in a
+`thegn job run cargo-test` (both channels; see [[cli]]). Each attempt runs in a
 scrubbed environment with a private home, one dispatch per attempt. A deadline
 kills the remote process group, and secrets stay out of the uploaded snapshot.
 Ctrl-C cancels the attempt. If thegn dies mid-job, the daemon reattaches the
@@ -784,8 +816,9 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
-> Remote worktrees and cloud providers are **dev-channel only** — see
-> [[release-channels]].
+> Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
+> and cloud providers other than Sprites and Vercel are **dev-channel only** —
+> see [[release-channels]].
 
 Daytona is in maintenance: thegn drives its REST API; interactive panes need
 the ssh gateway (planned). `thegn doctor` marks a Daytona env experimental and

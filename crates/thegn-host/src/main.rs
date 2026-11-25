@@ -321,6 +321,7 @@ mod ssh_seed;
 mod ssh_shim;
 mod stage_prompt;
 mod stage_worker_hold;
+mod stale_daemon;
 mod startup_heal;
 mod state_gc;
 mod worktree_discovery;
@@ -1077,6 +1078,16 @@ fn main() -> std::process::ExitCode {
             } else {
                 cmd::EXIT_ERROR
             };
+            if let Some(stale) = stale_daemon::detect(&error) {
+                return match stale_daemon::report(&stale) {
+                    stale_daemon::Outcome::Stopped => {
+                        std::process::ExitCode::from(cmd::EXIT_RETRYABLE as u8)
+                    }
+                    stale_daemon::Outcome::NotStopped => {
+                        std::process::ExitCode::from(cmd::EXIT_ERROR as u8)
+                    }
+                };
+            }
             thegn_core::msg::error(&format!("{error:#}"));
             std::process::ExitCode::from(code as u8)
         }
@@ -1084,6 +1095,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_main() -> anyhow::Result<()> {
+    run::mark_process_start();
     // Private worker bypasses normal config/channel/UI startup. Only an
     // explicit parent launch can feed the bounded request on stdin.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--voice-worker")) {
@@ -1371,8 +1383,14 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
-        Command::Fleet { .. } => ("fleet", Feature::Providers),
-        Command::Job { .. } => ("job", Feature::Providers),
+        // Plain `serve`, `attach`, `pair` and `session` (client/server over the
+        // TCP/unix control API) are stable. Only the separate direct-iroh
+        // listener and its pairing stay behind `Feature::Remote` below.
+        // `thegn fleet list|cost|inspect` is stable for Sprites and Vercel envs
+        // only: the verb is not gated here, `fleet_read::fleet_provider_allowed`
+        // scopes what it reads to the stable providers.
+        // `thegn job` is stable: its selected runners are Sprites and Vercel
+        // only (`selected_runner::build_from`), which graduated to stable.
         #[cfg(feature = "iroh")]
         Command::Serve {
             iroh_direct: true, ..
@@ -1383,6 +1401,21 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
         } => ("pair direct", Feature::Remote),
         _ => return None,
     })
+}
+
+/// The stable-channel refusal for a dev-only verb, naming the stable
+/// alternative where one exists (direct iroh -> plain `serve`/`pair new`).
+fn stable_refusal_message(verb: &str, feature_id: &str) -> String {
+    let alt = match verb {
+        "serve --iroh-direct" | "pair direct" => {
+            " On stable, use client/server instead: `thegn serve` to listen and `thegn pair new` to pair a client (then `thegn attach`)."
+        }
+        _ => "",
+    };
+    format!(
+        "`thegn {verb}` is a dev-channel feature ({feature_id}); this is the stable build. \
+         Run the dev build (`nix run .#dev`) or set THEGN_CHANNEL=dev to enable it.{alt}"
+    )
 }
 
 /// Verbs that install their own logging subscriber (daemon/serve) or must keep
@@ -1413,11 +1446,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     if let Some((verb, feat)) = experimental_command(&command)
         && !feat.allowed_in(channel)
     {
-        anyhow::bail!(
-            "`thegn {verb}` is a dev-channel feature ({}); this is the stable build. \
-             Run the dev build (`nix run .#dev`) or set THEGN_CHANNEL=dev to enable it.",
-            feat.id(),
-        );
+        anyhow::bail!("{}", stable_refusal_message(verb, feat.id()));
     }
     // Only processes that actually own long-lived shared state are controllers;
     // a worktree-resolved `thegn dispatch report` is always a client.
@@ -1819,3 +1848,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
 }
 
 // cache probe
+
+#[cfg(test)]
+mod stable_refusal_tests {
+    use super::stable_refusal_message;
+
+    #[test]
+    fn direct_iroh_refusal_names_the_stable_alternative() {
+        let m = stable_refusal_message("serve --iroh-direct", "remote");
+        assert!(
+            m.contains("thegn serve") && m.contains("thegn pair new"),
+            "{m}"
+        );
+        let m = stable_refusal_message("pair direct", "remote");
+        assert!(m.contains("thegn pair new"), "{m}");
+        assert!(!stable_refusal_message("host", "providers").contains("pair new"));
+    }
+}

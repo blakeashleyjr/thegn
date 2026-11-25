@@ -451,6 +451,7 @@ pub(super) fn spec(max_instances: u32) -> VercelSpec {
         max_lifetime_secs: 0,
         interactive_host_suffixes: Vec::new(),
         model_credentials: thegn_core::config::ModelCredentials::None,
+        egress: Vec::new(),
     }
 }
 
@@ -1733,4 +1734,61 @@ async fn usage_report_prices_snapshots_of_a_gone_sandbox_and_marks_partial_listi
     assert!(rows[0].snapshots_usd_month > 0.0, "{rows:?}");
     assert_eq!(rows[0].snapshot_bytes, 1024);
     assert_eq!(fake.count("snapshot_usage"), 1, "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn create_body_denies_egress_by_default() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    *fake.create.lock().unwrap() = Some(Ok(view(NAME, SessionStatus::Running, Some("s1"))));
+    let p = provider(&fake, ledger.path(), 2);
+    p.create().await.expect("create");
+    let body = fake.bodies.lock().unwrap()[0].clone();
+    assert_eq!(
+        body["networkPolicy"],
+        serde_json::json!({"mode": "deny-all"})
+    );
+}
+
+#[tokio::test]
+async fn create_body_carries_the_registry_preset() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    *fake.create.lock().unwrap() = Some(Ok(view(NAME, SessionStatus::Running, Some("s1"))));
+    let mut s = spec(2);
+    s.egress = thegn_core::vercel::egress::resolve(
+        thegn_core::config::SandboxEgress::Registries,
+        &["example.org".to_string()],
+    )
+    .unwrap();
+    let api: Arc<dyn Api> = fake.clone();
+    let p = VercelProvider::with_client_for_test(s, api, ledger.path().to_path_buf())
+        .expect("test provider admits its spec");
+    p.create().await.expect("create");
+    let body = fake.bodies.lock().unwrap()[0].clone();
+    assert_eq!(body["networkPolicy"]["mode"], "custom");
+    let allowed = body["networkPolicy"]["allowedDomains"].as_array().unwrap();
+    assert!(allowed.iter().any(|d| d == "crates.io"), "{allowed:?}");
+    assert!(allowed.iter().any(|d| d == "*.example.org"), "{allowed:?}");
+}
+
+#[tokio::test]
+async fn resume_reapplies_the_configured_egress_policy() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let ledger = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeApi::default());
+    fake.gets
+        .lock()
+        .unwrap()
+        .push_back(Some(view(NAME, SessionStatus::Stopped, None)));
+    *fake.resume.lock().unwrap() = Some(view(NAME, SessionStatus::Running, Some("sess_2")));
+    let p = provider(&fake, ledger.path(), 2);
+    p.session_for(NAME, Wake::Allow).await.unwrap();
+    assert_eq!(fake.count("policy"), 1, "{:?}", fake.calls());
+    assert_eq!(
+        fake.policies.lock().unwrap().get(NAME),
+        Some(&serde_json::json!({"mode": "deny-all"}))
+    );
 }

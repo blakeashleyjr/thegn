@@ -223,6 +223,19 @@ fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> R
     ))
 }
 
+/// Open the state DB to find daemons. When an older daemon blocks migration (the
+/// upgrade case this verb exists to fix), read the registry without migrating.
+fn open_for_discovery() -> Result<thegn_core::db::Db> {
+    match thegn_core::db::Db::open() {
+        Ok(db) => Ok(db),
+        Err(error) if crate::stale_daemon::detect(&error).is_some() => {
+            thegn_core::db::Db::open_read_only_wal_at(&thegn_core::db::state_db_path())?
+                .ok_or(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn stop(cfg: &Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -236,7 +249,7 @@ fn stop(cfg: &Config) -> Result<()> {
             tokio::task::spawn_blocking({
                 let scopes = scopes.clone();
                 move || -> Result<Vec<PathBuf>> {
-                    let db = thegn_core::db::Db::open()?;
+                    let db = open_for_discovery()?;
                     Ok(scopes
                         .iter()
                         .filter_map(|scope| {

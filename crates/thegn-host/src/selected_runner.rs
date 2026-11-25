@@ -472,13 +472,13 @@ fn has_pending_work(kind: EnvProviderKind, project: &str) -> bool {
 /// Start one background reconcile pass for the configured `[jobs] runner`: for
 /// each project ledger with unsettled attempts, build the runner and run
 /// `reconcile_pending`, logging what it settled. Inert (no thread, no I/O) when
-/// no runner is configured or the channel is stable. Must be called inside the
-/// daemon's runtime; the work runs on the blocking pool, never on the event loop.
+/// no runner is configured. Sprites and Vercel runners are stable-channel
+/// (every other provider env was already removed by the channel clamp). Must
+/// be called inside the daemon's runtime; the work runs on the blocking pool,
+/// never on the event loop.
 pub(crate) fn spawn_startup_reconcile(cfg: &Config) {
     let env_name = cfg.jobs.runner.trim();
-    // Cloud providers are a dev-channel feature, exactly as for `thegn job run`.
-    if env_name.is_empty() || !crate::channel_state::allows(thegn_core::channel::Feature::Providers)
-    {
+    if env_name.is_empty() {
         return;
     }
     let Some(env) = cfg.env.get(env_name) else {

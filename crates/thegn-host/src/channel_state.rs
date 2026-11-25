@@ -244,9 +244,9 @@ mod tests {
         .unwrap();
 
         // This is the same runtime copy passed as app_cfg to both reaper ticks.
-        // Stable clamps every dev-only placement: ssh and Kubernetes envs
-        // (`Feature::Remote`, WS01-P1-08) and provider envs, so only the
-        // local env survives.
+        // Stable clamps every dev-only placement: Kubernetes envs
+        // (`Feature::Remote`, WS01-P1-08) and non-Sprites/Vercel provider
+        // envs. Plain ssh/mosh envs are stable, so they survive with local.
         let reaper_input = runtime_config(cfg, Channel::Stable);
         assert_eq!(
             reaper_input
@@ -254,7 +254,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["plain"]
+            ["box", "plain"]
         );
         assert!(
             !reaper_input

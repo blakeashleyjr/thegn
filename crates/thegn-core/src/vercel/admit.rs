@@ -129,6 +129,7 @@ pub fn validate_env(pc: &crate::config::EnvProviderConfig) -> Result<(), AdmitEr
             ));
         }
     }
+    crate::vercel::egress::validate_allow(&pc.egress_allow)?;
     Ok(())
 }
 
@@ -291,6 +292,18 @@ mod tests {
         let long = format!("{}com", "a.".repeat(126));
         assert!(long.len() > 253);
         assert_eq!(field(&with(&[&long])), "interactive_host_suffixes");
+    }
+
+    #[test]
+    fn egress_allow_checked() {
+        let with = |s: &[&str]| EnvProviderConfig {
+            egress_allow: s.iter().map(|x| (*x).to_string()).collect(),
+            ..ok()
+        };
+        assert!(validate_env(&with(&["a.com", "*.b.org"])).is_ok());
+        for bad in ["*", "a.com:443", "a b"] {
+            assert_eq!(field(&with(&[bad])), "egress_allow", "{bad:?}");
+        }
     }
 
     #[test]

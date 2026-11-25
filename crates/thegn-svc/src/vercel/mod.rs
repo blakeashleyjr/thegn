@@ -112,6 +112,9 @@ pub struct VercelSpec {
     pub interactive_host_suffixes: Vec<String>,
     /// `[env.<name>.provider] model_credentials` (admitted: `none`/`upload`).
     pub model_credentials: thegn_core::config::ModelCredentials,
+    /// The resolved egress allow list ([`thegn_core::vercel::egress::resolve`]):
+    /// empty ⇒ deny-all, `["*"]` ⇒ allow-all. Applied on create and resume.
+    pub egress: Vec<String>,
 }
 
 /// The control-plane calls the provider makes. [`client::VercelClient`] is the
@@ -716,6 +719,9 @@ impl VercelProvider {
             match view.status {
                 SessionStatus::Running => {
                     if let Some(session) = view.session_id.as_deref() {
+                        if resumed {
+                            self.apply_configured_egress(name).await?;
+                        }
                         self.remember_session(name, session, resumed);
                         return Ok(session.to_string());
                     }
@@ -736,6 +742,7 @@ impl VercelProvider {
                         if view.status == SessionStatus::Running
                             && let Some(session) = view.session_id.as_deref()
                         {
+                            self.apply_configured_egress(name).await?;
                             self.remember_session(name, session, true);
                             return Ok(session.to_string());
                         }
@@ -753,6 +760,18 @@ impl VercelProvider {
             }
             tokio::time::sleep(self.poll).await;
         }
+    }
+
+    /// Apply the env's configured egress policy (deny by default) to a sandbox
+    /// that just resumed, so a resumed session never runs on a stale policy. A
+    /// failure is an error: the sandbox is not handed out.
+    async fn apply_configured_egress(&self, name: &str) -> Result<()> {
+        let body = api::network_policy_body(&self.spec.egress);
+        self.api()
+            .set_network_policy(name, &body)
+            .await
+            .context("vercel: applying the egress policy on resume failed")?;
+        Ok(())
     }
 
     /// Resume a stopped sandbox.
@@ -1106,7 +1125,7 @@ impl VercelProvider {
             region: self.spec.region.clone(),
             timeout_ms,
             tags: policy::tags_for(&controller, &owner, &crate::vps::host_label()),
-            egress: Vec::new(),
+            egress: self.spec.egress.clone(),
         };
         let body = api::create_body(&self.spec.scope, &plan);
         if !body.is_object() {
@@ -1365,6 +1384,7 @@ mod tests {
             max_lifetime_secs: 3600,
             interactive_host_suffixes: Vec::new(),
             model_credentials: thegn_core::config::ModelCredentials::None,
+            egress: Vec::new(),
         })
         .expect("a valid spec constructs");
         assert_eq!(provider.spec.token.expose(), "");

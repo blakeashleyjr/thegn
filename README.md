@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.131`). **x86_64 Linux and macOS on
+> **Status: public alpha** (`0.1.0-alpha.132`). **x86_64 Linux and macOS on
 > Apple silicon are supported;** on macOS install with `brew install blakeashleyjr/thegn/thegn`,
 > the release tarball (see [Install](#install)), the flake, or a source build. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -561,11 +561,14 @@ panel, PR) keep working.
   `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(SSH, Kubernetes and managed-provider placement are **dev channel only** —
-  see Channels.)_
+  selects them. Sprites and Vercel Sandbox environments (and `thegn job run` on
+  them) and SSH/mosh remote environments are supported on the stable channel.
+  _(Kubernetes and the other managed providers are **dev channel only** — see
+  Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over
-  **ssh**; composes with the container backends. _(**Dev channel only.**)_
+  **ssh**; composes with the container backends. Supported on the stable
+  channel, as is client/server mode (`thegn serve`, `attach`, `pair`).
 - **Opt out** — `backend = "none"` (or `enabled = false`). Agents need
   network and credentials, so `network` defaults to `nat` and
   `env_passthrough` forwards `SSH_AUTH_SOCK`/tokens.
@@ -577,9 +580,11 @@ Linux x86_64 Nix flake — ships the shell described above. A source checkout ca
 also build and install it with `./install.sh`. A set of experimental
 subsystems is compiled in but **clamped off** outside the dev channel:
 
-- remote worktrees over SSH and named environments over SSH or managed
-  providers,
-- cloud execution providers and the managed pool,
+- Kubernetes placement, the direct-iroh control listener and named
+  environments on managed providers other than Sprites and Vercel,
+- the other cloud execution providers (Fly, DigitalOcean, Hetzner, Machine0,
+  Daytona) and the managed pool (`thegn fleet` covers Sprites and Vercel
+  only),
 - the placement engine,
 - voice mode.
 

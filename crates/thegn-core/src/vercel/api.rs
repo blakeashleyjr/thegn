@@ -104,8 +104,8 @@ fn bad(reason: &'static str) -> ApiParseError {
 }
 
 /// The create body for `req` in `scope`. Never emits `source`, `credentials`,
-/// `env` or `ports`; always `persistent: true`; `networkPolicy` only when
-/// egress is non-empty.
+/// `env` or `ports`; always `persistent: true`; always carries a
+/// `networkPolicy` (an empty egress list is `deny-all`).
 pub fn create_body(scope: &Scope, req: &CreatePlan) -> serde_json::Value {
     let body = CreateRequest {
         project_id: scope.project_id.clone(),
@@ -116,7 +116,7 @@ pub fn create_body(scope: &Scope, req: &CreatePlan) -> serde_json::Value {
         persistent: true,
         region: req.region.clone(),
         tags: req.tags.clone(),
-        network_policy: (!req.egress.is_empty()).then(|| network_policy_body(&req.egress)),
+        network_policy: Some(network_policy_body(&req.egress)),
     };
     serde_json::to_value(body).unwrap_or(serde_json::Value::Null)
 }
@@ -628,7 +628,8 @@ mod tests {
             json!({
                 "projectId": "prj_b2", "name": "tg-x", "timeout": 1800000,
                 "resources": {"vcpus": 2}, "persistent": true,
-                "tags": {"thegn-owner": "x"}
+                "tags": {"thegn-owner": "x"},
+                "networkPolicy": {"mode": "deny-all"}
             })
         );
     }

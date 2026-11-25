@@ -296,11 +296,11 @@ impl ReverseTunnelSupervisor {
         // than spawn dead reconnect loops.
         if crate::bridge_sup::bridge_binary_path().is_none() {
             if !BRIDGE_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                thegn_core::msg::warn(
-                    "reverse tunnels (nix cache :8484) disabled: no resident bridge binary — \
-                     build it (`just bridge` / `nix build .#thegn-musl`) and set \
-                     THEGN_BRIDGE_BINARY",
-                );
+                thegn_core::msg::warn(&format!(
+                    "reverse tunnels (nix cache :8484) disabled: no resident bridge binary — {} \
+                         (from source: `just bridge` / `nix build .#thegn-musl`)",
+                    crate::bridge_sup::BRIDGE_MISSING_HINT
+                ));
             }
             return;
         }

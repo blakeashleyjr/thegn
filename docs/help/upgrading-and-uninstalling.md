@@ -138,6 +138,22 @@ Start thegn once so the controller can migrate the database, then run
 from the same build as the CLI: quit the host, run `thegn daemon stop`, then
 launch the new build. See [[debugging]] for doctor details.
 
+### "Another thegn process is still using the old schema"
+
+Quitting thegn leaves its background daemon running on purpose, so your panes
+survive. After you replace the binary, that old daemon still holds the state
+database on the old schema, and the new build refuses to migrate under it. thegn
+detects this, explains it, and offers a one-step fix:
+
+- On a terminal, thegn asks "Stop it now?" and runs `thegn daemon stop` if you
+  answer `y`. **This ends that instance's panes**, so it never does it unasked.
+- In a script or pipe, thegn prints the exact command and changes nothing:
+  `thegn daemon stop`, then run thegn again.
+- In a running host the banner reads `OLD DAEMON: an older thegn is still
+running`. Quit, run `thegn daemon stop`, and restart.
+
+`thegn daemon stop` works even while the migration is blocked.
+
 ## Rolling back
 
 A previous binary is safe to use only with a database that the newer build has
@@ -173,6 +189,18 @@ The database can contain live bearer credentials. Keep its backup private.
    recent commits.
 3. Restrict access to the backup files (`chmod 600`) and keep the directory
    private.
+
+### Automatic backup before a migration
+
+Before the first forward migration of an existing database, thegn writes a
+verified copy next to it, named
+`thegn.db.pre-migrate-<UTC timestamp>-v<old schema>.bak` (for example
+`thegn.db.pre-migrate-20261130T120000Z-v82.bak`), mode 0600. The newest three
+are kept. If the copy fails, thegn logs a warning and migrates anyway.
+
+To roll back to one: quit thegn, run `thegn daemon stop`, delete `thegn.db-wal`
+and `thegn.db-shm`, copy the chosen `.bak` over `thegn.db`, then start the
+older build that matches the `-v<old schema>` in its name.
 
 ### Restore
 

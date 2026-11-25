@@ -413,6 +413,9 @@ pub enum StateDbAvailability {
         observed: i64,
         build: i64,
     },
+    /// An older thegn daemon still holds the database on the old schema, so this
+    /// build cannot migrate it until that daemon is stopped.
+    OldDaemonRunning,
     Unavailable {
         detail: String,
     },
@@ -420,7 +423,7 @@ pub enum StateDbAvailability {
 
 impl StateDbAvailability {
     pub fn schema_refused(&self) -> bool {
-        matches!(self, Self::SchemaRefused { .. })
+        matches!(self, Self::SchemaRefused { .. } | Self::OldDaemonRunning)
     }
 
     pub fn mutations_allowed(&self) -> bool {
@@ -428,8 +431,10 @@ impl StateDbAvailability {
     }
 
     pub fn banner(&self) -> Option<String> {
-        let Self::SchemaRefused { observed, build } = self else {
-            return None;
+        let (observed, build) = match self {
+            Self::SchemaRefused { observed, build } => (*observed, *build),
+            Self::OldDaemonRunning => return Some(crate::stale_daemon::banner()),
+            _ => return None,
         };
         Some(format!(
             "DB REFUSED: disk v{observed} > build v{build}; rebuild/reinstall + restart host/daemon"

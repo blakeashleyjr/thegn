@@ -18,7 +18,8 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   Install with `brew install blakeashleyjr/thegn/thegn` (not quarantined). The
   release archive is unsigned; clear quarantine with
   `xattr -dr com.apple.quarantine ./thegn` after a browser download. Set Option as Meta/Alt in your terminal, and treat CPU caps as
-  unavailable; the `apple` sandbox backend has no automated runtime coverage.
+  unavailable; the sandbox on macOS is best-effort, needs Apple `container`,
+  podman or docker, and the `apple` backend has no automated runtime coverage.
   See [[terminal-compatibility]] and [[sandboxing]].
 - **The `apple` sandbox backend cannot run offline and has no host network.**
   `network = "none"`, and therefore the `sealed` profile, is refused with
@@ -90,7 +91,15 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 
 ## Experimental subsystems
 
-- **Remote, providers, placement, and voice are dev-channel only.** Treat them
-  as experimental rather than product promises; see [[release-channels]].
+- **Kubernetes placement, other providers, placement, and voice are
+  dev-channel only.** Treat them as experimental rather than product promises;
+  see [[release-channels]]. Sprites and Vercel environments (and `thegn job
+run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
+  `pair` client/server mode are the exception: they are supported on the stable
+  channel. Direct Iroh (`serve --iroh-direct`, `pair direct`) stays dev-only.
+  SSH remotes have no recorded paid or multi-host soak on this release, and
+  mosh needs `mosh-server` on the remote host. Neither has a recorded
+  paid live run on this release yet; see [[environments]] and
+  [[vercel-sandbox]].
 - **Observe and plugin app tabs are stable.** Use the stable channel for these
   features; see [[release-channels]].

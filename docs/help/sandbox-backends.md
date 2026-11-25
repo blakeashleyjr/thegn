@@ -55,8 +55,9 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > `podman machine set --rootful` with the `podman-rootless` backend instead.
 >
 > **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
-> own Linux VM, so it is the strongest isolation any backend here offers.
-> Without `apple`, podman, or docker, a Mac has no backend meeting the default
+> own Linux VM, which is stronger isolation on paper than a shared-kernel
+> container, but the backend is unverified on a device and has no automated
+> runtime coverage. Without `apple`, podman, or docker, a Mac has no backend meeting the default
 > floor, so sandboxed panes are refused. Opt out with
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
@@ -69,8 +70,10 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > offline. Use podman or docker for offline or sealed worktrees on a Mac.
 
 > **Platform status:** the public alpha supports Linux on x86_64, where
-> `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
-> backend and macOS are best-effort; the Windows `jobobject` and `wsl` entries
+> `bwrap`, `systemd`, podman and docker are the backends to use. macOS on Apple
+> silicon is supported, with a best-effort sandbox: install Apple `container`,
+> podman or docker first, and use podman or docker if you want `sealed`. The
+> `apple` backend has no runtime tests; the Windows `jobobject` and `wsl` entries
 > are not supported in this alpha.
 
 Container backends (podman, docker) are declined on native Windows for local

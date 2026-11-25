@@ -17,6 +17,7 @@
     },
     "root_files": [
       "thegn",
+      "thegn-musl",
       "LICENSE-MIT",
       "LICENSE-APACHE",
       "README.md"

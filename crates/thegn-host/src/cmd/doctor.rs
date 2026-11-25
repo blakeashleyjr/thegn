@@ -1868,6 +1868,16 @@ fn feature_state_line(
         )
     } else if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
         format!("{state}; experimental, not yet implemented")
+    } else if feature == thegn_core::channel::Feature::Providers && !feature.allowed_in(channel) {
+        // Sprites and Vercel envs graduated out of this gate
+        // (`EnvProviderKind::stable_channel`); say so, or the row reads as
+        // "no cloud environments on stable".
+        format!("{state}; Sprites and Vercel environments are stable and stay enabled")
+    } else if feature == thegn_core::channel::Feature::Remote && !feature.allowed_in(channel) {
+        // SSH/mosh remote workspaces and `[sandbox.remote]` graduated out of
+        // this gate; only Kubernetes placement and direct-iroh stay dev-only.
+        let _ = state;
+        "partly stable: stable = ssh/mosh remotes + client/server (serve/attach/pair); dev-only = Kubernetes placement, direct iroh".to_string()
     } else {
         state.to_string()
     }
@@ -9150,10 +9160,18 @@ args = ["--verbose"]
         );
         assert_eq!(
             feature_state_line(Feature::Remote, Channel::Stable),
-            "disabled (dev-only)"
+            "partly stable: stable = ssh/mosh remotes + client/server (serve/attach/pair); dev-only = Kubernetes placement, direct iroh"
         );
         assert_eq!(
             feature_state_line(Feature::Observe, Channel::Stable),
+            "enabled"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Providers, Channel::Stable),
+            "disabled (dev-only); Sprites and Vercel environments are stable and stay enabled"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Providers, Channel::Dev),
             "enabled"
         );
     }

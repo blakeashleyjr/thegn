@@ -1145,23 +1145,31 @@ impl Config {
             }
             let changed = match feat {
                 Feature::Remote => {
-                    let was = !self.sandbox.remote.host.is_empty();
-                    self.sandbox.remote.host.clear();
+                    // SSH/mosh remotes (`[sandbox.remote]`, `[env.*] placement =
+                    // "ssh"`) graduated to stable and are kept. Only the
+                    // Kubernetes placement is still experimental. An ssh env
+                    // that also names a dev-only provider is removed by the
+                    // `Providers` arm below.
                     let env_count = self.env.len();
-                    // Experimental remote placements: ssh and Kubernetes.
-                    self.env.retain(|_, env| {
-                        env.placement != crate::config::PlacementMode::Ssh
-                            && env.placement != crate::config::PlacementMode::K8s
-                    });
-                    was || self.env.len() != env_count
+                    self.env
+                        .retain(|_, env| env.placement != crate::config::PlacementMode::K8s);
+                    self.env.len() != env_count
                 }
                 Feature::Providers => {
                     let was = !self.host.is_empty();
                     self.host.clear();
                     let env_count = self.env.len();
+                    // Sprites and Vercel envs graduated to stable
+                    // (`EnvProviderKind::stable_channel`); every other provider
+                    // env (Fly / DO / Hetzner / Machine0 / Daytona / custom) and
+                    // the `[host.*]` pool stay dev-only.
                     self.env.retain(|_, env| {
-                        env.placement != crate::config::PlacementMode::Provider
-                            && env.provider.provider.trim().is_empty()
+                        let names_provider = env.placement
+                            == crate::config::PlacementMode::Provider
+                            || !env.provider.provider.trim().is_empty();
+                        !names_provider
+                            || crate::config::EnvProviderKind::of(&env.provider.provider)
+                                .stable_channel()
                     });
                     was || self.env.len() != env_count
                 }
@@ -3384,10 +3392,12 @@ mod tests {
         use crate::channel::{Channel, Feature};
         use crate::placement::Placement;
 
-        let source = "[sandbox]\ndefault_env = \"box\"\n[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n";
+        // A plain ssh env is stable now; one that also names a dev-only
+        // provider (fly) is still dropped by the `Providers` clamp.
+        let source = "[sandbox]\ndefault_env = \"box\"\n[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n[env.box.provider]\nprovider = \"fly\"\n";
         let mut stable: Config = toml::from_str(source).unwrap();
         let clamped = stable.clamp_to_channel(Channel::Stable);
-        assert!(clamped.contains(&Feature::Remote));
+        assert!(clamped.contains(&Feature::Providers));
         let loc = GitLoc::Local(std::path::PathBuf::from("/wt/x"));
         let (env, _) = resolve_environment(
             &stable,
@@ -3891,6 +3901,7 @@ mod tests {
         assert!(!schema.contains("interactive_host_suffixes"), "{schema}");
         assert!(!schema.contains("login_homes"), "{schema}");
         assert!(!schema.contains("lifetime_reap"), "{schema}");
+        assert!(!schema.contains("egress_allow"), "{schema}");
 
         let cfg: Config = toml::from_str(
             r#"
@@ -3929,6 +3940,11 @@ mod tests {
             assert!(effective.interactive_host_suffixes.is_empty(), "{overlay}");
             assert!(effective.login_homes.is_empty(), "{overlay}");
             assert!(!effective.lifetime_reap, "{overlay}");
+            assert_eq!(
+                effective.egress,
+                crate::config::SandboxEgress::Deny,
+                "{overlay}"
+            );
         }
     }
 

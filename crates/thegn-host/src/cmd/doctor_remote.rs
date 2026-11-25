@@ -102,7 +102,7 @@ fn sandbox_agents(cfg: &Config, env: &thegn_core::config::EnvConfig) -> Vec<Stri
 
 fn channel_warning(clamped: bool, rows_empty: bool) -> Option<String> {
     (clamped && rows_empty).then(|| {
-        "provider envs are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".to_string()
+        "dev-only provider envs (not Sprites or Vercel) are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".to_string()
     })
 }
 
@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(channel_warning(true, false), None);
         assert_eq!(
             channel_warning(true, true),
-            Some("provider envs are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".into())
+            Some("dev-only provider envs (not Sprites or Vercel) are configured but this instance runs on the stable channel, which ignores them; use the dev instance (THEGN_CHANNEL=dev)".into())
         );
     }
 
@@ -649,7 +649,7 @@ mod tests {
         })];
         let rendered = report_preamble(&rows).join("\n");
 
-        assert!(rendered.contains("provider envs are configured"));
+        assert!(rendered.contains("provider envs (not Sprites or Vercel) are configured"));
         assert!(!rendered.contains("no sprites or vercel envs configured"));
     }
 

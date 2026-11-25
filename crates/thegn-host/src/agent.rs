@@ -259,7 +259,7 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name, self.placement, self.reason, fix
             );
         }
-        use crate::env_halt::{HaltClass, classify_halt, remedy_text};
+        use crate::env_halt::{HaltClass, classify_halt, remedy_text_for};
         let class = classify_halt(&self.placement, &self.reason);
         if class != HaltClass::LocalRuntime && !self.ask {
             return write!(
@@ -269,13 +269,13 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name,
                 self.placement,
                 self.reason,
-                remedy_text(class, &self.env_name)
+                remedy_text_for(class, &self.env_name, &self.reason)
             );
         }
         let allow = if class != HaltClass::LocalRuntime {
             format!(
                 "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise {}",
-                remedy_text(class, &self.env_name)
+                remedy_text_for(class, &self.env_name, &self.reason)
             )
         } else if self.ask {
             "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()
@@ -2917,6 +2917,20 @@ mod env_selection_tests {
     }
 }
 
+/// The sub-line shown under a step that is known to take a while on a first
+/// create, so the wait reads as work in progress rather than a hang. `None`
+/// for steps that finish in seconds.
+fn slow_step_hint(step_id: &str) -> Option<&'static str> {
+    match step_id {
+        "agents_install" => {
+            Some("first run only: downloads the agent CLIs (about 1 min); later opens skip this")
+        }
+        "nix" | "toolchain" => Some("first run only: later opens restore the snapshot"),
+        "checkpoint" => Some("saving a snapshot so the next open is fast"),
+        _ => None,
+    }
+}
+
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
 /// **declared** environment inside it (see `thegn_core::envplan`): clone the
 /// repo, install the declared toolchain (Nix devShell / mise / runtimes), sync
@@ -3774,6 +3788,9 @@ fn provision_provider_env_inner(
                 std::cmp::Ordering::Equal => ProvisionState::Active, // spinner
                 std::cmp::Ordering::Greater => ProvisionState::Pending, // dot
             };
+        }
+        if let Some(hint) = slow_step_hint(&step.id) {
+            views[i].detail = Some(hint.to_string());
         }
         progress(&views);
         let step_t0 = std::time::Instant::now();
