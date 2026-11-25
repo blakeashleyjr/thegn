@@ -32,6 +32,8 @@ sync:
   max_settle_ms: 10000
 steps:
   - expect_visible: {text: "Every git worktree a tab.", timeout_ms: 20000}
+  # The way out is on the screen itself, not only in the footer's chord list.
+  - expect_visible: {text: "skip tour"}
   - key: {key: "escape"}
   - expect_visible: {text: "nothing saved", timeout_ms: 5000}
   - expect_not_visible: {text: "Every git worktree a tab.", timeout_ms: 5000}

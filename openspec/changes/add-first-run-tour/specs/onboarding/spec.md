@@ -5,16 +5,23 @@
 ### Requirement: First launch opens a skippable welcome tour
 
 On first launch (no `onboarding_done` marker) thegn SHALL open a full-screen
-welcome tour of eight chapters with progress dots. Every chapter SHALL be
-skippable, and `Esc` SHALL close the whole tour at once without writing any
-configuration. Closing the tour either way SHALL set the marker so it does not
-reopen. `THEGN_SKIP_ONBOARDING` SHALL suppress it. The command palette's
+welcome tour of eight chapters with progress dots. Every chapter SHALL show a
+persistent, visible skip control naming `Esc` outside the footer's chord list,
+SHALL be skippable, and `Esc` SHALL close the whole tour at once from any
+chapter without writing any configuration. Closing the tour either way SHALL
+record the outcome (`completed` or `skipped`) under `onboarding_done` so it does
+not reopen. `THEGN_SKIP_ONBOARDING` SHALL suppress it. The command palette's
 `setup-wizard` row SHALL reopen it.
 
 #### Scenario: Skip everything
 
 - **WHEN** a first-run user presses `Esc` on the welcome chapter
-- **THEN** the tour closes, the config file is unchanged, and the marker is set
+- **THEN** the tour closes, the config file is unchanged, and the marker reads `skipped`
+
+#### Scenario: The skip control is on every chapter
+
+- **WHEN** the user leaves from any chapter, the key drill included
+- **THEN** the skip control is painted there and `Esc` closes the tour as skipped
 
 #### Scenario: Skip one chapter
 
