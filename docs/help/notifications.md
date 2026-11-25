@@ -19,7 +19,9 @@ also raise the alert badge.
 A `Needs you` process failure clears when you acknowledge it with `x`, when the
 same program later exits cleanly in that worktree, when the worktree is removed,
 or automatically after seven days. Acknowledging the inbox row does not stop a
-still-failing process from producing a new failure.
+still-failing process from producing a new failure. An agent failure clears when a later
+agent run in that worktree finishes cleanly, and a test failure clears when a test runner
+(`pytest`, `nextest`, `jest`, `vitest`, `rspec`) later exits cleanly there.
 
 ### `agent_error_signatures`
 
