@@ -1131,7 +1131,7 @@ sandbox-e2e: build
     @if command -v podman >/dev/null 2>&1; then \
       echo "sandbox-e2e: podman found, running integration tests"; \
       PODMAN_E2E_FORCE=1 cargo test -p thegn-core -- sandbox; \
-    elif [ "$$PODMAN_E2E_FORCE" = "1" ]; then \
+    elif [ "${PODMAN_E2E_FORCE:-}" = "1" ]; then \
       echo "sandbox-e2e: PODMAN_E2E_FORCE=1 but podman not found"; exit 1; \
     else \
       echo "sandbox-e2e: podman not found, skipping (set PODMAN_E2E_FORCE=1 to fail on missing)"; \
@@ -1153,7 +1153,7 @@ sandbox-e2e-full: build
         --test sandbox_network_policy \
         --test sandbox_audit \
         --test sandbox_profile; \
-    elif [ "$$PODMAN_E2E_FORCE" = "1" ]; then \
+    elif [ "${PODMAN_E2E_FORCE:-}" = "1" ]; then \
       echo "sandbox-e2e-full: PODMAN_E2E_FORCE=1 but podman not found"; exit 1; \
     else \
       echo "sandbox-e2e-full: podman not found — skipping Tier 2 tests"; \

@@ -149,9 +149,9 @@ Anything that compiles runs on the Mac (see the guard note below).
 | `e2e-spec`                 | `spec`       | One muse spec under test/muse/specs/.                                                                                       | Mac          | OK      |
 | `e2e-update`               |              | Re-record muse snapshot baselines.                                                                                          | Mac          | OK      |
 | `e2e-glitch`               |              | Specs 18 to 28 (glitch-hunt subset).                                                                                        | Mac          | OK      |
-| `sandbox-e2e`              |              | Podman-backed sandbox tests (`cargo test -p thegn-core -- sandbox`); skips without podman.                                  | Mac          | STALE   |
+| `sandbox-e2e`              |              | Podman-backed sandbox tests (`cargo test -p thegn-core -- sandbox`); skips without podman.                                  | Mac          | OK      |
 | `sandbox-e2e-db`           |              | Tier 1 container-event DB audit test; runs in CI.                                                                           | Mac          | OK      |
-| `sandbox-e2e-full`         |              | Tier 2 podman suite (six named integration tests); skips without podman.                                                    | Mac          | STALE   |
+| `sandbox-e2e-full`         |              | Tier 2 podman suite (six named integration tests); skips without podman.                                                    | Mac          | OK      |
 | `sandbox-userns-e2e`       |              | User-namespace confinement scripts `test/userns-e2e.d/*.sh` (nightly).                                                      | light        | OK      |
 | `security-e2e`             |              | THE-307 bwrap security gate (requires Linux, bwrap, userns).                                                                | Mac          | OK      |
 | `plugin-conformance`       |              | `thegn plugin preview` and app-tab PTY conformance (needs the debug build; not in `ci`).                                    | light        | OK      |
@@ -293,7 +293,6 @@ symbol was checked in the tree.
 
 ### STALE
 
-- **`sandbox-e2e`, `sandbox-e2e-full`** (justfile, the `elif [ "$$PODMAN_E2E_FORCE" = "1" ]` lines). `$$` is a Make escape. Just passes it to `sh`, where it expands to the shell's PID, so the comparison is never true and `PODMAN_E2E_FORCE=1` can never fail on a missing podman; the documented "assert it must pass" mode is dead. The fix is `$PODMAN_E2E_FORCE` (or `${PODMAN_E2E_FORCE:-}`).
 - **Stable-install prose.** `docs/help/two-instances.md` ("stable is updated through Nix (see the README)"), the `live` recipe comment ("The stable instance is installed by Nix/home-manager") and the `REMOVED_FLAGS` refusal in `scripts/dev_live.py` say Nix/home-manager owns stable. On this machine stable is the plain binary at `~/.local/lib/thegn/thegn` and no Nix package installs it. `just update stable` is now the supported path; those three texts need a follow-up edit.
 
 ### DUPLICATE or overlapping
