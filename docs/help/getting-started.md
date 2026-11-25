@@ -13,7 +13,9 @@ project, worktree, and pane position.
 ## First-run checklist
 
 1. Install git, then start `thegn`. The flake and `./install.sh` also install
-   `tg`; the release tarball contains only `thegn`.
+   `tg`; the release tarball contains only `thegn`. To try it without
+   installing, run the flake's default app with
+   `nix run github:blakeashleyjr/thegn`.
 2. The first launch opens the [[onboarding]] tour: the workspace model, a
    theme, a sandbox tier, a default agent and a short key drill, in about two
    minutes. `Esc` skips it; reopen it from the palette with **Welcome tour…**.
