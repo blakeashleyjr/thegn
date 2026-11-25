@@ -234,7 +234,7 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   removes ledger records whose sprite is gone. It spares records younger than
   60 seconds, skips unrecorded sprites, and refuses on a partial listing. There is
   no background reaper unless you opt in with `lifetime_reap` (below).
-  `thegn env down --all` keeps its prompt, destroys only recorded sprites, and
+  `thegn env deprovision --all` keeps its prompt, destroys only recorded sprites, and
   says how many it skipped.
 - **Fleet states.** A recorded sandbox the provider does not list is `missing`
   only when this host still holds its local provisioned marker. Otherwise it is
@@ -563,6 +563,17 @@ lists the sandbox. A partial listing proves nothing.
   controller id is readable, ledger counts, ledger sandboxes no worktree or
   spare is bound to, and which env var names, git token and agent logins go
   into the sandbox. Sprites credential forwarding itself is unchanged.
+
+### Build and test jobs on a Sprite
+
+A project can bind one Sprite as the runner for pinned `cargo build` and
+`cargo test` jobs. Set `[jobs] runner = "<env name>"` and run
+`thegn job run cargo-test` (dev channel; see [[cli]]). Each attempt runs in a
+scrubbed environment with a private home, one dispatch per attempt. A deadline
+kills the remote process group, and secrets stay out of the uploaded snapshot.
+Ctrl-C cancels the attempt. If thegn dies mid-job, the daemon reattaches the
+attempt on its next start and never re-runs a command whose dispatch it cannot
+prove. One project may use one Sprite. For Vercel, see [[vercel-sandbox]].
 
 ## Interactive remote panes
 

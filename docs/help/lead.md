@@ -133,8 +133,8 @@ its own MCP servers for Todoist or mail, and never sees the credentials.
 ## Approvals
 
 The Lead never grants an approval. It asks (`approvals_request`) and you
-answer: press `y` or `n` on the request in the Notifications section, use
-`thegn approvals`, or answer from your phone (see [[mobile-access]]). Calls
+answer: press `y` or `n` on the request in the Notifications section, check
+`thegn lead status` for pending requests, or answer from your phone (see [[mobile-access]]). Calls
 that reach outside thegn, such as `issues.comment` and `issues.update`, ask
 you first unless the cap is listed in `[lead] outward_allow` (default empty).
 

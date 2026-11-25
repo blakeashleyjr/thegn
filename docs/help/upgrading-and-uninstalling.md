@@ -6,9 +6,34 @@ order: 41
 
 # Upgrading and uninstalling
 
-This page covers the release archive, Nix, and source-checkout installs. Your
+This page covers how to install, upgrade and remove thegn for each channel:
+Homebrew (macOS), the Linux release archive, Nix, and a source checkout. Your
 configuration, state database, and worktrees are kept when you upgrade or
 uninstall the binary.
+
+## Install
+
+Pick one channel. Only `git` is required at runtime; a sandbox backend
+(`bwrap`, `podman` or `docker` on Linux) is needed for the default sandbox.
+See [[sandboxing]] and [[getting-started]].
+
+- **macOS (Apple silicon):** `brew install blakeashleyjr/thegn/thegn`.
+  Homebrew installs `thegn` and the `tg` alias.
+- **Linux x86_64 release archive:** download the GNU or musl archive, verify it,
+  and put `thegn` on your `PATH`. The commands are under
+  [Release archive](#release-archive) below. Use the musl archive on older
+  distributions.
+- **Nix:** `nix profile install github:blakeashleyjr/thegn`.
+- **Source checkout:** `./install.sh` (needs Rust). It is not in the release
+  archive.
+
+The macOS release tarball also works, but it is not signed or notarized. A copy
+downloaded in a browser is quarantined by Gatekeeper; run
+`xattr -d com.apple.quarantine ./thegn` once before the first launch. Homebrew
+downloads are not quarantined.
+
+Windows has no published binary. Run `thegn doctor` after installing to check
+your setup.
 
 ## Before you start
 
@@ -56,6 +81,15 @@ downgrade path, and data written by the newer build remains invisible to the
 older one.
 
 ## Upgrade by install channel
+
+### Homebrew (macOS)
+
+```sh
+brew update
+brew upgrade thegn
+```
+
+Then follow [Finish the upgrade](#finish-the-upgrade).
 
 ### Release archive
 
@@ -174,6 +208,10 @@ report and remove any files you want gone yourself.
 
 There is no install manifest for a release archive. Delete the `thegn` binary
 you installed and any `tg` alias you created.
+
+### Homebrew
+
+Run `brew uninstall thegn`. It removes the binary and the `tg` alias only.
 
 ### Nix
 

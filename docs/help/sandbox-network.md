@@ -22,6 +22,24 @@ only enforced deny, and `*` in `network_block` means offline — see
 launch (standalone sandboxed terminals included), at `thegn env provision`, and
 in `thegn doctor`.
 
+### Host patterns
+
+Entries in `network_allow` and `network_block` share one grammar:
+
+| Entry     | Matches                                                       |
+| --------- | ------------------------------------------------------------- |
+| `*`       | Any host. Whole entry only, no port suffix.                   |
+| `x.com`   | `x.com` and every subdomain of it. `badx.com` does not match. |
+| `*.x.com` | Subdomains of `x.com`, never `x.com` itself.                  |
+| `=x.com`  | Exactly `x.com`.                                              |
+
+Add a port suffix to any name form: `:443`, a range such as `:8000-8100`, or
+`:*` for any port. A block entry without a port suffix blocks every port.
+Matching ignores case and one trailing dot. IP literals, names with an empty
+label, and percent-encoded or other non-hostname characters are refused. A
+malformed entry never matches, so a bad allow entry cannot widen the list and a
+bad block entry cannot block.
+
 On the `apple` backend, `network = "host"` is refused with
 `network-unexpressible` (Apple `container` has no host network; use `nat`).
 `network = "none"` (and therefore `sealed`) is refused too: Apple can create
@@ -42,7 +60,7 @@ enforcing the allow/block lists. `dns` picks how resolution composes with the
 overlay: `tunnel` (default) lets the overlay own resolution; `filter-only`
 drops the overlay's pushed DNS (such as Tailscale MagicDNS) so the runtime's
 default resolver is used; `filter-front` is reserved, warns and behaves as
-`tunnel`, and `thegn config validate --strict` rejects it. No mode filters
+`tunnel`, and `thegn config validate` rejects it. No mode filters
 hostnames.
 
 A running VPN sidecar is reused only when its tunnel configuration matches.

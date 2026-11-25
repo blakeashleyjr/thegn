@@ -181,7 +181,7 @@ from any shell.
 ## Structural diffs (difftastic)
 
 `[git] structural_diff` renders the **read-only** diff surfaces — the
-full-screen diff view and `thegn diff --structural` — through
+full-screen diff view and `thegn wt diff --structural` — through
 [difftastic](https://difftastic.wilfred.me.uk/) instead of a line diff:
 
 - `off` (default) — thegn's internal unified view.

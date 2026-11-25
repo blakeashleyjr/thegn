@@ -18,7 +18,7 @@ sandboxed launch is refused under the default floor. Pin one to skip the
 probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `jobobject`, `none`. Reserved (accepted by config, never selected):
 `smol`, `wsl`, `appcontainer`; a reserved value warns and resolves through
-`backend_chain`, and `thegn config validate --strict` rejects it.
+`backend_chain`, and `thegn config validate` rejects it.
 
 The outer `bwrap` and `systemd-run` launchers are resolved to absolute paths
 from thegn's own `PATH`. If either is missing there, launch is refused rather

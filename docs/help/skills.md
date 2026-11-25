@@ -22,7 +22,7 @@ then decides how to follow it under that harness's normal permission model.
 configured harnesses' native project directories: `.claude/skills/`,
 `.agents/skills/`, and `.pi/skills/` for Claude, Codex, and Pi respectively.
 It never writes a harness home directory. Omitting `--worktree` uses the shared
-worktree resolution described by `thegn help`; this is a per-worktree seed,
+worktree resolution described in [[cli]]; this is a per-worktree seed,
 not home synchronization.
 
 Automatic seeding runs during worktree creation and startup reconciliation

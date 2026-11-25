@@ -32,8 +32,10 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   on hardware yet. On any OS, a control socket path longer than 84 bytes (a
   long `THEGN_DIR` or `user@host`) also turns connection sharing off, with one
   warning; `thegn doctor` shows `multiplexing off` for such a host.
-- **Homebrew, AUR, `.deb`, `.rpm`, crates.io, and `cargo binstall` are not
-  install channels yet.** Use a release archive or the Nix flake.
+- **AUR, `.deb`, `.rpm`, crates.io, and `cargo binstall` are not install
+  channels yet.** On macOS use Homebrew
+  (`brew install blakeashleyjr/thegn/thegn`); on Linux use a release archive
+  or the Nix flake. See [[upgrading-and-uninstalling]].
 
 ## Interface
 
