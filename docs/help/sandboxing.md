@@ -43,9 +43,11 @@ In plain terms:
   The rest of home stays readable, the agent's own login stays usable, and the
   network is open. It stops accidental writes outside the worktree; it does not
   stop a hostile agent from reading or sending anything else it can see.
-- `sealed` hides `$HOME` and the network, but it still shares the host's
-  writable toolchain and package caches (cargo, rustup, npm and similar), so
-  it is hardened, not a full boundary.
+- `sealed` hides `$HOME` and the network. It shares the host's toolchain and
+  package caches (cargo, rustup, npm and similar) read-only, so code in the
+  sandbox cannot plant something the host later runs. Hook and compiler caches
+  (prek, pre-commit, sccache) and an out-of-tree shared target directory are
+  private to each sandbox and start cold.
 - **Only interactive worktree panes are sandboxed.** Headless `thegn agent run`,
   the agent queue and Autopilot, the merge gate, tests, lifecycle scripts and
   language servers run on the host in this alpha. The ⚠ table in
@@ -249,9 +251,11 @@ Adding a managed account picks the lowest available `acct<N>` name with no
 account row and no existing home directory. Thegn never reuses an existing
 home for a new account, so it cannot adopt a forgotten account's login.
 
-The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
-gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
-poison a shared cache), not a confidentiality one. The allowlist and every
+The automatic build caches (`~/.cargo/registry`, nix, `~/.m2`, gradle and
+similar) are mounted read-only, and the sccache, prek and pre-commit caches
+are private to each sandbox, so a pane cannot poison a cache the host later
+executes. Fetching a new dependency inside the sandbox therefore fails unless
+the host already has it. The allowlist and every
 mount are re-validated when the command line is built; a swap in the
 instant between that check and the runtime starting remains possible.
 
