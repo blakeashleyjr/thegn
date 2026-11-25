@@ -20,7 +20,7 @@ works on fresh Sprites and Vercel sandboxes.
 ### Changed
 
 - The standard sandbox profile hides credential files, cloud CLI logins and sibling repositories, and
-  mounts `~/.claude` and `~/.codex` settings read-only. Shared caches are read-only or private per sandbox.
+  mounts `~/.claude` and `~/.codex` settings read-only.
 - Usage polling is opt-in. thegn asks before scanning the default repository roots and before installing
   the merge-guard hook.
 - Copied text is no longer stored in the database unless clipboard register persistence is turned on.
