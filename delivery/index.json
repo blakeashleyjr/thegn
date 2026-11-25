@@ -996,6 +996,18 @@
       "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
     },
     {
+      "change": "fix-clean-remove-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2692",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "THE-2692 makes clean worktree removal non-destructive: the Alt-X menu pre-selects keep files, labels the delete row as keeping the branch, and its body says the branch and commits are kept."
+    },
+    {
       "change": "fix-exact-terminal-search-jumps",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

@@ -406,6 +406,10 @@ impl MenuOverlay {
     }
 }
 
+/// The clean-tree remove menu (Alt-X, or `d` with confirmation on). The
+/// non-destructive "keep files" arm is pre-selected, so a reflexive Enter
+/// detaches the checkout and keeps every file. The delete rows name the
+/// branch as kept: the destroy path never deletes a branch ref.
 pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
     let title = format!("Delete {} worktree(s)?", targets);
     MenuOverlay::new_with_default(
@@ -414,7 +418,7 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
         vec![
             item(
                 Some('y'),
-                "delete from disk",
+                "delete worktree files from disk (branch kept)",
                 MenuChoice::ConfirmDeleteWorktrees {
                     keep_files: false,
                     force: false,
@@ -435,7 +439,7 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
                 // hotkey is reachable and the debug-assert in `new_with_default`
                 // stays happy.
                 Some('f'),
-                "keep files",
+                "keep files (safe)",
                 MenuChoice::ConfirmDeleteWorktrees {
                     keep_files: true,
                     force: false,
@@ -443,9 +447,10 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             ),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
-        0,
+        // Index of "keep files (safe)": the non-destructive default.
+        2,
     )
-    .with_body(names_csv)
+    .with_body(format!("the branch and its commits are kept: {names_csv}"))
 }
 
 /// The sidebar's unified close-or-delete chooser (`d` / `Delete`): a
@@ -2055,8 +2060,42 @@ mod tests {
             delete_worktree_menu_dirty(1, "x").handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
         );
-        // The clean menu is unchanged: it still defaults to delete-from-disk.
-        assert_eq!(delete_worktree_menu(1, "x").selected(), 0);
+    }
+
+    #[test]
+    fn delete_worktree_menu_preselects_keep_files() {
+        let mut menu = delete_worktree_menu(1, "x");
+        // The non-destructive arm is the pre-selected default, so Enter alone
+        // never deletes a clean worktree's files.
+        assert_eq!(menu.selected(), 2);
+        assert_eq!(
+            menu.items()[2].choice,
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: true,
+                force: false,
+            }
+        );
+        assert!(!menu.items()[2].danger, "keep-files row is not danger");
+        assert_eq!(
+            menu.handle_key(&KeyCode::Enter, NONE),
+            MenuOutcome::Pick(MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: true,
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn delete_worktree_menu_says_branch_is_kept() {
+        let menu = delete_worktree_menu(1, "feat-x");
+        let delete = &menu.items()[0];
+        assert!(delete.label.contains("branch kept"));
+        assert!(!delete.label.contains("delete from disk"));
+        let body = menu.body.clone().unwrap_or_default();
+        assert!(
+            body.contains("the branch and its commits are kept") && body.contains("feat-x"),
+            "body names the kept branch: {body:?}"
+        );
     }
 
     #[test]
