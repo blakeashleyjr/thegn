@@ -98,6 +98,42 @@ struct FleetAgent {
     stage: Option<String>,
 }
 
+/// The list capability shares the CLI report shape but never makes the
+/// additional provider usage calls reserved for `fleet cost`.
+pub(crate) fn control_report(cfg: &Config) -> Result<serde_json::Value> {
+    let snapshot = crate::fleet_read::read(cfg)?;
+    fleet_list_json(&snapshot, remote_agents(&snapshot.view))
+}
+
+/// The pure composition behind [`control_report`]: one snapshot's list
+/// report (no usage rows), with the worktree-joined agent rows, sanitized
+/// for the control response. No I/O — the daemon handler owns that.
+fn fleet_list_json(
+    snapshot: &crate::fleet_read::FleetSnapshot,
+    agents: std::collections::BTreeMap<String, FleetAgent>,
+) -> Result<serde_json::Value> {
+    let report = FleetReport {
+        generated_ms: snapshot.generated_ms,
+        view: snapshot.view.clone(),
+        cost: snapshot.cost.clone(),
+        vercel_usage: None,
+        sprites_usage: None,
+        agents,
+    };
+    let mut value = serde_json::to_value(report)?;
+    sanitize_json(&mut value);
+    Ok(value)
+}
+
+fn sanitize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = sanitize_text(text, 4096),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_json),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(sanitize_json),
+        _ => {}
+    }
+}
+
 /// One sprites env's per-sprite usage (`fleet cost` only).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct SpritesUsage {
@@ -1601,6 +1637,153 @@ mod tests {
             })
         );
         assert!(!agents.contains_key("/wt/gone"));
+    }
+
+    #[test]
+    fn control_report_is_the_two_account_list_envelope_without_usage_calls() {
+        // THE-2020's no-credentials acceptance, synthetic: two fly accounts
+        // (one listing the other's sandbox again), a sprites account, and a
+        // fake provider whose token cannot resolve — composed through the
+        // same report the daemon serves at `fleet.list`.
+        let vm = |env: &str, id: &str| fleet_cost::SandboxRow {
+            provider: "fly".into(),
+            env: env.into(),
+            id: id.into(),
+            state: Some("started".into()),
+            size: Some("shared-cpu-1x:256MB".into()),
+            created_ms: Some(0),
+            ..fleet_cost::SandboxRow::default()
+        };
+        let inventory = |env: &str, provider: &str, rows| fleet_cost::EnvInventory {
+            env: env.into(),
+            provider: provider.into(),
+            completeness: fleet_cost::Completeness::Complete,
+            rows,
+        };
+        let view = fleet_cost::join(
+            vec![
+                inventory(
+                    "fly-acme",
+                    "fly",
+                    vec![vm("fly-acme", "tg-a"), vm("fly-acme", "tg-b\u{7}")],
+                ),
+                // The same account read through a second env: `tg-a` lists
+                // again and must collapse to one authoritative row.
+                inventory("fly-eu", "fly", vec![vm("fly-eu", "tg-a")]),
+                inventory(
+                    "sprites-prod",
+                    "sprites",
+                    vec![fleet_cost::SandboxRow {
+                        provider: "sprites".into(),
+                        env: "sprites-prod".into(),
+                        id: "tg-c".into(),
+                        ..fleet_cost::SandboxRow::default()
+                    }],
+                ),
+                fleet_cost::EnvInventory {
+                    env: "ghost".into(),
+                    provider: "sprites".into(),
+                    completeness: fleet_cost::Completeness::Unavailable(
+                        "unavailable: API token SPRITES_GHOST could not be resolved".into(),
+                    ),
+                    rows: vec![],
+                },
+            ],
+            vec![RecordedSandbox {
+                worktree: "/wt/a".into(),
+                provider: "fly".into(),
+                env: "fly-acme".into(),
+                id: "tg-a".into(),
+            }],
+        );
+        let agents = remote_agents_with(&view, &|worktree| {
+            (worktree == "/wt/a").then_some(thegn_core::issue::AgentDispatch {
+                id: 1,
+                issue_id: "THE-2020".into(),
+                worktree_path: worktree.into(),
+                agent_name: "coder\n".into(),
+                dispatched_at_ms: 0,
+                status: thegn_core::issue::AgentDispatchStatus::Running,
+                stage: Some("code".into()),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                note: None,
+                chunk_path: None,
+                report: None,
+                exit_code: None,
+                exited_at_ms: None,
+            })
+        });
+        let cost =
+            fleet_cost::fleet_cost(&view, fleet_cost::BUNDLED_PRICES, &Default::default(), NOW);
+        let snapshot = crate::fleet_read::FleetSnapshot {
+            generated_ms: NOW,
+            view,
+            cost,
+        };
+        let json = fleet_list_json(&snapshot, agents).unwrap();
+
+        // The list envelope: exactly the list fields, no usage sections.
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["agents", "cost", "generated_ms", "view"]);
+        assert_eq!(json["generated_ms"], NOW, "an explicit timestamp");
+        // One row per authoritative VM: the duplicate across accounts
+        // collapsed, and the ledger row joined to its worktree.
+        let rows = json["view"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["worktree"], "/wt/a");
+        assert_eq!(rows[0]["provider"], "fly");
+        assert_eq!(
+            json["view"]["orphans"], 2,
+            "tg-b and the sprites row are unjoined"
+        );
+        // The unreachable fake provider is one partial row with its reason.
+        assert_eq!(json["view"]["partial"][0]["env"], "ghost");
+        assert!(
+            json["view"]["partial"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("SPRITES_GHOST could not be resolved")
+        );
+        // Agent rows joined by worktree.
+        assert_eq!(json["agents"]["/wt/a"]["agent"], "coder");
+        // A control character in a provider string never reaches the response.
+        assert_eq!(rows[1]["id"], "tg-b");
+        assert!(!rows[1]["id"].as_str().unwrap().contains('\u{7}'));
+        // The estimate's provenance is carried through unchanged.
+        assert_eq!(
+            json["cost"]["per_row"].as_array().unwrap().len(),
+            rows.len()
+        );
+        assert!(
+            json["cost"]["price_table_date"]
+                .as_str()
+                .is_some_and(|date| !date.is_empty())
+        );
+    }
+
+    #[test]
+    fn control_report_of_an_unconfigured_fleet_reads_no_provider() {
+        // No `[env.*]` entries: the real path assembles offline (no network,
+        // no credentials) and still returns the explicit list envelope.
+        let _state = crate::testenv::IsolatedState::new();
+        let cfg: Config = toml::from_str("").expect("the empty config parses");
+        let json = control_report(&cfg).unwrap();
+        assert!(
+            json["generated_ms"].as_i64().is_some(),
+            "an explicit timestamp"
+        );
+        assert_eq!(json["view"]["rows"].as_array().map(Vec::len), Some(0));
+        assert!(json.get("vercel_usage").is_none());
+        assert!(json.get("sprites_usage").is_none());
+        assert!(json.get("agents").is_none(), "no rows to join");
     }
 
     #[test]

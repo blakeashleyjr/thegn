@@ -315,6 +315,8 @@ pub fn resolve_serve_scopes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verb {
     ListSessions,
+    /// Read the provider-backed fleet inventory and estimate.
+    FleetList,
     /// Move one persisted worktree presentation between profile stores. This
     /// is deliberately a CLI-only admin operation, not a daemon route.
     MigrateSession,
@@ -552,6 +554,7 @@ impl Verb {
     /// against the enum.
     pub const ALL: &'static [Verb] = &[
         Verb::ListSessions,
+        Verb::FleetList,
         Verb::MigrateSession,
         Verb::ListWorktrees,
         Verb::OpenSession,
@@ -676,6 +679,7 @@ impl Verb {
 pub fn required_scope(verb: Verb) -> Scope {
     match verb {
         Verb::ListSessions
+        | Verb::FleetList
         | Verb::ListWorktrees
         | Verb::WorktreeSandboxProfile
         | Verb::Snapshot
@@ -1179,6 +1183,7 @@ mod tests {
         use Verb::*;
         let read = [
             ListSessions,
+            FleetList,
             ListWorktrees,
             Snapshot,
             Events,

@@ -513,6 +513,7 @@ until its scope is granted.
 | `worktrees_sandbox_profile` | `read`        | a worktree's pinned sandbox profile (null = inherit configured policy)    |
 | `leases_list`               | `read`        | relay lease state per session                                             |
 | `me`                        | `read`        | the caller's pairing id, label, granted scopes                            |
+| `fleet_list`                | `read`        | provider fleet inventory, agents joined by worktree, and estimated costs  |
 | `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex)    |
 | `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                      |
 | `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities                |
