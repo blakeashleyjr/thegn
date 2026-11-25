@@ -747,3 +747,33 @@ async fn non_tty_streaming_reattach_resumes_after_the_delivered_offset() {
     );
     assert_eq!(recorded[1].authorization, "Bearer tok");
 }
+
+/// THE-2052: a detached launch starts the command once, asks the server to keep
+/// the session after disconnect, returns the announced session id and closes
+/// only its own end.
+#[tokio::test]
+async fn detached_launch_returns_the_session_id_and_asks_to_outlive_the_client() {
+    let mock = start_mock(vec![script(vec![
+        Out::Text(
+            r#"{"type":"session_info","session_id":"2051","command":"sh","created":1767609000,"cols":0,"rows":0,"is_owner":true,"tty":false}"#,
+        ),
+        Out::Close,
+    ])]);
+    let provider = provider(&mock);
+    let sid = provider
+        .open_exec_detached("tgtest1", &non_tty_spec(), Duration::from_secs(7200))
+        .await
+        .unwrap();
+    assert_eq!(sid, "2051");
+    let recorded = requests(&mock);
+    assert_eq!(recorded.len(), 1, "a detached launch runs the command once");
+    assert!(recorded[0].target.starts_with("/v1/sprites/tgtest1/exec?"));
+    assert!(
+        recorded[0]
+            .target
+            .contains("max_run_after_disconnect=7200s"),
+        "{}",
+        recorded[0].target
+    );
+    assert_eq!(recorded[0].authorization, "Bearer tok");
+}

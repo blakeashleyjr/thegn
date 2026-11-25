@@ -311,6 +311,22 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   bill. After a crash the worst case is the ceiling plus 5 minutes. If `curl` or
   the socket is missing in the VM, one line is printed and the command runs
   unheld.
+- **Background work does not survive its exec session.** A process a plain
+  `sprite-exec` (or `agent run`) starts with `nohup … &` or `setsid` is not
+  guaranteed to outlive that session: Sprites can stop it when the session
+  ends, and nothing keeps the sprite awake for it. Use
+  `thegn sprite-exec <sprite> --detach [--max <dur>] -- <cmd>` instead. It
+  starts the command as its own server-side exec session, prints the session
+  id and returns at once. The command runs inside the keep-awake heartbeat
+  above, so the sprite stays awake while it runs, independent of any client,
+  for at most `--max` (default 4 hours, capped at 24 hours); the same value is
+  asked of the server as `max_run_after_disconnect`. Follow it with
+  `sprite-exec <sprite> --attach <session>` (streams the output from the start,
+  reattaches across dropped streams and exits with the command's code) and
+  `sprite-exec <sprite> --status <session>` (prints `running`, `finished exit
+N`, or `not found`; exit 75 when the session is gone). A detached command has
+  no stdin. If `curl` or the socket is missing in the VM the command still
+  runs, unheld, and the sprite may sleep. Sprites only.
 - **Size.** Sprites have a fixed 8 vCPU; `size`, `min_vcpu`, `gpu` and `nvme`
   are ignored and validate warns. `min_ram_gb > 0` sets the sprite's memory
   limit to `min_ram_gb * 1024` MB (no autoscale) once, at create. The policy is

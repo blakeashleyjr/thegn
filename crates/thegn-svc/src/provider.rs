@@ -145,6 +145,7 @@ pub(crate) fn redacted_transport_error(
 
 #[path = "provider_sessions.rs"]
 mod sessions;
+pub use sessions::ExecSessionState;
 
 /// Per-request deadline for the small JSON **control-plane** calls (create,
 /// list, destroy, fs list, network policy, checkpoint metadata). The shared

@@ -36,7 +36,9 @@ use termwiz::terminal::{Terminal, new_terminal};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::wss_native_provider_kind;
 use thegn_core::sprite_hold::{HOLD_ENV, ceiling_secs, hold_name, wrap_argv};
-use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider, StreamingExec};
+use thegn_svc::provider::{
+    ExecControl, ExecFrame, ExecSession, ExecSessionState, ExecSpec, Provider, StreamingExec,
+};
 
 /// Exit code when the remote exec stream was lost and could not be reattached
 /// (`EX_TEMPFAIL`): the remote process did not survive. `session list` keys
@@ -135,6 +137,23 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         }
         None => argv,
     };
+    let (provider, env_name) = select_provider(cfg, id)?;
+    if tty_mode(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        let code = run_tty(&provider, &env_name, id, argv)?;
+        std::process::exit(code);
+    }
+    // Current-thread: one network call does not need a worker per core.
+    // See `agent::provider_runtime`.
+    let rt = crate::agent::provider_runtime()?;
+    let code = rt.block_on(run_streaming(&provider, &env_name, id, argv))?;
+    std::process::exit(code);
+}
+
+/// The sprites provider that owns sprite `id`, with its env name.
+fn select_provider(cfg: &Config, id: &str) -> Result<(Provider, String)> {
     let record_account = thegn_svc::vps::registry::read(id)
         .filter(|record| record.provider == "sprites")
         .map(|record| record.account);
@@ -161,18 +180,105 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         .nth(selected)
         .flatten()
         .ok_or_else(|| anyhow!("sprite-exec: selected Sprites env has no resolvable API token"))?;
-    if tty_mode(
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    ) {
-        let code = run_tty(&provider, &env_name, id, argv)?;
-        std::process::exit(code);
+    Ok((provider, env_name))
+}
+
+/// The default and largest `--max` for `--detach`: the keep-awake ceiling.
+pub(crate) fn detach_max_secs(max: Option<Duration>) -> u64 {
+    ceiling_secs(max.map(|max| max.as_secs().max(1)), 0)
+}
+
+/// The argv a detached launch sends: `cmd` inside the keep-awake heartbeat,
+/// bounded by `ceiling` seconds. A detached command always runs held, because
+/// the client that would otherwise keep the sprite awake is gone.
+pub(crate) fn detach_argv(cmd: &[String], task: &str, ceiling: u64) -> Result<Vec<String>> {
+    if cmd.is_empty() {
+        return Err(anyhow!("sprite-exec --detach needs a command after `--`"));
     }
-    // Current-thread: one network call does not need a worker per core.
-    // See `agent::provider_runtime`.
+    Ok(wrap_argv(cmd, task, ceiling))
+}
+
+/// `thegn sprite-exec <id> --detach [--max DUR] -- cmd…`: start `cmd` as a
+/// server-side exec session that outlives this process (THE-2052) and print
+/// its session id on stdout. The sprite stays awake while it runs, for at most
+/// `--max` (default 4 h, capped at 24 h), through the in-sprite heartbeat.
+pub fn run_detach(cfg: &Config, id: &str, cmd: &[String], max: Option<Duration>) -> Result<()> {
+    let ceiling = detach_max_secs(max);
+    let argv = detach_argv(cmd, &hold_task()?, ceiling)?;
+    let (provider, _env) = select_provider(cfg, id)?;
     let rt = crate::agent::provider_runtime()?;
-    let code = rt.block_on(run_streaming(&provider, &env_name, id, argv))?;
+    let spec = ExecSpec {
+        argv,
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let session = rt
+        .block_on(provider.open_exec_detached(id, &spec, Duration::from_secs(ceiling)))?
+        .ok_or_else(|| anyhow!("sprite-exec --detach: only Sprites sessions are detachable"))?;
+    write_stdout_line(&session);
+    Ok(())
+}
+
+/// `thegn sprite-exec <id> --attach <session>`: stream a detached session's
+/// output from its start, reattaching across dropped streams, and exit with its
+/// code. Never runs the command again.
+pub fn run_attach(cfg: &Config, id: &str, session: &str) -> Result<()> {
+    let (provider, env_name) = select_provider(cfg, id)?;
+    let rt = crate::agent::provider_runtime()?;
+    let code = rt.block_on(async {
+        let current = provider.attach_exec_fresh(id, session, 0).await?;
+        stream_attached(
+            &provider,
+            &env_name,
+            id,
+            current,
+            Some(session.to_owned()),
+            false,
+        )
+        .await
+    })?;
     std::process::exit(code);
+}
+
+/// `thegn sprite-exec <id> --status <session>`: print whether a detached
+/// session is still running. Exits 0 while running or finished with 0, the
+/// session's own code when finished with one, and 75 when it is gone.
+pub fn run_status(cfg: &Config, id: &str, session: &str) -> Result<()> {
+    let (provider, _env) = select_provider(cfg, id)?;
+    let rt = crate::agent::provider_runtime()?;
+    let state = rt
+        .block_on(provider.exec_session_state(id, session))?
+        .ok_or_else(|| anyhow!("sprite-exec --status: only Sprites sessions have a status"))?;
+    let (line, code) = status_line(session, state);
+    write_stdout_line(&line);
+    std::process::exit(code);
+}
+
+/// The one status line and the exit code for a session state.
+pub(crate) fn status_line(session: &str, state: ExecSessionState) -> (String, i32) {
+    match state {
+        ExecSessionState::Running => (format!("session {session} running"), 0),
+        ExecSessionState::Finished {
+            exit_code: Some(code),
+        } => (format!("session {session} finished exit {code}"), code),
+        ExecSessionState::Finished { exit_code: None } => {
+            (format!("session {session} finished exit unknown"), 0)
+        }
+        ExecSessionState::Absent => (
+            format!("session {session} not found (finished and reaped, or the sprite lost it)"),
+            EXIT_REMOTE_LOST,
+        ),
+    }
+}
+
+fn write_stdout_line(line: &str) {
+    let mut out = std::io::stdout();
+    if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+        tracing::debug!(target: "thegn::provider", "sprite-exec: stdout gone");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -587,9 +693,22 @@ async fn run_streaming(provider: &Provider, env: &str, id: &str, argv: Vec<Strin
         env: Vec::new(),
         cwd: None,
     };
-    let mut current = provider.open_exec_streaming(id, &spec).await?;
+    let current = provider.open_exec_streaming(id, &spec).await?;
+    stream_attached(provider, env, id, current, None, true).await
+}
 
-    let mut stdin_rx = if std::io::stdin().is_terminal() {
+/// Stream an already-open (or freshly attached) non-tty session to stdout with
+/// the reattach loop. `session_id` seeds the handle for a session attached by
+/// id; `forward_stdin` is false for a detached session, whose stdin is closed.
+async fn stream_attached(
+    provider: &Provider,
+    env: &str,
+    id: &str,
+    mut current: StreamingExec,
+    session_id: Option<String>,
+    forward_stdin: bool,
+) -> Result<i32> {
+    let mut stdin_rx = if !forward_stdin || std::io::stdin().is_terminal() {
         None
     } else {
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -620,7 +739,7 @@ async fn run_streaming(provider: &Provider, env: &str, id: &str, argv: Vec<Strin
     };
     let mut pending_stdin: Option<Vec<u8>> = None;
     let mut delivered: u64 = 0;
-    let mut session_id: Option<String> = None;
+    let mut session_id = session_id;
     let mut attempt = 0usize;
 
     let (result, stderr) = 'session: loop {
@@ -1101,6 +1220,44 @@ mod tests {
     use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
     use thegn_svc::provider::ExecSession;
+
+    #[test]
+    fn detach_max_defaults_to_four_hours_and_caps_at_a_day() {
+        assert_eq!(super::detach_max_secs(None), 4 * 3600);
+        assert_eq!(super::detach_max_secs(Some(Duration::from_secs(90))), 90);
+        assert_eq!(
+            super::detach_max_secs(Some(Duration::from_secs(99 * 3600))),
+            HOLD_MAX_CEILING_SECS
+        );
+    }
+
+    #[test]
+    fn detach_argv_runs_the_command_inside_the_heartbeat() {
+        let cmd = vec!["make".to_owned(), "-j8".to_owned()];
+        let argv = super::detach_argv(&cmd, "thegn-hold-0123456789abcdef", 600).unwrap();
+        assert_eq!(argv, wrap_argv(&cmd, "thegn-hold-0123456789abcdef", 600));
+        assert!(super::detach_argv(&[], "thegn-hold-0123456789abcdef", 600).is_err());
+    }
+
+    #[test]
+    fn status_line_reports_running_finished_and_gone() {
+        use thegn_svc::provider::ExecSessionState as S;
+        assert_eq!(
+            super::status_line("7", S::Running),
+            ("session 7 running".to_owned(), 0)
+        );
+        assert_eq!(
+            super::status_line("7", S::Finished { exit_code: Some(3) }),
+            ("session 7 finished exit 3".to_owned(), 3)
+        );
+        assert_eq!(
+            super::status_line("7", S::Finished { exit_code: None }).0,
+            "session 7 finished exit unknown"
+        );
+        let (line, code) = super::status_line("7", S::Absent);
+        assert!(line.contains("not found"), "{line}");
+        assert_eq!(code, EXIT_REMOTE_LOST);
+    }
 
     #[test]
     fn reconnect_delays_back_off_1_2_4_8_15() {
