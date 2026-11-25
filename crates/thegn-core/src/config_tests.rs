@@ -3434,13 +3434,16 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 
     // Every gated master toggle is forced off.
     assert!(!cfg.placement.enabled);
-    assert!(cfg.sandbox.remote.host.is_empty());
+    // SSH remotes ship on stable, so `[sandbox.remote]` survives the clamp.
+    assert_eq!(cfg.sandbox.remote.host, "box.example");
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
     assert!(cfg.lead.is_none());
     assert!(clamped.contains(&Feature::Lead));
-    // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), 5);
+    // Every gated feature that changed reports as clamped; SSH remotes are
+    // stable now, so `Remote` has nothing to drop here.
+    assert!(!clamped.contains(&Feature::Remote));
+    assert_eq!(clamped.len(), 4);
     assert!(!clamped.contains(&Feature::Observe));
     assert!(!clamped.contains(&Feature::PluginApps));
 
