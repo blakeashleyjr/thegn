@@ -1,13 +1,16 @@
 //! Pure agent-settings merge for `thegn mcp wire`.
 //!
-//! Writing the single secret-free proxy entry into an agent CLI's MCP settings
-//! is a JSON merge with three non-negotiables, all enforced here (host adapters
-//! only supply the file path + the container's JSON path):
+//! Writing thegn's secret-free entries ([`WIRED_ENTRIES`]: the proxy hub and
+//! thegn's own `mcp serve`) into an agent CLI's MCP settings is a JSON merge
+//! ([`apply_named`]) or, for Codex's `config.toml`, a TOML merge
+//! ([`apply_toml`]), with three non-negotiables, all enforced here (host
+//! adapters only supply the file path + the container's path):
 //!
-//! 1. **Secret-free.** The entry is argv only — no `env` block. Upstream
+//! 1. **Secret-free.** An entry is argv only — no `env` block. Upstream
 //!    secrets resolve at spawn in the hub, never in an agent settings file.
-//! 2. **Marker-tagged & idempotent.** thegn's entry carries [`MARKER_KEY`];
-//!    wiring twice yields exactly one entry.
+//! 2. **Marker-tagged & idempotent.** thegn's JSON entries carry
+//!    [`MARKER_KEY`], its TOML tables a [`TOML_MARKER`] comment; wiring twice
+//!    yields exactly one entry per key.
 //! 3. **Never clobber the user.** thegn refuses to overwrite or remove an entry
 //!    it did not mark — a user's own `thegn`-named entry is left untouched.
 
@@ -58,6 +61,38 @@ pub fn proxy_entry(command: &str) -> Value {
     })
 }
 
+/// The `mcpServers` key thegn's own docs/state server entry lives under.
+pub const SERVE_ENTRY_KEY: &str = "thegn-serve";
+
+/// The secret-free entry for thegn's own MCP server: `thegn mcp serve` with no
+/// `--scopes`, so the scope ceiling comes from config (`[mcp.serve] scopes`,
+/// `read` when unset) at every launch rather than being frozen into the agent's
+/// settings file. Marked like [`proxy_entry`]; never an `env` block.
+pub fn serve_entry(command: &str) -> Value {
+    json!({
+        "command": command,
+        "args": ["mcp", "serve"],
+        MARKER_KEY: true,
+    })
+}
+
+/// Every entry `thegn mcp wire` writes, as `(key, args)`: the aggregated
+/// third-party proxy and thegn's own docs/state server. One table so the JSON
+/// and TOML adapters can never drift apart.
+pub const WIRED_ENTRIES: &[(&str, &[&str])] = &[
+    (ENTRY_KEY, &["mcp", "proxy"]),
+    (SERVE_ENTRY_KEY, &["mcp", "serve"]),
+];
+
+/// The JSON entry for one [`WIRED_ENTRIES`] row.
+pub fn wired_entry(command: &str, args: &[&str]) -> Value {
+    json!({
+        "command": command,
+        "args": args,
+        MARKER_KEY: true,
+    })
+}
+
 /// Whether a settings-entry value is thegn-managed (carries [`MARKER_KEY`]).
 pub fn is_thegn_managed(entry: &Value) -> bool {
     entry
@@ -81,21 +116,39 @@ pub fn apply(
     entry: Value,
     remove: bool,
 ) -> Result<WireOutcome, String> {
+    apply_named(settings, container_path, ENTRY_KEY, entry, remove)
+}
+
+/// [`apply`] for an entry stored under `key` (e.g. [`SERVE_ENTRY_KEY`]). The
+/// same three guarantees: secret-free, marked and idempotent, never touching
+/// an entry of that name thegn did not mark.
+pub fn apply_named(
+    settings: &mut Value,
+    container_path: &[&str],
+    key: &str,
+    entry: Value,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    if remove && !path_exists(settings, container_path) {
+        // Never create an empty container just to report that nothing was
+        // there: removal must leave an unwired file byte-identical.
+        return Ok(WireOutcome::NothingToRemove);
+    }
     let container = ensure_object_path(settings, container_path)?;
 
-    let existing = container.get(ENTRY_KEY);
+    let existing = container.get(key);
     let existing_is_ours = existing.map(is_thegn_managed).unwrap_or(false);
     let existing_is_foreign = existing.is_some() && !existing_is_ours;
 
     if remove {
         if existing_is_foreign {
             return Err(format!(
-                "an entry named `{ENTRY_KEY}` exists but was not created by thegn \
+                "an entry named `{key}` exists but was not created by thegn \
                  (no `{MARKER_KEY}` marker) — refusing to remove it"
             ));
         }
         return if existing_is_ours {
-            container.remove(ENTRY_KEY);
+            container.remove(key);
             Ok(WireOutcome::Removed)
         } else {
             Ok(WireOutcome::NothingToRemove)
@@ -104,7 +157,7 @@ pub fn apply(
 
     if existing_is_foreign {
         return Err(format!(
-            "an entry named `{ENTRY_KEY}` exists but was not created by thegn \
+            "an entry named `{key}` exists but was not created by thegn \
              (no `{MARKER_KEY}` marker) — refusing to overwrite it"
         ));
     }
@@ -116,7 +169,138 @@ pub fn apply(
     } else {
         WireOutcome::Added
     };
-    container.insert(ENTRY_KEY.to_string(), entry);
+    container.insert(key.to_string(), entry);
+    Ok(outcome)
+}
+
+/// Whether every segment of `path` exists as an object below `root`.
+fn path_exists(root: &Value, path: &[&str]) -> bool {
+    let mut cur = root;
+    for seg in path {
+        match cur.get(*seg) {
+            Some(next) if next.is_object() => cur = next,
+            _ => return false,
+        }
+    }
+    cur.is_object()
+}
+
+// ── TOML agent settings (Codex `config.toml`) ───────────────────────────────
+
+/// The marker comment thegn writes above its own `[mcp_servers.<key>]` table
+/// in a TOML settings file. A comment rather than a key: an MCP client may
+/// reject unknown keys inside a server table, but every TOML reader ignores
+/// comments, and `toml_edit` writers (Codex's own included) keep them.
+pub const TOML_MARKER: &str = "# x-thegn-managed: written by `thegn mcp wire`; \
+                               undo with `thegn mcp wire --remove`";
+
+/// The substring that proves a TOML table is thegn's (see [`TOML_MARKER`]).
+const TOML_MARKER_TAG: &str = "x-thegn-managed";
+
+/// Whether a TOML item is a table carrying thegn's marker comment.
+pub fn toml_is_thegn_managed(item: &toml_edit::Item) -> bool {
+    item.as_table()
+        .and_then(|t| t.decor().prefix())
+        .and_then(|p| p.as_str())
+        .is_some_and(|s| s.contains(TOML_MARKER_TAG))
+}
+
+/// Whether the marked table `table` already holds exactly `command` + `args`.
+fn toml_entry_matches(table: &toml_edit::Table, command: &str, args: &[&str]) -> bool {
+    let command_ok = table.get("command").and_then(|i| i.as_str()) == Some(command);
+    let args_ok = table
+        .get("args")
+        .and_then(|i| i.as_array())
+        .is_some_and(|arr| {
+            arr.len() == args.len()
+                && arr
+                    .iter()
+                    .zip(args.iter())
+                    .all(|(v, want)| v.as_str() == Some(*want))
+        });
+    command_ok && args_ok && table.len() == 2
+}
+
+/// Build thegn's marked `[mcp_servers.<key>]` table: argv only, no `env`.
+fn toml_entry(command: &str, args: &[&str]) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table.insert("command", toml_edit::value(command));
+    let mut arr = toml_edit::Array::new();
+    for arg in args {
+        arr.push(*arg);
+    }
+    table.insert("args", toml_edit::value(arr));
+    table.decor_mut().set_prefix(format!("\n{TOML_MARKER}\n"));
+    table
+}
+
+/// [`apply_named`] for a TOML settings document whose server tables live under
+/// a top-level `container` table (Codex: `mcp_servers`). The same guarantees:
+/// argv only (no `env`), marked (by [`TOML_MARKER`]), idempotent, and a table
+/// of that name thegn did not mark is never overwritten or removed. A
+/// `container` that exists but is not a standard table (an inline table, a
+/// string) is refused rather than rewritten.
+pub fn apply_toml(
+    doc: &mut toml_edit::DocumentMut,
+    container: &str,
+    key: &str,
+    command: &str,
+    args: &[&str],
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    let root = doc.as_table_mut();
+    if remove && !root.contains_key(container) {
+        return Ok(WireOutcome::NothingToRemove);
+    }
+    if !root.contains_key(container) {
+        let mut fresh = toml_edit::Table::new();
+        // `[mcp_servers.thegn]` alone; no empty `[mcp_servers]` header.
+        fresh.set_implicit(true);
+        root.insert(container, toml_edit::Item::Table(fresh));
+    }
+    let servers = root
+        .get_mut(container)
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| {
+            format!("`{container}` is not a TOML table — refusing to rewrite it; edit it by hand")
+        })?;
+
+    let existing = servers.get(key);
+    let existing_is_ours = existing.map(toml_is_thegn_managed).unwrap_or(false);
+    let existing_is_foreign = existing.is_some() && !existing_is_ours;
+
+    if remove {
+        if existing_is_foreign {
+            return Err(format!(
+                "a `[{container}.{key}]` table exists but was not created by thegn \
+                 (no `{TOML_MARKER_TAG}` comment) — refusing to remove it"
+            ));
+        }
+        return if existing_is_ours {
+            servers.remove(key);
+            Ok(WireOutcome::Removed)
+        } else {
+            Ok(WireOutcome::NothingToRemove)
+        };
+    }
+
+    if existing_is_foreign {
+        return Err(format!(
+            "a `[{container}.{key}]` table exists but was not created by thegn \
+             (no `{TOML_MARKER_TAG}` comment) — refusing to overwrite it"
+        ));
+    }
+    if let Some(table) = existing.and_then(|item| item.as_table())
+        && toml_entry_matches(table, command, args)
+    {
+        return Ok(WireOutcome::Unchanged);
+    }
+    let outcome = if existing_is_ours {
+        WireOutcome::Updated
+    } else {
+        WireOutcome::Added
+    };
+    servers.insert(key, toml_edit::Item::Table(toml_entry(command, args)));
     Ok(outcome)
 }
 
@@ -409,5 +593,232 @@ mod tests {
     fn outcome_labels() {
         assert_eq!(WireOutcome::Added.as_str(), "added");
         assert_eq!(WireOutcome::NothingToRemove.as_str(), "nothing to remove");
+    }
+
+    // ── serve entry + named apply ───────────────────────────────────────────
+
+    #[test]
+    fn wired_entries_are_the_proxy_and_the_serve_server_secret_free() {
+        let keys: Vec<&str> = WIRED_ENTRIES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![ENTRY_KEY, SERVE_ENTRY_KEY]);
+        assert_eq!(
+            wired_entry("thegn", WIRED_ENTRIES[0].1),
+            proxy_entry("thegn")
+        );
+        assert_eq!(
+            wired_entry("thegn", WIRED_ENTRIES[1].1),
+            serve_entry("thegn")
+        );
+        let serve = serve_entry("/bin/thegn");
+        assert_eq!(serve["args"], json!(["mcp", "serve"]));
+        assert!(serve.get("env").is_none(), "wired entry must carry no env");
+        assert!(is_thegn_managed(&serve));
+    }
+
+    #[test]
+    fn named_apply_keeps_both_entries_and_removes_each_independently() {
+        let mut s = json!({ "mcpServers": { "git": { "command": "git-mcp" } } });
+        for (key, args) in WIRED_ENTRIES {
+            let out = apply_named(
+                &mut s,
+                &["mcpServers"],
+                key,
+                wired_entry("thegn", args),
+                false,
+            )
+            .unwrap();
+            assert_eq!(out, WireOutcome::Added, "{key}");
+        }
+        assert_eq!(s["mcpServers"].as_object().unwrap().len(), 3);
+        let again = apply_named(
+            &mut s,
+            &["mcpServers"],
+            SERVE_ENTRY_KEY,
+            serve_entry("thegn"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(again, WireOutcome::Unchanged);
+        let out = apply_named(&mut s, &["mcpServers"], SERVE_ENTRY_KEY, Value::Null, true).unwrap();
+        assert_eq!(out, WireOutcome::Removed);
+        assert!(s["mcpServers"].get(SERVE_ENTRY_KEY).is_none());
+        assert!(s["mcpServers"].get(ENTRY_KEY).is_some());
+        assert_eq!(s["mcpServers"]["git"]["command"], "git-mcp");
+    }
+
+    #[test]
+    fn named_apply_refuses_a_foreign_serve_entry() {
+        let mut s = json!({ "mcpServers": { "thegn-serve": { "command": "mine" } } });
+        let err = apply_named(
+            &mut s,
+            &["mcpServers"],
+            SERVE_ENTRY_KEY,
+            serve_entry("thegn"),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("`thegn-serve`"), "{err}");
+        assert_eq!(s["mcpServers"]["thegn-serve"]["command"], "mine");
+    }
+
+    #[test]
+    fn remove_never_creates_an_empty_container() {
+        let mut s = json!({ "theme": "dark" });
+        let out = apply(&mut s, &["mcpServers"], Value::Null, true).unwrap();
+        assert_eq!(out, WireOutcome::NothingToRemove);
+        assert_eq!(s, json!({ "theme": "dark" }));
+    }
+
+    // ── TOML (Codex config.toml) ────────────────────────────────────────────
+
+    fn toml_doc(body: &str) -> toml_edit::DocumentMut {
+        body.parse().expect("fixture parses")
+    }
+
+    #[test]
+    fn toml_wire_adds_marked_argv_only_tables_and_keeps_user_content() {
+        let mut doc = toml_doc(
+            "# my codex config\nmodel = \"gpt-5\"\n\n[mcp_servers.git]\ncommand = \"git-mcp\"\n",
+        );
+        for (key, args) in WIRED_ENTRIES {
+            let out = apply_toml(&mut doc, "mcp_servers", key, "/bin/thegn", args, false).unwrap();
+            assert_eq!(out, WireOutcome::Added, "{key}");
+        }
+        let text = doc.to_string();
+        assert!(
+            text.starts_with("# my codex config\nmodel = \"gpt-5\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("[mcp_servers.git]\ncommand = \"git-mcp\""),
+            "{text}"
+        );
+        assert!(text.contains(TOML_MARKER), "{text}");
+        assert!(!text.contains("env"), "no env block ever: {text}");
+
+        // What Codex will read back.
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let thegn = &parsed["mcp_servers"]["thegn"];
+        assert_eq!(thegn["command"].as_str(), Some("/bin/thegn"));
+        assert_eq!(
+            thegn["args"].as_array().unwrap().len(),
+            2,
+            "args = [\"mcp\", \"proxy\"]"
+        );
+        let serve = &parsed["mcp_servers"]["thegn-serve"];
+        assert_eq!(serve["args"][1].as_str(), Some("serve"));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn toml_wire_is_idempotent_across_a_reparse_and_updates_on_change() {
+        let mut doc = toml_doc("");
+        apply_toml(
+            &mut doc,
+            "mcp_servers",
+            ENTRY_KEY,
+            "thegn",
+            &["mcp", "proxy"],
+            false,
+        )
+        .unwrap();
+        let mut reparsed = toml_doc(&doc.to_string());
+        assert_eq!(
+            apply_toml(
+                &mut reparsed,
+                "mcp_servers",
+                ENTRY_KEY,
+                "thegn",
+                &["mcp", "proxy"],
+                false
+            )
+            .unwrap(),
+            WireOutcome::Unchanged
+        );
+        assert_eq!(reparsed.to_string(), doc.to_string(), "byte-identical");
+        assert_eq!(
+            apply_toml(
+                &mut reparsed,
+                "mcp_servers",
+                ENTRY_KEY,
+                "tg",
+                &["mcp", "proxy"],
+                false
+            )
+            .unwrap(),
+            WireOutcome::Updated
+        );
+        assert_eq!(
+            reparsed.to_string().matches("[mcp_servers.thegn]").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn toml_wire_refuses_foreign_tables_and_non_table_containers() {
+        let body = "[mcp_servers.thegn]\ncommand = \"mine\"\n";
+        let mut doc = toml_doc(body);
+        let err = apply_toml(
+            &mut doc,
+            "mcp_servers",
+            ENTRY_KEY,
+            "thegn",
+            &["mcp", "proxy"],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        let err = apply_toml(&mut doc, "mcp_servers", ENTRY_KEY, "", &[], true).unwrap_err();
+        assert!(err.contains("refusing to remove"), "{err}");
+        assert_eq!(doc.to_string(), body);
+
+        let inline = "mcp_servers = { git = { command = \"git-mcp\" } }\n";
+        let mut doc = toml_doc(inline);
+        let err = apply_toml(
+            &mut doc,
+            "mcp_servers",
+            ENTRY_KEY,
+            "thegn",
+            &["mcp", "proxy"],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a TOML table"), "{err}");
+        assert_eq!(doc.to_string(), inline);
+    }
+
+    #[test]
+    fn toml_remove_restores_the_pre_wire_file() {
+        let body = "model = \"gpt-5\"\n";
+        let mut doc = toml_doc(body);
+        assert_eq!(
+            apply_toml(&mut doc, "mcp_servers", ENTRY_KEY, "", &[], true).unwrap(),
+            WireOutcome::NothingToRemove
+        );
+        assert_eq!(
+            doc.to_string(),
+            body,
+            "remove on an unwired file is a no-op"
+        );
+        for (key, args) in WIRED_ENTRIES {
+            apply_toml(&mut doc, "mcp_servers", key, "thegn", args, false).unwrap();
+        }
+        let mut wired = toml_doc(&doc.to_string());
+        for (key, _) in WIRED_ENTRIES {
+            assert_eq!(
+                apply_toml(&mut wired, "mcp_servers", key, "", &[], true).unwrap(),
+                WireOutcome::Removed,
+                "{key}"
+            );
+        }
+        let parsed: toml::Value = toml::from_str(&wired.to_string()).unwrap();
+        assert!(
+            parsed
+                .get("mcp_servers")
+                .and_then(|v| v.as_table())
+                .is_none_or(|t| t.is_empty()),
+            "{wired}"
+        );
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
     }
 }

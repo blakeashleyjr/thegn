@@ -15,6 +15,7 @@ reference. Every guide assumes the [[getting-started]] mental model.
 - [[merge-queue]] — queue branches locally and let the fold-actor land them
 - [[pr-queue]] — shepherd pull requests on the forge, on a team
 - [[sandboxing]] — run each worktree's process in a container
+- [[agent-integrations]] — what each coding agent gets, and the one command that wires it
 
 ## The shape of a day
 

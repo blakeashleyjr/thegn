@@ -80,13 +80,15 @@ pub enum Action {
     /// Re-read config and reconcile the daemon's mcp-proxy upstreams
     /// (start/stop/restart/refilter). Requires a running daemon.
     Reload,
-    /// Write the single secret-free proxy entry into agent CLIs' MCP settings
-    /// (marker-tagged, idempotent, reversible). `[[agents]]` is the source of
-    /// truth for which agents by default.
+    /// Write thegn's two secret-free entries into agent CLIs' MCP settings:
+    /// `thegn` (the `mcp proxy` hub) and `thegn-serve` (thegn's own docs and
+    /// live-state server). Marker-tagged, idempotent, reversible, and never
+    /// touching an entry thegn did not write. Codex's TOML config is edited in
+    /// place, comments kept.
     Wire {
         /// A specific agent kind (claude|codex|cursor|windsurf|vscode|zed|amp|
         /// gemini). Omit to wire every configured `[[agents]]` with a known
-        /// adapter (or pass `--all`).
+        /// adapter plus every such agent installed for you (or pass `--all`).
         #[arg(long)]
         agent: Option<String>,
         /// Wire every supported agent adapter, not just configured ones.
