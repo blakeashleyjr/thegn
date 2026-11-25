@@ -737,6 +737,13 @@
       "changes": [
         "dynamic-key-discovery"
       ]
+    },
+    {
+      "issue": "THE-2705",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "hide-zero-fleet-meter"
+      ]
     }
   ]
 }

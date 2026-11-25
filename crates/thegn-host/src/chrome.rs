@@ -1712,7 +1712,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
         "fleet" => model
             .fleet
             .as_deref()
-            .and_then(fleet_widget)
+            .and_then(|snap| fleet_widget(snap, model.bars.fleet_always_show))
             .map(|(text, warn)| {
                 let fg = if warn {
                     level_color(Level::Warn)
@@ -1728,10 +1728,18 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
 /// The `fleet` widget's text and whether it warrants the amber tone (an orphan
 /// VM, a recorded VM the provider no longer lists, or a provider burn at a
 /// `[placement.fleet_budget]` limit). `None` hides it.
-pub(crate) fn fleet_widget(snap: &crate::fleet_read::FleetSnapshot) -> Option<(String, bool)> {
+pub(crate) fn fleet_widget(
+    snap: &crate::fleet_read::FleetSnapshot,
+    always_show: bool,
+) -> Option<(String, bool)> {
     let (view, cost) = (&snap.view, &snap.cost);
     let warn = view.orphans > 0 || !view.missing.is_empty() || !cost.budget.is_empty();
     if view.rows.is_empty() && cost.total_hourly <= 0.0 && !warn {
+        return None;
+    }
+    // A zero burn with nothing to flag (no unpriced VM, no warning) is hidden
+    // unless `[bars] fleet_always_show` keeps the meter on the bar.
+    if !always_show && cost.total_hourly <= 0.0 && cost.unpriced == 0 && !warn {
         return None;
     }
     let mut text = if cost.total_hourly > 0.0 && cost.total_hourly < 0.01 {

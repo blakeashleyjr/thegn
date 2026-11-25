@@ -77,7 +77,10 @@ The `fleet` widget shows the estimated hourly burn of your provider VMs
 inventoried and each VM is priced from the bundled price table or your
 `[placement.price]` overrides. `+N` counts VMs with no known price. It turns
 amber with a warning mark when a VM has no worktree (an orphan) or a
-worktree's recorded VM is no longer listed by its provider. Clicking it opens
+worktree's recorded VM is no longer listed by its provider. While the burn is
+zero (every listed VM stopped, or no provider usage yet) and nothing needs a
+warning or a price, the widget is hidden to keep the bar quiet; set
+`fleet_always_show = true` in `[bars]` to keep the `$0.00/h` meter on the bar. Clicking it opens
 the **fleet** popup: each VM's provider and env, id, state, size, `$/h`,
 accrued cost, worktree (or `ORPHAN`) and age, then the totals (per-provider
 hourly, today, month to date, and the next 24 h / 30 d at the current burn),

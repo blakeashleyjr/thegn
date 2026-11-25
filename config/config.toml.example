@@ -362,8 +362,11 @@ top_left = ["brand"]
 # clock. "weather" ships in the list but draws nothing until [weather] enabled =
 # true — the same way "gpu" is inert on a machine without one. "fleet" (the
 # estimated $/h of provider VMs; click for the per-VM popup) is likewise inert
-# until an [env.*] names an API provider (fly, sprites, hetzner, …).
+# until an [env.*] names an API provider (fly, sprites, hetzner, …). A "fleet"
+# burn of $0.00/h is hidden while nothing is burning; set fleet_always_show to
+# keep the meter on the bar at zero.
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "fleet", "date", "clock"]
+fleet_always_show = false
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
 bottom_left = ["help", "drawer", "keyhints"]

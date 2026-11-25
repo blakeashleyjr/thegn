@@ -116,6 +116,7 @@ bars.bottom_left
 bars.bottom_right
 bars.clock_format
 bars.date_format
+bars.fleet_always_show
 bars.top_left
 bars.top_right
 calendar.agenda_rows

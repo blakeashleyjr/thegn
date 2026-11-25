@@ -3380,6 +3380,10 @@ pub struct BarsConfig {
     pub date_format: String,
     /// chrono format string for the `clock` widget.
     pub clock_format: String,
+    /// Keep the `fleet` $/h meter on the bar while its burn is zero. Off by
+    /// default: a zero burn with nothing to flag (no VM running, or no provider
+    /// usage yet) hides the widget so the cluster shows only live numbers.
+    pub fleet_always_show: bool,
 }
 
 impl Default for BarsConfig {
@@ -3419,6 +3423,7 @@ impl Default for BarsConfig {
             ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
+            fleet_always_show: false,
         }
     }
 }
