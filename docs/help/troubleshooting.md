@@ -10,8 +10,8 @@ Start with the symptom you see. For more diagnostics, see [[debugging]].
 
 ## thegn will not start, says “command not found,” or shows a loader error
 
-**Why:** The GNU archive needs a glibc version at least as new as the build
-runner. The archive contains `thegn` only (no `tg` alias), and Git is
+**Why:** The GNU archive needs glibc 2.28 or newer; the musl archive works on any
+distribution. The archive contains `thegn` only (no `tg` alias), and Git is
 required at runtime.
 
 **Do this:** On an older Linux distribution, use the musl archive. Put

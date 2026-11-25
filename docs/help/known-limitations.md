@@ -13,7 +13,8 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 ## Platforms
 
 - **Linux x86_64 is supported.** Install from a GNU or musl release archive or
-  the Nix flake; use the musl archive on systems with older glibc.
+  the Nix flake; the GNU archive needs glibc 2.28 or newer, and the musl archive works on any
+  distribution.
 - **macOS on Apple silicon is supported**; Intel macOS has no release binary.
   Install with `brew install blakeashleyjr/thegn/thegn` (not quarantined). The
   release archive is unsigned; clear quarantine with
