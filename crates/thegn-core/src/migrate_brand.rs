@@ -60,6 +60,55 @@ pub struct MigrationReport {
     pub moved: Vec<(PathBuf, PathBuf)>,
     /// Human-readable warnings for anything skipped or failed.
     pub warnings: Vec<String>,
+    /// "both old and new exist" notices. Kept apart from `warnings` so
+    /// [`run_startup_migration`] can show them at most once per day.
+    pub notices: Vec<String>,
+}
+
+/// File in the new state dir recording the epoch second the both-exist notice
+/// was last shown.
+pub(crate) const NOTICE_MARKER_NAME: &str = "both-exist-notice.last";
+
+/// Minimum seconds between two displays of the both-exist notice.
+pub(crate) const NOTICE_INTERVAL_S: i64 = 24 * 60 * 60;
+
+/// Pure once-a-day decision: show when never shown, when the interval has
+/// elapsed, or when the clock ran backwards (re-arm instead of silencing).
+pub(crate) fn notice_due(last_shown_s: Option<i64>, now_s: i64) -> bool {
+    match last_shown_s {
+        None => true,
+        Some(last) => now_s < last || now_s.saturating_sub(last) >= NOTICE_INTERVAL_S,
+    }
+}
+
+fn read_notice_marker(path: &Path) -> Option<i64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn write_notice_marker(path: &Path, now_s: i64) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{now_s}\n"))
+}
+
+/// Move `notices` into `warnings` only when `notice_due` allows it, and
+/// record the show time. Otherwise the notices are dropped for this run.
+fn throttle_notices(report: &mut MigrationReport, marker: &Path, now_s: i64) {
+    if report.notices.is_empty() {
+        return;
+    }
+    if !notice_due(read_notice_marker(marker), now_s) {
+        report.notices.clear();
+        return;
+    }
+    if let Err(e) = write_notice_marker(marker, now_s) {
+        report.warnings.push(format!(
+            "could not record migrate notice time in {}: {e}",
+            marker.display()
+        ));
+    }
+    report.warnings.append(&mut report.notices);
 }
 
 impl MigrationReport {
@@ -274,7 +323,7 @@ pub(crate) fn migrate_at(
             RootAction::OldAbsent => {}
             RootAction::NewExists => {
                 if old.exists() {
-                    report.warnings.push(format!(
+                    report.notices.push(format!(
                         "both {} and {} exist — preferring the new path, old left untouched",
                         old.display(),
                         new.display()
@@ -360,7 +409,10 @@ pub fn run_startup_migration() -> MigrationReport {
     let state_parent = util::xdg_state_home();
     let config_parent = util::xdg_config_home();
     let home = util::home();
-    migrate_at(&state_parent, &config_parent, &home, migrate_app_home)
+    let mut report = migrate_at(&state_parent, &config_parent, &home, migrate_app_home);
+    let marker = state_parent.join("thegn").join(NOTICE_MARKER_NAME);
+    throttle_notices(&mut report, &marker, util::now());
+    report
 }
 
 #[cfg(test)]
@@ -449,7 +501,8 @@ mod tests {
 
         let report = migrate_at(&state, &config, &home, true);
         assert!(!report.migrated_anything());
-        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.notices.len(), 1, "{:?}", report.notices);
         assert_eq!(
             std::fs::read(config.join("thegn/config.toml")).unwrap(),
             b"new",
@@ -459,6 +512,44 @@ mod tests {
             config.join("superzej/config.toml").exists(),
             "old preserved"
         );
+    }
+
+    #[test]
+    fn notice_due_once_per_day() {
+        let day = NOTICE_INTERVAL_S;
+        assert!(notice_due(None, 1_000));
+        assert!(!notice_due(Some(1_000), 1_000));
+        assert!(!notice_due(Some(1_000), 1_000 + day - 1));
+        assert!(notice_due(Some(1_000), 1_000 + day));
+        assert!(notice_due(Some(1_000), 1_000 + 3 * day));
+        // Clock stepped backwards: re-arm rather than stay silent for days.
+        assert!(notice_due(Some(1_000), 500));
+    }
+
+    #[test]
+    fn notice_throttle_shows_once_then_waits_a_day() {
+        let t = tempfile::tempdir().unwrap();
+        let marker = t.path().join("st/thegn").join(NOTICE_MARKER_NAME);
+        let mk = || MigrationReport {
+            notices: vec!["both exist".into()],
+            ..Default::default()
+        };
+        let now = 1_700_000_000;
+
+        let mut first = mk();
+        throttle_notices(&mut first, &marker, now);
+        assert_eq!(first.warnings, vec!["both exist".to_string()]);
+        assert!(first.notices.is_empty());
+        assert!(marker.exists(), "show time recorded in the new state dir");
+
+        let mut same_day = mk();
+        throttle_notices(&mut same_day, &marker, now + 100);
+        assert!(same_day.warnings.is_empty(), "{:?}", same_day.warnings);
+        assert!(same_day.notices.is_empty());
+
+        let mut next_day = mk();
+        throttle_notices(&mut next_day, &marker, now + NOTICE_INTERVAL_S);
+        assert_eq!(next_day.warnings, vec!["both exist".to_string()]);
     }
 
     #[test]
