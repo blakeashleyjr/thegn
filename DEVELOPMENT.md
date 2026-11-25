@@ -109,8 +109,9 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
 - **CPU is not the only axis, and it was the only one gated.** `just bench-soak`
   (`cpu-sample.sh --scenario soak`) samples what a windowed CPU measurement
   structurally cannot see — unreaped **children** (zombies counted separately),
-  **fds** by class, **thread** high-water, and the **read-syscall rate** — and,
-  unlike the advisory A/B perf recipes, it **fails** on a ceiling. It exists
+  **fds** by class, **thread** high-water, the **read-syscall rate**, and
+  **resident memory** for the host and the pane daemon. Unlike the advisory A/B
+  perf recipes, it **fails** on a ceiling. It exists
   because an instance ran three days to 4,408 zombie `git-lfs` children and
   26,063 reads/sec, taking the machine to load 10–13 with `top` showing 45% idle,
   while its cores-used looked ordinary: **4,408 zombies consume zero CPU.** The
@@ -197,7 +198,7 @@ just smoke           # hermetic end-to-end CLI test
 just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
-just bench-soak      # resource-soak gate: children/fds/threads/syscall rate (not in ci)
+just bench-soak      # resource-soak gate: children/fds/threads/syscall rate/memory (not in ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
 just test-windows-wine  # windows-gnu tests under Wine (heavy, not in ci)
 just test-remote host=<h>  # gate on an ssh host; see CONTRIBUTING.md

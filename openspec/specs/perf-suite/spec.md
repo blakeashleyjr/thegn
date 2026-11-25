@@ -34,6 +34,23 @@ The runtime SHALL emit a slow-frame warning when `render_p50_us` exceeds `THEGN_
 - **WHEN** median render time exceeds the configured frame budget
 - **THEN** a slow-frame warning is emitted
 
+### Requirement: Soak output reports host and daemon resident memory
+
+The soak harness SHALL publish peak resident memory for the host and, when the
+scenario starts one, the pane daemon, in KiB, naming the OS source. A fixed RSS
+ceiling SHALL be enforced only after a measured run fixes its value; the harness
+MUST NOT invent a default ceiling.
+
+#### Scenario: RSS is reported
+
+- **WHEN** a soak run samples a procfs-backed host and pane daemon
+- **THEN** its JSON includes `rss_host_kb` and `rss_daemon_kb` in KiB
+
+#### Scenario: No measurement fixes the ceiling
+
+- **WHEN** no measured RSS baseline has been recorded
+- **THEN** the RSS gate is unset and the run reports the value without failing on it
+
 ### Requirement: Benchmarks are opt-in and excluded from CI
 
 The idle harness, micro-benchmarks, and flame-graph profiler SHALL be opt-in tools excluded from `just ci` because they are machine-dependent, while the render-decision invariants MUST be enforced in CI as pure unit tests.
