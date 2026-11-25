@@ -1,0 +1,4 @@
+- [x] Workflow `bridge` job and archive include
+- [x] Manifest/validator/stage/payload require `thegn-musl`
+- [x] Homebrew/AUR/nfpm install it
+- [x] Docs and tests

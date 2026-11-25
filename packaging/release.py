@@ -35,6 +35,8 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # fixed name in `expected_release_assets` and is bound by the manifest like every
 # other asset.
 TRUSTED_NAME_RE = re.compile(r"(?:thegn[A-Za-z0-9._+-]*|SHA256SUMS)")
+# Static x86_64-linux-musl resident bridge shipped beside the host binary.
+BRIDGE_NAME = "thegn-musl"
 TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,}")
 PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 RELEASE_TAG_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")
@@ -192,7 +194,7 @@ def _validate_manifest(manifest: Mapping[str, Any], packaging_dir: Path) -> None
     if formats != {"unix": "tar.gz", "windows": "zip"}:
         raise ReleaseError("archive.formats must map unix to tar.gz and windows to zip")
     root_files = archive.get("root_files")
-    if root_files != ["thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]:
+    if root_files != ["thegn", BRIDGE_NAME, "LICENSE-MIT", "LICENSE-APACHE", "README.md"]:
         raise ReleaseError("archive.root_files does not match the release archive layout")
 
     targets = _object(manifest.get("targets"), "targets")
@@ -406,6 +408,9 @@ def _archive_required_files(manifest: Mapping[str, Any], target: str) -> list[st
     target_config = manifest["targets"][target]
     required = list(manifest["archive"]["root_files"])
     required[0] = target_config.get("binary", project["binary"])
+    if target_config.get("platform") != "unix":
+        # The resident bridge is a Linux musl binary pushed from unix hosts only.
+        required.remove(BRIDGE_NAME)
     return required
 
 
@@ -566,7 +571,7 @@ def stage_archive(
                             os.fsync(destination.fileno())
                             os.fchmod(
                                 destination.fileno(),
-                                0o755 if name == required[0] else 0o644,
+                                0o755 if name in (required[0], BRIDGE_NAME) else 0o644,
                             )
                     finally:
                         source.close()
@@ -604,11 +609,12 @@ def stage_archive(
 def verify_package_payload(staged: Mapping[str, str], payload_root: Path, label: str) -> None:
     expected = {
         "usr/bin/thegn": ("thegn", "file"),
+        f"usr/bin/{BRIDGE_NAME}": (BRIDGE_NAME, "file"),
         "usr/bin/tg": (None, "alias"),
         "usr/share/licenses/thegn/LICENSE-MIT": ("LICENSE-MIT", "file"),
         "usr/share/licenses/thegn/LICENSE-APACHE": ("LICENSE-APACHE", "file"),
     }
-    for digest_name in ("thegn", "LICENSE-MIT", "LICENSE-APACHE"):
+    for digest_name in ("thegn", BRIDGE_NAME, "LICENSE-MIT", "LICENSE-APACHE"):
         digest = staged.get(digest_name)
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReleaseError(
@@ -695,9 +701,9 @@ def load_staged_digests(path: Path) -> dict[str, str]:
         if descriptor is not None:
             os.close(descriptor)
     value = _object(value, f"staged digests in {path}")
-    required = {"thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"}
+    required = {"thegn", BRIDGE_NAME, "LICENSE-MIT", "LICENSE-APACHE", "README.md"}
     if set(value) != required:
-        raise ReleaseError("staged digests must contain exactly the four archive root files")
+        raise ReleaseError("staged digests must contain exactly the five archive root files")
     for name, digest in value.items():
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReleaseError(f"staged digest for {name} must be lowercase 64-hex SHA-256")
@@ -960,7 +966,9 @@ def _validate_archive_layout(
                             f"archive {path} exceeds compression ratio {MAX_COMPRESSION_RATIO}"
                         )
                     regular.add(member.name.rstrip("/"))
-                    if member.name.rstrip("/") == "thegn" and not member.mode & 0o111:
+                    if member.name.rstrip("/") in ("thegn", BRIDGE_NAME) and not (
+                        member.mode & 0o111
+                    ):
                         thegn_executable = False
         else:
             with zipfile.ZipFile(path) as archive:
@@ -1060,8 +1068,7 @@ def validate_assets(
                 f"checksum mismatch for {archive_name}: expected {checksum}, got {actual}"
             )
         target_config = targets[target]
-        required = list(manifest["archive"]["root_files"])
-        required[0] = target_config.get("binary", project["binary"])
+        required = _archive_required_files(manifest, target)
         _validate_archive_layout(archive_path, target_config["platform"], required)
         url = f"{repository}/releases/download/{tag}/{archive_name}"
         assets[target] = Asset(target, archive_path, checksum_path, checksum, url)
@@ -1196,8 +1203,7 @@ def build_release_manifest(
     for target, config in manifest["targets"].items():
         if config["enabled"]:
             archive_name, _ = _asset_names(manifest, tag, target)
-            required = list(manifest["archive"]["root_files"])
-            required[0] = config.get("binary", manifest["project"]["binary"])
+            required = _archive_required_files(manifest, target)
             _validate_archive_layout(found[archive_name], config["platform"], required)
 
     result_assets = []

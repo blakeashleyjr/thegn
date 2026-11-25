@@ -17,6 +17,7 @@ sha256sums=('@@SHA256@@')
 
 package() {
   install -Dm755 thegn "${pkgdir}/usr/bin/thegn"
+  install -Dm755 thegn-musl "${pkgdir}/usr/bin/thegn-musl"
   ln -s thegn "${pkgdir}/usr/bin/tg"
   install -Dm644 LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"

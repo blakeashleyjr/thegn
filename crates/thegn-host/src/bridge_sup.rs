@@ -260,6 +260,11 @@ pub fn verified_exec_argv(bridge: &ResidentBridge, args: &[String]) -> Vec<Strin
     argv
 }
 
+/// Operator-facing explanation shared by every "no bridge found" message.
+pub const BRIDGE_MISSING_HINT: &str = "provider connects run without a resident bridge; release \
+     archives and Homebrew ship `thegn-musl` beside `thegn` — reinstall, place it next to the \
+     thegn executable, or set THEGN_BRIDGE_BINARY to a static x86_64-linux-musl thegn";
+
 /// The local static-musl `thegn` to push into a remote env, or `None` to skip
 /// the push (the bridge then falls back to the per-op git path). Resolution:
 /// `THEGN_BRIDGE_BINARY` env (an explicit artifact path, e.g. set by the nix
@@ -384,9 +389,7 @@ impl LocalBridgeReport {
     pub(crate) fn lines(&self) -> Vec<String> {
         let mut lines = vec!["Provider bridge (local artifact)".to_string()];
         match self {
-            Self::Absent => lines.push(
-                "  artifact      none (provider connects run without a resident bridge; set THEGN_BRIDGE_BINARY or install thegn-musl beside thegn)".to_string(),
-            ),
+            Self::Absent => lines.push(format!("  artifact      none ({BRIDGE_MISSING_HINT})")),
             Self::Unreadable { path, error } => lines.push(format!(
                 "  artifact      {} (unreadable: {error})",
                 path.display()
@@ -396,7 +399,10 @@ impl LocalBridgeReport {
                 bytes,
                 bridge,
             } => {
-                lines.push(format!("  artifact      {} ({bytes} bytes)", path.display()));
+                lines.push(format!(
+                    "  artifact      {} ({bytes} bytes)",
+                    path.display()
+                ));
                 lines.push(format!("  sha256        {}", bridge.sha256()));
                 lines.push(format!(
                     "  resident      {} (re-verified before every launch)",

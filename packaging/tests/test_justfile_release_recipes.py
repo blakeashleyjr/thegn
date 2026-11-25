@@ -89,6 +89,9 @@ class ReleaseArtifactsRecipeTests(unittest.TestCase):
             )
 
             env = os.environ.copy()
+            bridge_stub = stub_dir / "bridge-stub"
+            bridge_stub.write_bytes(b"bridge-fixture")
+            env["THEGN_BRIDGE_BINARY"] = str(bridge_stub)
             env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
             if cargo_target_dir is None:
                 env.pop("CARGO_TARGET_DIR", None)

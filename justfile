@@ -1595,10 +1595,11 @@ release-package-dry-run tag:
     mkdir -p "$assets" "$stage"
     cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
     printf '#!/bin/sh\nexit 0\n' >"$stage/thegn"
-    chmod +x "$stage/thegn"
+    printf '#!/bin/sh\nexit 0\n' >"$stage/thegn-musl"
+    chmod +x "$stage/thegn" "$stage/thegn-musl"
     for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
       stem="thegn-$tag-$target"
-      (cd "$stage" && tar czf "$assets/$stem.tar.gz" thegn LICENSE-MIT LICENSE-APACHE README.md)
+      (cd "$stage" && tar czf "$assets/$stem.tar.gz" thegn thegn-musl LICENSE-MIT LICENSE-APACHE README.md)
       (cd "$assets" && shasum -a 256 "$stem.tar.gz" >"$stem.sha256")
     done
     python3 packaging/release.py validate --tag "$tag" --assets-dir "$assets"
@@ -1644,10 +1645,17 @@ release-artifacts tag:
     cargo build --release --locked -p thegn-host --bin thegn --features iroh --target "$target"
     rm -rf "$out/stage"; mkdir -p "$out/stage"
     cp "${CARGO_TARGET_DIR:-target}/$target/release/thegn" "$out/stage/thegn"
+    # Every archive ships the static Linux musl resident bridge beside the host
+    # binary (Sprites/Vercel panes push it; a macOS host needs it too). Take it
+    # from THEGN_BRIDGE_BINARY, else the `just bridge` output; refuse to ship
+    # an archive without one.
+    bridge="${THEGN_BRIDGE_BINARY:-$PWD/target/release/thegn-musl}"
+    [ -f "$bridge" ] || { echo "release-artifacts: no bridge at $bridge — run 'just bridge' or set THEGN_BRIDGE_BINARY" >&2; exit 1; }
+    install -m755 "$bridge" "$out/stage/thegn-musl"
     # Same `include:` set as the release workflow — a dual-licensed artifact
     # must carry its license text, and the rehearsal must match what ships.
     cp LICENSE-MIT LICENSE-APACHE README.md "$out/stage/"
-    (cd "$out/stage" && tar czf "../$archive.tar.gz" thegn LICENSE-MIT LICENSE-APACHE README.md)
+    (cd "$out/stage" && tar czf "../$archive.tar.gz" thegn thegn-musl LICENSE-MIT LICENSE-APACHE README.md)
     # `shasum -a 256`, not `sha256sum`: macOS has no GNU coreutils by default,
     # which is the same fallback the release action makes.
     (cd "$out" && shasum -a 256 "$archive.tar.gz" >"$archive.sha256")

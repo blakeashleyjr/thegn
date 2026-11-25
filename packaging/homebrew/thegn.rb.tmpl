@@ -23,6 +23,9 @@ class Thegn < Formula
 
   def install
     bin.install "thegn"
+    # Linux musl bridge pushed into Sprites/Vercel sandboxes; the host finds it
+    # next to its own executable.
+    bin.install "thegn-musl"
     bin.install_symlink "thegn" => "tg"
   end
 
