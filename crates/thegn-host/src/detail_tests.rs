@@ -2488,3 +2488,38 @@ fn mq_row_identity_drift_label_replaces_environment_label() {
     let note = row.note.as_deref().unwrap();
     assert!(!note.contains('\u{1b}'));
 }
+
+#[test]
+fn enter_on_a_notification_shows_its_full_text_in_place() {
+    let long = format!("spawn failed: {} end-marker", "word ".repeat(60));
+    let mut n = notif(NotificationKind::LogError, "pane", &long, 5);
+    n.worktree_path = "/wt/a".into();
+    let model = notif_model(vec![n], vec![]);
+    let mut ov = open_notifications(&model);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let all = l
+        .rows
+        .iter()
+        .map(|r| r.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(all.contains("end-marker"), "full text shown: {all}");
+    assert!(all.contains("jump to worktree"));
+    assert_eq!(ov.title(), "Notification");
+}
+
+#[test]
+fn wrap_full_text_keeps_every_word_and_breaks_long_tokens() {
+    let lines = super::wrap_full_text("aaa bbb\nccc", 8);
+    assert_eq!(lines, vec!["aaa bbb", "ccc"]);
+    let long = "x".repeat(20);
+    let wrapped = super::wrap_full_text(&long, 8);
+    assert_eq!(wrapped.concat(), long);
+    assert!(wrapped.iter().all(|l| l.len() <= 8));
+}

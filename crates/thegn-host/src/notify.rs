@@ -461,6 +461,17 @@ pub fn record(
     )
 }
 
+fn suppressed_decision() -> RouteDecision {
+    RouteDecision {
+        record: false,
+        effective_priority: thegn_core::notification::Priority::Notice,
+        desktop: false,
+        toast: false,
+        push_sinks: Vec::new(),
+        sound: None,
+    }
+}
+
 pub(crate) fn record_with_facts(
     db: &thegn_core::db::Db,
     state: &NotifyState,
@@ -474,19 +485,14 @@ pub(crate) fn record_with_facts(
     // a flaky remote fires an identical process_failed every few seconds; one
     // per window is signal, the rest are inbox noise.
     if kind == "process_failed" {
+        // Identical repeats for the same worktree fold into the existing unread
+        // row ("×N", latest time) instead of adding rows, in or out of window.
+        if let Ok(Some(_)) = db.collapse_repeat_notification(kind, worktree, message) {
+            return (suppressed_decision(), None);
+        }
         let now = chrono::Local::now().timestamp();
         if !state.debounce.lock().unwrap().allow(worktree, kind, now) {
-            return (
-                RouteDecision {
-                    record: false,
-                    effective_priority: thegn_core::notification::Priority::Notice,
-                    desktop: false,
-                    toast: false,
-                    push_sinks: Vec::new(),
-                    sound: None,
-                },
-                None,
-            );
+            return (suppressed_decision(), None);
         }
     }
     let decision = state.decide(kind, source_ref, message, worktree);

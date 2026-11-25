@@ -40,6 +40,9 @@ pub(crate) struct OnboardingUi {
     pub ui: Option<OnboardingWizard>,
     pub wait: Option<(u32, bool)>,
     pub tour: Option<WelcomeTour>,
+    /// Unix seconds when the current wizard/tour flow began; pane spawn failures
+    /// recorded at or after it veto the success line.
+    pub started_at: Option<i64>,
 }
 
 impl OnboardingUi {
@@ -51,6 +54,7 @@ impl OnboardingUi {
     /// Open the welcome tour (palette `setup-wizard`), replacing an open wizard.
     pub(crate) fn open_tour(&mut self, cfg: &Config) {
         self.ui = None;
+        self.started_at = Some(thegn_core::util::now());
         self.tour = Some(WelcomeTour::new(cfg));
     }
 
@@ -127,6 +131,7 @@ pub(crate) fn startup(
             ui: wizard,
             wait: None,
             tour,
+            started_at: Some(thegn_core::util::now()),
         },
         rebuild,
     )
@@ -221,13 +226,38 @@ pub(crate) fn handle_key_event(
             }
             persist_done(completed);
             model.status = if completed {
-                "setup complete — re-run any time with `thegn setup`".into()
+                completion_status(
+                    "setup complete — re-run any time with `thegn setup`",
+                    ob.started_at,
+                    &model.panel.notifications,
+                )
             } else {
                 "setup dismissed — re-run any time with `thegn setup`".into()
             };
         }
     }
     applied
+}
+
+/// The status line for a finished flow: `success` unless a pane failed to spawn
+/// (an unread `process_failed` notification recorded since `started_at`), in
+/// which case the failure text (real error + log path) replaces the success claim.
+fn completion_status(
+    success: &str,
+    started_at: Option<i64>,
+    notifications: &[thegn_core::notification::Notification],
+) -> String {
+    let Some(since) = started_at else {
+        return success.to_string();
+    };
+    match notifications.iter().find(|n| {
+        n.kind == thegn_core::notification::NotificationKind::ProcessFailed
+            && !n.read
+            && n.created_at_ms >= since
+    }) {
+        Some(n) => format!("setup finished, but a pane failed to start: {}", n.message),
+        None => success.to_string(),
+    }
 }
 
 /// Feed one key to the welcome tour: live theme preview, probe spawns, and on
@@ -288,6 +318,7 @@ fn handle_tour_key(
             };
             save_tour_writes(writes, model, cfg, refresh_tx, waker, applied);
             if open_setup {
+                ob.started_at = Some(thegn_core::util::now());
                 ob.ui = Some(OnboardingWizard::new(cfg));
             }
         }
@@ -789,5 +820,30 @@ mod tests {
             startup_db_state(Some(&db)),
             (false, Some("vscode".to_string()))
         );
+    }
+
+    #[test]
+    fn completion_status_reports_a_recorded_pane_failure_not_success() {
+        use thegn_core::notification::{Notification, NotificationKind};
+        let fail = |at: i64, read: bool| Notification {
+            id: 1,
+            kind: NotificationKind::ProcessFailed,
+            source_ref: "pane".into(),
+            message: "Shell failed to launch: boom. Log: /tmp/thegn.log".into(),
+            created_at_ms: at,
+            read,
+            worktree_path: String::new(),
+        };
+        let ok = "setup complete";
+        assert_eq!(completion_status(ok, Some(100), &[]), ok);
+        assert_eq!(completion_status(ok, Some(100), &[fail(50, false)]), ok);
+        assert_eq!(completion_status(ok, Some(100), &[fail(150, true)]), ok);
+        assert_eq!(completion_status(ok, None, &[fail(150, false)]), ok);
+        let shown = completion_status(ok, Some(100), &[fail(150, false)]);
+        assert!(
+            shown.contains("boom") && shown.contains("/tmp/thegn.log"),
+            "{shown}"
+        );
+        assert!(!shown.contains("setup complete"));
     }
 }
