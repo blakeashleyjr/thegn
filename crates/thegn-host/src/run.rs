@@ -861,10 +861,13 @@ pub async fn main(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
     let daemon_cfg = cfg.daemon.clone();
-    tokio::task::spawn_blocking(move || {
+    // Filesystem work (private run dir + locator files) that nothing before the
+    // event loop reads: overlap it with session/theme/DB/hydration startup and
+    // join it just before the loop, so it is still published before any pane
+    // can launch without sitting serially on the launch→first-frame path.
+    let control_publish_task = tokio::task::spawn_blocking(move || {
         crate::daemon::control_publish::publish_for_config(&daemon_cfg);
-    })
-    .await?;
+    });
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let session_t0 = std::time::Instant::now();
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
@@ -1414,6 +1417,8 @@ pub async fn main(
 
     let resident_supervisor =
         thegn_svc::plugin::ResidentSupervisor::new(tokio::runtime::Handle::current());
+    // Join the overlapped control-locator publish (normally long finished).
+    control_publish_task.await?;
     let result = event_loop(
         resident_supervisor.clone(),
         &mut buf,
@@ -1564,6 +1569,16 @@ pub async fn main(
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
+}
+
+/// `THEGN_BENCH_FIRST_FRAME_EXIT` fast exit: restore terminal modes and leave
+/// the process immediately so the measured time is time-to-first-frame.
+fn bench_first_frame_exit() -> ! {
+    let _ = crate::frame_writer::write_terminal_teardown(
+        b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
+    ); // best-effort: bench exit; the process is leaving regardless
+    thegn_core::log_trace::run_panic_restore_once();
+    std::process::exit(0)
 }
 
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
@@ -17707,10 +17722,12 @@ async fn event_loop<T: Terminal>(
                     "first frame submitted"
                 );
                 // Benchmark hook (`just bench`): exit right after the first
-                // real frame so hyperfine measures launch → first paint.
-                // `run::main` still tears down the alt screen + raw mode.
+                // real frame so hyperfine measures launch → first paint, not
+                // teardown. Restore the terminal (same bytes + shared panic
+                // restore as the normal teardown), then `process::exit`,
+                // skipping task joins and drops.
                 if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some() {
-                    return Ok(());
+                    bench_first_frame_exit();
                 }
                 crate::db_maintain::arm_after_first_frame();
                 // Deferred warms — AFTER the first flush so they never tax
