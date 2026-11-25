@@ -343,14 +343,25 @@ fn apply_mode_status(
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
 /// is created in `~/.local/state/thegn/recordings/` and every frame pushed
 /// to the terminal is appended to it.
-/// Yank `text` into register `name` (in memory) and persist the affected
+/// Yank `text` into register `name` (in memory) and, when `persist` is set
+/// (`[clipboard] persist_registers`, default off), persist the affected
 /// registers to the DB so they survive a restart. `name` defaults to `"`; the
 /// yank also updates the default register (vim semantics), so an unnamed
 /// `PasteRegister` retrieves the most recent copy. The volatile `"+` clipboard
 /// register is never persisted (the caller writes the OS clipboard separately).
-fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text: String) {
+fn store_yank(
+    registers: &mut thegn_core::registers::Registers,
+    name: char,
+    text: String,
+    persist: bool,
+) {
     use thegn_core::registers::{DEFAULT, is_persistent};
     if !registers.yank(name, text.clone()) {
+        return;
+    }
+    // Copied text can carry secrets: it reaches the DB only when the user opted
+    // in with `[clipboard] persist_registers`.
+    if !persist {
         return;
     }
     // The in-memory register is already updated (same-session paste works now);
@@ -3452,10 +3463,18 @@ fn load_loop_startup_prefs(
     thegn_core::registers::Registers,
     crate::monitor::MonitorPrefs,
 ) {
-    let registers = db
-        .and_then(|db| db.all_registers().ok())
-        .map(thegn_core::registers::Registers::from_pairs)
-        .unwrap_or_default();
+    // Yank retention is opt-in: when off, rows an earlier build left behind are
+    // deleted and nothing is loaded.
+    let registers = if cfg.clipboard.persist_registers {
+        db.and_then(|db| db.all_registers().ok())
+            .map(thegn_core::registers::Registers::from_pairs)
+            .unwrap_or_default()
+    } else {
+        if let Some(db) = db {
+            let _ = db.clear_registers(); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+        thegn_core::registers::Registers::default()
+    };
     let monitor = match db {
         Some(db) => crate::monitor::state::load(db, &cfg.monitor),
         None => crate::monitor::MonitorPrefs::from_config(&cfg.monitor),
@@ -19463,6 +19482,7 @@ async fn event_loop<T: Terminal>(
                                         &mut registers,
                                         thegn_core::registers::DEFAULT,
                                         text.clone(),
+                                        keymap.config().clipboard.persist_registers,
                                     );
                                     match copy_result {
                                         Ok(()) => toasts.info(
@@ -29022,6 +29042,7 @@ async fn event_loop<T: Terminal>(
                                             &mut registers,
                                             thegn_core::registers::DEFAULT,
                                             text.clone(),
+                                            keymap.config().clipboard.persist_registers,
                                         );
                                         match copy_result {
                                             Ok(()) => toasts.info(

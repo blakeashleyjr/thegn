@@ -144,6 +144,7 @@ ci.ttl_secs
 clipboard.image_paste
 clipboard.keep_hours
 clipboard.max_image_bytes
+clipboard.persist_registers
 clipboard.remote_dir
 confirm_delete
 daemon.enabled

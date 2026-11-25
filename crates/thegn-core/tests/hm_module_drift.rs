@@ -1697,6 +1697,7 @@ fn every_numeric_option_matches_its_destination_range() {
         ("sessionResidentPoolLimit", "session.resident_pool_limit"),
         ("clipboardMaxImageBytes", "clipboard.max_image_bytes"),
         ("clipboardKeepHours", "clipboard.keep_hours"),
+        ("clipboardPersistRegisters", "clipboard.persist_registers"),
         ("locScanIntervalSecs", "loc.scan_interval_secs"),
         ("locMaxScanPerRound", "loc.max_scan_per_round"),
         ("locWatchInvalidateSecs", "loc.watch_invalidate_secs"),

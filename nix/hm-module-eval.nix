@@ -105,6 +105,7 @@
           clipboardMaxImageBytes = 1048576;
           clipboardRemoteDir = "~/.cache/thegn/paste-hm";
           clipboardKeepHours = 12;
+          clipboardPersistRegisters = true;
           locEnabled = false;
           locScanIntervalSecs = 1800;
           locMaxScanPerRound = 4;

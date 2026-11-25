@@ -518,8 +518,15 @@ fn loop_startup_prefs_use_one_optional_db_connection() {
         .unwrap();
     let db = thegn_core::db::Db::open_at(&root.path().join("thegn.db")).unwrap();
     db.put_register('a', "saved register").unwrap();
-    let cfg = thegn_core::config::Config::default();
+    let mut cfg = thegn_core::config::Config::default();
 
+    // Default: yank retention is off; stale rows are not loaded and are deleted.
+    let (registers, _) = load_loop_startup_prefs(Some(&db), &cfg);
+    assert_eq!(registers.get('a'), None);
+    assert!(db.all_registers().unwrap().is_empty());
+
+    db.put_register('a', "saved register").unwrap();
+    cfg.clipboard.persist_registers = true;
     let (registers, prefs) = load_loop_startup_prefs(Some(&db), &cfg);
     assert_eq!(registers.get('a'), Some("saved register"));
     assert_eq!(

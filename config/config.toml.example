@@ -5042,6 +5042,7 @@ image_paste = true             # master switch; false ⇒ paste-image inert, no 
 max_image_bytes = 10485760     # refuse clipboard images larger than this (10 MiB), before any byte leaves the machine
 remote_dir = "~/.cache/thegn/paste"  # confined remote drop dir (0700); leading ~ expands via the remote $HOME
 keep_hours = 24                # sweep drops older than this on the next paste (age-based; no reaper thread)
+persist_registers = false      # true ⇒ yanked text is kept in thegn.db across restarts; default keeps it in memory only
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,

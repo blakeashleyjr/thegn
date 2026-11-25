@@ -305,6 +305,9 @@ pub trait WorktreeAuxStore {
     /// Load every persisted register as `(name, value)` pairs.
     fn all_registers(&self) -> Result<Vec<(char, String)>>;
 
+    /// Delete every persisted register (yank retention is opt-in).
+    fn clear_registers(&self) -> Result<()>;
+
     /// Insert or update the share record for `(worktree, local_port)`.
     fn upsert_share(
         &self,

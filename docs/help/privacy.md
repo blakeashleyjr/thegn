@@ -40,6 +40,11 @@ dials it (see [[media]]).
   and the file is restricted to your account (0600). The database also holds
   some live bearer credentials (iroh pair secrets), so treat copies and backups
   as sensitive.
+- **Copied text:** Text you copy from a pane is kept in memory only (yank
+  registers) and is not written to the state database. `[clipboard]
+persist_registers = true` opts in to keeping it across restarts; turning it
+  off again deletes the stored registers at the next startup. The `"+`
+  system-clipboard register is never stored. See [[copy-and-select]].
 - **Doctor report:** `thegn doctor` redacts identifying tailnet detail —
   the tailnet name and the control URL print as `***redacted***` — because
   its output is regularly pasted into issues. `thegn doctor --full` (alias

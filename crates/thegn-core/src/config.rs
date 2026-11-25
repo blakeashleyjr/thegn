@@ -1647,6 +1647,11 @@ pub struct ClipboardConfig {
     /// Age (hours) past which a drop file is swept on the next paste. The sweep
     /// is age-based and piggybacks each paste — no background timer (0%-idle).
     pub keep_hours: u64,
+    /// Persist yank registers (copied text) to the state database so they
+    /// survive a restart. Default `false`: registers live in memory only, and
+    /// any register rows left by an earlier build are deleted at startup. Copied
+    /// text can carry secrets, so retention on disk is opt-in.
+    pub persist_registers: bool,
 }
 
 impl Default for ClipboardConfig {
@@ -1656,6 +1661,7 @@ impl Default for ClipboardConfig {
             max_image_bytes: 10 * 1024 * 1024,
             remote_dir: "~/.cache/thegn/paste".to_string(),
             keep_hours: 24,
+            persist_registers: false,
         }
     }
 }

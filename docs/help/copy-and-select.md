@@ -83,8 +83,10 @@ identify it as partial.
 ## Registers
 
 Yanks land in named registers, vim-style. `"` is the default and `+` is
-the system clipboard; some registers persist across sessions, so a yank
-survives a restart. **Paste from register** (palette, or bind
+the system clipboard. Registers live in memory only by default, so yanked
+text is never written to disk and does not survive a restart. To keep them
+across restarts, set `[clipboard] persist_registers = true`; the text is then
+stored in the state database (`"+` is never stored). **Paste from register** (palette, or bind
 `paste-register`) prompts for the register character and pastes it into the
 focused pane.
 

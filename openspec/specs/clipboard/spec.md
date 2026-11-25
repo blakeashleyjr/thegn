@@ -86,3 +86,17 @@ is untouched.
   than `keep_hours`
 - **THEN** those files are deleted as part of the same operation, and no
   path outside the drop directory is touched
+
+### Requirement: Copied text is not persisted by default
+
+Yank registers SHALL be held in memory only unless `[clipboard]
+persist_registers` is `true` (default `false`). When it is `false`, thegn SHALL
+NOT write copied text to the state database and SHALL delete any registers
+stored by an earlier build at startup. The `"+` clipboard register SHALL never
+be persisted.
+
+#### Scenario: Default copy leaves no database trace
+
+- **WHEN** the user copies text from a pane with default config
+- **THEN** the text is available to `paste-register` in this session and no
+  row is written to the `registers` table
