@@ -331,6 +331,206 @@ fn ensure_object_path<'a>(
         .ok_or_else(|| "settings container is not a JSON object".to_string())
 }
 
+// ── Lifecycle hooks (Claude `settings.json`, Codex `notify`) ────────────────
+
+/// The shell-comment tag that proves a Claude hook command is thegn's.
+pub const HOOK_MARKER: &str = "x-thegn-managed";
+
+/// Claude hook events thegn registers, as `(settings event, hook verb event)`:
+/// a finished turn reports `stop`, a permission or idle prompt `notification`.
+pub const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[("Stop", "stop"), ("Notification", "attention")];
+
+/// Quote one argv word for a POSIX shell (Claude runs hook commands through
+/// one). Plain paths stay bare.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':'));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// The marked shell command for one Claude hook event.
+pub fn claude_hook_command(command: &str, event: &str) -> String {
+    format!(
+        "{} agent hook claude {event} # {HOOK_MARKER}",
+        shell_word(command)
+    )
+}
+
+fn hook_group(command: &str, event: &str) -> Value {
+    json!({
+        "hooks": [{
+            "type": "command",
+            "command": claude_hook_command(command, event),
+        }]
+    })
+}
+
+/// Whether a Claude hook group holds a thegn-marked command.
+fn hook_group_is_ours(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains(HOOK_MARKER))
+            })
+        })
+}
+
+/// Add (or `remove`) thegn's lifecycle hook groups in a Claude settings tree.
+/// Only groups carrying [`HOOK_MARKER`] are ever replaced or removed; the
+/// user's own groups and every other key are left as they were. A `hooks` or
+/// event value of the wrong JSON type is refused rather than rewritten.
+pub fn apply_claude_hooks(
+    settings: &mut Value,
+    command: &str,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    if settings.is_null() {
+        *settings = Value::Object(Map::new());
+    }
+    let root = settings
+        .as_object_mut()
+        .ok_or_else(|| "settings root is not a JSON object".to_string())?;
+    if remove && !root.contains_key("hooks") {
+        return Ok(WireOutcome::NothingToRemove);
+    }
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "`hooks` is not a JSON object — refusing to rewrite it".to_string())?;
+
+    let mut any_added = false;
+    let mut any_updated = false;
+    let mut any_removed = false;
+    for (event, verb_event) in CLAUDE_HOOK_EVENTS {
+        if remove && !hooks.contains_key(*event) {
+            continue;
+        }
+        let groups = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                format!("`hooks.{event}` is not a JSON array — refusing to rewrite it")
+            })?;
+        let ours = groups.iter().position(hook_group_is_ours);
+        if remove {
+            if let Some(i) = ours {
+                groups.remove(i);
+                any_removed = true;
+            }
+        } else {
+            let want = hook_group(command, verb_event);
+            match ours {
+                Some(i) if groups[i] == want => {}
+                Some(i) => {
+                    groups[i] = want;
+                    any_updated = true;
+                }
+                None => {
+                    groups.push(want);
+                    any_added = true;
+                }
+            }
+        }
+        if groups.is_empty() {
+            hooks.remove(*event);
+        }
+    }
+    if any_removed && hooks.is_empty() {
+        root.remove("hooks");
+    }
+    Ok(if remove {
+        if any_removed {
+            WireOutcome::Removed
+        } else {
+            WireOutcome::NothingToRemove
+        }
+    } else if any_added {
+        WireOutcome::Added
+    } else if any_updated {
+        WireOutcome::Updated
+    } else {
+        WireOutcome::Unchanged
+    })
+}
+
+/// The Codex `notify` argv thegn writes: Codex appends the event JSON as one
+/// more argument, so the verb reads it from the tail.
+pub fn codex_notify_argv(command: &str) -> Vec<String> {
+    ["agent", "hook", "codex", "stop"]
+        .iter()
+        .fold(vec![command.to_string()], |mut v, a| {
+            v.push((*a).to_string());
+            v
+        })
+}
+
+/// Whether a TOML `notify` value is thegn's own hook argv (its tail is
+/// `agent hook codex stop`).
+fn toml_notify_is_ours(item: &toml_edit::Item) -> bool {
+    let Some(arr) = item.as_array() else {
+        return false;
+    };
+    let words: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    words.len() == arr.len() && words.len() == 5 && words[1..] == ["agent", "hook", "codex", "stop"]
+}
+
+/// Add (or `remove`) thegn's top-level `notify = [...]` in a Codex
+/// `config.toml`. A `notify` the user wrote (any other argv) is never
+/// overwritten or removed: Codex runs a single notifier, so this is refused.
+pub fn apply_codex_notify(
+    doc: &mut toml_edit::DocumentMut,
+    command: &str,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    let root = doc.as_table_mut();
+    let existing = root.get("notify");
+    let ours = existing.is_some_and(toml_notify_is_ours);
+    if remove {
+        return match existing {
+            None => Ok(WireOutcome::NothingToRemove),
+            Some(_) if ours => {
+                root.remove("notify");
+                Ok(WireOutcome::Removed)
+            }
+            Some(_) => Err("`notify` was not written by thegn — refusing to remove it".to_string()),
+        };
+    }
+    if existing.is_some() && !ours {
+        return Err("`notify` is already set by you — refusing to overwrite it".to_string());
+    }
+    let want = codex_notify_argv(command);
+    if ours
+        && existing
+            .and_then(|i| i.as_array())
+            .and_then(|a| a.iter().next())
+            .and_then(|v| v.as_str())
+            == Some(command)
+    {
+        return Ok(WireOutcome::Unchanged);
+    }
+    let mut arr = toml_edit::Array::new();
+    for w in &want {
+        arr.push(w.as_str());
+    }
+    root.insert("notify", toml_edit::value(arr));
+    Ok(if ours {
+        WireOutcome::Updated
+    } else {
+        WireOutcome::Added
+    })
+}
+
 // ── The Lead's private MCP config (THE-2188) ────────────────────────────────
 
 /// The Lead's `thegn mcp serve` entry key in its private `mcp.json`.
@@ -820,5 +1020,96 @@ mod tests {
             "{wired}"
         );
         assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn claude_hooks_are_marked_idempotent_reversible_and_keep_user_groups() {
+        let user = json!({
+            "theme": "dark",
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}
+        });
+        let mut s = user.clone();
+        assert_eq!(
+            apply_claude_hooks(&mut s, "/bin/thegn", false),
+            Ok(WireOutcome::Added)
+        );
+        assert_eq!(s["theme"], "dark");
+        assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["command"], "echo mine");
+        assert_eq!(
+            s["hooks"]["Notification"][0]["hooks"][0]["command"],
+            "/bin/thegn agent hook claude attention # x-thegn-managed"
+        );
+        let before = s.clone();
+        assert_eq!(
+            apply_claude_hooks(&mut s, "/bin/thegn", false),
+            Ok(WireOutcome::Unchanged)
+        );
+        assert_eq!(s, before);
+        assert_eq!(
+            apply_claude_hooks(&mut s, "/opt/other/thegn", false),
+            Ok(WireOutcome::Updated)
+        );
+        assert_eq!(
+            apply_claude_hooks(&mut s, "/x", true),
+            Ok(WireOutcome::Removed)
+        );
+        assert_eq!(s, user);
+    }
+
+    #[test]
+    fn claude_hooks_remove_on_unwired_is_a_noop_and_wrong_types_are_refused() {
+        let mut s = json!({"theme": "dark"});
+        assert_eq!(
+            apply_claude_hooks(&mut s, "t", true),
+            Ok(WireOutcome::NothingToRemove)
+        );
+        assert_eq!(s, json!({"theme": "dark"}));
+        let mut bad = json!({"hooks": {"Stop": "nope"}});
+        assert!(apply_claude_hooks(&mut bad, "t", false).is_err());
+        assert_eq!(bad, json!({"hooks": {"Stop": "nope"}}));
+        let mut bad = json!({"hooks": []});
+        assert!(apply_claude_hooks(&mut bad, "t", false).is_err());
+    }
+
+    #[test]
+    fn claude_hook_command_quotes_a_path_with_spaces() {
+        assert_eq!(
+            claude_hook_command("/a b/thegn", "stop"),
+            "'/a b/thegn' agent hook claude stop # x-thegn-managed"
+        );
+    }
+
+    #[test]
+    fn codex_notify_is_written_once_and_never_overwrites_a_user_notifier() {
+        let mut doc: toml_edit::DocumentMut = "# mine\nmodel = \"x\"\n".parse().unwrap();
+        assert_eq!(
+            apply_codex_notify(&mut doc, "/bin/thegn", false),
+            Ok(WireOutcome::Added)
+        );
+        let text = doc.to_string();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["notify"][3].as_str(), Some("codex"));
+        assert!(text.starts_with("# mine\n"));
+        assert_eq!(
+            apply_codex_notify(&mut doc, "/bin/thegn", false),
+            Ok(WireOutcome::Unchanged)
+        );
+        assert_eq!(doc.to_string(), text);
+        assert_eq!(
+            apply_codex_notify(&mut doc, "/bin/thegn", true),
+            Ok(WireOutcome::Removed)
+        );
+        assert_eq!(doc.to_string(), "# mine\nmodel = \"x\"\n");
+
+        let mut theirs: toml_edit::DocumentMut = "notify = [\"my-notifier\"]\n".parse().unwrap();
+        assert!(apply_codex_notify(&mut theirs, "/bin/thegn", false).is_err());
+        assert!(apply_codex_notify(&mut theirs, "/bin/thegn", true).is_err());
+        assert_eq!(theirs.to_string(), "notify = [\"my-notifier\"]\n");
+        let mut none: toml_edit::DocumentMut = "".parse().unwrap();
+        assert_eq!(
+            apply_codex_notify(&mut none, "t", true),
+            Ok(WireOutcome::NothingToRemove)
+        );
     }
 }

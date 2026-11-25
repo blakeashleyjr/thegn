@@ -26,7 +26,14 @@
 
 ## 4. Follow-ups
 
-- [ ] 4.1 Lifecycle hooks reporting working/waiting/done for Claude and Codex.
+- [x] 4.1 Lifecycle hooks for Claude (`Stop`, `Notification` in
+      `settings.json`) and Codex (`notify`), written by the same marked
+      writer as `thegn mcp wire` and reporting through the hidden
+      `thegn agent hook` verb over the control socket (finished turn and
+      needs-you; working stays CPU-derived).
 - [ ] 4.2 Hermes registry harness and YAML MCP adapter.
 - [ ] 4.3 Remote envs: rewrite the carried MCP command to the in-sandbox thegn.
-- [ ] 4.4 Offer `thegn mcp wire` from the welcome tour's agent step.
+- [x] 4.4 Offer the wiring from the welcome tour's agent step as an explicit
+      one-key accept (`w`), written at finish.
+- [ ] 4.5 Show the same offer once to an existing user whose detected agents
+      are not wired (outside the first-run tour).

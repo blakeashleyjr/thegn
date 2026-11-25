@@ -367,6 +367,9 @@ fn save_tour_writes(
                     command,
                     keep,
                 } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
+                WriteOp::WireAgents { kinds } => {
+                    crate::cmd::mcp_proxy_cmd::wire_kinds(&kinds).map(|_| ())
+                }
                 other => Err(anyhow::anyhow!("the welcome tour cannot write {other:?}")),
             };
             if let Err(e) = r {
@@ -508,6 +511,9 @@ fn run_effects(
                 command,
                 keep,
             } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
+            WriteOp::WireAgents { kinds } => {
+                crate::cmd::mcp_proxy_cmd::wire_kinds(&kinds).map(|_| ())
+            }
         };
         match r {
             Ok(()) => wrote += 1,
@@ -671,13 +677,16 @@ fn probe_forge() -> ForgeStatus {
 /// harness, so off the loop.
 fn probe_agents() -> Vec<AgentInfo> {
     // off-loop: inside spawn_blocking
+    let unwired = crate::cmd::mcp_proxy_cmd::unwired_detected_agents(&Config::default());
     thegn_core::harness::HARNESSES
         .iter()
         .map(|h| {
             let command = h.interactive_command().to_string();
             let program = command.split_whitespace().next().unwrap_or("").to_string();
+            let id = h.id().to_string();
             AgentInfo {
-                id: h.id().to_string(),
+                unwired: unwired.contains(&id),
+                id,
                 name: h.display_name().to_string(),
                 path: thegn_core::util::which_path(&program),
                 command,

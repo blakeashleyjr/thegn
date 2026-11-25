@@ -342,22 +342,209 @@ pub fn wire(cfg: &Config, agent: Option<&str>, all: bool, remove: bool) -> Resul
 
     let command = proxy_command();
     for a in targets {
-        let path = settings_path(a, &home, &env);
-        match wire_file(a, &path, &command, remove) {
-            Ok(outcomes) => {
-                for (key, outcome) in outcomes {
-                    outln!(
-                        "{} {key}: {} ({})",
-                        a.kind,
-                        outcome.as_str(),
-                        path.display()
-                    );
-                }
-            }
-            Err(e) => outln!("{}: skipped — {e}", a.kind),
+        for line in wire_target(a, &home, &env, &command, remove) {
+            outln!("{line}");
         }
     }
     Ok(())
+}
+
+/// Wire (or remove) one agent end to end: its MCP entries, then its lifecycle
+/// hooks. Returns the report lines; a refusal is a line, never an error, so
+/// one agent's foreign entry never blocks the next.
+fn wire_target(
+    a: &Adapter,
+    home: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    command: &str,
+    remove: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let path = settings_path(a, home, env);
+    match wire_file(a, &path, command, remove) {
+        Ok(outcomes) => {
+            for (key, outcome) in outcomes {
+                lines.push(format!(
+                    "{} {key}: {} ({})",
+                    a.kind,
+                    outcome.as_str(),
+                    path.display()
+                ));
+            }
+        }
+        Err(e) => lines.push(format!("{}: skipped — {e}", a.kind)),
+    }
+    if let Some(hook_path) = hooks_path(a, home, env) {
+        match wire_hooks_file(a, &hook_path, command, remove) {
+            Ok(outcome) => lines.push(format!(
+                "{} hooks: {} ({})",
+                a.kind,
+                outcome.as_str(),
+                hook_path.display()
+            )),
+            Err(e) => lines.push(format!("{} hooks: skipped — {e}", a.kind)),
+        }
+    }
+    lines
+}
+
+/// The agents that have lifecycle hooks thegn can write (`claude`, `codex`).
+pub fn hook_capable(kind: &str) -> bool {
+    matches!(kind, "claude" | "codex")
+}
+
+/// Agent kinds installed for this user that thegn can wire and that are not
+/// fully wired yet (an MCP entry or a lifecycle hook is missing). The welcome
+/// tour offers exactly these; an empty answer means there is nothing to offer.
+pub fn unwired_detected_agents(cfg: &Config) -> Vec<String> {
+    let home = thegn_core::util::home();
+    let env = |k: &str| std::env::var(k).ok();
+    let command = proxy_command();
+    default_targets(cfg, &home, &env)
+        .into_iter()
+        .filter(|a| hook_capable(a.kind))
+        .filter(|a| detected(a, &home, &env))
+        .filter(|a| !is_wired(a, &home, &env, &command))
+        .map(|a| a.kind.to_string())
+        .collect()
+}
+
+/// Whether wiring the agent now would change nothing (dry run on the text).
+fn is_wired(
+    a: &Adapter,
+    home: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    command: &str,
+) -> bool {
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    let mcp_ok = {
+        let path = settings_path(a, home, env);
+        match a.format {
+            Format::Json => {
+                let body = read(&path);
+                let mut v: Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| Value::Object(Map::new()));
+                wire::WIRED_ENTRIES.iter().all(|(key, args)| {
+                    wire::apply_named(
+                        &mut v,
+                        a.container,
+                        key,
+                        wire::wired_entry(command, args),
+                        false,
+                    ) == Ok(WireOutcome::Unchanged)
+                })
+            }
+            Format::Toml => {
+                let mut doc: toml_edit::DocumentMut = read(&path).parse().unwrap_or_default();
+                let container = a.container.first().copied().unwrap_or("mcp_servers");
+                wire::WIRED_ENTRIES.iter().all(|(key, args)| {
+                    wire::apply_toml(&mut doc, container, key, command, args, false)
+                        == Ok(WireOutcome::Unchanged)
+                })
+            }
+        }
+    };
+    let hooks_ok = hooks_path(a, home, env).is_none_or(|p| {
+        let body = read(&p);
+        match a.kind {
+            "claude" => {
+                let mut v: Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| Value::Object(Map::new()));
+                wire::apply_claude_hooks(&mut v, command, false) == Ok(WireOutcome::Unchanged)
+            }
+            _ => {
+                let mut doc: toml_edit::DocumentMut = body.parse().unwrap_or_default();
+                wire::apply_codex_notify(&mut doc, command, false) == Ok(WireOutcome::Unchanged)
+            }
+        }
+    });
+    mcp_ok && hooks_ok
+}
+
+/// Wire the named agent kinds (MCP entries + lifecycle hooks), as the welcome
+/// tour's one-key accept does. Returns one report line per write.
+pub fn wire_kinds(kinds: &[String]) -> Result<Vec<String>> {
+    let home = thegn_core::util::home();
+    let env = |k: &str| std::env::var(k).ok();
+    let command = proxy_command();
+    let mut lines = Vec::new();
+    for kind in kinds {
+        let Some(a) = adapter(kind) else {
+            bail!("unknown agent `{kind}` — known: {}", known_kinds());
+        };
+        lines.extend(wire_target(a, &home, &env, &command, false));
+    }
+    Ok(lines)
+}
+
+/// Where an agent's lifecycle-hook settings live: Claude's `settings.json`
+/// (relocated by an absolute `CLAUDE_CONFIG_DIR`) or Codex's `config.toml`.
+fn hooks_path(
+    a: &Adapter,
+    home: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    match a.kind {
+        "claude" => Some(
+            env("CLAUDE_CONFIG_DIR")
+                .filter(|d| std::path::Path::new(d).is_absolute())
+                .map(|d| PathBuf::from(d).join("settings.json"))
+                .unwrap_or_else(|| home.join(".claude/settings.json")),
+        ),
+        "codex" => Some(settings_path(a, home, env)),
+        _ => None,
+    }
+}
+
+/// Apply thegn's lifecycle hooks to one agent's settings file. Same rules as
+/// [`wire_file`]: nothing is written unless something changed, an unparseable
+/// file is refused, and `--remove` never creates a file.
+fn wire_hooks_file(
+    a: &Adapter,
+    path: &std::path::Path,
+    command: &str,
+    remove: bool,
+) -> Result<WireOutcome> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => Some(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => bail!("cannot read {}: {e}", path.display()),
+    };
+    if remove && body.is_none() {
+        return Ok(WireOutcome::NothingToRemove);
+    }
+    let body = body.unwrap_or_default();
+    let (outcome, rendered) = match a.kind {
+        "claude" => {
+            let mut settings: Value = if body.trim().is_empty() {
+                Value::Object(Map::new())
+            } else {
+                serde_json::from_str(&body)
+                    .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?
+            };
+            let outcome = wire::apply_claude_hooks(&mut settings, command, remove)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            (outcome, serde_json::to_string_pretty(&settings)?)
+        }
+        _ => {
+            let mut doc: toml_edit::DocumentMut = body
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?;
+            let outcome = wire::apply_codex_notify(&mut doc, command, remove)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            (outcome, doc.to_string())
+        }
+    };
+    if !matches!(
+        outcome,
+        WireOutcome::Unchanged | WireOutcome::NothingToRemove
+    ) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, rendered)?;
+    }
+    Ok(outcome)
 }
 
 /// Apply every [`wire::WIRED_ENTRIES`] row to one settings file, writing it
@@ -684,5 +871,84 @@ mod wire_tests {
         let again = wire_file(codex, &path, "/bin/thegn", false).unwrap();
         assert!(again.iter().all(|(_, o)| *o == WireOutcome::Unchanged));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn claude_hooks_round_trip_on_disk_and_remove_on_absent_file_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude/settings.json");
+        let claude = adapter("claude").unwrap();
+        assert_eq!(
+            wire_hooks_file(claude, &path, "/bin/thegn", true).unwrap(),
+            WireOutcome::NothingToRemove
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            wire_hooks_file(claude, &path, "/bin/thegn", false).unwrap(),
+            WireOutcome::Added
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("agent hook claude stop")
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            wire_hooks_file(claude, &path, "/bin/thegn", false).unwrap(),
+            WireOutcome::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            wire_hooks_file(claude, &path, "/bin/thegn", true).unwrap(),
+            WireOutcome::Removed
+        );
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, json!({}));
+    }
+
+    #[test]
+    fn codex_notify_shares_config_toml_with_the_mcp_tables_and_refuses_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let codex = adapter("codex").unwrap();
+        wire_file(codex, &path, "/bin/thegn", false).unwrap();
+        assert_eq!(
+            wire_hooks_file(codex, &path, "/bin/thegn", false).unwrap(),
+            WireOutcome::Added
+        );
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["notify"][2].as_str(), Some("hook"));
+        assert_eq!(
+            parsed["mcp_servers"]["thegn"]["command"].as_str(),
+            Some("/bin/thegn")
+        );
+        wire_hooks_file(codex, &path, "/bin/thegn", true).unwrap();
+        wire_file(codex, &path, "/bin/thegn", true).unwrap();
+
+        let theirs = tmp.path().join("theirs.toml");
+        std::fs::write(&theirs, "notify = [\"mine\"]\n").unwrap();
+        assert!(wire_hooks_file(codex, &theirs, "/bin/thegn", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            "notify = [\"mine\"]\n"
+        );
+    }
+
+    #[test]
+    fn unwired_detection_flips_once_wired() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let claude = adapter("claude").unwrap();
+        assert!(!is_wired(claude, tmp.path(), &no_env, "/bin/thegn"));
+        let lines = wire_target(claude, tmp.path(), &no_env, "/bin/thegn", false);
+        assert!(
+            lines.iter().any(|l| l.starts_with("claude hooks: added")),
+            "{lines:?}"
+        );
+        assert!(is_wired(claude, tmp.path(), &no_env, "/bin/thegn"));
+        wire_target(claude, tmp.path(), &no_env, "/bin/thegn", true);
+        assert!(!is_wired(claude, tmp.path(), &no_env, "/bin/thegn"));
     }
 }

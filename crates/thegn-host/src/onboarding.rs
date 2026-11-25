@@ -121,6 +121,9 @@ pub struct AgentInfo {
     pub name: String,
     pub command: String,
     pub path: Option<String>,
+    /// Installed and wireable, but thegn's MCP entries or lifecycle hooks are
+    /// not all written yet (the tour offers to write them).
+    pub unwired: bool,
 }
 
 /// A probe's answer, delivered via `RefreshKind::Onboarding`.
@@ -200,6 +203,10 @@ pub enum WriteOp {
         command: String,
         keep: Vec<(String, String)>,
     },
+    /// `thegn mcp wire` for these agent kinds: MCP entries and lifecycle hooks,
+    /// marked and reversible (`thegn mcp wire --remove`). Only ever produced
+    /// by the welcome tour's explicit one-key accept.
+    WireAgents { kinds: Vec<String> },
 }
 
 /// Side effects for the loop to perform. The wizard stays pure; the loop's

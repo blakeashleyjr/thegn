@@ -579,7 +579,7 @@ single MCP server — tools namespaced `<upstream>__<tool>`, calls routed to the
 owning upstream, health-checked with a per-upstream circuit breaker.
 
 ```sh
-thegn mcp wire                 # write `thegn` (proxy) + `thegn-serve` into configured or installed agents
+thegn mcp wire                 # write `thegn` (proxy) + `thegn-serve` + lifecycle hooks (Claude Stop/Notification, Codex notify) into configured or installed agents
 thegn mcp wire --agent codex   # a specific vendor (claude|codex|cursor|windsurf|vscode|zed|gemini|amp)
 thegn mcp wire --remove        # take thegn's entries back out (only the ones thegn marked)
 thegn mcp status               # per-upstream: exposed/hidden tools, scope, breaker

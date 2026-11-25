@@ -36,6 +36,15 @@ again. An entry with the same name that you wrote yourself is never changed or
 removed, and a settings file thegn cannot parse is left alone. Wire one agent
 with `--agent <kind>`.
 
+The same command also writes lifecycle hooks, so the [[sidebar]] and attention
+queue hear from the agent itself instead of guessing: Claude gets a `Stop` and
+a `Notification` hook in `~/.claude/settings.json`, Codex a `notify` line in
+`config.toml`. Each calls `thegn agent hook`, which tells the daemon a turn
+finished or the agent needs you, and prints nothing. A hook or `notify` you
+wrote yourself is never replaced; Codex runs only one notifier, so thegn skips
+it and says so. The welcome tour offers all of this with one key (`w`) on its
+agents step and writes nothing until you press it.
+
 Codex keeps its servers in `~/.codex/config.toml` (or `$CODEX_HOME`), which
 thegn edits in place: your comments and tables stay as they were, and thegn's
 tables carry a `# x-thegn-managed` comment.
