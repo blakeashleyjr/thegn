@@ -8044,6 +8044,9 @@ async fn event_loop<T: Terminal>(
     // frame (title bar) and focuses the pane (drag model rule 2 applied to
     // panes: press arms, motion commits). Esc cancels.
     let mut pane_lift: Option<(crate::center::PaneId, usize, usize, bool)> = None;
+    // Tab-strip drag-to-reorder: a press on a tab chip arms it with that tab's
+    // index; releasing over a different chip moves the tab there.
+    let mut tab_lift: Option<usize> = None;
     // Files-panel → pane drag (THE-135): a press on a Files FILE row arms it
     // (the click still selects the row); motion off the press cell makes it a
     // drag; a release over a center pane types the shell-quoted path there
@@ -15943,6 +15946,7 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        model.drawer_focused = focus.drawer();
         let drawer_bar = drawer_bar_state(&current_config, &drawer_runtime, drawer);
         if model.drawer_bar != drawer_bar {
             model.drawer_bar = drawer_bar;
@@ -17989,6 +17993,30 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
 
+                // Tab-strip drag-to-reorder: motion is ignored; the release over
+                // another chip of the strip commits the move, anywhere else
+                // cancels. Wheel samples during the hold are not a release.
+                if let Some(from) = tab_lift
+                    && !m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && !m.mouse_buttons.contains(MouseButtons::HORZ_WHEEL)
+                {
+                    if !left {
+                        tab_lift = None;
+                        mouse_left_down = false;
+                        if chrome.center_tabs.contains(mx, my)
+                            && let Some(to) =
+                                crate::chrome::center_tab_hit(&model, chrome.center_tabs, mx)
+                            && session.move_tab_to(from, to)
+                        {
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            persist_session_layout(&mut session, &panes);
+                            need_relayout = true;
+                        }
+                        dirty = true;
+                    }
+                    continue;
+                }
+
                 // Files-panel → pane drag (THE-135). Motion only arms the drop
                 // (and shows the prompt once); the release decides. Only a
                 // drag that MOVED and ends over a displayed center pane
@@ -18874,6 +18902,7 @@ async fn event_loop<T: Terminal>(
                             && i < g.tabs.len()
                         {
                             g.active_tab = i;
+                            tab_lift = Some(i);
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
@@ -28389,6 +28418,40 @@ async fn event_loop<T: Terminal>(
                                 ) == crate::handlers::pane_geometry::SwapOutcome::Swapped
                                 {
                                     need_relayout = true;
+                                }
+                            }
+                            // Tab/pane rearranging: pure `Session` ops. Panes keep
+                            // their ids, so no PTY is touched — only the layout.
+                            Action::MoveTabLeft | Action::MoveTabRight => {
+                                if session.move_active_tab(action == Action::MoveTabRight) {
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                }
+                            }
+                            Action::BreakPaneToTab => {
+                                if session.break_pane_to_tab(focused) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                } else {
+                                    model.status =
+                                        "Pane is the tab's only pane — nothing to break out"
+                                            .to_string();
+                                }
+                            }
+                            Action::MovePaneToPrevTab | Action::MovePaneToNextTab => {
+                                if session.move_pane_to_adjacent_tab(
+                                    focused,
+                                    action == Action::MovePaneToNextTab,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                } else {
+                                    model.status = "No tab there to move the pane to".to_string();
                                 }
                             }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`

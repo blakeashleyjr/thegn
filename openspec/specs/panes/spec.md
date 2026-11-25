@@ -337,3 +337,55 @@ it is drawn.
 
 - **WHEN** no pane is between its spawn and its first output
 - **THEN** no sampler thread exists and no descendant sampling occurs
+
+### Requirement: Tabs reorder and panes move between tabs
+
+thegn SHALL provide `move-tab-left` / `move-tab-right` (default
+`Shift+Alt+←/→`) that swap the active tab one slot within its worktree strip
+(no wrap; a move past either end is a no-op), and a drag on the tab strip that
+moves the pressed tab to the chip it is released over. thegn SHALL provide
+`break-pane-to-tab` (default `Ctrl+Alt+Shift+b`) that moves the focused pane
+into a new tab right after the active one, and `move-pane-to-prev-tab` /
+`move-pane-to-next-tab` (default `Ctrl+Alt+Shift+←/→`) that move the focused
+pane beside the focused pane of the neighbouring tab. A tab's last pane MUST
+NOT be moved out. A moved pane keeps its pane id, so its PTY and session stay
+alive, and the resulting tab order and membership persist with the layout.
+
+#### Scenario: Reordering a tab
+
+- **WHEN** the second of three tabs is active and the user invokes
+  `move-tab-right`
+- **THEN** it becomes the third tab, stays active, and the order is still
+  there after detach and restart
+
+#### Scenario: Breaking a pane out
+
+- **WHEN** a tab holds two panes and the user invokes `break-pane-to-tab`
+  on one
+- **THEN** a new tab right after the active one holds that pane, the process
+  in it is the same one that was running, and that tab is active
+
+#### Scenario: Moving a pane to the next tab
+
+- **WHEN** the user invokes `move-pane-to-next-tab` on a pane of a split tab
+- **THEN** the pane sits beside the next tab's focused pane with its process
+  alive; at the last tab the action is a no-op
+
+### Requirement: The panel lists the layout keys
+
+When `[panel] layout_hints` is on (default), the right panel SHALL show a
+"Layout keys" block in its blank tail space, below the section content and
+above the pinned Lead footer, listing split, swap, resize, zoom, lock and the
+tab / pane move chords as read from the live keymap. The block MUST drop its
+lowest-priority rows and truncate text when space is short, MUST never cover
+panel content, and MUST NOT take rows from the Lead footer.
+
+#### Scenario: A rebind shows
+
+- **WHEN** the user rebinds `zoom` to another chord
+- **THEN** the block shows the new chord on its next frame
+
+#### Scenario: Disabled
+
+- **WHEN** `[panel] layout_hints = false`
+- **THEN** no Layout keys block is drawn

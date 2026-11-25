@@ -241,6 +241,59 @@ fn heading(label: impl Into<String>, note: Option<String>) -> Section {
     }
 }
 
+/// The metered-AI block: pay-per-token spend from the model proxy's audit
+/// rows (subscription plans stay in the usage gauge), split per model, with a
+/// plain note when part of it is estimated or unpriced. Empty when the proxy
+/// recorded no metered spend this month.
+fn ai_sections(ai: &thegn_core::proxy::stats::AiSpend) -> Vec<Section> {
+    if ai.mtd <= 0.0 && ai.unpriced == 0 {
+        return Vec::new();
+    }
+    let mut kv: Vec<(String, String, Tok)> = vec![(
+        "AI burn".to_string(),
+        format!("{}/h", usd(ai.burn_hourly, 4)),
+        Tok::Slot(S::Text),
+    )];
+    kv.push(("AI today (UTC)".to_string(), usd(ai.today, 2), dim()));
+    kv.push(("AI month to date".to_string(), usd(ai.mtd, 2), dim()));
+    for model in ai.by_model.iter().take(MAX_ROWS) {
+        kv.push((
+            model.name.clone(),
+            format!(
+                "{}/h · {} today · {} mtd",
+                usd(model.burn_hourly, 4),
+                usd(model.today, 2),
+                usd(model.mtd, 2)
+            ),
+            dim(),
+        ));
+    }
+    let mut secs = vec![
+        spacer(),
+        heading(
+            "metered AI (model proxy)",
+            Some("trailing hour · pay-per-token only".to_string()),
+        ),
+        Section::KeyVal(kv),
+    ];
+    if ai.estimated {
+        secs.push(heading(
+            "some AI cost is estimated from the price table, not billed",
+            None,
+        ));
+    }
+    if ai.unpriced > 0 {
+        secs.push(heading(
+            format!(
+                "{} request(s) had no known price and are not counted",
+                ai.unpriced
+            ),
+            None,
+        ));
+    }
+    secs
+}
+
 /// The section stack and its row cursor (pure; `now_ms` is injected for the
 /// age column).
 fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
@@ -381,6 +434,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
         ));
     }
     secs.push(Section::KeyVal(totals));
+    secs.extend(ai_sections(&snap.ai));
 
     if !view.partial.is_empty() {
         secs.push(spacer());
@@ -448,6 +502,7 @@ mod tests {
             generated_ms: NOW - 60_000,
             view,
             cost,
+            ai: Default::default(),
         }
     }
 

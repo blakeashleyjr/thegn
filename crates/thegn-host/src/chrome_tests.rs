@@ -2154,6 +2154,38 @@ fn stats_cluster_drops_date_then_gpu_when_tight() {
 }
 
 #[test]
+fn stats_cluster_sheds_in_documented_order_across_widths() {
+    let order = [
+        "date", "weather", "fleet", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+        "battery", "net", "clock", "mem", "cpu",
+    ];
+    // Config order is arbitrary; shedding follows the ladder, not position.
+    let parts: Vec<(String, usize)> = order
+        .iter()
+        .rev()
+        .map(|id| (id.to_string(), 6usize))
+        .collect();
+    let mut last_kept = usize::MAX;
+    for avail in (1..=cluster_width(&parts, &(0..parts.len()).collect::<Vec<_>>())).rev() {
+        let kept = fit_stats_cluster(&parts, avail);
+        assert!(kept.len() <= last_kept);
+        last_kept = kept.len();
+        let names: Vec<&str> = kept.iter().map(|&i| parts[i].0.as_str()).collect();
+        // A widget that is still shown means every harder-to-shed one is too.
+        for (rank, id) in order.iter().enumerate() {
+            if names.contains(id) {
+                for later in &order[rank + 1..] {
+                    assert!(names.contains(later), "{later} shed before {id}: {names:?}");
+                }
+            }
+        }
+        if names.contains(&"date") {
+            assert!(names.contains(&"cpu"), "{names:?}");
+        }
+    }
+}
+
+#[test]
 fn masthead_brand_breakpoints() {
     assert_eq!(masthead_brand_cols(160), BRAND_FULL_COLS);
     assert_eq!(masthead_brand_cols(96), BRAND_FULL_COLS);
@@ -2943,6 +2975,101 @@ fn dense_panel_shows_no_navigation_footer() {
         !text.contains("NAVIGATE"),
         "footer must hide when the panel body fills the rect: {text:?}"
     );
+}
+
+fn layout_hint_model() -> FrameModel {
+    let mut model = panel_model();
+    for (id, _) in crate::panel::layout_hints::ROWS {
+        model
+            .chord_hints
+            .insert((*id).to_string(), format!("chord-{id}"));
+    }
+    model
+}
+
+#[test]
+fn panel_shows_layout_keys_block_and_follows_a_rebind() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    let mut model = layout_hint_model();
+    model.chord_hints.insert("zoom".into(), "Ctrl-q".into());
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("LAYOUT KEYS"), "title missing: {text:?}");
+    assert!(
+        text.contains("Ctrl-q"),
+        "rebound zoom chord missing: {text:?}"
+    );
+    assert!(
+        text.contains("pane to own tab"),
+        "break row missing: {text:?}"
+    );
+}
+
+#[test]
+fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
+    use crate::panel::PanelUi;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 40,
+    };
+    let mut model = layout_hint_model();
+    model.panel_focused = false;
+    model.center_focused = true;
+    model.keyhints = vec![
+        ("chord-zoom".to_string(), "zoom twice".to_string()),
+        ("Alt-n".to_string(), "new pane here".to_string()),
+    ];
+    let mut s = Surface::new(44, 40);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    let text = s.screen_chars_to_string();
+    assert!(text.contains("PANE KEYS"), "title missing: {text:?}");
+    assert!(text.contains("new pane here"), "pane key missing: {text:?}");
+    assert!(
+        !text.contains("zoom twice"),
+        "a chord the Layout block shows must not repeat: {text:?}"
+    );
+    assert!(text.contains("LAYOUT KEYS"), "layout block kept: {text:?}");
+
+    model.context_hints_off = true;
+    let mut s = Surface::new(44, 40);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("PANE KEYS"));
+}
+
+#[test]
+fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
+    use crate::panel::PanelUi;
+    let mut model = layout_hint_model();
+    model.layout_hints_off = true;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 30,
+    };
+    let mut s = Surface::new(44, 30);
+    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
+    // Enabled, but a rect the panel body fills leaves no room for it.
+    let model = layout_hint_model();
+    let tiny = Rect {
+        x: 0,
+        y: 0,
+        cols: 44,
+        rows: 8,
+    };
+    let mut s = Surface::new(44, 8);
+    draw_panel(&mut s, tiny, &model, &PanelUi::default());
+    assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
 }
 
 #[test]
@@ -4005,7 +4132,35 @@ fn fleet_snap(
             unpriced,
             ..FleetCost::default()
         },
+        ai: Default::default(),
     }
+}
+
+#[test]
+fn fleet_widget_includes_metered_ai_burn() {
+    let ai = |burn: f64| thegn_core::proxy::stats::AiSpend {
+        burn_hourly: burn,
+        ..Default::default()
+    };
+    // AI alone keeps the meter on the bar with no VMs at all.
+    let mut snap = fleet_snap(0, 0.0, 0, 0);
+    assert_eq!(fleet_widget(&snap, false), None);
+    snap.ai = ai(0.25);
+    assert_eq!(
+        fleet_widget(&snap, false),
+        Some(("$0.25/h".to_string(), false))
+    );
+    // VM and AI burn are summed.
+    let mut both = fleet_snap(1, 0.5, 0, 0);
+    both.ai = ai(0.25);
+    assert_eq!(
+        fleet_widget(&both, false).map(|(t, _)| t),
+        Some("$0.75/h".to_string())
+    );
+    // The zero-hide rule applies to the total: zero VM + zero AI stays hidden.
+    let mut zero = fleet_snap(1, 0.0, 0, 0);
+    zero.ai = ai(0.0);
+    assert_eq!(fleet_widget(&zero, false), None);
 }
 
 #[test]
@@ -4013,29 +4168,31 @@ fn fleet_widget_text_and_tone() {
     // No snapshot: absent (the default-listed id takes no columns).
     assert!(masthead_widget("fleet", &FrameModel::default()).is_none());
     // Nothing listed, nothing burning: absent.
-    assert_eq!(fleet_widget(&fleet_snap(0, 0.0, 0, 0)), None);
+    assert_eq!(fleet_widget(&fleet_snap(0, 0.0, 0, 0), true), None);
     // Burn, two decimals, quiet tone.
     assert_eq!(
-        fleet_widget(&fleet_snap(2, 0.456, 0, 0)),
+        fleet_widget(&fleet_snap(2, 0.456, 0, 0), false),
         Some(("$0.46/h".to_string(), false))
     );
-    // Listed but all stopped still shows the (zero) burn.
+    // Listed but all stopped: a zero burn is hidden by default, and shown
+    // once `[bars] fleet_always_show` is on.
+    assert_eq!(fleet_widget(&fleet_snap(1, 0.0, 0, 0), false), None);
     assert_eq!(
-        fleet_widget(&fleet_snap(1, 0.0, 0, 0)),
+        fleet_widget(&fleet_snap(1, 0.0, 0, 0), true),
         Some(("$0.00/h".to_string(), false))
     );
     // Sub-cent floor.
     assert_eq!(
-        fleet_widget(&fleet_snap(1, 0.004, 0, 0)).map(|(t, _)| t),
+        fleet_widget(&fleet_snap(1, 0.004, 0, 0), false).map(|(t, _)| t),
         Some("<$0.01/h".to_string())
     );
     // Unpriced rows are counted after the burn.
     assert_eq!(
-        fleet_widget(&fleet_snap(3, 1.0, 2, 0)).map(|(t, _)| t),
+        fleet_widget(&fleet_snap(3, 1.0, 2, 0), false).map(|(t, _)| t),
         Some("$1.00/h +2".to_string())
     );
     // An orphan warns: amber tone plus the warn mark.
-    let (text, warn) = fleet_widget(&fleet_snap(1, 0.5, 0, 1)).unwrap();
+    let (text, warn) = fleet_widget(&fleet_snap(1, 0.5, 0, 1), false).unwrap();
     assert!(warn);
     assert!(text.starts_with("$0.50/h "), "{text}");
     assert!(text.ends_with(crate::caps::active_glyphs().warn), "{text}");
@@ -4050,10 +4207,13 @@ fn fleet_widget_text_and_tone() {
             env: "e".into(),
             id: "tg-gone".into(),
         });
-    assert_eq!(fleet_widget(&missing).map(|(_, w)| w), Some(true));
+    assert_eq!(fleet_widget(&missing, false).map(|(_, w)| w), Some(true));
     // A budget breach warns; the text is unchanged apart from the warn mark.
     let mut over = fleet_snap(2, 3.2, 0, 0);
-    assert_eq!(fleet_widget(&over), Some(("$3.20/h".to_string(), false)));
+    assert_eq!(
+        fleet_widget(&over, false),
+        Some(("$3.20/h".to_string(), false))
+    );
     over.cost
         .budget
         .push(thegn_core::placement::fleet_cost::BudgetBreach {
@@ -4063,7 +4223,7 @@ fn fleet_widget_text_and_tone() {
             limit: 3.0,
         });
     assert_eq!(
-        fleet_widget(&over),
+        fleet_widget(&over, false),
         Some((
             format!("$3.20/h {}", crate::caps::active_glyphs().warn),
             true
@@ -4096,7 +4256,44 @@ fn fleet_widget_not_amber_for_down_and_unrecorded_only() {
             env: "e".into(),
             id: "tg-down".into(),
         });
-    assert_eq!(fleet_widget(&snap), Some(("$0.00/h".to_string(), false)));
+    assert_eq!(
+        fleet_widget(&snap, true),
+        Some(("$0.00/h".to_string(), false))
+    );
+    assert_eq!(fleet_widget(&snap, false), None);
+}
+
+#[test]
+fn fleet_zero_burn_render_hidden_at_each_width_unless_always_show() {
+    // Listed VMs, all stopped: the zero `$/h` meter is absent from the masthead
+    // at every width by default, and comes back with `fleet_always_show`.
+    let render = |always_show: bool, cols: usize| {
+        let chrome = layout::compute(cols, 10, false, false);
+        let model = FrameModel {
+            fleet: Some(std::sync::Arc::new(fleet_snap(1, 0.0, 0, 0))),
+            stats: thegn_metrics::StatsSnapshot {
+                cpu_pct: Some(12),
+                ..Default::default()
+            },
+            bars: thegn_core::config::BarsConfig {
+                top_right: vec!["cpu".into(), "fleet".into(), "clock".into()],
+                fleet_always_show: always_show,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut s = Surface::new(cols, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        lines(&s)[0].clone()
+    };
+    for cols in [200usize, 120, 80, 60] {
+        let hidden = render(false, cols);
+        assert!(!hidden.contains("$0.00/h"), "{cols} cols: {hidden:?}");
+    }
+    for cols in [200usize, 120] {
+        let shown = render(true, cols);
+        assert!(shown.contains("$0.00/h"), "{cols} cols: {shown:?}");
+    }
 }
 
 #[test]

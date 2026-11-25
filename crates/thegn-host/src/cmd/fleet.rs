@@ -1721,6 +1721,7 @@ mod tests {
             generated_ms: NOW,
             view,
             cost,
+            ai: Default::default(),
         };
         let json = fleet_list_json(&snapshot, agents).unwrap();
 

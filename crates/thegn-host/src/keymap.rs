@@ -141,6 +141,16 @@ pub enum Action {
     SwapPaneRight,
     SwapPaneUp,
     SwapPaneDown,
+    /// Reorder the active tab one slot left / right in its worktree strip.
+    MoveTabLeft,
+    MoveTabRight,
+    /// Move the focused pane into its own new tab (right after the active one);
+    /// the pane's PTY stays alive.
+    BreakPaneToTab,
+    /// Move the focused pane into the previous / next tab, beside that tab's
+    /// focused pane; the pane's PTY stays alive.
+    MovePaneToPrevTab,
+    MovePaneToNextTab,
     /// Alt+arrow: the same spatial focus graph as `Focus*` (panes ← → sidebar /
     /// panel, masthead / statusbar / drawer), but a move that dead-ends at the
     /// outer edge falls through to the tab/worktree switch Alt+arrow historically
@@ -621,6 +631,11 @@ impl Action {
             Action::SwapPaneRight => "swap-pane-right",
             Action::SwapPaneUp => "swap-pane-up",
             Action::SwapPaneDown => "swap-pane-down",
+            Action::MoveTabLeft => "move-tab-left",
+            Action::MoveTabRight => "move-tab-right",
+            Action::BreakPaneToTab => "break-pane-to-tab",
+            Action::MovePaneToPrevTab => "move-pane-to-prev-tab",
+            Action::MovePaneToNextTab => "move-pane-to-next-tab",
             Action::NavLeft => "nav-left",
             Action::NavRight => "nav-right",
             Action::NavUp => "nav-up",
@@ -783,6 +798,11 @@ impl Action {
             "swap-pane-right" => Action::SwapPaneRight,
             "swap-pane-up" => Action::SwapPaneUp,
             "swap-pane-down" => Action::SwapPaneDown,
+            "move-tab-left" => Action::MoveTabLeft,
+            "move-tab-right" => Action::MoveTabRight,
+            "break-pane-to-tab" => Action::BreakPaneToTab,
+            "move-pane-to-prev-tab" => Action::MovePaneToPrevTab,
+            "move-pane-to-next-tab" => Action::MovePaneToNextTab,
             "nav-left" => Action::NavLeft,
             "nav-right" => Action::NavRight,
             "nav-up" => Action::NavUp,
@@ -1594,6 +1614,19 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt L", Action::SwapPaneRight).unwrap();
     map.insert_all("Alt K", Action::SwapPaneUp).unwrap();
     map.insert_all("Alt J", Action::SwapPaneDown).unwrap();
+    // Tab/pane rearranging (zellij parity): Shift+Alt+←/→ reorders the active
+    // tab; Ctrl+Alt+Shift+←/→ sends the focused pane to the previous / next tab
+    // and Ctrl+Alt+Shift+b breaks it out into its own tab.
+    map.insert_all("Shift Alt Left", Action::MoveTabLeft)
+        .unwrap();
+    map.insert_all("Shift Alt Right", Action::MoveTabRight)
+        .unwrap();
+    map.insert_all("Ctrl Alt Shift Left", Action::MovePaneToPrevTab)
+        .unwrap();
+    map.insert_all("Ctrl Alt Shift Right", Action::MovePaneToNextTab)
+        .unwrap();
+    map.insert_all("Ctrl Alt Shift b", Action::BreakPaneToTab)
+        .unwrap();
     // Rule 1, Alt tier — Alt+arrow navigates panes/tabs/worktrees and never
     // enters chrome (the sidebar/panel/bars stay Ctrl's job). Within the center
     // it moves to the pane in that direction; at the pane-layout edge it falls
@@ -2100,6 +2133,26 @@ mod tests {
         assert_eq!(k('X', Modifiers::ALT), Some(Action::CloseWorktree));
         assert_eq!(k('o', Modifiers::ALT), Some(Action::SwitchWorkspace));
         assert_eq!(k('t', Modifiers::ALT), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn rearrange_actions_round_trip_and_have_default_chords() {
+        for (id, chord) in [
+            ("move-tab-left", "Shift Alt Left"),
+            ("move-tab-right", "Shift Alt Right"),
+            ("break-pane-to-tab", "Ctrl Alt Shift b"),
+            ("move-pane-to-prev-tab", "Ctrl Alt Shift Left"),
+            ("move-pane-to-next-tab", "Ctrl Alt Shift Right"),
+        ] {
+            let action = Action::from_key(id).unwrap_or_else(|| panic!("{id} not parsed"));
+            assert_eq!(action.key(), id);
+            assert_eq!(
+                action_spec(id).and_then(|s| s.default_chords.first().copied()),
+                Some(chord)
+            );
+        }
+        // Building the default map panics if any of those chords collides.
+        drop(default_keymap());
     }
 
     #[test]

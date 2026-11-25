@@ -3393,6 +3393,10 @@ pub struct BarsConfig {
     pub date_format: String,
     /// chrono format string for the `clock` widget.
     pub clock_format: String,
+    /// Keep the `fleet` $/h meter on the bar while its burn is zero. Off by
+    /// default: a zero burn with nothing to flag (no VM running, or no provider
+    /// usage yet) hides the widget so the cluster shows only live numbers.
+    pub fleet_always_show: bool,
 }
 
 impl Default for BarsConfig {
@@ -3432,6 +3436,7 @@ impl Default for BarsConfig {
             ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
+            fleet_always_show: false,
         }
     }
 }
@@ -5312,6 +5317,16 @@ pub struct PanelConfig {
     /// Fraction of the window the Half width claims. Unset = 0.5. Clamped to
     /// 0.3–0.9 at apply time; never below the resting width.
     pub half_ratio: Option<f32>,
+    /// Show the compact "Layout keys" hint block (split, swap, resize, zoom,
+    /// tab / pane moves, lock) in the blank tail of the right panel. The
+    /// chords are read from the live keymap. `false` hides it.
+    #[serde(default = "default_true")]
+    pub layout_hints: bool,
+    /// Show the focused zone's keys (pane, drawer, bars; the panel's own when
+    /// it has focus) in the panel's otherwise-blank rows, read from the live
+    /// keymap. `false` keeps only the panel's own NAVIGATE footer.
+    #[serde(default = "default_true")]
+    pub context_hints: bool,
 }
 
 impl Default for PanelConfig {
@@ -5321,6 +5336,8 @@ impl Default for PanelConfig {
             collapse_on_escape: true,
             width: None,
             half_ratio: None,
+            layout_hints: true,
+            context_hints: true,
         }
     }
 }

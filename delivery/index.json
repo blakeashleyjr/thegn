@@ -960,6 +960,18 @@
       "summary": "Classify active Ethernet, Wi-Fi, and generic network fallback semantics truthfully."
     },
     {
+      "change": "dynamic-key-discovery",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2704",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Panel blank rows teach the focused zone's live keys (slice 1 shipped); finer contexts, fading learned chords and a which-key overlay remain."
+    },
+    {
       "change": "expand-media-surfaces",
       "lifecycle": "proposed",
       "disposition": "superseded-retire",
@@ -1227,6 +1239,18 @@
       "summary": "THE-2695 tightens the default standard sandbox: local panes mask well-known credential locations, private ~/.ssh entries and sibling repositories over the read-only $HOME (bwrap/OCI masks, systemd InaccessiblePaths), carve only agent runtime state writable, and explain the boundary in the first-run and new-worktree panels; remote build, tests and live bwrap check remain unchecked."
     },
     {
+      "change": "hide-zero-fleet-meter",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2705",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The top-right fleet $/h meter hides while its burn is zero; [bars] fleet_always_show keeps it; render tests at several widths."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1280,6 +1304,18 @@
       ],
       "summary": "Truthful backend caveats shipped; task 5.1 superseded by reserved smol, wsl and appcontainer (fix-truth-in-reporting); replacements owned by WS07-P2-04 and WS06.",
       "archive_path": "openspec/changes/archive/2026-11-23-mark-unverified-backends/"
+    },
+    {
+      "change": "meter-ai-spend-in-fleet-burn",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2707",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The fleet $/h meter adds metered AI spend from the model proxy to VM burn; the popup splits VM vs AI per model."
     },
     {
       "change": "monitor-framework",

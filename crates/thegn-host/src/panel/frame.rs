@@ -12,6 +12,9 @@ use crate::seg::{Line, Seg, Tok, clip_end, seg, sp};
 use super::sections::{self, PanelRow, SectionCtx};
 use super::{PanelHit, PanelTab, PanelUi, budget};
 
+/// A tab-label compaction level: the separator and the label for each tab.
+type TabLevel = (&'static str, fn(PanelTab) -> &'static str);
+
 /// The fully-assembled panel: one entry per visible row, plus the full
 /// view's rail hit spans (empty in Normal/Half).
 #[derive(Debug, Clone, Default)]
@@ -400,6 +403,91 @@ pub(super) fn width_chip(ui: &PanelUi, free_cols: usize) -> Option<(Vec<Seg>, us
     None
 }
 
+/// The tabs one tab-bar row shows at a given width.
+struct TabPlan {
+    tabs: Vec<(PanelTab, &'static str)>,
+    sep: &'static str,
+    /// Some tabs are hidden: a trailing `+` marks the overflow.
+    overflow: bool,
+}
+
+/// Panel tabs in display order.
+const TAB_ORDER: [PanelTab; 4] = [
+    PanelTab::Git,
+    PanelTab::Work,
+    PanelTab::System,
+    PanelTab::Help,
+];
+
+fn short_tab_label(tab: PanelTab, one: bool) -> &'static str {
+    match (tab, one) {
+        (PanelTab::Git, false) => "gt",
+        (PanelTab::Work, false) => "wk",
+        (PanelTab::System, false) => "sy",
+        (PanelTab::Help, false) => "hp",
+        (PanelTab::Git, true) => "g",
+        (PanelTab::Work, true) => "w",
+        (PanelTab::System, true) => "s",
+        (PanelTab::Help, true) => "h",
+    }
+}
+
+/// Choose how the tab strip fits `cols`: full labels, then 2-letter, then
+/// 1-letter labels, and only then hide tabs — never the active tab or the
+/// primary (`work`) tab, with a `+` overflow marker for what is hidden.
+fn tab_plan(active: PanelTab, cols: usize) -> TabPlan {
+    // Cells for a run: lead pad + labels + separators + the overflow marker.
+    let width = |labels: &[&str], sep: usize, overflow: bool| {
+        1 + labels.iter().map(|l| l.len()).sum::<usize>()
+            + sep * labels.len().saturating_sub(1)
+            + if overflow { 2 } else { 0 }
+    };
+    // Leave room for the width chip's smallest form only when it is free;
+    // the tabs themselves must fit the whole row.
+    let levels: [TabLevel; 3] = [
+        ("  ", |t| t.label()),
+        (" ", |t| short_tab_label(t, false)),
+        (" ", |t| short_tab_label(t, true)),
+    ];
+    for (sep, lab) in levels {
+        let labels: Vec<&str> = TAB_ORDER.iter().map(|&t| lab(t)).collect();
+        if width(&labels, sep.len(), false) <= cols {
+            return TabPlan {
+                tabs: TAB_ORDER.iter().map(|&t| (t, lab(t))).collect(),
+                sep,
+                overflow: false,
+            };
+        }
+    }
+    // Still too wide: keep the active and primary tabs, then fill by order.
+    let (sep, lab) = levels[2];
+    let mut keep: Vec<PanelTab> = vec![active];
+    if active != PanelTab::Work {
+        keep.push(PanelTab::Work);
+    }
+    for &t in &TAB_ORDER {
+        if keep.contains(&t) {
+            continue;
+        }
+        let mut trial = keep.clone();
+        trial.push(t);
+        let labels: Vec<&str> = trial.iter().map(|&x| lab(x)).collect();
+        if width(&labels, sep.len(), true) <= cols {
+            keep = trial;
+        }
+    }
+    let overflow = keep.len() < TAB_ORDER.len();
+    TabPlan {
+        tabs: TAB_ORDER
+            .iter()
+            .filter(|t| keep.contains(t))
+            .map(|&t| (t, lab(t)))
+            .collect(),
+        sep,
+        overflow,
+    }
+}
+
 /// The tab row, its tab spans, and the optional width-chip click target.
 type TabBar = (
     PanelRow,
@@ -413,21 +501,16 @@ type TabBar = (
 /// rendered — an invisible tab made the 4th press look like a dead keystroke.
 fn tab_bar_row(ui: &PanelUi, focused: bool, cols: usize) -> TabBar {
     use crate::seg::{seg, sp};
-    let tabs = [
-        PanelTab::Git,
-        PanelTab::Work,
-        PanelTab::System,
-        PanelTab::Help,
-    ];
+    let plan = tab_plan(ui.tab, cols);
     let mut segs = vec![sp(1)];
     let mut spans: Vec<(std::ops::Range<usize>, PanelTab)> = Vec::new();
     let mut col = 1usize; // column after the leading sp(1)
-    for (i, &tab) in tabs.iter().enumerate() {
+    for (i, (tab, label)) in plan.tabs.iter().enumerate() {
         if i > 0 {
-            segs.push(seg(Tok::Slot(S::Ghost3), "  "));
-            col += 2;
+            segs.push(seg(Tok::Slot(S::Ghost3), plan.sep));
+            col += plan.sep.len();
         }
-        let on = tab == ui.tab;
+        let on = *tab == ui.tab;
         let tok = if on && focused {
             Tok::Slot(S::Accent)
         } else if on {
@@ -435,14 +518,17 @@ fn tab_bar_row(ui: &PanelUi, focused: bool, cols: usize) -> TabBar {
         } else {
             Tok::Slot(S::Ghost2)
         };
-        let label = tab.label();
-        let mut s = seg(tok, label);
+        let mut s = seg(tok, *label);
         if on {
             s = s.bold();
         }
         segs.push(s);
-        spans.push((col..col + label.len(), tab));
+        spans.push((col..col + label.len(), *tab));
         col += label.len();
+    }
+    if plan.overflow {
+        segs.push(seg(Tok::Slot(S::Ghost3), " +"));
+        col += 2;
     }
     let mut chip_hit = None;
     if let Some((chip, w)) = width_chip(ui, cols.saturating_sub(col)) {
@@ -1650,6 +1736,57 @@ mod tests {
         );
         assert_eq!(chip_text(&chip_ui(Full, Section::Help), 100), want("full"));
         assert_eq!(chip_text(&chip_ui(Half, Section::Changes), 6), None);
+    }
+
+    #[test]
+    fn narrow_tab_bar_compacts_and_never_drops_active_or_work() {
+        use crate::layout::PanelWidth::Normal;
+        let model = model_with(PanelData::default());
+        for active in [
+            PanelTab::Git,
+            PanelTab::Work,
+            PanelTab::System,
+            PanelTab::Help,
+        ] {
+            for cols in [40usize, 24, 16, 12, 9, 7, 5] {
+                let mut ui = chip_ui(Normal, Section::Changes);
+                ui.tab = active;
+                let frame = build_panel(&model, &ui, cols, 30, true);
+                let tabs: Vec<PanelTab> = frame.tab_spans.iter().map(|(_, t)| *t).collect();
+                assert!(tabs.contains(&active), "{active:?} at {cols}: {tabs:?}");
+                if cols >= 7 {
+                    assert!(
+                        tabs.contains(&PanelTab::Work),
+                        "work dropped at {cols}: {tabs:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_bar_labels_compact_before_tabs_disappear() {
+        use crate::layout::PanelWidth::Normal;
+        let model = model_with(PanelData::default());
+        let mut ui = chip_ui(Normal, Section::Changes);
+        ui.tab = PanelTab::System;
+        let row = |cols| {
+            text_of(&build_panel(&model, &ui, cols, 30, true).rows[0].line)
+                .trim()
+                .to_string()
+        };
+        assert!(
+            row(30).starts_with("git  work  system  help"),
+            "{:?}",
+            row(30)
+        );
+        assert!(row(14).starts_with("gt wk sy hp"), "{:?}", row(14));
+        assert!(row(8).starts_with("g w s h"), "{:?}", row(8));
+        let tight = row(5);
+        assert!(
+            tight.contains('w') && tight.contains('s') && tight.contains('+'),
+            "{tight:?}"
+        );
     }
 
     #[test]

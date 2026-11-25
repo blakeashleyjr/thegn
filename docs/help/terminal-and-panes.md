@@ -48,6 +48,11 @@ actions:
     swap-pane-right,
     swap-pane-up,
     swap-pane-down,
+    move-tab-left,
+    move-tab-right,
+    break-pane-to-tab,
+    move-pane-to-prev-tab,
+    move-pane-to-next-tab,
     nav-left,
     nav-right,
     nav-up,
@@ -72,6 +77,23 @@ Falling off the pane edge is the usual way to change tabs, so `next-tab`
 and `prev-tab` carry no chord of their own. Bind them in `[keybinds]` if
 you want a direct key.
 
+### Rearranging tabs and panes
+
+- `Shift-Alt-←/→` (`move-tab-left` / `move-tab-right`) — move the active tab
+  one slot left / right in the strip. It stops at either end (no wrap). You can
+  also **drag a tab chip** along the strip and release over another chip.
+  Tab order is saved with the layout, so it survives detach and restart.
+- `Ctrl-Alt-Shift-b` (`break-pane-to-tab`) — move the focused pane into its own
+  new tab, placed right after the current one. Nothing happens when it is the
+  tab's only pane.
+- `Ctrl-Alt-Shift-←/→` (`move-pane-to-prev-tab` / `move-pane-to-next-tab`) —
+  move the focused pane into the previous / next tab, beside that tab's focused
+  pane, and follow it there. No wrap, and the last pane of a tab stays put.
+
+A moved pane keeps its process: the shell, its scrollback and its agent
+session carry on unchanged. All five are in the command palette, and the panel
+footer lists their live chords (see [[panel]]).
+
 ## Splits
 
 - `Alt-p` — smart split (along the pane's longer dimension)
@@ -85,6 +107,8 @@ you want a direct key.
 - `Alt-↑/↓` — move to the pane above / below; at the top / bottom pane it
   switches to the previous / next worktree within the current project. This
   never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
+- `Alt-H/J/K/L` — swap the focused pane with its neighbour; `Ctrl-Shift-←/↓/↑/→`
+  — resize it (tab and pane moves are under "Rearranging tabs and panes" above)
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
   → tiled (see Zoom below)
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
