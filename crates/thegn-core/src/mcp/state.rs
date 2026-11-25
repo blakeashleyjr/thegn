@@ -95,6 +95,12 @@ pub struct StateToolSpec {
 /// (pinned by `state_tools_match_state_caps`).
 pub const STATE_TOOLS: &[StateToolSpec] = &[
     StateToolSpec {
+        cap: "fleet.list",
+        description: "Read provider fleet inventory, worktree joins, and estimated costs. \
+                      Read-only; requires a running daemon.",
+        args: &[],
+    },
+    StateToolSpec {
         cap: "sessions.list",
         description: "List the thegn pane daemon's live terminal sessions: id, program, \
                       worktree, geometry, attached clients, lease state. Live state — \
@@ -1332,6 +1338,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 /// this table is the thing that grows to retire those excuses
 /// (`mcp_tools_cover_catalog` arbitrates both directions).
 pub const MCP_STATE_CAPS: &[&str] = &[
+    "fleet.list",
     "sessions.list",
     "worktrees.list",
     "worktrees.sandbox_profile",
@@ -2618,6 +2625,22 @@ mod tests {
     }
 
     #[test]
+    fn fleet_list_routes_to_its_cap_id_and_is_denied_without_read_scope() {
+        // THE-2020: the fleet read is a no-argument read tool. Routed when
+        // allowed, refused before any fetch when not.
+        let allowed = StateRouter::new(vec!["fleet.list"], |cap, _| Ok(json!({ "cap": cap })));
+        let res = allowed.call("fleet_list", &json!({})).unwrap().unwrap();
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("fleet.list"), "{text}");
+
+        // A caller without read scope is refused before the report is fetched.
+        let denied = StateRouter::new(vec![], |_, _| panic!("fetch must not run"));
+        let (code, msg) = denied.call("fleet_list", &json!({})).unwrap().unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(msg.contains("scope `read`"), "{msg}");
+    }
+
+    #[test]
     fn redact_for_audit_hides_the_comment_body_but_keeps_its_size() {
         let secret = "token sk-live-12345 in a comment";
         let args = json!({ "id": "linear:T-1", "body": secret, "account": "w" });
@@ -2771,6 +2794,8 @@ mod tests {
         // forces a deliberate scope-model decision rather than silently
         // widening `read`."
         let read = [
+            // THE-2020: provider fleet inventory read.
+            "fleet.list",
             "sessions.list",
             "worktrees.list",
             "worktrees.sandbox_profile",

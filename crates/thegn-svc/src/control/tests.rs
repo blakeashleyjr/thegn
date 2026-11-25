@@ -153,6 +153,16 @@ impl ControlApi for FakeApi {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
     }
+    fn fleet_list(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        self.record("fleet_list");
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "generated_ms": 42,
+                "view": { "rows": [{ "provider": "fly" }] },
+                "cost": {},
+            }))
+        })
+    }
     fn record_session<'a>(
         &'a self,
         session: &'a str,
@@ -820,6 +830,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/skills"),
         ("GET", "/v1/leases"),
         ("GET", "/v1/me"),
+        ("GET", "/v1/fleet"),
         ("GET", "/v1/sessions/s1/snapshot"),
         ("GET", "/v1/agent/sessions"),
         ("GET", "/v1/git/status?worktree=%2Fw"),
@@ -833,6 +844,34 @@ async fn read_scope_covers_exactly_the_read_surface() {
             "{method} {path} must be readable with read scope"
         );
     }
+}
+
+#[tokio::test]
+async fn fleet_list_is_read_scoped_and_never_reaches_the_api_without_it() {
+    let r = rig(false);
+    let none = token(&r, "");
+    assert_eq!(
+        call(&r, "GET", "/v1/fleet", Some(&none)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(r.api.calls().is_empty(), "refusal happens before the trait");
+
+    let read = token(&r, "read");
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/fleet")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["generated_ms"], 42);
+    assert_eq!(value["view"]["rows"][0]["provider"], "fly");
+    assert_eq!(r.api.calls(), ["fleet_list"]);
 }
 
 #[tokio::test]

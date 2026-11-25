@@ -749,6 +749,12 @@ async fn fetch_state(
     };
     let client = super::session::connect(cfg).await;
     match cap {
+        "fleet.list" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            c.call_raw("GET", "/v1/fleet", None)
+                .await
+                .map_err(|error| error.to_string())
+        }
         "worktrees.list" => match client {
             Ok(c) => {
                 let wts = c.worktrees().await.map_err(|e| e.to_string())?;
@@ -1444,6 +1450,9 @@ mod tests {
     use thegn_core::control::ScopeSet;
 
     const READ_CAPS: &[&str] = &[
+        // THE-2020: the provider fleet inventory read (no daemon required at
+        // CLI scope, but the MCP tool routes through the daemon's HTTP route).
+        "fleet.list",
         "sessions.list",
         "worktrees.list",
         "worktrees.sandbox_profile",
@@ -1522,7 +1531,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 28);
+        assert_eq!(READ_CAPS.len(), 29);
     }
 
     #[test]

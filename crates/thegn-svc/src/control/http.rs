@@ -852,6 +852,16 @@ pub(super) async fn list_worktrees(
     }
 }
 
+pub(super) async fn fleet_list(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authed(&state, &headers, Verb::FleetList) {
+        return response;
+    }
+    match state.api.fleet_list().await {
+        Ok(report) => axum::Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 pub(super) async fn list_skills(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(response) = authed(&state, &headers, Verb::SkillsList) {
         return response;

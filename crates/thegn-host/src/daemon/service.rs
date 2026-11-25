@@ -1951,6 +1951,18 @@ impl DaemonService {
 }
 
 impl ControlApi for DaemonService {
+    fn fleet_list(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        let config = self.config.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || crate::cmd::fleet::control_report(&config))
+                .await
+                .map_err(|error| {
+                    ControlError::Internal(anyhow::anyhow!("fleet read task failed: {error}"))
+                })?
+                .map_err(|error| ControlError::Unavailable(error.to_string()))
+        })
+    }
+
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();
