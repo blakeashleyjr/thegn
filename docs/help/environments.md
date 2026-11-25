@@ -445,6 +445,18 @@ environments.
   probe could not run; the reason is printed). Warnings name the cause, for
   example `sprite out of memory: kernel killed rustc 3.7 GB`, and a lifetime
   under an hour. With `--json` the same report is the `health` object.
+- **Background health sampler.** While thegn runs, it probes each running
+  provider sandbox that belongs to a worktree about once a minute (every
+  5 minutes after a failed or timed-out probe). A sandbox the provider reports
+  cold, warm or stopped is never probed, since that would wake and bill it. A
+  changed boot id raises one notification naming the cause (`sprite restarted:
+likely out of memory (3.7 GB of 4.0 GB used before the restart)`, `it slept
+while idle`, or `it reached its maximum lifetime`), a new kernel OOM kill
+  raises one naming the process and its size, and a sandbox with under an hour
+  of lifetime left raises one. Each is also kept in a bounded per-sandbox event
+  journal (500 events, 30 days). When a `thegn sprite-exec` stream ends without
+  an exit status and a fresh probe shows a new boot id, the specific warning is
+  printed instead of `exec stream ended without an exit status`.
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.
