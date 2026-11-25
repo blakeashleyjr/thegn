@@ -350,7 +350,9 @@ impl Fixture {
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(
+                File::create(captures.path().join("daemon.stderr")).expect("daemon stderr capture"),
+            ));
         let child = daemon_command.spawn().expect("spawn isolated pane daemon");
         let mut daemon = RunningDaemon { child };
         wait_for_socket(runtime.path(), &mut daemon);
@@ -459,6 +461,19 @@ impl Fixture {
             waited.program,
             String::from_utf8_lossy(&waited.stdout),
             String::from_utf8_lossy(&waited.stderr)
+        );
+        // Libtest shows stderr only for a failing test, so the worker pane's
+        // captured output and the daemon's stderr make a failure diagnosable.
+        let snapshot = self.cli(&["session", "snapshot", "--session", session, "--text"]);
+        let mut diag = std::io::stderr().lock();
+        let _write_result = writeln!(
+            diag,
+            "worker session {session}\nwait: {}\nsnapshot (status {}): {}{}\ndaemon stderr: {}",
+            String::from_utf8_lossy(&waited.stdout),
+            snapshot.status,
+            String::from_utf8_lossy(&snapshot.stdout),
+            String::from_utf8_lossy(&snapshot.stderr),
+            fs::read_to_string(self.captures.path().join("daemon.stderr")).unwrap_or_default()
         );
         (opened, waited)
     }
