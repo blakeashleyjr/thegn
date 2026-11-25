@@ -845,7 +845,9 @@ fn render_list(
             }),
         ]);
     }
-    let mut out = vec![if view.rows.is_empty() {
+    let mut out = vec![if view.rows.is_empty() && !view.partial.is_empty() {
+        "No provider sandboxes confirmed; inventory is incomplete.".to_string()
+    } else if view.rows.is_empty() {
         "No provider sandboxes listed.".to_string()
     } else {
         table(&rows)
@@ -1092,6 +1094,26 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn list_marks_an_empty_unavailable_inventory_as_incomplete() {
+        let view = FleetView {
+            partial: vec![PartialEnv {
+                env: "vps".into(),
+                reason: "unavailable: timeout".into(),
+            }],
+            ..FleetView::default()
+        };
+        let cost = fleet_cost::fleet_cost(&view, TABLE, &Default::default(), NOW);
+        let text = render_list(&view, &cost, NOW, &Default::default());
+        assert!(
+            text.contains("No provider sandboxes confirmed; inventory is incomplete."),
+            "{text}"
+        );
+        assert!(!text.contains("No provider sandboxes listed."), "{text}");
+        assert!(text.contains("vps: unavailable: timeout"), "{text}");
+        assert!(text.contains("0 sandbox(es)"), "{text}");
     }
 
     #[test]
