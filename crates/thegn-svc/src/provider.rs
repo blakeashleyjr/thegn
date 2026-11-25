@@ -2884,7 +2884,11 @@ impl SpritesProvider {
     /// once the in-guest fs service is up. Bounded by construction: each probe is
     /// itself capped by [`CONTROL_TIMEOUT`], and the loop stops at `budget`.
     async fn wait_ready(&self, id: &str, budget: std::time::Duration) -> Result<()> {
-        const PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+        // Adaptive: a cold sprite usually answers within a few seconds, so probe
+        // quickly at first (250 ms) and back off to 1 s for a slow boot.
+        const PROBE_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(250);
+        const PROBE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut backoff = PROBE_BACKOFF_START;
         let start = std::time::Instant::now();
         loop {
             let remaining = budget.saturating_sub(start.elapsed());
@@ -2911,7 +2915,8 @@ impl SpritesProvider {
                     budget.as_secs()
                 ));
             }
-            tokio::time::sleep(PROBE_BACKOFF.min(remaining)).await;
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = (backoff * 2).min(PROBE_BACKOFF_MAX);
         }
     }
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`

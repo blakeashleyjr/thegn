@@ -59,8 +59,14 @@ pub enum Action {
         /// Provider envs: return once a shell can open; the background steps
         /// (coding agents, agent logins, shell history, snapshot) finish on
         /// the next open or the next plain env up.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         shell_ready: bool,
+        /// Provider envs: wait for every step, including the background ones.
+        /// Without a flag a terminal run returns once a shell can open and
+        /// finishes the background steps in a detached `env up --wait`;
+        /// scripts (no terminal) always wait.
+        #[arg(long)]
+        wait: bool,
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
@@ -233,7 +239,14 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Up {
             target,
             shell_ready,
-        } => lifecycle(cfg, target.get(), Lifecycle::Up { shell_ready }),
+            wait,
+        } => lifecycle(
+            cfg,
+            target.get(),
+            Lifecycle::Up {
+                wait: UpWait::pick(shell_ready, wait, interactive_terminal()),
+            },
+        ),
         Action::Down {
             stop,
             force,
@@ -1055,7 +1068,7 @@ struct DownOpts {
 }
 
 enum Lifecycle {
-    Up { shell_ready: bool },
+    Up { wait: UpWait },
     Down(DownOpts),
 }
 
@@ -1099,15 +1112,13 @@ fn provider_kind(cfg: &Config, env_name: &str) -> String {
 fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Result<()> {
     let env = resolve_for(cfg, worktree.clone())?;
     match action {
-        Lifecycle::Up { shell_ready } => {
+        Lifecycle::Up { wait } => {
             outln!("bringing up env {} ({})…", env.name, env.placement.label());
             let wt = super::resolve_worktree(worktree)
                 .to_string_lossy()
                 .into_owned();
             resume_parked_sandbox(cfg, &env, &wt);
-            bring_up(&env, &wt, |progress| {
-                up_provision(cfg, &wt, shell_ready, progress)
-            })?;
+            bring_up(&env, &wt, |progress| up_provision(cfg, &wt, wait, progress))?;
             crate::ssh_seed::seed_if_needed(cfg, &wt)
                 .with_context(|| format!("env up failed: seeding {wt} on env {}", env.name))?;
             sshfs(&env, true)?;
@@ -1510,10 +1521,39 @@ fn bring_up(
     Ok(())
 }
 
+/// How long `env up` waits on a provider env's background steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpWait {
+    /// Every step, including the deferred ones (scripts, `--wait`).
+    All,
+    /// Return once a shell can open; the next open or `env up` finishes the rest.
+    ShellReady,
+    /// Return once a shell can open and finish the rest in a detached `env up --wait`.
+    Detach,
+}
+
+impl UpWait {
+    /// `--shell-ready` and `--wait` win; otherwise only a terminal run detaches.
+    fn pick(shell_ready: bool, wait: bool, terminal: bool) -> Self {
+        if shell_ready {
+            Self::ShellReady
+        } else if wait || !terminal {
+            Self::All
+        } else {
+            Self::Detach
+        }
+    }
+}
+
+fn interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 fn up_provision(
     cfg: &Config,
     wt: &str,
-    shell_ready: bool,
+    wait: UpWait,
     progress: &mut dyn FnMut(&[ProvisionStepView]),
 ) -> Result<bool> {
     let outcome = crate::agent::provision_worktree_mode(
@@ -1529,11 +1569,29 @@ fn up_provision(
         "provision: shell ready on {}; background steps follow",
         deferred.sandbox
     ));
-    if shell_ready {
-        msg::info(&format!(
-            "provision: background steps pending; they finish on the next open or `thegn env up --worktree {wt}`"
-        ));
-        return Ok(true);
+    match wait {
+        UpWait::ShellReady => {
+            msg::info(&format!(
+                "provision: background steps pending; they finish on the next open or `thegn env up --worktree {wt}`"
+            ));
+            return Ok(true);
+        }
+        UpWait::Detach => {
+            // Release the run lease first: the detached run must take it.
+            let sandbox = deferred.sandbox.clone();
+            drop(deferred);
+            match spawn_background_finish(wt, &sandbox) {
+                Ok(log) => msg::info(&format!(
+                    "provision: finishing coding agents and snapshot in the background (log: {}); `thegn env show` reports a failure",
+                    log.display()
+                )),
+                Err(error) => msg::info(&format!(
+                    "provision: could not start the background steps ({error:#}); they finish on the next open or `thegn env up --worktree {wt}`"
+                )),
+            }
+            return Ok(true);
+        }
+        UpWait::All => {}
     }
     let mode = match deferred.lease {
         Some(lease) => crate::agent::ProvisionMode::Deferred(lease),
@@ -1541,6 +1599,39 @@ fn up_provision(
     };
     let finished = crate::agent::provision_worktree_mode(cfg, wt, mode, &mut *progress)?;
     Ok(finished.provisioned)
+}
+
+/// Start `thegn env up --wait` detached (own process group, output to a log under
+/// the state dir) so the deferred steps outlive this process. A failure there is
+/// recorded in the deferred journal, which `env show` and the next open report.
+fn spawn_background_finish(wt: &str, sandbox: &str) -> Result<PathBuf> {
+    use std::process::{Command, Stdio};
+    let dir = thegn_core::util::xdg_state_home()
+        .join("thegn")
+        .join("provider")
+        .join("deferred");
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = sandbox
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let log_path = dir.join(format!("{safe}.up.log"));
+    let log = std::fs::File::create(&log_path)?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["env", "up", "--wait", "--worktree", wt])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    // The child is intentionally not waited on: it is the background finisher.
+    #[allow(clippy::zombie_processes)]
+    crate::platform::bundle_custody::spawn_detached_group(&mut cmd)?;
+    Ok(log_path)
 }
 
 /// Run `provision`, printing each step transition as one stderr line.
@@ -3620,6 +3711,7 @@ mod set_location_tests {
 /// `land --release-sandbox` parse (or refuse) as documented.
 #[cfg(test)]
 mod b162_cli_tests {
+    use super::UpWait;
     use clap::Parser as _;
 
     fn parse(args: &[&str]) -> Result<crate::Cli, clap::Error> {
@@ -3647,6 +3739,15 @@ mod b162_cli_tests {
     #[test]
     fn env_adopt_requires_env() {
         assert!(parse(&["thegn", "env", "adopt", "foo", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn up_wait_picks_detach_only_for_a_bare_terminal_run() {
+        assert_eq!(UpWait::pick(false, false, true), UpWait::Detach);
+        assert_eq!(UpWait::pick(false, false, false), UpWait::All);
+        assert_eq!(UpWait::pick(false, true, true), UpWait::All);
+        assert_eq!(UpWait::pick(true, false, true), UpWait::ShellReady);
+        assert!(parse(&["thegn", "env", "up", "--wait", "--shell-ready"]).is_err());
     }
 
     #[test]

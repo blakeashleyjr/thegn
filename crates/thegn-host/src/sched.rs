@@ -49,6 +49,56 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Concurrency and queued-admission cap for background closures.
 const BG_PERMITS: usize = 8;
 
+/// Most background workers allowed to hold a `thegn.db` connection while they do
+/// git work (neighbour prefetch, per-worktree PR refresh). Each WAL connection
+/// pins three descriptors, so an unbounded fan-out at startup showed up as 18
+/// db fds at the settled idle sample (THE-2630). The workers are latency
+/// insensitive, so excess ones wait for a slot before opening their connection.
+const BG_DB_SLOTS: usize = 2;
+
+/// Counting gate whose `acquire` blocks the calling (blocking-pool) thread.
+pub(crate) struct DbSlots {
+    free: std::sync::Mutex<usize>,
+    ready: std::sync::Condvar,
+}
+
+/// Releases its slot on drop.
+pub(crate) struct DbSlot<'a>(&'a DbSlots);
+
+impl DbSlots {
+    pub(crate) const fn new(slots: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(slots),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn acquire(&self) -> DbSlot<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.ready.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        DbSlot(self)
+    }
+}
+
+impl Drop for DbSlot<'_> {
+    fn drop(&mut self) {
+        let mut free = self.0.free.lock().unwrap_or_else(|e| e.into_inner());
+        *free += 1;
+        self.0.ready.notify_one();
+    }
+}
+
+static BG_DB: DbSlots = DbSlots::new(BG_DB_SLOTS);
+
+/// Wait for one of the shared background db slots; hold the guard for as long
+/// as the worker's `Db` is open.
+pub(crate) fn bg_db_slot() -> DbSlot<'static> {
+    BG_DB.acquire()
+}
+
 struct AdmissionLedger {
     admitted: AtomicU64,
     refused: AtomicU64,
@@ -535,6 +585,30 @@ mod tests {
         let snapshot = L.snapshot();
         assert_eq!(snapshot.admitted, 1);
         assert_eq!(snapshot.refused, 0);
+    }
+
+    #[test]
+    fn db_slots_bound_concurrent_holders() {
+        let gate = Arc::new(DbSlots::new(2));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let (gate, live, peak) = (gate.clone(), live.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    let _slot = gate.acquire();
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2);
+        assert_eq!(*gate.free.lock().unwrap(), 2, "every slot released");
     }
 
     #[test]

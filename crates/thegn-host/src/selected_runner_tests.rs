@@ -221,6 +221,52 @@ fn an_unconfigured_runner_starts_no_reconcile() {
 }
 
 #[test]
+fn startup_reconcile_covers_every_job_env_with_the_configured_runner_first() {
+    let mut cfg = Config::default();
+    for (name, provider) in [
+        ("alpha", sprites("a", TOKEN_VAR)),
+        ("beta", vercel("team_1", "prj_1", TOKEN_VAR)),
+        ("gamma", sprites("g", TOKEN_VAR)),
+        ("local", pc("local")),
+    ] {
+        cfg.env.insert(
+            name.into(),
+            thegn_core::config::EnvConfig {
+                provider,
+                ..Default::default()
+            },
+        );
+    }
+    let names = |cfg: &Config| -> Vec<String> {
+        reconcile_targets(cfg)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    // No configured runner: every Sprites/Vercel env, by name; others are left out.
+    assert_eq!(names(&cfg), ["alpha", "beta", "gamma"]);
+    // The configured runner leads; the rest keep name order.
+    cfg.jobs.runner = "gamma".into();
+    assert_eq!(names(&cfg), ["gamma", "alpha", "beta"]);
+    // A runner naming a missing env does not hide the other envs.
+    cfg.jobs.runner = "ghost".into();
+    assert_eq!(names(&cfg), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn an_unresolvable_env_is_skipped_without_failing_the_pass() {
+    let _state = crate::testenv::IsolatedState::new();
+    let rt = runtime();
+    // Neither env can resolve a token or a binding, and no ledger has pending
+    // work: the pass must complete without building a runner or panicking.
+    let targets = vec![
+        ("broken".to_owned(), sprites("", MISSING_VAR)),
+        ("gone".to_owned(), vercel("", "", MISSING_VAR)),
+    ];
+    reconcile_all(&targets, rt.handle());
+}
+
+#[test]
 fn startup_reattach_skips_live_leases_and_rows_without_a_session() {
     use sprites_job::{AttemptState, OwnerLease};
     let now = thegn_core::util::now_ms();
