@@ -4,6 +4,8 @@
 //! - [`ledger`]: ownership. A `creating` record is written to the file ledger
 //!   (`vps::registry`, provider `sprites`) **before** `POST /v1/sprites`, and
 //!   `destroy` refuses a sprite this host cannot prove it created.
+//! - [`marker`]: the creation marker on the sprite that lets another instance
+//!   on the same account adopt it on reattach without `thegn env adopt`.
 //! - [`resources`]: the memory policy (`min_ram_gb` × 1024 MiB).
 //! - [`usage`]: CPU and reserved GB-hours from the Sprites usage API.
 //! - [`hold_api`]: the keep-awake Tasks-API hold constants.
@@ -16,6 +18,7 @@ pub mod hold_api;
 pub mod inspect;
 pub mod job;
 pub mod ledger;
+pub mod marker;
 pub mod resources;
 pub mod usage;
 

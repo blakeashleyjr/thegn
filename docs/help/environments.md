@@ -245,6 +245,16 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `env adopt` line if the sprite is yours. This also applies when a record was
   lost, and to the dev instance for a sprite the stable instance created for the
   same worktree path: the two instances do not share records.
+- **Automatic recovery across instances.** thegn stamps a creation marker
+  (`/workspace/.thegn/sprite-owner`: sprite name, account fingerprint,
+  controller id, 30 minute lease) on a sprite it creates or reattaches. When a
+  listed sprite has no record here, reattach, `env snapshot` and `env restore`
+  read that marker and record the sprite for you if it names this sprite and
+  account and its lease is ours or has lapsed, so stable can pick up a sprite
+  dev made (and the reverse) without `env adopt`. A live lease held by another
+  instance, or a missing marker (sprites made before this release), still
+  refuses with the `env adopt` line. The check reads the sprite and, on
+  reattach, writes the marker, which wakes a cold sprite.
 - **Checkpoint and restore need a record too.** `thegn env snapshot` and
   `thegn env restore` run the same ledger proof first. Without a record they
   refuse with the `thegn env adopt` line. A sprite made before the ledger
