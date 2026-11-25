@@ -5593,6 +5593,9 @@ fn dispatch_menu_choice(
         MenuChoice::SandboxRetry
         | MenuChoice::SandboxRunOnHost
         | MenuChoice::SandboxStartRuntime(_) => {}
+        MenuChoice::ModelCredentialsForward(_)
+        | MenuChoice::ModelCredentialsNotNow(_)
+        | MenuChoice::ModelCredentialsNever(_) => {}
     }
     GitAfter::None
 }
@@ -21060,7 +21063,6 @@ async fn event_loop<T: Terminal>(
                                 materialize_failed.remove(&(target.group.clone(), target.tab));
                                 prewarm_failed.remove(&(target.group.clone(), target.tab));
                                 model.status = "Retrying environment bring-up…".into();
-                                dirty = true;
                             }
                             active_menu = None;
                             if let Some(v) = pr_view.as_mut() {

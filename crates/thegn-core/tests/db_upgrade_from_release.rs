@@ -109,10 +109,9 @@ fn shipped_release_dbs_upgrade_without_losing_rows() {
         // A table may be renamed or folded away by a migration, but a table
         // that survives must not have lost rows.
         for (table, n) in &before {
+            // A table that is gone was renamed or folded away; only survivors are checked.
             if let Some(m) = after.get(table) {
                 assert!(m >= n, "{rung}: table {table} dropped rows ({n} -> {m})");
-            } else {
-                eprintln!("{rung}: table {table} ({n} rows) removed by migration");
             }
         }
         for key in KEY_TABLES {
