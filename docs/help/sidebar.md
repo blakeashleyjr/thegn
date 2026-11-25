@@ -166,7 +166,10 @@ gesture below has a keyboard equivalent.
 
 A project's worktrees include every git worktree of the repository, so ones
 another tool made (an agent harness, a script, plain `git worktree add`) show
-up too. A worktree is **external** when it sits outside thegn's own checkout
+up too. A checkout thegn is itself creating — the new-worktree wizard prepares
+its worktree while the form is open — is never picked up from here: it appears
+only when its creation completes, and cancelling the wizard leaves no row
+behind. A worktree is **external** when it sits outside thegn's own checkout
 layout (`<worktrees_dir>/<repo>/…`, or `.worktrees` inside the repository),
 outside every `worktree_roots` entry of its project, and has not been filed
 into a folder — filing one adopts it. The home checkout is never external.

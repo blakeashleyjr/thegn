@@ -35,6 +35,13 @@ live rendering: same folders, sort order, pin behavior, and gutter alignment.
 - **WHEN** the same workspace renders live and then dormant (parked)
 - **THEN** the tree shape — folders, order, pinned rows — is identical
 
+#### Scenario: A creation in flight never renders as a worktree row
+
+- **WHEN** the new-worktree wizard's speculative checkout exists on disk while
+  its form is open, or the form is cancelled before submit
+- **THEN** no worktree row appears for that checkout while the creation is in
+  flight, and cancelling leaves no row behind
+
 ### Requirement: Manual ordering independent of recency
 
 Workspace ordering in the sidebar SHALL default to an explicit persisted
