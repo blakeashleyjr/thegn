@@ -49,9 +49,12 @@ const MAX_QUEUED_JOBS: usize = 4096;
 #[cfg(test)]
 const MAX_QUEUED_JOBS: usize = 8;
 
-/// How long the writer keeps its connection open with nothing to do.
+/// How long the writer keeps its connection open with nothing to do. Kept well
+/// under the idle bench's 20 s settle cap: startup writes trail into the settle,
+/// and a 20 s close could leave the writer's main/WAL/shm handles (3 fds) open
+/// at the sample (THE-2630: 17 > 16).
 #[cfg(not(test))]
-const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(20);
+const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(3600);
 

@@ -13,7 +13,8 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 ## Platforms
 
 - **Linux x86_64 is supported.** Install from a GNU or musl release archive or
-  the Nix flake; use the musl archive on systems with older glibc.
+  the Nix flake; the GNU archive needs glibc 2.28 or newer, and the musl archive works on any
+  distribution.
 - **macOS on Apple silicon is supported**; Intel macOS has no release binary.
   Install with `brew install blakeashleyjr/thegn/thegn` (not quarantined). The
   release archive is unsigned; clear quarantine with
@@ -63,6 +64,10 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 - **`route_to_host` can hold off-host provider worktrees from automatic
   draining.** If the host cannot verify the provider source it holds the row
   for review rather than folding it; see [[merge-queue]].
+- **A Sprites interactive (pty) exec can drop the line break after its first
+  line of output.** The Sprite sends that first line without its CRLF, so the
+  next line starts on the same row; later lines are unaffected. Non-pty execs
+  keep it. This is upstream of thegn; see [[environments]].
 
 ## Security model
 

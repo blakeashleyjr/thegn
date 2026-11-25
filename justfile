@@ -1135,6 +1135,7 @@ sprites-live-recycle:
 # Hermetic end-to-end test against the debug binary.
 smoke: build
     ./test/install-plan.sh
+    ./test/check-glibc-floor-test.sh
     ./test/make-app.sh
     ./test/dev-tui-plan.sh
     ./test/instance-lifecycle.sh

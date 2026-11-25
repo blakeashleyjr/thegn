@@ -68,7 +68,10 @@ works without an agent configured, and configured agent and tool entries can
 launch ordinary command-line programs. thegn-proxy is a separate, opt-in
 component.
 The application is alpha software, and its pre-1.0 configuration and CLI
-surfaces can change. This page makes no performance comparison.
+surfaces can change. This page makes no performance comparison: measured
+results, with the machines and commands that produced them, live in
+[performance results](../performance-results.md) — none are recorded yet, so
+no speed claim here or in the launch copy is backed by a published number.
 
 ## Using them together
 

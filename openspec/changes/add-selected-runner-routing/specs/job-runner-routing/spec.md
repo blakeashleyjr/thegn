@@ -123,3 +123,36 @@ default, or local) without resolving a token or dispatching anything.
 - **WHEN** neither a project binding nor `[jobs] runner` is set
 - **THEN** `job route` reports destination `local` and `job run` still
   requires `--runner`
+
+### Requirement: Automatic route for a stock terminal agent
+
+A project that sets the trusted `[project.<slug>.jobs] route = "auto"` and has
+an effective runner SHALL route its terminal agent's qualified recipes through
+the same request as `thegn job run`. A recipe is qualified only when it is
+exactly `cargo build` or `cargo test` with no further arguments, run at the
+worktree root with no build-altering environment. Compound (`a && b`) and piped
+(`a | b`, producer side only) lines SHALL be judged command by command; any
+shell syntax the matcher does not model SHALL be reported as outside coverage.
+Everything else SHALL run the real tool unchanged. `route` SHALL have no global
+spelling and SHALL default to off. A qualified recipe that cannot reach its
+runner SHALL fail with the reason and MUST NOT start a local compiler; running
+locally SHALL require an explicit `THEGN_JOB_LOCAL=1`, announced on stderr. The
+shim MUST pass through inside a selected job.
+
+#### Scenario: Only the opted-in project routes
+
+- **WHEN** project A sets `route = "auto"` and project B does not, both with a
+  runner
+- **THEN** `cargo build` at A's root routes remotely and at B's root runs
+  locally
+
+#### Scenario: A near-miss stays local and says so
+
+- **WHEN** the agent runs `cargo build --release`
+- **THEN** the real `cargo` runs and a notice states that the closed recipe
+  forwards no arguments
+
+#### Scenario: A routed recipe cannot reach its runner
+
+- **WHEN** the runner refuses, is unavailable or its acknowledgement is lost
+- **THEN** the command exits non-zero with the reason and no local build runs

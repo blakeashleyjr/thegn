@@ -748,9 +748,14 @@ fn attach_prewarm_sessions(
         .filter(|session| session.provider == "daemon")
         .map(|session| session.session.clone())
         .collect();
+    // THE-2683: sessions a persisted daemon record names reattach onto their
+    // recorded leaf when their tab materializes, so grafting one here would
+    // show it twice once that tab opens.
+    let recorded = worktree_attach::recorded_daemon_sessions(ctx.session);
     let targets: Vec<_> = targets
         .into_iter()
         .filter(|target| !shown.contains(&target.session))
+        .filter(|target| !recorded.contains(&target.session))
         .collect();
     let budget = worktree_attach::MAX_PANES_PER_TAB
         .saturating_sub(ctx.session.worktrees[gi].tabs[ti].center.pane_ids().len());
@@ -1027,6 +1032,16 @@ pub(crate) fn drain_specs(
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        // THE-2683: a persisted daemon record is a promise that materialize
+        // reattaches that session onto its own leaf (below), so a recorded
+        // session is not headless and must not also enter the attach pool —
+        // the probe lists it beside the truly headless sessions (it is live
+        // and carries this worktree), and the surplus graft used to show it a
+        // second time beside the leaf that reattached it. Every group/tab of
+        // the session counts, not just this tab's: a neighboring tab's
+        // recorded session reattaches when ITS tab materializes. Computed
+        // before the mutable tab borrow below; recomputed per batch.
+        let recorded = worktree_attach::recorded_daemon_sessions(ctx.session);
         let Some(tab) = ctx.session.worktrees[gi].tabs.get_mut(ti) else {
             continue;
         };
@@ -1075,7 +1090,12 @@ pub(crate) fn drain_specs(
         // `panes.table` here — cheap and correct. Leaves with a persisted
         // daemon record are excluded from the pool: they reattach their OWN
         // prior session (the existing warm-reattach contract) and must not
-        // have an agent session aimed at them.
+        // have an agent session aimed at them — and the recorded sessions are
+        // excluded from the targets for the same reason (THE-2683): the
+        // materialize below reattaches each one onto its own leaf, so one
+        // that stayed in the pool landed a second time as a surplus split,
+        // restoring a single-pane tab with an extra pane and a different
+        // split.
         let (attach, surplus, overflow) =
             if batch_attach.is_empty() || !ctx.panes.daemon_route_enabled() {
                 (Vec::new(), Vec::new(), 0usize)
@@ -1091,6 +1111,7 @@ pub(crate) fn drain_specs(
                 let targets: Vec<AttachTarget> = batch_attach
                     .into_iter()
                     .filter(|t| !shown.contains(&t.session))
+                    .filter(|t| !recorded.contains(&t.session))
                     .collect();
                 let fit = targets.len();
                 let spawn_leaves: Vec<u32> = specs
@@ -1760,6 +1781,297 @@ mod tests {
         assert!(panes.table.is_empty(), "a failed resolve spawns nothing");
     }
 
+    /// THE-2683: the demo quit-and-relaunch. The tab's daemon session
+    /// survives the quit (the pane daemon owns the PTY), so the relaunch's
+    /// worktree probe returns it — live, this worktree — and the session
+    /// model also persisted its record; materialize reattaches that session
+    /// onto its own leaf (the warm-reattach contract). Before the fix the
+    /// drain filtered the probe targets only against live panes (`shown` —
+    /// empty here, the pane does not exist yet), so the recorded session
+    /// sailed into the surplus pool and `graft_surplus` split it in beside
+    /// the leaf that had just reattached it: the restored single-pane tab
+    /// came back with a second pane and a different split. The drain now
+    /// drops targets a persisted daemon record names; removing that filter
+    /// fails this test with two panes.
+    #[test]
+    fn drain_specs_restores_a_persisted_session_without_grafting_a_second_pane() {
+        let mut session = Session {
+            id: "s1".into(),
+            // Empty worktree path: the remote fallbacks are gated on a
+            // non-empty worktree, so the leaf takes the plain attach path.
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 7u32;
+        {
+            let tab = &mut session.worktrees[0].tabs[0];
+            tab.center = crate::center::CenterTree::Leaf(leaf);
+            tab.focused_pane = leaf;
+            tab.pane_sessions.insert(
+                leaf,
+                ProviderSession {
+                    provider: "daemon".into(),
+                    id: "local".into(),
+                    session: "warm-1".into(),
+                },
+            );
+        }
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let cfg = thegn_core::config::Config::default();
+        let mut daemon_cfg = cfg.daemon.clone();
+        daemon_cfg.enabled = true;
+        panes.set_daemon_config(daemon_cfg);
+        let attached = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attached_by_spawn = std::sync::Arc::clone(&attached);
+        panes.set_test_daemon_spawn(move |panes, session| {
+            let session = session.ok_or_else(|| anyhow::anyhow!("attach target missing"))?;
+            let id = panes.insert_test_daemon_pane(session.to_string());
+            attached_by_spawn
+                .lock()
+                .unwrap()
+                .push((session.to_string(), id));
+            Ok(id)
+        });
+
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        };
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 0,
+                target_leaves: vec![leaf],
+                origin: SpecOrigin::Materialize,
+                specs: Ok(vec![(leaf, spec)]),
+                relaunch: RelaunchOutcome::NotAttempted,
+                // The probe found the still-live daemon session the
+                // persisted record names — the relaunch batch from the
+                // repro.
+                attach: vec![AttachTarget {
+                    session: "warm-1".into(),
+                    program: "sh".into(),
+                }],
+                remote: false,
+                remembered_agent: None,
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        let mut attached_now = attached.lock().unwrap().clone();
+        assert_eq!(
+            attached_now.len(),
+            1,
+            "the recorded session reattaches exactly once"
+        );
+        let (_, restored) = attached_now.pop().expect("the single attach spawn");
+        assert_eq!(
+            panes.table.keys().copied().collect::<Vec<_>>(),
+            vec![restored],
+            "no surplus pane is grafted beside the reattached one"
+        );
+        let tab = &session.worktrees[0].tabs[0];
+        assert_eq!(
+            tab.center,
+            crate::center::CenterTree::Leaf(restored),
+            "the single-pane tab stays a single pane — no adopt::graft split"
+        );
+        assert_eq!(tab.focused_pane, restored);
+        assert!(
+            panes.table[&restored].is_daemon_backed(),
+            "the restored pane rides the daemon"
+        );
+        assert_eq!(
+            panes.table[&restored]
+                .provider_session()
+                .expect("daemon pane")
+                .session,
+            "warm-1",
+            "the pane carries the reattached session, not a fresh shell"
+        );
+    }
+
+    /// THE-85 still lands: a live session the session model holds no record
+    /// for takes the tab's missing leaf — the recorded filter must not empty
+    /// the pool for everyone. (Such a target exists when the pane daemon has
+    /// a session this session never knew, e.g. a tab closed while its
+    /// session lived on in another group.)
+    #[test]
+    fn drain_specs_attaches_a_recordless_live_target_onto_the_missing_leaf() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 7u32;
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(leaf);
+        session.worktrees[0].tabs[0].focused_pane = leaf;
+
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let cfg = thegn_core::config::Config::default();
+        let mut daemon_cfg = cfg.daemon.clone();
+        daemon_cfg.enabled = true;
+        panes.set_daemon_config(daemon_cfg);
+        let attached = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attached_by_spawn = std::sync::Arc::clone(&attached);
+        panes.set_test_daemon_spawn(move |panes, session| {
+            let session = session.ok_or_else(|| anyhow::anyhow!("attach target missing"))?;
+            let id = panes.insert_test_daemon_pane(session.to_string());
+            attached_by_spawn
+                .lock()
+                .unwrap()
+                .push((session.to_string(), id));
+            Ok(id)
+        });
+
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        };
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 0,
+                target_leaves: vec![leaf],
+                origin: SpecOrigin::Materialize,
+                specs: Ok(vec![(leaf, spec)]),
+                relaunch: RelaunchOutcome::NotAttempted,
+                // Headless: no persisted record names this session.
+                attach: vec![AttachTarget {
+                    session: "headless-1".into(),
+                    program: "sh".into(),
+                }],
+                remote: false,
+                remembered_agent: None,
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        let mut attached_now = attached.lock().unwrap().clone();
+        assert_eq!(
+            attached_now.len(),
+            1,
+            "the headless session attaches exactly once"
+        );
+        let (_, restored) = attached_now.pop().expect("the single attach spawn");
+        assert_eq!(
+            panes.table.keys().copied().collect::<Vec<_>>(),
+            vec![restored],
+            "the headless session takes the missing leaf — exactly one pane"
+        );
+        let tab = &session.worktrees[0].tabs[0];
+        assert_eq!(
+            tab.center,
+            crate::center::CenterTree::Leaf(restored),
+            "the attach rides the existing leaf, no split"
+        );
+        assert_eq!(
+            panes.table[&restored]
+                .provider_session()
+                .expect("daemon pane")
+                .session,
+            "headless-1"
+        );
+        assert!(need_relayout, "the new pane must be laid out");
+        assert!(dirty, "the new pane changes the frame");
+    }
+
     #[test]
     fn drain_specs_prewarm_skip_attaches_live_target_without_fresh_spawn() {
         let mut session = Session {
@@ -1864,6 +2176,122 @@ mod tests {
         assert!(prewarm_failed.is_empty(), "a benign skip is not a failure");
         assert!(need_relayout, "the adopted pane changes tab geometry");
         assert!(dirty, "the adopted pane changes the frame");
+    }
+
+    /// THE-2683 on the prewarm-skip path: a skipped prewarm still attaches
+    /// the worktree live sessions, but the tab's own persisted record — the
+    /// still-alive session the quit left behind — reattaches when a later
+    /// focused materialize consumes its leaf. The recorded session must
+    /// stay out of the surplus graft, or the tab would come up with an
+    /// extra pane split beside the pane that reattached it.
+    #[test]
+    fn drain_specs_prewarm_skip_leaves_a_persisted_sessions_record_to_its_leaf() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let leaf = 7u32;
+        {
+            let tab = &mut session.worktrees[0].tabs[0];
+            tab.center = crate::center::CenterTree::Leaf(leaf);
+            tab.focused_pane = leaf;
+            tab.pane_sessions.insert(
+                leaf,
+                ProviderSession {
+                    provider: "daemon".into(),
+                    id: "local".into(),
+                    session: "live-session".into(),
+                },
+            );
+        }
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(pane_tx);
+        let cfg = thegn_core::config::Config::default();
+        let mut daemon_cfg = cfg.daemon.clone();
+        daemon_cfg.enabled = true;
+        panes.set_daemon_config(daemon_cfg);
+        let attached = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attached_by_spawn = std::sync::Arc::clone(&attached);
+        panes.set_test_daemon_spawn(move |panes, session| {
+            let session = session.ok_or_else(|| anyhow::anyhow!("attach target missing"))?;
+            attached_by_spawn.lock().unwrap().push(session.to_string());
+            Ok(panes.insert_test_daemon_pane(session.to_string()))
+        });
+
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let loading_retired = std::collections::HashSet::new();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::from([("app/home".into(), 0)]);
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel();
+        spec_tx
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 0,
+                target_leaves: vec![leaf],
+                origin: SpecOrigin::Prewarm,
+                specs: Err(SpecError::PrewarmSkipped),
+                relaunch: RelaunchOutcome::NotAttempted,
+                // The probe found the very session the persisted record
+                // names — it is live and carries this worktree.
+                attach: vec![AttachTarget {
+                    session: "live-session".into(),
+                    program: "claude".into(),
+                }],
+                remote: false,
+                remembered_agent: None,
+            })
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_retired: &loading_retired,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            attached.lock().unwrap().is_empty(),
+            "the recorded session must not be grafted"
+        );
+        assert!(panes.table.is_empty(), "a benign skip still spawns nothing");
+        assert!(
+            prewarm_inflight.is_empty(),
+            "the skipped request is settled"
+        );
+        assert!(prewarm_failed.is_empty(), "a benign skip is not a failure");
+        assert!(!need_relayout, "nothing was grafted, so no relayout");
+        assert!(!dirty, "nothing changed the frame");
     }
 
     /// A skipped prewarm still carries attach targets, but its result has no

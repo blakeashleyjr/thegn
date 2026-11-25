@@ -55,7 +55,7 @@ It checks the pane-daemon listeners it knows about and reports any it cannot
 check or stop. It prints that no pane daemon is running only after checking all
 listeners.
 
-Windows support is deferred. On Linux and best-effort macOS, config is under
+Windows support is deferred. On Linux and macOS, config is under
 `$XDG_CONFIG_HOME/thegn` (usually `~/.config/thegn`); run `thegn config path`
 to print the config file path. State is under `$XDG_STATE_HOME/thegn` (usually
 `~/.local/state/thegn`) and includes `thegn.db`, logs, and crash reports.

@@ -52,8 +52,8 @@ built to degrade to what a terminal reports, so they are expected to work, but
 treat that as unverified; `thegn doctor` shows what thegn detected. If something
 renders wrongly, report it with the "Outer terminal" field filled in.
 
-macOS is best-effort; the Option-as-Alt table below is configuration
-guidance, not a test result.
+macOS terminal support is best-effort; the Option-as-Alt table below is
+configuration guidance, not a test result.
 
 ## Nix batteries terminal
 

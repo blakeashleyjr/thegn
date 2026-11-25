@@ -34,8 +34,8 @@ Named `[env.<name>]` execution environments (local, container, or a cloud
 provider) appear in the panel's **system → environments** section — `↵`
 (re)binds the cursor env to the active worktree, `t` tests its provider
 token (the outcome pops as a toast and is logged), `n` opens the add
-wizard (on the stable channel it offers `local`, `sprites` and `vercel`; the
-other kinds appear on the dev channel), and `x`
+wizard (on the stable channel it offers `local`, `ssh`, `sprites` and `vercel`;
+the other kinds appear on the dev channel), and `x`
 removes it after a confirm (removal also forgets the stored token). On a
 [[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
 the sandbox) and the row shows `results not pulled` until a pull succeeds. An
@@ -58,7 +58,7 @@ changes rather than treating the pool as empty.
 When a worktree opens and its spare ledger cannot be read, a warning appears on
 the status line and in a toast, and the worktree is provisioned fresh instead
 of claiming a spare.
-On the dev channel, before a spare is handed to a worktree, the worktree's
+On the dev channel, and for Sprites and Vercel environments on stable, before a spare is handed to a worktree, the worktree's
 network allow/block policy is verified on that spare and re-applied if it
 drifted. An unverifiable spare is quarantined (listed in `thegn doctor`) and
 the worktree is provisioned fresh. Empty policies skip this check. A provider
@@ -76,8 +76,8 @@ its ledger row remains until the provider confirms destruction, so a failed
 destroy leaves it listed for a later retry.
 A stale or released spare is recycled from its base checkpoint only when the
 provider's checkpoint list confirms that checkpoint exists; if the list cannot
-be read, the spare is destroyed instead. On the dev channel, after a
-checkpoint restore, `thegn env restore` and warm-pool recycle verify an
+be read, the spare is destroyed instead. On the dev channel, and for Sprites and
+Vercel environments on stable, after a checkpoint restore, `thegn env restore` and warm-pool recycle verify an
 environment's non-empty network allow/block policy when the provider supports
 egress control. If needed, the policy is re-applied and read back. If
 verification fails, `thegn env restore` fails and reports that the sandbox is
@@ -86,7 +86,7 @@ successful `env restore` reports the verified counts. Before it restores a
 Sprites checkpoint, thegn reads the checkpoint: a missing one (404) refuses with
 "no checkpoint", a non-empty `health` refuses as unhealthy, and any other failed
 read refuses too, so nothing is rolled back to a checkpoint that is gone or
-broken. On the dev channel,
+broken. On the dev channel, and for Sprites and Vercel environments on stable,
 opening a worktree against an existing provider sandbox with egress control
 also verifies its non-empty network policy and reapplies it if it drifted. If
 the policy cannot be verified, opening is refused and the sandbox is left in
@@ -98,7 +98,8 @@ error; worktree deletion refuses before removing anything; closing a tab does
 path-only cleanup and warns that an SSH sandbox container may remain. On the
 dev channel, provider SSH connect, warm-pool operations, hibernation,
 provisioning and host placement are refused or skipped with the reason. The
-close auto-checkpoint is also skipped with a warning on the dev channel. In
+close auto-checkpoint is also skipped with a warning on the dev channel, and
+for Sprites and Vercel environments on stable. In
 the panel's system → environments section, an unreadable selection marks
 no environment bound, adds a red `binding unreadable: <reason>` row and a
 `binding?` badge, and `↵` refuses to rebind until the state database is
@@ -116,7 +117,8 @@ configured (dev channel), the tab shows `env?` and the loading splash shows
 `env: unknown`. `thegn doctor` reports an unknown environment; a failed pane
 connection is not blamed on a guessed provider. Provisioning skips trust-gated
 devcontainer steps and launch skips devshell injection, with a warning. On the
-dev channel, an unreadable account selection refuses a provider pane; failed
+dev channel, and for Sprites and Vercel environments on stable, an unreadable
+account selection refuses a provider pane; failed
 SSH sandbox teardown identifies the container that may still be running, and
 hibernation refuses a restore when its record cannot be read while hibernation
 is enabled. Teardown and close auto-checkpoint warnings appear on the status
@@ -245,6 +247,16 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   `env adopt` line if the sprite is yours. This also applies when a record was
   lost, and to the dev instance for a sprite the stable instance created for the
   same worktree path: the two instances do not share records.
+- **Automatic recovery across instances.** thegn stamps a creation marker
+  (`/workspace/.thegn/sprite-owner`: sprite name, account fingerprint,
+  controller id, 30 minute lease) on a sprite it creates or reattaches. When a
+  listed sprite has no record here, reattach, `env snapshot` and `env restore`
+  read that marker and record the sprite for you if it names this sprite and
+  account and its lease is ours or has lapsed, so stable can pick up a sprite
+  dev made (and the reverse) without `env adopt`. A live lease held by another
+  instance, or a missing marker (sprites made before this release), still
+  refuses with the `env adopt` line. The check reads the sprite and, on
+  reattach, writes the marker, which wakes a cold sprite.
 - **Checkpoint and restore need a record too.** `thegn env snapshot` and
   `thegn env restore` run the same ledger proof first. Without a record they
   refuse with the `thegn env adopt` line. A sprite made before the ledger

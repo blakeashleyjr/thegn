@@ -12,8 +12,17 @@ machine and when thegn or a tool it starts can contact the network.
 No vendor telemetry was found: the source contains no analytics or crash-upload
 client. thegn does not check for new versions. A first-run network trace script
 exists in the source tree (`scripts/first-run-net-trace.sh`, run with
-`just net-trace`); its results are pending, so this page does not claim that
-thegn makes no network calls.
+`just net-trace`). It traces the release binary's first frame with `strace` and
+lists every `connect()` target. A trace of main commit `1c5b3de0ab` showed only
+local Unix-socket connects (the session bus was disabled and the user systemd
+socket is a Unix socket). It showed no TCP connection to loopback or elsewhere.
+The trace covers the first frame only; it does not show network use after that,
+and it cannot see setuid helpers. So this page does not claim that thegn makes
+no network calls at all.
+
+The first-run trace used to show one TCP connect to the default MPD address
+(`127.0.0.1:6600`). That probe is gone: `[media] backend = "auto"` no longer
+dials it (see [[media]]).
 
 ## What stays on your machine
 
@@ -31,6 +40,11 @@ thegn makes no network calls.
   and the file is restricted to your account (0600). The database also holds
   some live bearer credentials (iroh pair secrets), so treat copies and backups
   as sensitive.
+- **Doctor report:** `thegn doctor` redacts identifying tailnet detail —
+  the tailnet name and the control URL print as `***redacted***` — because
+  its output is regularly pasted into issues. `thegn doctor --full` (alias
+  `--unredacted`) prints them verbatim; `thegn doctor bundle` always
+  archives the redacted view. See [[debugging]].
 - **Doctor bundles:** `thegn doctor bundle --out FILE` creates a local gzip
   archive with a doctor report, redacted config, retained crash reports and
   bounded log tails (up to 500 lines per log). It does not upload the archive.

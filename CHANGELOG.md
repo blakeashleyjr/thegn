@@ -7,6 +7,42 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.134] — 2026-11-25
+
+Agent builds and tests can run on a Sprite or Vercel sandbox. With
+`[project.<slug>.jobs] route = "auto"`, a terminal agent's `cargo build` and
+`cargo test` go to the project's job runner instead of the local machine.
+
+### Added
+
+- `thegn job shim`, `thegn job shim-install` and `thegn job match`. A
+  `route = "auto"` agent pane gets the shim directory on its `PATH`, and
+  `[jobs] admission_timeout_secs` (default 30) bounds the wait for a runner.
+- A sprite created by another thegn instance is adopted from its creation
+  marker (`/workspace/.thegn/sprite-owner`, 30-minute lease) instead of being
+  refused.
+- `thegn doctor --full` shows tailnet identity; the default output redacts it.
+
+### Changed
+
+- The Linux GNU release archive is built against a glibc 2.28 floor, so it
+  runs on Debian 12 and other older distributions. Asset names are unchanged.
+- The environments, privacy and launch docs no longer call Sprites and Vercel
+  dev-only, and record the first-run network trace.
+
+### Fixed
+
+- A cancelled worktree create no longer leaves a ghost row in the sidebar.
+- A recorded daemon session stays out of the relaunch attach pool, so restore
+  brings back the saved layout.
+- The idle benchmark's warm-up launch skips the first-run tour; the database
+  writer closes an idle connection after 5 seconds.
+
+### Known limitations
+
+- A Sprites interactive (pty) exec can drop the line break after its first
+  line of output. The loss is upstream of thegn.
+
 ## [0.1.0-alpha.133] — 2026-11-25
 
 Model credentials are no longer sent to a remote sandbox without asking. If

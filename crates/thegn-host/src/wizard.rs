@@ -1441,6 +1441,12 @@ pub fn run_worker(
             return;
         }
     };
+    // Claim the checkout before it exists on disk so discovery never
+    // adopts a path this worker owns (THE-2684): the worker registers the
+    // row itself on submit or rolls the checkout back on cancel, and a
+    // mid-flight adoption would render a `tg/…` sidebar row that outlives
+    // the rollback. Held until the worker exits, on every path.
+    let mut _claim = crate::worktree_discovery::claim_creation_path(&path);
     // Display label for the hook's `$THEGN_WORKSPACE` only. The AUTHORITATIVE
     // slug (the tab key) is resolved later from the worker's own DB handle:
     // opening a second connection here would make an unrelated busy/locked
@@ -1532,10 +1538,24 @@ pub fn run_worker(
             // the worktree in place — resurrect picks it up next session.
             Err(_) => return,
             Ok(WizardCmd::Cancel) => {
-                if let Err(error) =
-                    crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
-                {
-                    thegn_core::msg::warn(&format!("wizard cancellation cleanup failed: {error}"));
+                match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+                    Ok(()) => {
+                        // A hydration pass can still have registered the
+                        // mid-flight checkout when its discovery snapshot was
+                        // read before this worker claimed the path
+                        // (THE-2684). The checkout is gone now, so retire its
+                        // row too instead of leaving a `tg/…` sidebar ghost
+                        // for the next hydration to reap.
+                        if let Ok(db) = open_db() {
+                            let path_s = path.to_string_lossy().into_owned();
+                            let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                        }
+                    }
+                    Err(error) => {
+                        thegn_core::msg::warn(&format!(
+                            "wizard cancellation cleanup failed: {error}"
+                        ));
+                    }
                 }
                 tracing::info!(
                     target: "thegn::worktree_create",
@@ -1613,6 +1633,11 @@ pub fn run_worker(
                 match worktree::rename(root, &path, &branch, &want, cfg) {
                     Ok(new_path) => {
                         branch = want;
+                        // Re-claim under the moved path so discovery stays off
+                        // the checkout across the rename: the fresh claim is
+                        // inserted before this assignment drops the old one,
+                        // so no window exists without one.
+                        _claim = crate::worktree_discovery::claim_creation_path(&new_path);
                         path = new_path;
                         // A sandbox container is keyed by the worktree path —
                         // re-ensure for the moved path (cheap next to a checkout).
@@ -3014,6 +3039,98 @@ mod tests {
             !repo.join(".worktrees/tg-doomed").exists(),
             "worktree dir cleaned up"
         );
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn worker_cancel_retires_a_row_raced_in_by_discovery() {
+        let repo = temp_repo("cancel-raced-row");
+        let db = repo.join("state/thegn.db");
+        let path = worktree::allocate_worktree_path(&repo, "tg/doomed", &test_cfg()).unwrap();
+        let path_s = path.to_string_lossy().into_owned();
+        // A hydration pass whose discovery snapshot was read before the worker
+        // claimed the path registers the mid-flight checkout (THE-2684):
+        // cancel must retire the row with the worktree, not leave a `tg/…`
+        // sidebar ghost for the next hydration to reap.
+        let handle = Db::open_at(&db).unwrap();
+        handle
+            .put_worktree(
+                "r/tg-doomed",
+                &repo.to_string_lossy(),
+                &path_s,
+                "tg/doomed",
+                None,
+                None,
+            )
+            .unwrap();
+        drop(handle);
+        let events = drive_worker(&repo, "tg/doomed", vec![WizardCmd::Cancel], &db);
+        assert!(done_payload(&events).is_none());
+        let handle = Db::open_at(&db).unwrap();
+        assert!(
+            handle
+                .worktrees()
+                .unwrap()
+                .iter()
+                .all(|row| row.worktree != path_s),
+            "cancel retires the raced registry row with the worktree"
+        );
+        assert!(!path.is_dir(), "speculative worktree removed");
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn worker_holds_a_discovery_claim_for_the_speculative_checkout() {
+        let _state = crate::testenv::IsolatedState::new();
+        let repo = temp_repo("claim-held");
+        let db = repo.join("state/thegn.db");
+        let path = worktree::allocate_worktree_path(&repo, "tg/held", &test_cfg()).unwrap();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The worker runs on its own thread, parked on the command channel once
+        // the speculative checkout exists, so the claim is observable from this
+        // thread without racing the worker's exit. The claim is inserted before
+        // `git worktree add` runs, so a dir on disk implies the claim is held.
+        let worker_repo = repo.clone();
+        let worker_db = db.clone();
+        let worker = std::thread::spawn(move || {
+            run_worker(
+                WorkerCtx {
+                    cfg: test_cfg(),
+                    repo_root: worker_repo,
+                    candidate: "tg/held".into(),
+                    exact_branch: false,
+                    generation: 7,
+                    db_path: Some(worker_db),
+                    base_override: None,
+                },
+                cmd_rx,
+                ev_tx,
+                || {},
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !path.is_dir() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(path.is_dir(), "speculative checkout appeared");
+        assert!(
+            crate::worktree_discovery::claimed_creation_paths_snapshot().contains(&path),
+            "the claim is held while the checkout exists"
+        );
+        cmd_tx.send(WizardCmd::Cancel).unwrap();
+        drop(cmd_tx);
+        worker.join().expect("worker thread finished");
+        assert!(
+            !crate::worktree_discovery::claimed_creation_paths_snapshot().contains(&path),
+            "the claim is released when the worker exits"
+        );
+        assert!(!path.is_dir(), "cancel removed the speculative worktree");
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(done_payload(&events).is_none());
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 

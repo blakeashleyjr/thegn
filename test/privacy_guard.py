@@ -4,6 +4,13 @@
 The names are kept only as SHA-256 hashes of lowercase tokens, so this file does not publish them. Every tracked
 text file is split into lowercase alphanumeric tokens (also joined across `-`), each token is hashed, and any hit
 fails the check. Real home-directory paths are matched directly, since `/home/<user>` is not a secret name.
+
+A second rule keeps pointers to the private audit tree out of live files: `docs/audits/` (including relative
+`](audits/…)`) records private evidence and is not part of the public repo, so no tracked file outside the
+sanctioned survivors may point at it. The survivors are dated records, exactly as in test/brand-guard.sh and
+test/stale-docs-guard.sh: an architect's design record or a proposal quotes the state of the world it reasons
+about, and that quoting is not a live pointer. The rule matches `audits/` not preceded by `-` or a word character,
+so a compound like `sandbox-audits/` is not swept (and is also not the private tree's path).
 """
 import hashlib
 import re
@@ -23,19 +30,35 @@ DENY = {
     "940fa5e673fa44c93882522adbcfd13226740c932a85679b5de3dc13c1fafaa7",
 }
 HOME_PATH = re.compile(r"/home/blake(?![a-z0-9])")
+AUDITS_PTR = re.compile(r"(?<![-\w])audits/")
 WORD = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SKIP = {"test/privacy_guard.py"}
+
+# Dated records and the guards themselves may name the private audit tree; live
+# files may not point at it. Mirrors the sanctioned-survivor lists in
+# test/brand-guard.sh and test/stale-docs-guard.sh.
+AUDITS_PTR_ALLOW_PREFIXES = (
+    ".thegn/pipeline/",  # agent-written records
+    "docs/plans/",  # dated plans
+    "docs/superpowers/",  # dated design records
+    "openspec/changes/",  # proposals and the archive quote the scrubbed tree
+    "scripts/spikes/",  # dated spike programme; its evidence tree is private
+)
+AUDITS_PTR_ALLOW_FILES = {"test/brand-guard.sh"}
 
 
 def hashed(token: str) -> bool:
     return hashlib.sha256(token.encode()).hexdigest() in DENY
 
 
-def scan(text: str):
+def scan(text: str, audits_ptr: bool = True):
     for lineno, line in enumerate(text.splitlines(), 1):
         low = line.lower()
         if HOME_PATH.search(low):
             yield lineno, "home-directory path"
+            continue
+        if audits_ptr and AUDITS_PTR.search(low):
+            yield lineno, "pointer to the private docs/audits/ record"
             continue
         for match in WORD.finditer(low):
             whole = match.group(0)
@@ -55,11 +78,15 @@ def main() -> int:
             text = (root / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
             continue
-        for lineno, why in scan(text):
+        audits_allowed = (
+            rel in AUDITS_PTR_ALLOW_FILES
+            or rel.startswith(AUDITS_PTR_ALLOW_PREFIXES)
+        )
+        for lineno, why in scan(text, audits_ptr=not audits_allowed):
             print(f"{rel}:{lineno}: {why}")
             failures += 1
     if failures:
-        print(f"privacy-guard: {failures} private name(s) above must not be committed", file=sys.stderr)
+        print(f"privacy-guard: {failures} finding(s) above must not be committed", file=sys.stderr)
         return 1
     print("privacy-guard: clean")
     return 0

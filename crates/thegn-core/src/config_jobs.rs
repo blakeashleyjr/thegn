@@ -11,14 +11,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{EnvConfig, EnvProviderKind};
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct JobsConfig {
     /// The `[env.<name>]` that runs `thegn job run`. Its provider must be
     /// `sprites` or `vercel`. Empty = no runner selected (`job run` then needs
     /// `--runner <env>`).
     pub runner: String,
+    /// Seconds a routed job waits for the runner to admit it before failing
+    /// closed (a runner that is transiently unavailable). 0 = do not wait.
+    pub admission_timeout_secs: u64,
 }
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            runner: String::new(),
+            admission_timeout_secs: DEFAULT_ADMISSION_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Default bound on the admission wait of a routed job.
+pub const DEFAULT_ADMISSION_TIMEOUT_SECS: u64 = 30;
 
 impl JobsConfig {
     /// Semantic checks: a selected runner must be a configured Sprites or Vercel
@@ -52,19 +67,62 @@ pub struct JobsOverlay {
     /// Wins over the global `[jobs] runner` for this project only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// Automatic routing of a stock terminal agent's `cargo build` / `cargo
+    /// test` through this project's runner (`"auto"`), or not (`"off"`, the
+    /// default). Opt-in per project; there is no global spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+/// Whether a project's qualified build/test commands are routed automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteMode {
+    /// Nothing is intercepted; `thegn job run` is the only way in.
+    #[default]
+    Off,
+    /// The shell shim forwards qualified recipes to the project's runner.
+    Auto,
+}
+
+impl RouteMode {
+    /// Parse the config spelling; `None` for anything unknown.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "" | "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 impl JobsOverlay {
     pub fn is_empty(&self) -> bool {
-        self.runner.is_none()
+        self.runner.is_none() && self.route.is_none()
     }
 
-    /// Semantic checks, same rule as the global key.
+    /// Semantic checks, same rule as the global key for `runner`; `route` must
+    /// be `"off"` or `"auto"`.
     pub fn validate(&self, prefix: &str, envs: &BTreeMap<String, EnvConfig>) -> Vec<String> {
-        JobsConfig {
+        let mut errs = JobsConfig {
             runner: self.runner.clone().unwrap_or_default(),
+            ..JobsConfig::default()
         }
-        .validate(prefix, envs)
+        .validate(prefix, envs);
+        if let Some(route) = self.route.as_deref()
+            && RouteMode::parse(route).is_none()
+        {
+            errs.push(format!(
+                "{prefix}.route: \"{route}\" is not valid; use \"off\" or \"auto\""
+            ));
+        }
+        errs
     }
 }
 
@@ -135,10 +193,33 @@ mod tests {
         assert!(JobsOverlay::default().validate("p.jobs", &envs).is_empty());
         let bad = JobsOverlay {
             runner: Some("fl".into()),
+            ..Default::default()
         };
         let errs = bad.validate("workspace.x.jobs", &envs);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("workspace.x.jobs.runner"), "{errs:?}");
+    }
+
+    #[test]
+    fn the_route_key_is_off_or_auto() {
+        assert_eq!(RouteMode::parse("auto"), Some(RouteMode::Auto));
+        assert_eq!(RouteMode::parse(" off "), Some(RouteMode::Off));
+        assert_eq!(RouteMode::parse(""), Some(RouteMode::Off));
+        assert_eq!(RouteMode::parse("always"), None);
+        let envs = BTreeMap::new();
+        let ok = JobsOverlay {
+            route: Some("auto".into()),
+            ..Default::default()
+        };
+        assert!(ok.validate("p.jobs", &envs).is_empty());
+        assert!(!ok.is_empty());
+        let bad = JobsOverlay {
+            route: Some("sometimes".into()),
+            ..Default::default()
+        };
+        let errs = bad.validate("project.x.jobs", &envs);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("project.x.jobs.route"), "{errs:?}");
     }
 
     #[test]
@@ -158,6 +239,7 @@ mod tests {
         envs.insert("fl".to_string(), env("fly"));
         let jobs = |runner: &str| JobsConfig {
             runner: runner.into(),
+            ..JobsConfig::default()
         };
         assert!(jobs("sp").validate("jobs", &envs).is_empty());
         assert!(jobs("vx").validate("jobs", &envs).is_empty());
@@ -167,5 +249,15 @@ mod tests {
         let missing = jobs("nope").validate("jobs", &envs);
         assert_eq!(missing.len(), 1);
         assert!(missing[0].contains("no [env.nope]"), "{missing:?}");
+    }
+
+    #[test]
+    fn the_admission_wait_defaults_to_thirty_seconds_and_parses() {
+        assert_eq!(JobsConfig::default().admission_timeout_secs, 30);
+        let parsed: JobsConfig = toml::from_str("admission_timeout_secs = 5").unwrap();
+        assert_eq!(parsed.admission_timeout_secs, 5);
+        assert!(parsed.runner.is_empty());
+        let empty: JobsConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.admission_timeout_secs, 30);
     }
 }

@@ -12,6 +12,7 @@
 
 use thegn_core::config::Config;
 use thegn_core::seam::{Availability, Kind, Probe, ProbeReport};
+use thegn_core::tailnet::IdentityDetail;
 
 /// `Ready` when `bin` is on `PATH`, else `Unavailable` naming it.
 pub fn binary_availability(bin: &str) -> Availability {
@@ -21,8 +22,18 @@ pub fn binary_availability(bin: &str) -> Availability {
     }
 }
 
-/// Collect every configured provider's probe.
+/// Collect every configured provider's probe, paste-safe by default: the
+/// host-discovery row redacts the tailnet name and control URL
+/// ([`IdentityDetail::Redacted`]) because doctor output gets pasted into
+/// issues; `thegn doctor --full` opts in through [`probes_with_detail`].
 pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
+    probes_with_detail(cfg, IdentityDetail::Redacted)
+}
+
+/// [`probes`] with the identity detail explicit: every seam reports the same
+/// shape either way — only the tailnet row's note text carries identity, so
+/// the redacted default loses nothing a triager needs.
+pub fn probes_with_detail(cfg: &Config, detail: IdentityDetail) -> Vec<ProbeReport> {
     let mut out = Vec::new();
     out.extend(ci_probes(cfg));
     out.extend(forge_probes(cfg));
@@ -37,7 +48,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(media_probes(cfg));
     out.extend(push_probes(cfg));
     out.extend(structural_probes(cfg));
-    out.extend(host_discovery_probes(cfg));
+    out.extend(host_discovery_probes(cfg, detail));
     out.extend(voice_probes(cfg));
     out.extend(debug_probes(cfg));
     out
@@ -198,7 +209,8 @@ fn structural_probes(cfg: &Config) -> Vec<ProbeReport> {
 
 /// The inbound host-discovery seam: a reserved kind reports as such; the
 /// implemented `tailnet` kind runs its (cheap, local) probe unless disabled.
-fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
+/// `detail` threads the doctor identity mode into the tailnet row's notes.
+fn host_discovery_probes(cfg: &Config, detail: IdentityDetail) -> Vec<ProbeReport> {
     use crate::host_discovery::HostDiscovery;
     use thegn_core::config::HostDiscoveryKind;
     let kind = cfg.host_discovery.kind;
@@ -214,7 +226,7 @@ fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
                         .note("[host_discovery.tailnet] enabled = false"),
                 ];
             }
-            vec![crate::host_discovery::TailnetDiscovery::new(tc.clone()).probe()]
+            vec![crate::host_discovery::TailnetDiscovery::new(tc.clone()).probe_with(detail)]
         }
         // Reserved kinds returned above; exhaustive so a new kind is a compile error.
         HostDiscoveryKind::Mdns | HostDiscoveryKind::Consul => {
@@ -823,7 +835,7 @@ mod tests {
         // A reserved discovery kind reports as reserved (never silently omitted).
         let mut cfg = hermetic_config();
         cfg.host_discovery.kind = thegn_core::config::HostDiscoveryKind::Consul;
-        let r = host_discovery_probes(&cfg);
+        let r = host_discovery_probes(&cfg, IdentityDetail::Redacted);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].seam, "host_discovery");
         match &r[0].availability {
@@ -833,10 +845,45 @@ mod tests {
         // Disabled tailnet: reported (id `tailnet`), Ready, no subprocess.
         let mut off = hermetic_config();
         off.host_discovery.tailnet.enabled = false;
-        let r = host_discovery_probes(&off);
+        let r = host_discovery_probes(&off, IdentityDetail::Redacted);
         assert_eq!(r[0].id, "tailnet");
         assert!(r[0].availability.is_ready());
         assert!(r[0].notes.iter().any(|n| n.contains("enabled = false")));
+    }
+
+    #[test]
+    fn probes_default_is_the_redacted_detail() {
+        // The registry default is the redacted view (THE-2682): `probes` is
+        // byte-equal to the explicit redacted run, and the detail never
+        // changes a row's shape — only the tailnet row's note text carries
+        // identity, so both batches hold the cross-seam invariants. With
+        // tailnet enabled but the client binary absent the row is Unavailable
+        // naming the binary (no subprocess — hermetic), whatever the detail.
+        let mut enabled = hermetic_config();
+        enabled.host_discovery.tailnet.enabled = true;
+        enabled.host_discovery.tailnet.tailscale_bin = "/nonexistent/thegn-no-tailscale-xyz".into();
+        for batch in [
+            probes(&enabled),
+            probes_with_detail(&enabled, IdentityDetail::Redacted),
+            probes_with_detail(&enabled, IdentityDetail::Full),
+        ] {
+            crate::conformance::assert_report_invariants(&batch);
+        }
+        assert_eq!(
+            probes(&enabled),
+            probes_with_detail(&enabled, IdentityDetail::Redacted),
+            "probes() must delegate with IdentityDetail::Redacted"
+        );
+        let rows = probes(&enabled);
+        let row = rows
+            .iter()
+            .find(|r| r.seam == "host_discovery")
+            .expect("host_discovery row present");
+        assert_eq!(row.id, "tailnet");
+        assert!(
+            matches!(&row.availability, Availability::Unavailable(w) if w.contains("thegn-no-tailscale-xyz")),
+            "{row:?}"
+        );
     }
 
     #[test]
