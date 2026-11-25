@@ -355,9 +355,10 @@ sandbox, credentials, model flag and env overlay an interactive pane gets.
 `--widen-permissions` permits a wider set and is only valid on plain opens.
 
 `session open --track <issue>` is the ad-hoc worker form: it requires
-`--worktree`, opens the plain session, then writes a dispatch roster row visible
-to `dispatch list`, `dispatch wait` and `dispatch verify`. For a lane without
-an issue, use `session open --brief-file F [--vars key=value]`; repeatable
+`--worktree`, refuses a duplicate issue before the session opens, then records
+a dispatch roster row visible to `dispatch list`, `dispatch wait` and
+`dispatch verify`. For a lane without an issue, use
+`session open --brief-file F [--vars key=value]`; repeatable
 `--vars` bindings render `{key}` placeholders in the file. These options cannot
 be combined with `--prompt`, `--issue` or `--resume-work`, and `--vars` requires
 `--brief-file`.

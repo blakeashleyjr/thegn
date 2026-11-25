@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thegn_core::config::{Config, EnvProviderKind};
 use thegn_core::db::Db;
+use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pipeline_report::display_cell;
 use thegn_core::store::NotificationStore;
 use thegn_core::store::WorkspaceStore;
@@ -595,6 +596,27 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
     let hint = exit_hint(status.exit_code());
+    // A tracked `--wait` owns its row's verdict (THE-2681): once the agent
+    // actually exited, close the row here — `done` on exit 0, `failed` for
+    // any other exit — instead of leaving it `running` for a supervisor that
+    // never comes (the transport-retry observer skips exits someone is
+    // watching, and `--wait` is watching). A timed-out run leaves the row
+    // alone, exactly like the session. A close failure never changes the
+    // agent's exit code.
+    let row_close = match (row, status) {
+        (Some(row), WaitStatus::Exited(code)) => {
+            let session = info.id.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let db = Db::open()?;
+                close_tracked_row(&db, row, &session, code)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("agent run dispatch close task failed: {e}"))
+            .and_then(|r| r);
+            Some(close_result(res))
+        }
+        _ => None,
+    };
     // `--pull`: only once the agent actually exited (a timed-out session is
     // still running); a failure never changes the agent's exit code.
     let pull_outcome = if pull && matches!(status, WaitStatus::Exited(_)) {
@@ -639,6 +661,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         if let (Some(s), Some(map)) = (&stop_outcome, obj.as_object_mut()) {
             map.insert("stopped".to_string(), s.json());
         }
+        if let (Some(c), Some(map)) = (&row_close, obj.as_object_mut()) {
+            map.insert("row_close".to_string(), c.json());
+        }
         crate::cmd::emit_json(&obj)?;
     } else {
         if !tail.is_empty() {
@@ -660,6 +685,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         if let Some(row) = row {
             outln!("dispatch {row} tracked");
+            if let Some(c) = &row_close {
+                outln!("{}", c.line(row));
+            }
         }
         if let Some(p) = &pull_outcome {
             outln!("{}", p.line());
@@ -781,6 +809,133 @@ impl StopOutcome {
             ),
             Some(e) => format!("[agent run: could not stop {}: {e}]", self.name),
         }
+    }
+}
+
+/// What closing a tracked run's dispatch row after its observed exit
+/// decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackedClose {
+    /// The row moved to this terminal status (`done` on exit 0, `failed`
+    /// otherwise).
+    Closed(AgentDispatchStatus),
+    /// A newer verdict owns the row — its session was republished (a
+    /// transport-retry relaunch) or its status moved (a human's `dispatch
+    /// finish/fail/abandon`) — so the close matched nothing, and the row now
+    /// reads this status.
+    Kept(AgentDispatchStatus),
+}
+
+/// The terminal status a tracked run's observed exit closes its row with:
+/// `done` only when the agent exited 0, `failed` for any other exit — the
+/// same line [`process_exit_code`] draws for the process itself.
+pub(crate) fn tracked_exit_status(code: Option<i32>) -> AgentDispatchStatus {
+    if code == Some(0) {
+        AgentDispatchStatus::Done
+    } else {
+        AgentDispatchStatus::Failed
+    }
+}
+
+/// The roster note recorded with the close: what the run observed.
+fn tracked_exit_note(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("agent run --wait: session exited {code}"),
+        None => "agent run --wait: session exit code was not reaped".into(),
+    }
+}
+
+/// Close a tracked run's dispatch row after the run observed its session
+/// exit, fenced on the run recorded at the open: a row whose session was
+/// republished (a transport-retry relaunch) or whose status moved (a
+/// human's `dispatch finish/fail/abandon`) matches nothing and is preserved.
+/// `Kept` carries the row's current status so the report can say what won.
+/// Blocking (roster read/write): call from `spawn_blocking`, or pass an
+/// isolated `Db` in tests.
+pub(crate) fn close_tracked_row(
+    db: &Db,
+    row: i64,
+    session: &str,
+    code: Option<i32>,
+) -> Result<TrackedClose> {
+    let run = db
+        .dispatch_run_ref(row)?
+        .ok_or_else(|| anyhow::anyhow!("no dispatch with id {row}"))?;
+    if run.session_id.as_str() != session {
+        return Ok(TrackedClose::Kept(kept_status(db, row)?));
+    }
+    let target = tracked_exit_status(code);
+    let closed = db.compare_and_set_dispatch_status_run(
+        &run,
+        AgentDispatchStatus::Running,
+        target,
+        Some(&tracked_exit_note(code)),
+    )?;
+    Ok(if closed {
+        TrackedClose::Closed(target)
+    } else {
+        TrackedClose::Kept(kept_status(db, row)?)
+    })
+}
+
+/// The status a preserved row reads now (best effort — `Unknown` when it
+/// vanished between the refused close and this read).
+fn kept_status(db: &Db, row: i64) -> Result<AgentDispatchStatus> {
+    Ok(db
+        .get_dispatch(row)?
+        .map(|row| row.status)
+        .unwrap_or(AgentDispatchStatus::Unknown))
+}
+
+/// What closing a tracked run's dispatch row after the observed exit did, as
+/// reported to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowCloseOutcome {
+    /// The terminal status written (`done`/`failed`); `None` when this run
+    /// did not close the row.
+    pub status: Option<&'static str>,
+    /// Why the row was left alone, when it was (a newer verdict, or a
+    /// database failure).
+    pub note: Option<String>,
+}
+
+impl RowCloseOutcome {
+    /// `{"status":…,"note":…}`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "status": self.status, "note": self.note })
+    }
+
+    /// The single line printed in text mode.
+    pub(crate) fn line(&self, row: i64) -> String {
+        match (&self.status, &self.note) {
+            (Some(status), _) => format!("dispatch {row} {status}"),
+            (None, Some(note)) => format!("[agent run: dispatch {row} left untouched: {note}]"),
+            (None, None) => format!("[agent run: dispatch {row} left untouched]"),
+        }
+    }
+}
+
+/// Fold a close result into the reported outcome: `Closed` reports the
+/// terminal status written, `Kept` reports what newer verdict owns the row,
+/// and an error reports the failure. None of it changes the agent's exit
+/// code.
+pub(crate) fn close_result(res: Result<TrackedClose>) -> RowCloseOutcome {
+    match res {
+        Ok(TrackedClose::Closed(status)) => RowCloseOutcome {
+            status: Some(status.as_str()),
+            note: None,
+        },
+        Ok(TrackedClose::Kept(status)) => RowCloseOutcome {
+            status: None,
+            note: Some(format!(
+                "a newer verdict owns the row (it now reads {})",
+                status.as_str()
+            )),
+        },
+        Err(e) => RowCloseOutcome {
+            status: None,
+            note: Some(format!("{e:#}")),
+        },
     }
 }
 
@@ -1172,15 +1327,17 @@ async fn observe_until_exit(
 mod tests {
     use super::{
         CliCheck, DEFAULT_TIMEOUT_SECS, EnvChoice, PIPELINE_ENV, PROGRESS_EVERY, TAIL_BYTES,
-        TAIL_LINES, TailRing, WaitStatus, agent_program, cli_check_argv, cli_check_outcome,
-        cli_missing_warning, env_choice, exit_hint, other_live_sessions, output_tail,
-        pin_env_for_run, process_exit_code, progress_line, pull_result, should_stop_after_run,
-        stop_result, strip_ansi, tail_lines,
+        TAIL_LINES, TailRing, TrackedClose, WaitStatus, agent_program, cli_check_argv,
+        cli_check_outcome, cli_missing_warning, close_result, close_tracked_row, env_choice,
+        exit_hint, other_live_sessions, output_tail, pin_env_for_run, process_exit_code,
+        progress_line, pull_result, should_stop_after_run, stop_result, strip_ansi, tail_lines,
+        tracked_exit_status,
     };
     use std::time::Duration;
     use thegn_core::config::Config;
     use thegn_core::config::EnvProviderKind;
     use thegn_core::db::Db;
+    use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::store::WorkspaceStore;
     use thegn_core::testenv::IsolatedState;
 
@@ -1893,5 +2050,168 @@ mod tests {
             serde_json::json!({"ok": false, "name": "m0-wt", "error": "boom"})
         );
         assert_eq!(bad.line(), "[agent run: could not stop m0-wt: boom]");
+    }
+
+    /// A queued-then-running dispatch row bound to `session`, as
+    /// `session_track::insert_and_start` would have written it.
+    fn running_tracked_row(db: &Db, session: &str) -> i64 {
+        use thegn_core::issue::NewDispatch;
+        use thegn_core::store::NotificationStore;
+        let mut new = NewDispatch::new("linear:THE-2681", "/wt/a", "coder");
+        new.session_id = Some(session);
+        let row = db.put_agent_dispatch(new).expect("row");
+        db.set_dispatch_status_checked(
+            row,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Running,
+            None,
+        )
+        .expect("publish");
+        row
+    }
+
+    #[test]
+    fn tracked_exit_status_matches_the_process_exit_line() {
+        assert_eq!(tracked_exit_status(Some(0)), AgentDispatchStatus::Done);
+        assert_eq!(tracked_exit_status(Some(1)), AgentDispatchStatus::Failed);
+        assert_eq!(tracked_exit_status(Some(130)), AgentDispatchStatus::Failed);
+        assert_eq!(
+            tracked_exit_status(None),
+            AgentDispatchStatus::Failed,
+            "an unreaped exit is not a success"
+        );
+    }
+
+    #[test]
+    fn close_tracked_row_closes_a_clean_exit_as_done() {
+        use thegn_core::store::NotificationStore;
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let row = running_tracked_row(&db, "session-1");
+        assert_eq!(
+            close_tracked_row(&db, row, "session-1", Some(0)).expect("close"),
+            TrackedClose::Closed(AgentDispatchStatus::Done)
+        );
+        let read = db.get_dispatch(row).expect("read").expect("row exists");
+        assert_eq!(read.status, AgentDispatchStatus::Done);
+        assert_eq!(
+            db.dispatch_notes(row, None, 0)
+                .expect("notes")
+                .last()
+                .expect("close note")
+                .text,
+            "agent run --wait: session exited 0"
+        );
+        // THE-2681's repro: the closed row no longer blocks the next
+        // tracked open of the same issue.
+        let (active, truncated) = db
+            .list_dispatches_with_status(
+                &[
+                    AgentDispatchStatus::Queued,
+                    AgentDispatchStatus::Spawning,
+                    AgentDispatchStatus::Running,
+                    AgentDispatchStatus::WaitingHuman,
+                    AgentDispatchStatus::PrOpen,
+                ],
+                50,
+            )
+            .expect("active roster");
+        assert!(!truncated);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn close_tracked_row_closes_a_nonzero_exit_as_failed() {
+        use thegn_core::store::NotificationStore;
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let row = running_tracked_row(&db, "session-1");
+        assert_eq!(
+            close_tracked_row(&db, row, "session-1", Some(3)).expect("close"),
+            TrackedClose::Closed(AgentDispatchStatus::Failed)
+        );
+        let read = db.get_dispatch(row).expect("read").expect("row exists");
+        assert_eq!(read.status, AgentDispatchStatus::Failed);
+        assert_eq!(
+            db.dispatch_notes(row, None, 0)
+                .expect("notes")
+                .last()
+                .expect("close note")
+                .text,
+            "agent run --wait: session exited 3"
+        );
+    }
+
+    #[test]
+    fn close_tracked_row_keeps_a_parked_row() {
+        use thegn_core::store::NotificationStore;
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let row = running_tracked_row(&db, "session-1");
+        db.set_dispatch_status_checked(
+            row,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            Some("parked: transport failure"),
+        )
+        .expect("park");
+        assert_eq!(
+            close_tracked_row(&db, row, "session-1", Some(0)).expect("close"),
+            TrackedClose::Kept(AgentDispatchStatus::WaitingHuman)
+        );
+        let read = db.get_dispatch(row).expect("read").expect("row exists");
+        assert_eq!(read.status, AgentDispatchStatus::WaitingHuman);
+    }
+
+    #[test]
+    fn close_tracked_row_keeps_a_row_published_to_another_session() {
+        use thegn_core::store::NotificationStore;
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let row = running_tracked_row(&db, "session-2");
+        assert_eq!(
+            close_tracked_row(&db, row, "session-1", Some(0)).expect("close"),
+            TrackedClose::Kept(AgentDispatchStatus::Running)
+        );
+        let read = db.get_dispatch(row).expect("read").expect("row exists");
+        assert_eq!(read.status, AgentDispatchStatus::Running);
+    }
+
+    #[test]
+    fn close_tracked_row_names_a_missing_row() {
+        let _state = IsolatedState::new();
+        let db = Db::open_memory().expect("db");
+        let error = close_tracked_row(&db, 99, "session-1", Some(0))
+            .expect_err("a row that does not exist is an error, not a silent no-op");
+        assert!(format!("{error:#}").contains("no dispatch with id 99"));
+    }
+
+    #[test]
+    fn close_result_folds_each_close_outcome() {
+        let closed = close_result(Ok(TrackedClose::Closed(AgentDispatchStatus::Done)));
+        assert_eq!(closed.status, Some("done"));
+        assert_eq!(closed.note, None);
+        assert_eq!(closed.line(759), "dispatch 759 done");
+        assert_eq!(
+            closed.json(),
+            serde_json::json!({"status": "done", "note": null})
+        );
+
+        let kept = close_result(Ok(TrackedClose::Kept(AgentDispatchStatus::WaitingHuman)));
+        assert_eq!(kept.status, None);
+        let note = kept.note.as_deref().expect("kept note");
+        assert!(note.contains("waiting_human"), "note says what won: {note}");
+        assert!(
+            kept.line(759)
+                .starts_with("[agent run: dispatch 759 left untouched:")
+        );
+
+        let failed = close_result(Err(anyhow::anyhow!("database locked")));
+        assert_eq!(failed.status, None);
+        assert_eq!(failed.note.as_deref(), Some("database locked"));
+        assert_eq!(
+            failed.line(759),
+            "[agent run: dispatch 759 left untouched: database locked]"
+        );
     }
 }

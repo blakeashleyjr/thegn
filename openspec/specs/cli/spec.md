@@ -215,6 +215,20 @@ contract, so a supervisor can drive the whole loop with no MCP transport.
 - **THEN** at most three issues with the requested status are emitted,
   machine-readable
 
+#### Scenario: A duplicate tracked open is refused before any session exists
+
+- **WHEN** `thegn session open --track <issue>` or `thegn agent run --track
+<issue>` names an issue that already has an active dispatch row
+- **THEN** the command refuses before the session is opened, so no worker is
+  launched only to be killed by the post-open tracking admission
+
+#### Scenario: A tracked wait closes its row at the observed exit
+
+- **WHEN** `thegn agent run --track <issue> --wait` observes its session exit
+- **THEN** the row the run opened is closed `done` on exit 0 and `failed`
+  otherwise, fenced on the run that opened it so a republished session or a
+  supervisor verdict is never overwritten, and a timeout leaves the row running
+
 ### Requirement: The roster is writable from the CLI, pipeline columns included
 
 The CLI SHALL append a dispatch row — issue, worktree, agent — and SHALL accept

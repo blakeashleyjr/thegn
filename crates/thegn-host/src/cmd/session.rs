@@ -1193,9 +1193,12 @@ pub(crate) struct PlainOpen<'a> {
 /// `--stage` without `--issue` applies that stage's `model`/`env`/
 /// `permissions` (THE-83) and defaults the agent to the stage's configured
 /// one. A promptless open stays an interactive launch. Returns the opened
-/// session and, with `track`, the dispatch row written for it. Shared by
-/// `session open` and `agent run` (THE-2005); prints nothing itself beyond
-/// the private-/tmp warning, so each caller owns its output shape.
+/// session and, with `track`, the dispatch row written for it. With `track`
+/// the duplicate-issue refusal runs before the session is opened
+/// (THE-2681); the post-open insert re-runs the same gate, so a row admitted
+/// in the gap still tears the opened session down. Shared by `session open`
+/// and `agent run` (THE-2005); prints nothing itself beyond the private-/tmp
+/// warning, so each caller owns its output shape.
 pub(crate) async fn open_plain(
     cfg: &Config,
     client: &ControlClient,
@@ -1269,6 +1272,15 @@ pub(crate) async fn open_plain(
         adopt,
         already_capped: false,
     };
+    // A duplicate issue is knowable before the session exists (THE-2681):
+    // refuse it here rather than opening a worker only to kill it when the
+    // post-open insert runs the same active-row gate. `track_opened` still
+    // re-runs that gate after the open, so a row admitted in the gap is
+    // caught and the opened session torn down.
+    if let Some(track_issue) = track {
+        let db = Db::open()?;
+        crate::cmd::session_track::refuse_duplicate_track(&db, track_issue, &wt)?;
+    }
     let info = client.open(&spec).await?;
     confirm_opened(client, &info.id).await?;
     let tracked_row = match track {

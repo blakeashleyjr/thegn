@@ -276,8 +276,10 @@ gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 For an ad-hoc plain worker, add `--track <issue-id>` to `session open`.
 This requires `--worktree` and records a plain, running dispatch row bound to
 the opened session, so `dispatch list`, `dispatch wait`, `dispatch verify`,
-and the sidebar can see it. The session is opened before the row is inserted;
-if tracking fails, the new session is killed. A headless worker that exits
+and the sidebar can see it. An issue that already has an active dispatch row
+is refused before the session is opened, so no worker is launched only to be
+killed; the row insert re-runs that gate after the open, and a duplicate
+admitted in that gap still kills the new session. A headless worker that exits
 before the row insert completes can outpace the daemon's bounded exit lookup;
 the row is then left for reconciliation. `--track` cannot be combined with
 `--issue` or `--resume-work`; `--stage` may still layer launch settings onto
@@ -330,7 +332,8 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
   an env keeps it. The pin is noted on stderr.
 - `--track <issue-id>` writes the plain dispatch row described above, so
   `dispatch list` and the sidebar see the run. It is optional: ad-hoc runs
-  have no issue.
+  have no issue, and an issue that already has an active dispatch row is
+  refused before the session is opened.
 - Without `--wait`, the command prints the session id (and
   `dispatch <row> tracked`) and returns; `--json` prints `{session, row, env}`,
   where `env` is the env this run pinned, or `null`.
@@ -342,7 +345,13 @@ thegn agent run --agent codex --worktree ~/wt/fix-login \
   session is **left running**; the message names it so you can
   `session wait` on it again or `session close` it. `--json` prints
   `{session, row, env, status, exit_code, output_tail, duration_ms}`, where
-  `status` is `exited` or `timeout`.
+  `status` is `exited` or `timeout`. With `--track`, the observed exit closes
+  the row too — `dispatch <row> done` after exit 0, `dispatch <row> failed`
+  otherwise; a timeout leaves the row running with the session. The close is
+  fenced on the run that opened it, so a republished session or a supervisor
+  verdict is never overwritten; if a newer verdict owns the row, the output
+  says so, and `--json` adds a `row_close` object (`status`, plus a `note`
+  whenever the row was not closed).
 
 ### Reading a run you did not wait for
 
