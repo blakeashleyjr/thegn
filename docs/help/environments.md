@@ -12,6 +12,10 @@ contexts: [panel:environments]
 
 Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
 
+> **Remote placements are dev channel only.** SSH, Kubernetes and provider
+> (Sprites, Vercel, Fly and similar) environments are removed on the stable
+> channel; set `THEGN_CHANNEL=dev` to use them. See [[release-channels]].
+
 ## Environments
 
 Named `[env.<name>]` execution environments (local, container, or a cloud
