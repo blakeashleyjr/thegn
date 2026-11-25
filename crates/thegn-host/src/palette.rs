@@ -960,7 +960,15 @@ pub(crate) const ENV_SETUP_KINDS: &[&str] = &[
 pub(crate) fn build_agent_palette(
     cfg: &thegn_core::config::Config,
 ) -> Vec<crate::palette::PaletteItem> {
-    crate::agent::choices(cfg)
+    build_agent_palette_for(cfg, crate::agent::choices(cfg))
+}
+
+/// Like [`build_agent_palette`] for an already-chosen (e.g. host-filtered) list.
+pub(crate) fn build_agent_palette_for(
+    _cfg: &thegn_core::config::Config,
+    choices: Vec<String>,
+) -> Vec<crate::palette::PaletteItem> {
+    choices
         .into_iter()
         .map(|name| {
             let label = format!(

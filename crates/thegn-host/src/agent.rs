@@ -38,6 +38,57 @@ pub fn choices(cfg: &Config) -> Vec<String> {
     labels
 }
 
+/// The program basename of an `[[agents]]` command (`/opt/bin/claude --x` → `claude`).
+fn agent_program(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Drop picker entries for KNOWN coding agents that `detected` (see
+/// [`detect_host_agents`]) does not list, so a fresh machine does not offer an
+/// agent it cannot run. Custom agents, tools and `shell` are always kept.
+pub(crate) fn filter_undetected_agents(
+    cfg: &Config,
+    choices: Vec<String>,
+    detected: &[String],
+) -> Vec<String> {
+    let known = thegn_core::envplan::known_agents();
+    choices
+        .into_iter()
+        .filter(|name| {
+            let Some(entry) = cfg.agents.iter().find(|a| &a.name == name) else {
+                return true;
+            };
+            if entry.name == SHELL || entry.command.trim() == "__shell__" {
+                return true;
+            }
+            let program = agent_program(&entry.command);
+            !known.contains(&program) || detected.iter().any(|d| d == program)
+        })
+        .collect()
+}
+
+/// True when `choices` offers no coding agent at all (only tools and the shell).
+pub(crate) fn has_no_agent(cfg: &Config, choices: &[String]) -> bool {
+    !choices.iter().any(|c| {
+        c != SHELL
+            && cfg
+                .agents
+                .iter()
+                .any(|a| &a.name == c && a.command.trim() != "__shell__")
+    })
+}
+
+/// The empty-state hint shown under the picker when no coding agent was found.
+pub(crate) const NO_AGENT_HINT: &str = "No coding agent found on PATH. Install claude \
+(https://claude.com/product/claude-code) or codex (https://github.com/openai/codex), \
+then run it once to log in.";
+
 /// Resolve a picker label to the command string to run inside the worktree.
 /// `shell` (and any unknown label) resolves to the interactive login shell.
 /// Always uses the host (non-OCI) form; callers that know the sandbox context
