@@ -6,6 +6,9 @@ parent: sandboxing
 
 # Vercel sandboxes
 
+> **Dev channel only.** Provider environments are removed on the stable channel;
+> set `THEGN_CHANNEL=dev` to use them. See [[release-channels]].
+
 An environment with `provider = "vercel"` runs a worktree in a Vercel Sandbox
 microVM. thegn drives it through Vercel's HTTP API and a hidden `thegn
 vercel-exec` bridge; there is no SSH.

@@ -30,6 +30,23 @@ while the process is contained.
 a hostile agent** (home readable, network direct by default, shared kernel).
 `sealed` is the hardened tier. See [[sandbox-security-model]].
 
+In plain terms:
+
+- `standard` leaves `~/.ssh`, cloud credentials (`~/.aws` and similar), the
+  `gh` token and agent logins readable, and the network open. It stops
+  accidental writes outside the worktree; it does not stop a hostile agent from
+  reading or sending those files.
+- `sealed` hides `$HOME` and the network, but it still shares the host's
+  writable toolchain and package caches (cargo, rustup, npm and similar), so
+  it is hardened, not a full boundary.
+- **Only interactive worktree panes are sandboxed.** Headless `thegn agent run`,
+  the agent queue and Autopilot, the merge gate, tests, lifecycle scripts and
+  language servers run on the host in this alpha. The ⚠ table in
+  [[sandbox-security-model]] lists each launch.
+- Network allow and block lists are advisory except on the Sprites and Vercel
+  providers (dev channel). Only `network = "none"` (and so `sealed`) is
+  enforced locally.
+
 `[sandbox] profile` picks a bundle of isolation knobs. Set it globally,
 per repo via a `.thegn.toml` overlay, or per run with
 `THEGN_SANDBOX_PROFILE`. A single worktree can also pin its own profile; see

@@ -11,7 +11,9 @@ actions: [integrate, merge-drain, open-merge-queue, sweep-merged]
 
 A **local** merge queue: finished branches queue up, and a fold-actor
 lands them on `main` one by one — fold, gate, advance the ref — without
-ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
+ever checking `main` out. It is on by default (`[merge_queue] enabled = true`);
+set `enabled = false` to turn it off. It is only useful once you set a
+`gate_command`.
 
 ## Queueing
 

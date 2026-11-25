@@ -18,7 +18,8 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   Install with `brew install blakeashleyjr/thegn/thegn` (not quarantined). The
   release archive is unsigned; clear quarantine with
   `xattr -dr com.apple.quarantine ./thegn` after a browser download. Set Option as Meta/Alt in your terminal, and treat CPU caps as
-  unavailable; the `apple` sandbox backend has no automated runtime coverage.
+  unavailable; the sandbox on macOS is best-effort, needs Apple `container`,
+  podman or docker, and the `apple` backend has no automated runtime coverage.
   See [[terminal-compatibility]] and [[sandboxing]].
 - **The `apple` sandbox backend cannot run offline and has no host network.**
   `network = "none"`, and therefore the `sealed` profile, is refused with
