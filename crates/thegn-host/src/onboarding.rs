@@ -1356,7 +1356,7 @@ impl OnboardingWizard {
                         segs
                     }
                 };
-                vec![
+                let mut lines = vec![
                     Line::segs(detected),
                     blank(),
                     Line::segs(self.cycle_row(
@@ -1369,10 +1369,22 @@ impl OnboardingWizard {
                         self.focus == Field::SandboxProfile,
                         SANDBOX_PROFILES[self.profile_sel],
                     )),
+                ];
+                // THE-2695: say plainly what the chosen profile does and does
+                // not protect, before the user commits to it.
+                if let Some(profile) = thegn_core::config::SandboxProfile::from_str_any(
+                    SANDBOX_PROFILES[self.profile_sel],
+                ) {
+                    let explanation = thegn_core::sandbox_pin::explain(profile);
+                    lines.push(note(explanation.one_liner));
+                    lines.extend(explanation.hides.iter().map(|text| note(*text)));
+                }
+                lines.extend([
                     blank(),
                     note("auto walks the chain and picks the first available backend."),
                     note("press r to re-check after starting a runtime."),
-                ]
+                ]);
+                lines
             }
             Step::Appearance => vec![
                 Line::segs(self.cycle_row(

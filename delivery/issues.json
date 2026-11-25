@@ -737,6 +737,13 @@
       "changes": [
         "fix-clean-remove-default"
       ]
+    },
+    {
+      "issue": "THE-2695",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "hide-credentials-in-standard-sandbox"
+      ]
     }
   ]
 }

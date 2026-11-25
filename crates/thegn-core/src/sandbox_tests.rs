@@ -7795,3 +7795,121 @@ fn default_spec_not_used_in_resolution() {
         }
     }
 }
+
+/// THE-2695: a temp home bound read-only with a credential dir, a token file
+/// and a sibling repository listed as hidden.
+fn hidden_paths_fixture(backend: Backend) -> (tempfile::TempDir, PathBuf, SandboxSpec) {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let home = std::fs::canonicalize(temp.path()).unwrap().join("home");
+    std::fs::create_dir_all(home.join(".aws")).unwrap();
+    std::fs::create_dir_all(home.join("code/other/.git")).unwrap();
+    std::fs::write(home.join(".netrc"), b"machine x").unwrap();
+    let mut sandbox = spec(backend);
+    let home_s = home.display().to_string();
+    sandbox.mounts.insert(
+        0,
+        Mount {
+            host: home_s.clone(),
+            dest: home_s,
+            ro: true,
+            cache: false,
+        },
+    );
+    sandbox.hidden_paths = [".aws", ".netrc", "code/other"]
+        .iter()
+        .map(|rel| home.join(rel).display().to_string())
+        .collect();
+    (temp, home, sandbox)
+}
+
+#[test]
+fn hidden_paths_bwrap_masks_credentials_and_siblings_after_the_home_bind() {
+    let (_temp, home, sandbox) = hidden_paths_fixture(Backend::Bwrap);
+    let argv = backend_enter_argv_with_env(&sandbox, "true", SandboxArgvEnv::default()).unwrap();
+    let h = home.display().to_string();
+    let bind = argv
+        .windows(3)
+        .position(|triple| triple == ["--ro-bind", h.as_str(), h.as_str()])
+        .expect("home is bound read-only");
+    let aws = format!("{h}/.aws");
+    let other = format!("{h}/code/other");
+    let netrc = format!("{h}/.netrc");
+    let aws_mask = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", aws.as_str()])
+        .expect("~/.aws is masked with a tmpfs");
+    let other_mask = argv
+        .windows(2)
+        .position(|pair| pair == ["--tmpfs", other.as_str()])
+        .expect("the sibling repository is masked with a tmpfs");
+    let netrc_mask = argv
+        .windows(3)
+        .position(|triple| triple == ["--ro-bind", "/dev/null", netrc.as_str()])
+        .expect("~/.netrc is masked with /dev/null");
+    let command = argv.iter().position(|arg| arg == "--").unwrap();
+    for mask in [aws_mask, other_mask, netrc_mask] {
+        assert!(bind < mask && mask < command, "{argv:?}");
+    }
+}
+
+#[test]
+fn hidden_paths_bwrap_keep_an_explicitly_mounted_path() {
+    let (_temp, home, mut sandbox) = hidden_paths_fixture(Backend::Bwrap);
+    let aws = home.join(".aws").display().to_string();
+    sandbox.mounts.push(Mount {
+        host: aws.clone(),
+        dest: aws.clone(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(&sandbox, "true", SandboxArgvEnv::default()).unwrap();
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", aws.as_str()]),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn hidden_paths_oci_masks_local_podman_only() {
+    let (_temp, home, sandbox) = hidden_paths_fixture(Backend::Podman);
+    let argv = oci_create_opts_in(&sandbox, &[], None).unwrap();
+    let h = home.display().to_string();
+    let aws = format!("{h}/.aws");
+    let netrc = format!("/dev/null:{h}/.netrc:ro");
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--tmpfs", aws.as_str()]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2).any(|pair| pair == ["-v", netrc.as_str()]),
+        "{argv:?}"
+    );
+    let (_temp2, _home2, mut remote) = hidden_paths_fixture(Backend::Podman);
+    remote.placement = Placement::Ssh(SshPlacement::plain(
+        "host".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    assert!(oci_hidden_path_args(&remote).is_empty());
+}
+
+#[test]
+fn hidden_paths_systemd_are_inaccessible_unless_they_hold_the_worktree() {
+    let (_temp, home, mut sandbox) = hidden_paths_fixture(Backend::Systemd);
+    sandbox.read_only_root = true;
+    sandbox.hidden_paths.push("/wt".into());
+    let argv = backend_enter_argv_with_env(&sandbox, "true", SandboxArgvEnv::default()).unwrap();
+    let aws = format!("InaccessiblePaths=-{}/.aws", home.display());
+    assert!(
+        argv.windows(2).any(|pair| pair == ["-p", aws.as_str()]),
+        "{argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg == "InaccessiblePaths=-/wt"),
+        "{argv:?}"
+    );
+}

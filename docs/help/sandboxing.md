@@ -27,7 +27,8 @@ while the process is contained.
 ## Hardening profiles
 
 `standard` (the default) is an **accident guard**: it is **not a boundary against
-a hostile agent** (home readable, network direct by default, shared kernel).
+a hostile agent** (the rest of home readable, network direct by default, shared
+kernel).
 `sealed` is the hardened tier. See [[sandbox-security-model]].
 
 **Interactive panes are sandboxed. Headless `thegn agent run`, queue, merge-gate
@@ -36,10 +37,12 @@ and test launches run on the host in this alpha.** The ⚠ table in
 
 In plain terms:
 
-- `standard` leaves `~/.ssh`, cloud credentials (`~/.aws` and similar), the
-  `gh` token and agent logins readable, and the network open. It stops
-  accidental writes outside the worktree; it does not stop a hostile agent from
-  reading or sending those files.
+- `standard` hides well-known credential files (`~/.ssh` private keys,
+  `~/.aws` and other cloud CLI logins, the `gh` token, `~/.netrc` and similar)
+  and the repositories beside the worktree, and keeps agent settings read-only.
+  The rest of home stays readable, the agent's own login stays usable, and the
+  network is open. It stops accidental writes outside the worktree; it does not
+  stop a hostile agent from reading or sending anything else it can see.
 - `sealed` hides `$HOME` and the network, but it still shares the host's
   writable toolchain and package caches (cargo, rustup, npm and similar), so
   it is hardened, not a full boundary.
@@ -98,9 +101,26 @@ are outside it.
 
 Under `standard`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
-host files. That is _integrity_ isolation only: the whole `$HOME` stays
-**readable**, credentials included (`~/.ssh`, `~/.aws`, `~/.gnupg`,
-`~/.config/gh`, thegn state). `open` leaves `$HOME` readable and writable.
+host files. On a local bwrap, podman, docker or systemd pane, `standard` also
+hides these paths from the read-only `$HOME` (an empty directory or file
+replaces each one; systemd makes it inaccessible):
+
+- credential locations: `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`,
+  `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`,
+  `~/.config/git/credentials`, `~/.config/{gh,hub,glab-cli,doctl,hcloud,op,sops,age,rclone}`,
+  `~/.secrets`, `~/.password-store`, `~/.vault-token`, `~/.npmrc`, `~/.pypirc`,
+  `~/.cargo/credentials*`, `~/.terraform.d/credentials.tfrc.json`, gpg private
+  keys, keyrings and browser profiles;
+- every entry of `~/.ssh` except `known_hosts`, `config`, `authorized_keys` and
+  `*.pub`, so private keys are hidden while git over ssh still works through
+  your ssh agent (`SSH_AUTH_SOCK`);
+- the git repositories beside the worktree and beside its main checkout
+  (dot-named entries are skipped). The worktree, its main checkout and its git
+  common dir stay visible.
+
+A path you mount explicitly (`[sandbox] mounts`, a bundle identity) is not
+hidden. The rest of `$HOME` stays **readable**, including thegn state and the
+agent's own login. `open` leaves `$HOME` readable and writable.
 
 `sealed` / `sealed-tunnel` add _confidentiality_: the host `$HOME` is
 **hidden**. The pane sees a private, empty `$HOME` (tmpfs; systemd uses
@@ -257,10 +277,12 @@ caches, `/tmp`, and a narrow set of shell-state paths (`~/tmp`,
 `~/.zsh_history`, `~/.bash_history`). The XDG roots default to
 `~/.local/state` and `~/.local/share`; configured absolute roots outside
 `$HOME` work too. Only those application leaves are mounted. Missing,
-relative, symlinked, non-UTF-8, or overlapping roots are omitted. Agent config
-dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaults) are writable for
-every non-sealed pane, so an agent CLI you run by hand can persist its
-state instead of dying on a read-only filesystem. A carve-out whose path
+relative, symlinked, non-UTF-8, or overlapping roots are omitted. In agent
+config dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex`
+defaults) only the runtime state is writable for a non-sealed pane: sessions,
+project state, todos, session env, shell snapshots, logs, the prompt history
+and the login file. An agent CLI you run by hand can persist its state, while
+its settings, hooks, plugins and skills stay read-only. A carve-out whose path
 has a symlink in any component below `$HOME` is skipped with a warning, never
 followed; the pane launches without it. `$HOME` itself may be reached through
 a system link (`/home -> /var/home`).

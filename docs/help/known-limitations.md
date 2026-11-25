@@ -89,9 +89,11 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 - **Provider placements without an enforceable isolation request are reported
   as `provider-managed (unverified)`.** Review the provider's isolation
   guarantees before using that placement; see [[sandboxing]].
-- **The default `standard` profile protects integrity, not credentials:
-  `$HOME` stays readable. The opt-in `sealed` profile hides it.** See
-  [[sandboxing]] and [[sandbox-profiles]].
+- **The default `standard` profile hides well-known credential files and
+  sibling repositories, but the rest of `$HOME` stays readable.** Secrets kept
+  elsewhere in home remain visible, and it is not a boundary against a hostile
+  agent. The opt-in `sealed` profile hides all of `$HOME`. See [[sandboxing]]
+  and [[sandbox-profiles]].
 - **Native plugins run unsandboxed as your user.** Enable only plugins you
   trust; see [[plugins]].
 

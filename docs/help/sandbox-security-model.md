@@ -13,8 +13,9 @@ it is not true yet.
 
 ## Read this first
 
-- `standard` leaves `~/.ssh`, cloud credentials, the `gh` token and agent
-  logins readable, and the network open.
+- `standard` hides `~/.ssh` private keys, cloud credentials, the `gh` token
+  and the repositories beside the worktree. The rest of home, including agent
+  logins, stays readable, and the network is open.
 - `sealed` hides `$HOME` and the network but shares writable toolchain caches.
 - Interactive worktree panes are sandboxed. Headless agent runs, the queue, the
   merge gate, tests and language servers run on the host (see the table below).
@@ -25,9 +26,10 @@ it is not true yet.
 
 - `open` is not a sandbox.
 - `standard` (the default) is an **accident guard**. It stops writes outside the
-  worktree and approved paths and masks thegn's control plane. It is **not a
-  boundary against a hostile agent**: home is readable, network is direct by
-  default, and the kernel is shared.
+  worktree and approved paths, masks thegn's control plane, hides well-known
+  credential files and sibling repositories, and keeps agent settings
+  read-only. It is **not a boundary against a hostile agent**: the rest of home
+  is readable, network is direct by default, and the kernel is shared.
 - `sealed` is the hardened tier. `sealed` **with** `workspace.mode =
 "private-copy"` is the boundary tier on a shared kernel.
 - VM tiers add a guest kernel.
@@ -96,18 +98,24 @@ physical access.
 | `sealed`                | Hardened tier.                    | Shared kernel.                          |
 | `sealed` + private copy | Boundary tier on a shared kernel. | ⚠ Not available yet.                    |
 
-`standard` does not protect:
+`standard` hides the credential locations, private `~/.ssh` entries and
+sibling repositories listed in [[sandboxing]], and keeps agent settings in
+`~/.claude` and `~/.codex` read-only. It does not protect:
 
-- A readable home, including `~/.ssh`, cloud credentials, and the agent's own
-  login token.
+- The rest of a readable home, including the agent's own login token, secrets
+  stored outside the well-known locations, and folders that are not git
+  repositories.
+- ⚠ Sibling repositories on the systemd backend when a hidden path would also
+  hide the worktree or a mount, and repositories that are not beside the
+  worktree or its main checkout.
 - The network. It is direct by default, including `localhost`, the LAN, and
   metadata endpoints.
 - The network namespace on bwrap. With `network = "nat"` it is the host's, so
   abstract unix sockets and localhost TCP are reachable.
 - ⚠ Shared read-write toolchain caches that your host later executes (`.rustup`,
   the cargo registry and git caches, pre-commit caches).
-- ⚠ Writable `~/.keychain` (sourced by host login shells), `~/.claude-profiles`
-  (agent settings, hooks and credentials) and `~/.claude/projects`.
+- ⚠ Writable `~/.keychain` (sourced by host login shells) and
+  `~/.claude-profiles` (agent settings, hooks and credentials).
 - ⚠ A shared `.git` that stays writable in some launches (see Git and landing).
 
 `sealed` lists the shared kernel as its limit. Its gaps:
@@ -169,7 +177,8 @@ hooks read-only.
 
 - Shared-kernel tiers do not survive a kernel exploit.
 - Data can leave to any destination the network policy allows.
-- In `standard`, every file in your home directory is readable.
+- In `standard`, every file in your home directory outside the hidden
+  credential locations and sibling repositories is readable.
 - Code from a sandboxed branch runs on your host when it is landed and gated,
   tested, or built there.
 - Terminal channels, as above.
