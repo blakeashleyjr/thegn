@@ -153,7 +153,9 @@ pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 /// per-attempt `HOME`, then the recipe argv. It enters the checkout and `exec`s
 /// the recipe under `env -i`, keeping only proxy and CA variables from the
 /// sandbox environment, with a per-attempt `HOME`, `CARGO_HOME` and
-/// `CARGO_TARGET_DIR`. When the recipe is `cargo` and the image has none, it
+/// `CARGO_TARGET_DIR`. For a `cargo` recipe it also sets `CARGO_BUILD_JOBS` to
+/// floor(MemTotal / 3 GiB) (min 1, max the CPU count) unless already set, so a
+/// memory-tight sandbox is not OOM-killed. When the recipe is `cargo` and the image has none, it
 /// first installs a minimal rustup toolchain into the per-attempt home, and
 /// when the image has no C linker (`cc`) it installs one with the image's
 /// package manager (`sudo -n` when not root). Any failure to get that far prints
@@ -199,6 +201,27 @@ if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
     fi
     [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed"
     command -v cc >/dev/null 2>&1 || fail "no C linker (cc) after the package install"
+fi
+if [ "$1" = cargo ]; then
+    # A rustc can take ~3 GB, so cargo's default one-job-per-CPU parallelism
+    # OOM-kills the build on a memory-tight sandbox (4 vCPU / 8 GB). Unless the
+    # sandbox already sets it, use floor(MemTotal / 3 GiB) jobs, at least 1 and
+    # never more than the CPU count.
+    jobs=${CARGO_BUILD_JOBS:-}
+    if [ -z "$jobs" ]; then
+        mem_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null)
+        case "$mem_kb" in
+            ''|*[!0-9]*) ;;
+            *)
+                jobs=$((mem_kb / 3145728))
+                [ "$jobs" -ge 1 ] || jobs=1
+                cpus=$(nproc 2>/dev/null || echo 0)
+                case "$cpus" in ''|*[!0-9]*) cpus=0 ;; esac
+                if [ "$cpus" -ge 1 ] && [ "$jobs" -gt "$cpus" ]; then jobs=$cpus; fi
+                ;;
+        esac
+    fi
+    [ -z "$jobs" ] || set -- "CARGO_BUILD_JOBS=$jobs" "$@"
 fi
 for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
     SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE; do
@@ -2094,6 +2117,17 @@ mod tests {
         assert!(!LAUNCH_SCRIPT.contains("VERCEL"));
         assert!(!LAUNCH_SCRIPT.contains(".claude"));
         assert!(LAUNCH_SCRIPT.contains(crate::sprites::job::SELECTED_JOB_ENV));
+    }
+
+    #[test]
+    fn the_launcher_bounds_cargo_jobs_by_memory() {
+        assert!(LAUNCH_SCRIPT.contains("CARGO_BUILD_JOBS"));
+        assert!(LAUNCH_SCRIPT.contains("/proc/meminfo"));
+        assert!(LAUNCH_SCRIPT.contains("3145728"));
+        // Computed before the proxy loop and the scrubbed exec that carries it.
+        let jobs = LAUNCH_SCRIPT.find("CARGO_BUILD_JOBS=$jobs").unwrap();
+        assert!(jobs < LAUNCH_SCRIPT.find("for v in HTTP_PROXY").unwrap());
+        assert!(jobs < LAUNCH_SCRIPT.find("exec env -i").unwrap());
     }
 
     #[test]

@@ -405,6 +405,20 @@ account. Not yet checked on a live account; each is shown as unverified:
 - Whether session history can be listed per sandbox (so the cost estimate is
   current-session only).
 
+## Builds on small sandboxes
+
+A Hobby sandbox has 4 vCPU and 8 GB. One `rustc` can use about 3 GB, so cargo's
+default of one job per CPU can get the compiler OOM-killed (clippy and nextest
+fail with `Out of memory: Killed process (rustc)`). For a `cargo` recipe, the
+selected-job launcher sets `CARGO_BUILD_JOBS` to floor(MemTotal / 3 GiB), at
+least 1 and at most the CPU count (2 on the Hobby size). Set `CARGO_BUILD_JOBS`
+in the sandbox environment to override it. In an interactive shell in the
+sandbox, export `CARGO_BUILD_JOBS` yourself the same way.
+
+The security suite (`just security-e2e`) needs bwrap user namespaces, which a
+Vercel sandbox does not provide. That is expected, not a thegn bug: run it on a
+host with user namespaces.
+
 The kind is experimental (`thegn doctor` says so).
 
 ## Unverified
