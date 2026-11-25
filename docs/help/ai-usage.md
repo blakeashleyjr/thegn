@@ -207,6 +207,19 @@ opening headers and the first usable output, then use the idle limit between
 chunks; they end after one hour even while data continues. A timed-out attempt
 can fall through to the next upstream lane.
 
+### Metered AI spend in the fleet meter
+
+The masthead `fleet` cost meter adds the proxy's metered spend to provider VM
+burn, so one number covers both: `$/h` is VM burn plus the cost of requests in
+the trailing hour. Only pay-per-token usage counts (API keys through the model
+proxy); subscription and OAuth lanes cost `$0` here and stay in the usage `%`
+gauge. The `fleet` popup adds a **metered AI** block with the burn, today (UTC)
+and month to date, split per backend/model. Costs the proxy computed from its
+price table are estimates, and the popup says so; a request with usage but no
+known price is not counted and the popup notes how many. With the model proxy
+disabled, or nothing recorded, there is no AI spend and the meter shows VM burn
+only. See [bars](bars.md).
+
 ## MCP tools
 
 ### Lead tool surface

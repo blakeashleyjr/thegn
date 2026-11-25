@@ -91,6 +91,14 @@ limit is reached, a `budget` section at the top lists each provider's burn
 against its limit (amber at `warn_hourly`, red at `max_hourly`, where new
 sandboxes are refused). Long worktree paths show their tail. Every amount is an estimate, not a bill.
 
+The meter is one combined burn: provider VMs plus **metered AI spend**, the
+pay-per-token cost the model proxy recorded over the trailing hour (see
+[AI account usage](ai-usage.md)). Subscription plans are not counted; they stay
+in the usage gauge. The hide-at-zero rule applies to the total. The popup adds
+a **metered AI** block with the AI burn, today (UTC), month to date, and a row
+per backend/model; it says when a cost is estimated from the price table or a
+request had no known price. With the model proxy off, AI spend is zero.
+
 In the popup, `↑`/`↓` (or `j`/`k`) select a VM. On a VM bound to a worktree,
 `s` stops it and `d` destroys it, each after a confirmation. Stop parks the VM
 (fly stop, machine0 suspend) and `thegn env up` resumes it. Destroy pulls the

@@ -4132,7 +4132,35 @@ fn fleet_snap(
             unpriced,
             ..FleetCost::default()
         },
+        ai: Default::default(),
     }
+}
+
+#[test]
+fn fleet_widget_includes_metered_ai_burn() {
+    let ai = |burn: f64| thegn_core::proxy::stats::AiSpend {
+        burn_hourly: burn,
+        ..Default::default()
+    };
+    // AI alone keeps the meter on the bar with no VMs at all.
+    let mut snap = fleet_snap(0, 0.0, 0, 0);
+    assert_eq!(fleet_widget(&snap, false), None);
+    snap.ai = ai(0.25);
+    assert_eq!(
+        fleet_widget(&snap, false),
+        Some(("$0.25/h".to_string(), false))
+    );
+    // VM and AI burn are summed.
+    let mut both = fleet_snap(1, 0.5, 0, 0);
+    both.ai = ai(0.25);
+    assert_eq!(
+        fleet_widget(&both, false).map(|(t, _)| t),
+        Some("$0.75/h".to_string())
+    );
+    // The zero-hide rule applies to the total: zero VM + zero AI stays hidden.
+    let mut zero = fleet_snap(1, 0.0, 0, 0);
+    zero.ai = ai(0.0);
+    assert_eq!(fleet_widget(&zero, false), None);
 }
 
 #[test]

@@ -744,6 +744,13 @@
       "changes": [
         "hide-zero-fleet-meter"
       ]
+    },
+    {
+      "issue": "THE-2707",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "meter-ai-spend-in-fleet-burn"
+      ]
     }
   ]
 }

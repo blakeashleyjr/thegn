@@ -1282,6 +1282,18 @@
       "archive_path": "openspec/changes/archive/2026-11-23-mark-unverified-backends/"
     },
     {
+      "change": "meter-ai-spend-in-fleet-burn",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2707",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The fleet $/h meter adds metered AI spend from the model proxy to VM burn; the popup splits VM vs AI per model."
+    },
+    {
       "change": "monitor-framework",
       "archive_path": "openspec/changes/archive/2026-11-03-monitor-framework/",
       "lifecycle": "archived",

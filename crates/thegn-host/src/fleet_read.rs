@@ -36,6 +36,9 @@ pub(crate) struct FleetSnapshot {
     pub(crate) generated_ms: i64,
     pub(crate) view: FleetView,
     pub(crate) cost: FleetCost,
+    /// Metered AI spend from the model proxy's audit rows. Default (all zero)
+    /// when the proxy has recorded nothing or its database cannot be read.
+    pub(crate) ai: thegn_core::proxy::stats::AiSpend,
 }
 
 /// Inventory every provider env and price the result at "now".
@@ -43,11 +46,25 @@ pub(crate) fn read(cfg: &Config) -> Result<FleetSnapshot> {
     let view = gather(cfg, None)?;
     let generated_ms = thegn_core::util::now_ms();
     let cost = priced(cfg, &view, generated_ms);
+    let ai = ai_spend_now(generated_ms);
     Ok(FleetSnapshot {
         generated_ms,
         view,
         cost,
+        ai,
     })
+}
+
+/// Metered AI spend (model-proxy audit rows, month to date) at `now_ms`. A
+/// database that cannot be read is no spend: the widget then shows VM burn only.
+/// Blocking; runs inside the off-loop fleet read.
+fn ai_spend_now(now_ms: i64) -> thegn_core::proxy::stats::AiSpend {
+    use thegn_core::store::ModelProxyStore;
+    let month = fleet_cost::utc_month_start_ms(now_ms);
+    let rows = thegn_core::db::Db::open()
+        .and_then(|db| db.model_proxy_requests_since(month, 200_000))
+        .unwrap_or_default();
+    thegn_core::proxy::stats::ai_spend(&rows, now_ms, fleet_cost::utc_day_start_ms(now_ms), month)
 }
 
 /// Price a view at `now_ms` and record its `[placement.fleet_budget]`

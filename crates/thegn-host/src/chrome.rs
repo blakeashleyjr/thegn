@@ -1733,19 +1733,22 @@ pub(crate) fn fleet_widget(
     always_show: bool,
 ) -> Option<(String, bool)> {
     let (view, cost) = (&snap.view, &snap.cost);
+    // One combined burn: provider VMs plus metered (pay-per-token) AI spend
+    // over the trailing hour. The zero-hide rule applies to the total.
+    let burn = cost.total_hourly + snap.ai.burn_hourly.max(0.0);
     let warn = view.orphans > 0 || !view.missing.is_empty() || !cost.budget.is_empty();
-    if view.rows.is_empty() && cost.total_hourly <= 0.0 && !warn {
+    if view.rows.is_empty() && burn <= 0.0 && !warn {
         return None;
     }
     // A zero burn with nothing to flag (no unpriced VM, no warning) is hidden
     // unless `[bars] fleet_always_show` keeps the meter on the bar.
-    if !always_show && cost.total_hourly <= 0.0 && cost.unpriced == 0 && !warn {
+    if !always_show && burn <= 0.0 && cost.unpriced == 0 && !warn {
         return None;
     }
-    let mut text = if cost.total_hourly > 0.0 && cost.total_hourly < 0.01 {
+    let mut text = if burn > 0.0 && burn < 0.01 {
         "<$0.01/h".to_string()
     } else {
-        format!("${:.2}/h", cost.total_hourly.max(0.0))
+        format!("${:.2}/h", burn.max(0.0))
     };
     if cost.unpriced > 0 {
         write!(text, " +{}", cost.unpriced).expect("writing to String cannot fail");

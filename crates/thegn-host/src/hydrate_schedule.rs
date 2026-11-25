@@ -107,9 +107,9 @@ fn bars_place(bars: &thegn_core::config::BarsConfig, id: &str) -> bool {
     .any(|placed| placed == id)
 }
 
-/// The fleet slot: armed only when the widget is placed somewhere and at
-/// least one `[env.*]` has a non-custom (API) provider, since a custom env
-/// has nothing to inventory.
+/// The fleet slot: armed only when the widget is placed somewhere and there
+/// is something to read: at least one `[env.*]` with a non-custom (API)
+/// provider to inventory, or the enabled model proxy (metered AI spend).
 fn fleet_every_slots(cfg: &Config) -> Option<u64> {
     use thegn_core::config::EnvProviderKind;
     let provider_env = cfg.env.values().any(|envc| {
@@ -118,7 +118,7 @@ fn fleet_every_slots(cfg: &Config) -> Option<u64> {
             EnvProviderKind::Custom
         )
     });
-    (provider_env && bars_place(&cfg.bars, "fleet"))
+    ((provider_env || cfg.model_proxy.enabled) && bars_place(&cfg.bars, "fleet"))
         .then(|| thegn_core::time_policy::cadence_slots(FLEET_POLL_SECS, 60, 500).get())
 }
 
