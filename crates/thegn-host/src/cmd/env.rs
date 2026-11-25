@@ -3716,6 +3716,7 @@ mod set_location_tests {
 /// `land --release-sandbox` parse (or refuse) as documented.
 #[cfg(test)]
 mod b162_cli_tests {
+    use super::UpWait;
     use clap::Parser as _;
 
     fn parse(args: &[&str]) -> Result<crate::Cli, clap::Error> {
