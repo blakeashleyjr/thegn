@@ -398,10 +398,19 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
     // the default profile's state and credentials.
     let env_profile = std::env::var("THEGN_PROFILE").ok();
     let selector = resolve_selector(cli_profile, env_profile.as_deref())?;
-    let default_state_home = util::xdg_state_home();
+    // A child process (the pane daemon the UI spawns, a pane shell) inherits an
+    // environment this function already rewrote. Re-rooting that would nest
+    // `profiles/<name>/profiles/<name>` and register a different state scope,
+    // so recognise the inherited root and recover the original base instead.
+    let current_dir = util::thegn_dir();
+    let inherited = inherited_base(&current_dir, &selector.name);
+    let default_state_home = match (&inherited, std::env::var_os(DEFAULT_STATE_HOME_ENV)) {
+        (Some(_), Some(prior)) if !prior.is_empty() => PathBuf::from(prior),
+        _ => util::xdg_state_home(),
+    };
     // Bound the name for a profile being created here; an existing one keeps
     // whatever it was created as (see `on_disk_name`).
-    let base = util::thegn_dir();
+    let base = inherited.unwrap_or(current_dir);
     let name = on_disk_name(&base, &selector.name);
 
     let paths = match profile_root(&base, &name) {
@@ -417,6 +426,7 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
                 // pane/child shell knows its profile (util::HOST_ENV_ALLOW_PREFIX
                 // admits `THEGN_*`).
                 std::env::set_var("THEGN_PROFILE", &name);
+                std::env::set_var(DEFAULT_STATE_HOME_ENV, &default_state_home);
             }
             apply_credential_env(&root, ssh_key.as_deref());
             ProfilePaths { name, root }
@@ -430,6 +440,25 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
     let _ = DEFAULT_STATE_HOME.set(default_state_home);
     let _ = ACTIVE.set(paths); // best-effort: first-set-wins: the active profile is set once
     Ok(())
+}
+
+/// Env var carrying the pre-reroot state home to children, so a re-entrant
+/// [`reroot`] keeps [`default_state_home`] pointing at the legacy default root.
+const DEFAULT_STATE_HOME_ENV: &str = "THEGN_DEFAULT_STATE_HOME";
+
+/// When `dir` is already `<base>/profiles/<name>` for the requested profile
+/// (an inherited, already-rerooted `THEGN_DIR`), the un-rerooted `<base>`.
+fn inherited_base(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    if name == "default" {
+        return None;
+    }
+    let profiles = dir.parent()?;
+    let named = dir.file_name().and_then(|n| n.to_str())?;
+    let is_profiles = profiles.file_name().and_then(|n| n.to_str()) == Some("profiles");
+    if !is_profiles || named != name {
+        return None;
+    }
+    profiles.parent().map(PathBuf::from)
 }
 
 /// The profile-scoped credential environment for a named profile's `root`:
@@ -1179,6 +1208,20 @@ mod tests {
         // `default` is never rerooted, so never capped.
         assert_eq!(on_disk_name(&base, "default"), "default");
         let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn inherited_root_is_recognised_so_reroot_is_idempotent() {
+        let base = std::path::Path::new("/home/x/.thegn");
+        let root = profile_root(base, "work").unwrap();
+        assert_eq!(inherited_base(&root, "work"), Some(base.to_path_buf()));
+        // Applying the recovered base again lands on the same root, not a nested one.
+        let again = profile_root(&inherited_base(&root, "work").unwrap(), "work").unwrap();
+        assert_eq!(again, root);
+        // A plain base, another profile, or the default profile is not inherited.
+        assert_eq!(inherited_base(base, "work"), None);
+        assert_eq!(inherited_base(&root, "other"), None);
+        assert_eq!(inherited_base(&root, "default"), None);
     }
 
     #[test]

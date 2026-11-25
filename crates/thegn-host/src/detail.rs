@@ -164,6 +164,14 @@ pub enum DetailAction {
     /// snapshot of the log tail so no model re-borrow / loop round-trip is needed
     /// (handled inside [`DetailOverlay::handle_key`]).
     ShowLog(Vec<LogLine>),
+    /// Drill a notification row into its full text *in place* (Enter on the
+    /// notifications list), so a long message is never reduced to its truncated
+    /// title. `worktree` (may be empty) adds a "jump to worktree" row.
+    ShowNotification {
+        message: String,
+        age: String,
+        worktree: String,
+    },
     /// Switch to the worktree at this path (a notification's `worktree_path`).
     /// Only reaches an *open* tab; the "Needs you" list uses [`Self::ActivateTarget`]
     /// instead so a dormant-workspace worktree opens rather than erroring.
@@ -812,6 +820,14 @@ impl DetailOverlay {
                             self.enter_log_view(lines);
                             DetailOutcome::Pending
                         }
+                        Some(DetailAction::ShowNotification {
+                            message,
+                            age,
+                            worktree,
+                        }) => {
+                            self.enter_notification_view(&message, &age, &worktree);
+                            DetailOutcome::Pending
+                        }
                         // DrillCiRun swaps to the run's header in place *and* asks
                         // the loop to kick the off-loop jobs/steps/log fetch. It's
                         // the one action that keeps the overlay open (Act, not
@@ -1096,6 +1112,38 @@ impl DetailOverlay {
         self.scroll = 0;
         self.sel = self.content_len().saturating_sub(1);
         self.scroll_to_sel();
+    }
+
+    /// Swap this overlay's content in place for the notification's full text,
+    /// word-wrapped over as many rows as it needs (scrollable). A worktree adds a
+    /// final "jump to worktree" row carrying the old Enter behaviour.
+    fn enter_notification_view(&mut self, message: &str, age: &str, worktree: &str) {
+        const WIDTH: usize = 64;
+        let mut rows: Vec<DetailRow> = wrap_full_text(message, WIDTH)
+            .into_iter()
+            .map(|line| DetailRow::new(Tok::Slot(S::Text), "", line))
+            .collect();
+        if rows.is_empty() {
+            rows.push(DetailRow::new(Tok::Slot(S::Dim), "", "(empty)"));
+        }
+        rows.push(DetailRow::new(Tok::Slot(S::Dim), "", format!("{age} ago")));
+        if !worktree.is_empty() {
+            rows.push(
+                DetailRow::new(Tok::Slot(S::Dim), "\u{2192}", "jump to worktree")
+                    .on_enter(DetailAction::FocusWorktree(worktree.to_string())),
+            );
+        }
+        let n = rows.len();
+        self.content = DetailContent::List(ListDetail {
+            rows,
+            empty_hint: String::new(),
+        });
+        self.title = "Notification".into();
+        self.cols = 72;
+        self.rows = (n + 2).clamp(5, 22);
+        self.hint = None;
+        self.scroll = 0;
+        self.sel = 0;
     }
 
     /// The outer box rect this overlay will draw, for outside-click
@@ -2805,6 +2853,63 @@ fn other_repo_rows(model: &FrameModel) -> Vec<DetailRow> {
         .collect()
 }
 
+/// Greedy word wrap of a whole message to `width` columns, honouring its own
+/// newlines, sanitising control characters and hard-breaking over-long words so
+/// no text is ever dropped.
+pub(crate) fn wrap_full_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let width = width.max(8);
+    let mut out = Vec::new();
+    for raw in display_cell_keep_newlines(text).lines() {
+        let mut cur = String::new();
+        for word in raw.split_whitespace() {
+            let mut word = word.to_string();
+            while UnicodeWidthStr::width(word.as_str()) > width {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                let mut head = String::new();
+                let mut used = 0;
+                let mut rest = word.chars();
+                let mut tail = String::new();
+                for c in rest.by_ref() {
+                    let w = UnicodeWidthChar::width(c).unwrap_or(0);
+                    if used + w > width {
+                        tail.push(c);
+                        break;
+                    }
+                    used += w;
+                    head.push(c);
+                }
+                tail.extend(rest);
+                out.push(head);
+                word = tail;
+            }
+            let need =
+                UnicodeWidthStr::width(cur.as_str()) + 1 + UnicodeWidthStr::width(word.as_str());
+            if !cur.is_empty() && need > width {
+                out.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(&word);
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// [`display_cell`] that keeps `\n` so a multi-line message stays multi-line.
+fn display_cell_keep_newlines(text: &str) -> String {
+    text.split('\n')
+        .map(display_cell)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One inbox row for the Alerts / Notifications groups (log rows are handled by
 /// [`logs_row`]). Enter jumps to the worktree; `x` dismisses (the row leaves
 /// the list in place); `a` clears all. Navigating never marks anything read.
@@ -2815,9 +2920,13 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
     // not a millisecond clock — gives the real age.
     let mut row = DetailRow::new(marker, glyph, display_cell(&n.message))
         .note(format!("{} ago", thegn_core::util::age(n.created_at_ms)));
-    if !n.worktree_path.is_empty() {
-        row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
-    }
+    // Enter opens the full text (the row itself is truncated); the detail view
+    // carries the jump-to-worktree row.
+    row = row.on_enter(DetailAction::ShowNotification {
+        message: n.message.clone(),
+        age: thegn_core::util::age(n.created_at_ms),
+        worktree: n.worktree_path.clone(),
+    });
     if n.id != 0 {
         row = row.action('x', DetailAction::DismissNotification { id: n.id });
     }

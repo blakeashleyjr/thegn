@@ -730,6 +730,20 @@
       "changes": [
         "fix-relaunch-duplicate-panes"
       ]
+    },
+    {
+      "issue": "THE-2692",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "fix-clean-remove-default"
+      ]
+    },
+    {
+      "issue": "THE-2695",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "hide-credentials-in-standard-sandbox"
+      ]
     }
   ]
 }

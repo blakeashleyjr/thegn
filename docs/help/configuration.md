@@ -684,7 +684,7 @@ rejects. It also exposes `confirmDelete` and the scalar theme options
 It also exposes `sessionScrollbackLines`, `sessionRestoreGraceSecs`,
 `sessionFocusOnCreate` and `sessionResidentPoolLimit` for `[session]`, and
 `clipboardImagePaste`, `clipboardMaxImageBytes`, `clipboardRemoteDir` and
-`clipboardKeepHours` for `[clipboard]`.
+`clipboardKeepHours` and `clipboardPersistRegisters` for `[clipboard]`.
 It also exposes `locEnabled`, `locScanIntervalSecs`, `locMaxScanPerRound` and
 `locWatchInvalidateSecs` for `[loc]`, and `replayEnabled`,
 `replayMaxBytesPerPane`, `replayMaxDurationSecs`, `replayKeyframeIntervalMs`,

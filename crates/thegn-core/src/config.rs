@@ -151,6 +151,10 @@ pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
 /// Maximum bytes read from a file-backed SecretRef by the config resolvers.
 pub const FILE_SECRET_REF_MAX_BYTES: u64 = 64 * 1024;
 
+/// Repository discovery roots the first-run wizard offers (prefilled, never
+/// scanned until the user confirms them and `repo_roots` is persisted).
+pub const DEFAULT_REPO_ROOTS: [&str; 2] = ["~/code", "~/src"];
+
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
@@ -1647,6 +1651,11 @@ pub struct ClipboardConfig {
     /// Age (hours) past which a drop file is swept on the next paste. The sweep
     /// is age-based and piggybacks each paste — no background timer (0%-idle).
     pub keep_hours: u64,
+    /// Persist yank registers (copied text) to the state database so they
+    /// survive a restart. Default `false`: registers live in memory only, and
+    /// any register rows left by an earlier build are deleted at startup. Copied
+    /// text can carry secrets, so retention on disk is opt-in.
+    pub persist_registers: bool,
 }
 
 impl Default for ClipboardConfig {
@@ -1656,6 +1665,7 @@ impl Default for ClipboardConfig {
             max_image_bytes: 10 * 1024 * 1024,
             remote_dir: "~/.cache/thegn/paste".to_string(),
             keep_hours: 24,
+            persist_registers: false,
         }
     }
 }
@@ -1799,10 +1809,11 @@ pub struct UsageConfig {
     /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
     /// Antigravity quota summary) using the on-disk OAuth token.
     ///
-    /// **On by default**, because Claude publishes no window state to disk: with
-    /// this off the feature has nothing to show for a Claude account and every
-    /// row reads "unavailable". `false` restricts it to offline sources (Codex
-    /// rollup files) — the shell itself stays offline either way.
+    /// **Off by default**: thegn does not use an existing Claude (or
+    /// Antigravity) login until the user opts in. Claude publishes no window
+    /// state to disk, so with this off its rows read "unavailable"; Codex
+    /// rollup files are still read offline. The shell itself stays offline
+    /// either way.
     pub allow_network: bool,
     /// Show the statusbar badge. The badge is the always-on affordance; turn it
     /// off to keep the overlay and panel section without spending bar width.
@@ -1849,7 +1860,7 @@ impl Default for UsageConfig {
     fn default() -> Self {
         UsageConfig {
             enabled: true,
-            allow_network: true,
+            allow_network: false,
             statusbar: true,
             warn_percent: crate::usage::DEFAULT_WARN_PERCENT,
             crit_percent: crate::usage::DEFAULT_CRIT_PERCENT,
@@ -2306,12 +2317,14 @@ pub struct GitConfig {
     /// passphrase prompt can never hang a background op. Off by default: a
     /// working gpg-agent signs headlessly.
     pub override_gpg: bool,
-    /// Install a `pre-merge-commit` hook that refuses a `git merge` run against
+    /// Offer a `pre-merge-commit` hook that refuses a `git merge` run against
     /// the canonical (primary) checkout from *inside* a thegn sandbox, where
     /// the canonical worktree's filesystem view can be incoherent and silently
     /// corrupt the merge. On by default; points at `thegn integrate` (an
-    /// object-DB fold with no checkout). No-op outside a sandbox, in linked
-    /// worktrees, and when a foreign hook is already present. Per-merge escape
+    /// object-DB fold with no checkout). The hook is only installed after the
+    /// owner answers yes to a once-per-repo prompt (remembered in the git dir's
+    /// `thegn-merge-guard`); a non-interactive start never installs it. No-op
+    /// outside a sandbox, in linked worktrees, and when a foreign hook is already present. Per-merge escape
     /// hatch: `THEGN_MERGE_GUARD_OFF=1`.
     pub merge_guard: bool,
     /// Poll the remote in the background (`git fetch --prune`, never a merge) so
@@ -6943,9 +6956,9 @@ impl Config {
         }
         self.worktrees_dir = paths.expand_tilde(&self.worktrees_dir);
         self.workspaces_dir = paths.expand_tilde(&self.workspaces_dir);
-        if self.repo_roots.is_empty() {
-            self.repo_roots = vec![self.workspaces_dir.clone()];
-        }
+        // An unset `repo_roots` stays empty: the picker scans nothing outside
+        // repos the user opened explicitly until first-run setup records the
+        // roots they chose (prefilled from `DEFAULT_REPO_ROOTS`).
         self.repo_roots = self
             .repo_roots
             .iter()
@@ -7960,6 +7973,22 @@ mod agent_error_signatures_tests {
         };
         let errors = cfg.validate();
         assert!(errors.iter().any(|error| error.contains("more than 64")));
+    }
+}
+
+#[cfg(test)]
+mod usage_default_tests {
+    use super::*;
+
+    #[test]
+    fn usage_network_polling_is_opt_in() {
+        let cfg = UsageConfig::default();
+        assert!(
+            !cfg.allow_network,
+            "no credentialed fetch until the user opts in"
+        );
+        // Offline sources (Codex rollups) and the feature itself stay on.
+        assert!(cfg.enabled);
     }
 }
 

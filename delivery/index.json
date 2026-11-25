@@ -996,6 +996,18 @@
       "summary": "THE-2491 owns pipeline worktree filing; implementation landed, with coordinator Mac sidebar proof and rendered evidence still unchecked."
     },
     {
+      "change": "fix-clean-remove-default",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2692",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "THE-2692 makes clean worktree removal non-destructive: the Alt-X menu pre-selects keep files, labels the delete row as keeping the branch, and its body says the branch and commits are kept."
+    },
+    {
       "change": "fix-exact-terminal-search-jumps",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -1201,6 +1213,18 @@
         }
       ],
       "summary": "Sprites model_credentials grant, destroy proof, exec deadline, close snapshot and literal search default; live checks open."
+    },
+    {
+      "change": "hide-credentials-in-standard-sandbox",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2695",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2695 tightens the default standard sandbox: local panes mask well-known credential locations, private ~/.ssh entries and sibling repositories over the read-only $HOME (bwrap/OCI masks, systemd InaccessiblePaths), carve only agent runtime state writable, and explain the boundary in the first-run and new-worktree panels; remote build, tests and live bwrap check remain unchecked."
     },
     {
       "change": "isolate-maintenance-regression-fixtures",

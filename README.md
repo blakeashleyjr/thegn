@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.135`). **x86_64 Linux and macOS on
+> **Status: public alpha** (`0.1.0-alpha.136`). **x86_64 Linux and macOS on
 > Apple silicon are supported;** on macOS install with `brew install blakeashleyjr/thegn/thegn`,
 > the release tarball (see [Install](#install)), the flake, or a source build. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -28,7 +28,8 @@ built on zellij; that architecture was fully stripped and it is now a
 from-scratch native compositor.)
 
 Worktree panes run **sandboxed by default**: an **accident guard**, not a
-boundary against a hostile agent — home stays readable and the network is
+boundary against a hostile agent. It hides well-known credential files and
+sibling repositories, but the rest of home stays readable and the network is
 direct. The opt-in `sealed` profile is the hardened tier that hides `$HOME`
 and disables network access. What is protected, what is not, and which
 launches still run on the host is in the
@@ -37,7 +38,7 @@ sandbox-and-credentials note under [First run](#3-first-run).
 
 ## Quickstart (Linux x86_64)
 
-Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. See [Install](#install) for platform details.
+Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. On Windows, run the Linux build inside WSL2: see `docs/help/wsl2.md` for the Ubuntu 24.04 steps. See [Install](#install) for platform details.
 
 ### 1. Install
 
@@ -115,12 +116,13 @@ More: press `F1`, or see [getting started](docs/help/getting-started.md).
 
 > **Sandbox and credentials.** Worktree panes run in a sandbox by default. The
 > default `standard` profile keeps files outside the worktree read-only, apart
-> from carved-back state directories, and leaves `$HOME` readable, including
-> credentials such as `~/.ssh`, `~/.aws` and `~/.config/gh`. The opt-in `sealed`
+> from carved-back state directories. It hides well-known credential files
+> (`~/.ssh` private keys, `~/.aws`, `~/.config/gh` and similar) and the
+> repositories beside the worktree, but the rest of `$HOME` stays readable. The opt-in `sealed`
 > profile hides `$HOME` and disables network access, but still shares the host's
 > read-write toolchain caches. `standard` is an accident
-> guard, not a boundary against a hostile agent: home is readable, network is
-> direct by default, and the kernel is shared. `sealed` is the hardened tier.
+> guard, not a boundary against a hostile agent: the rest of home is readable,
+> network is direct by default, and the kernel is shared. `sealed` is the hardened tier.
 > `[[plugins]]` extensions are native, unsandboxed processes. See the
 > [sandboxing help page](docs/help/sandboxing.md) and the
 > [security model](docs/help/sandbox-security-model.md).

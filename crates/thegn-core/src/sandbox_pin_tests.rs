@@ -100,6 +100,11 @@ fn sandbox_pin_explanations_cover_profile_capability_and_network_facts() {
     );
     assert!(standard_text.contains("readable"));
     assert!(standard_text.contains("~/.ssh"));
+    // THE-2695: standard says what it hides and what it does not stop.
+    assert!(standard_text.contains("Hides ~/.ssh keys, cloud CLI logins, token files"));
+    assert!(standard_text.contains("repos beside this one"));
+    assert!(standard_text.contains("agent settings stay read-only"));
+    assert!(standard_text.contains("Does not stop a hostile agent"));
     assert!(standard_text.contains("default capabilities"));
     assert!(standard_text.contains("SSH") && standard_text.contains("provider"));
     assert!(standard_text.contains("VPN attachments work"));

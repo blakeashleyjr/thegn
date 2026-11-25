@@ -40,6 +40,11 @@ dials it (see [[media]]).
   and the file is restricted to your account (0600). The database also holds
   some live bearer credentials (iroh pair secrets), so treat copies and backups
   as sensitive.
+- **Copied text:** Text you copy from a pane is kept in memory only (yank
+  registers) and is not written to the state database. `[clipboard]
+persist_registers = true` opts in to keeping it across restarts; turning it
+  off again deletes the stored registers at the next startup. The `"+`
+  system-clipboard register is never stored. See [[copy-and-select]].
 - **Doctor report:** `thegn doctor` redacts identifying tailnet detail —
   the tailnet name and the control URL print as `***redacted***` — because
   its output is regularly pasted into issues. `thegn doctor --full` (alias
@@ -74,11 +79,12 @@ dials it (see [[media]]).
   GitLab CI refreshes use `gh` or `glab` when available, with their existing
   authentication, to read PR/CI data; a missing `gh` disables the GitHub CLI
   integration.
-- **AI-account usage — `[usage] enabled = true` and `allow_network = true`:**
-  Codex usage is read from local files, while Claude and Antigravity usage may
-  use an authenticated request with the OAuth token already stored by that
-  tool; polling defaults to 300 seconds and is floored at 60. Turning off
-  `allow_network` stops those requests and shows those rows as unavailable;
+- **AI-account usage — `[usage] enabled = true`:** Codex usage is read from
+  local files. Claude and Antigravity usage use an authenticated request with
+  the OAuth token already stored by that tool **only if you set
+  `allow_network = true`**; it is off by default, so thegn never uses your
+  existing login until you opt in. Polling defaults to 300 seconds and is
+  floored at 60. With `allow_network` off those rows show as unavailable;
   turning off `enabled` removes the feature. thegn does not ask for or store an
   API key for this feature.
 - **Cover art — `[media] show_art = true`:** when the Now-Playing panel receives

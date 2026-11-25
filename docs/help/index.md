@@ -14,7 +14,8 @@ is rendered in-process.
 
 This is a public alpha. Linux on x86_64 and macOS on Apple silicon are supported;
 the macOS sandbox is best-effort (it needs Apple `container`, podman or docker,
-and `sealed` needs podman or docker). Windows is not supported yet. Install from the GitHub release
+and `sealed` needs podman or docker). There is no native Windows build; on Windows, run
+the Linux build inside WSL2 ([[wsl2]]). Install from the GitHub release
 archive or the Nix flake (the README's Install section has both).
 
 In the `F1` overlay, press `/` to search every page; `Tab` switches between

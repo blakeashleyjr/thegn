@@ -40,6 +40,9 @@ does not infer removals.
 
 - `Alt-W` — **new project**: pick a repo from your scanned roots
   (`repo_roots` in the config) or paste a git URL to clone and open.
+  Nothing is scanned until you choose the roots: first-run setup asks
+  (prefilled with `~/code` and `~/src`) and saves the answer as `repo_roots`;
+  until then only repositories you opened explicitly appear.
   A repository reached through multiple roots, such as symlinked or nested
   roots, is listed once. A broad root such as `/` or your home directory adds
   a `broad root: … (scan limited to 20000 repos)` warning row above the repos;

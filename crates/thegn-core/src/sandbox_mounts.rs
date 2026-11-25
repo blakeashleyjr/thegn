@@ -478,15 +478,15 @@ pub fn xdg_carveout_report_at(
         }
     }
     // Coding-agent config dirs (Claude Code's `CLAUDE_CONFIG_DIR` / `~/.claude`,
-    // Codex's `CODEX_HOME` / `~/.codex`) carved read-write: the agent CLI writes
-    // runtime state (`session-env`, todos, shell snapshots) here, so a plain
-    // sandbox shell where the user runs `claude`/`codex` *manually* needs it
-    // writable too — the bundle-launch path (`bundle::compose_inner`) only carves
-    // this when thegn itself recognizes the launched provider, missing the
-    // manual-in-a-shell case. `effective_config_dir` returns `Some` only for a
-    // dir that already exists (so bwrap overmounts an existing inode). Off for
-    // sealed: an untrusted network=none agent must not get write access to the
-    // host's real credential dirs (same posture as `~/.keychain` above).
+    // Codex's `CODEX_HOME` / `~/.codex`): the agent CLI writes runtime state
+    // (`session-env`, todos, shell snapshots) here, so a plain sandbox shell
+    // where the user runs `claude`/`codex` *manually* needs that state
+    // writable too. THE-2695: only the runtime state is carved
+    // ([`agent_runtime_state_paths`]); settings, hooks, plugins and skills stay
+    // read-only, so a pane cannot rewrite what the host agent later runs.
+    // `effective_config_dir` returns `Some` only for a dir that already exists.
+    // Off for sealed: an untrusted network=none agent must not get write access
+    // to the host's real credential dirs (same posture as `~/.keychain` above).
     if !matches!(
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
@@ -497,16 +497,77 @@ pub fn xdg_carveout_report_at(
                     warn_symlinked_carve(Path::new(&dir));
                     continue;
                 }
-                mounts.push(Mount {
-                    host: dir.clone(),
-                    dest: dir,
-                    ro: false,
-                    cache: false,
-                });
+                for path in agent_runtime_state_paths(p.id, p.auth_marker, Path::new(&dir)) {
+                    if !link_free_below_home(&path, home, home_canon.as_deref()) {
+                        warn_symlinked_carve(&path);
+                        continue;
+                    }
+                    let path = path.to_string_lossy().into_owned();
+                    if mounts.iter().any(|m| m.dest == path) {
+                        continue;
+                    }
+                    mounts.push(Mount {
+                        host: path.clone(),
+                        dest: path,
+                        ro: false,
+                        cache: false,
+                    });
+                }
             }
         }
     }
     (mounts, omissions)
+}
+
+/// Runtime-state entries of Claude Code's config dir that the agent writes
+/// while it runs: transcripts and project state, todos, session env, shell
+/// snapshots, logs and the prompt history.
+const CLAUDE_RUNTIME_STATE: &[&str] = &[
+    "projects",
+    "todos",
+    "sessions",
+    "session-env",
+    "shell-snapshots",
+    "statsig",
+    "ide",
+    "debug",
+    "file-history",
+    "plans",
+    "logs",
+    "history.jsonl",
+];
+
+/// Runtime-state entries of the Codex home: sessions, logs and history.
+const CODEX_RUNTIME_STATE: &[&str] = &[
+    "sessions",
+    "archived_sessions",
+    "log",
+    "shell_snapshots",
+    "history.jsonl",
+];
+
+/// The existing runtime-state entries of an agent config `dir` that a
+/// sandboxed agent may write (THE-2695): the provider's runtime state plus its
+/// login file `auth_marker`, which the agent refreshes in place. Everything
+/// else in the dir (settings, hooks, plugins, skills, installed binaries)
+/// stays read-only. An unknown provider gets only its login file.
+pub fn agent_runtime_state_paths(provider_id: &str, auth_marker: &str, dir: &Path) -> Vec<PathBuf> {
+    let names: &[&str] = match provider_id {
+        "claude" => CLAUDE_RUNTIME_STATE,
+        "codex" => CODEX_RUNTIME_STATE,
+        _ => &[],
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for name in names.iter().copied().chain(std::iter::once(auth_marker)) {
+        if name.is_empty() {
+            continue;
+        }
+        let path = dir.join(name);
+        if (path.is_dir() || path.is_file()) && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn default_writable_carveouts_at(
@@ -1300,14 +1361,15 @@ pub fn sealed_mount_still_ok(m: &Mount, home: &Path) -> bool {
 }
 
 /// Whether `host` is one of the built-in agent config dirs (`~/.claude`,
-/// `~/.codex`, or the env-selected `CLAUDE_CONFIG_DIR`/`CODEX_HOME`) that a sealed
-/// launch always drops — dropping those is expected, not worth a warning.
+/// `~/.codex`, or the env-selected `CLAUDE_CONFIG_DIR`/`CODEX_HOME`), or a
+/// runtime-state entry inside one, that a sealed launch always drops —
+/// dropping those is expected, not worth a warning.
 pub fn is_builtin_agent_carve(host: &str) -> bool {
     let h = Path::new(host);
     let home = std::env::var("HOME").unwrap_or_default();
     crate::account::providers().iter().any(|p| {
-        crate::account::effective_config_dir(p).is_some_and(|d| Path::new(&d) == h)
-            || (!home.is_empty() && Path::new(&home).join(p.default_dir) == h)
+        crate::account::effective_config_dir(p).is_some_and(|d| h.starts_with(&d))
+            || (!home.is_empty() && h.starts_with(Path::new(&home).join(p.default_dir)))
     })
 }
 
@@ -2202,8 +2264,11 @@ mod tests {
             .join(format!("tg-agentcfg-{}", crate::util::now()));
         let present = base.join("present");
         let absent = base.join("absent"); // deliberately not created
-        std::fs::create_dir_all(&present).unwrap();
+        std::fs::create_dir_all(present.join("todos")).unwrap();
+        std::fs::write(present.join("settings.json"), b"{}").unwrap();
         let present_s = present.to_string_lossy().into_owned();
+        let todos_s = present.join("todos").to_string_lossy().into_owned();
+        let settings_s = present.join("settings.json").to_string_lossy().into_owned();
         let absent_s = absent.to_string_lossy().into_owned();
         let prev = std::env::var("CLAUDE_CONFIG_DIR").ok(); // best-effort: test: the saved env value may legitimately be unset
 
@@ -2225,21 +2290,66 @@ mod tests {
         std::fs::remove_dir_all(&base).ok(); // best-effort: test cleanup: scratch removal must never fail the test
 
         assert!(
-            hardened.iter().any(|m| m.host == present_s && !m.ro),
-            "hardened profile must carve the agent config dir writable"
+            hardened.iter().any(|m| m.host == todos_s && !m.ro),
+            "hardened profile must carve the agent's runtime state writable"
+        );
+        // THE-2695: settings (and the dir as a whole) stay read-only.
+        assert!(
+            !hardened
+                .iter()
+                .any(|m| m.host == present_s || m.host == settings_s),
+            "hardened profile must not carve the agent config dir or its settings"
         );
         assert!(
-            !sealed.iter().any(|m| m.host == present_s),
+            !sealed.iter().any(|m| m.host.starts_with(&present_s)),
             "sealed agent profile must NOT carve the host config dir writable"
         );
         assert!(
-            !sealed_tunnel.iter().any(|m| m.host == present_s),
+            !sealed_tunnel.iter().any(|m| m.host.starts_with(&present_s)),
             "sealed-tunnel profile must NOT carve the host config dir writable"
         );
         assert!(
-            !hardened_absent.iter().any(|m| m.host == absent_s),
+            !hardened_absent
+                .iter()
+                .any(|m| m.host.starts_with(&absent_s)),
             "a non-existent config dir must never be carved"
         );
+    }
+
+    #[test]
+    fn agent_runtime_state_paths_lists_only_existing_runtime_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["projects", "todos", "hooks", "plugins", "local"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        for file in ["settings.json", "history.jsonl", ".credentials.json"] {
+            std::fs::write(dir.path().join(file), b"{}").unwrap();
+        }
+        let names = |paths: Vec<PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let claude = names(agent_runtime_state_paths(
+            "claude",
+            ".credentials.json",
+            dir.path(),
+        ));
+        assert_eq!(
+            claude,
+            vec!["projects", "todos", "history.jsonl", ".credentials.json"]
+        );
+        // An unknown provider gets only its login file; a missing one nothing.
+        assert_eq!(
+            names(agent_runtime_state_paths(
+                "other",
+                ".credentials.json",
+                dir.path()
+            )),
+            vec![".credentials.json"]
+        );
+        assert!(agent_runtime_state_paths("other", "auth.json", dir.path()).is_empty());
     }
 
     #[test]

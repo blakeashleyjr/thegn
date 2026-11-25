@@ -735,6 +735,16 @@ impl NewWorktreeWizard {
                     }
                     WizardOutcome::Pending
                 }
+                // The wizard opens on this list, so a user who just starts
+                // typing a branch name would otherwise have every key dropped
+                // and silently get the generated name. Route name characters
+                // to the Name field (j/k stay list navigation here).
+                KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                    self.focus = Field::Name;
+                    self.tail.push(*c);
+                    self.name_edited = true;
+                    WizardOutcome::Pending
+                }
                 _ => WizardOutcome::Pending,
             },
         }
@@ -763,7 +773,8 @@ impl NewWorktreeWizard {
             } else {
                 vec![
                     explanation.one_liner,
-                    "Home stays readable, including credentials, ~/.ssh and cloud tokens.",
+                    "Hides ~/.ssh keys, cloud CLI logins, token files and repos beside this one.",
+                    "The rest of home stays readable; files outside the worktree are read-only.",
                     explanation.network,
                     "SSH/provider envs and run-on-host work.",
                 ]
@@ -2315,6 +2326,19 @@ mod tests {
     }
 
     #[test]
+    fn typing_on_program_list_reaches_the_branch_name() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w =
+            NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &test_cfg());
+        assert_eq!(w.focus, Field::Program);
+        key(&mut w, KeyCode::Char('f'));
+        key(&mut w, KeyCode::Char('x'));
+        assert_eq!(w.focus, Field::Name);
+        assert!(w.candidate().ends_with("fx"));
+        assert!(w.name_edited);
+    }
+
+    #[test]
     fn typing_marks_edited_and_blocks_suggestion() {
         let cfg = test_cfg();
         let root = tempfile::tempdir().unwrap();
@@ -2587,8 +2611,8 @@ mod tests {
             );
             if profile_sel == 0 {
                 assert!(
-                    frame.contains("credentials"),
-                    "standard explains readable credentials: {frame}"
+                    frame.contains("Hides"),
+                    "standard explains what it hides: {frame}"
                 );
             } else {
                 assert!(

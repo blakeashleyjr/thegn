@@ -620,6 +620,12 @@ pub struct SandboxSpec {
     /// never mounted wholesale. A backend that cannot honor this is refused by
     /// [`crate::sandbox_floor::home_gate`] rather than silently exposing `$HOME`.
     pub seal_home: Option<String>,
+    /// Canonical host paths the `standard` profile hides from its read-only
+    /// `$HOME` (THE-2695): credential locations, private `~/.ssh` entries and
+    /// sibling git repositories ([`crate::sandbox_hidden::standard_hidden_paths`]).
+    /// bwrap and local podman/docker mask each one exposed by a bind; systemd
+    /// makes it inaccessible. Empty for every other profile and placement.
+    pub hidden_paths: Vec<String>,
     /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
     pub volume_owners: Vec<(String, String)>,
     /// The launch's egress plan: the ONLY egress field on the spec (B11).
@@ -674,6 +680,7 @@ impl Default for SandboxSpec {
             oci_runtime: None,
             daemon_persistent: false,
             seal_home: None,
+            hidden_paths: Vec::new(),
             volume_owners: Vec::new(),
             egress: None,
         }
@@ -2406,7 +2413,10 @@ fn resolve_placed_with(
     // read-only at their symlink-target paths so the $HOME-mounted symlinks
     // resolve in-sandbox. Local placements only (paths are probed on this
     // host); gated exactly like the toolchain mounts that expose $HOME.
-    if inject_host_toolchain && placement.is_local() && seal_home.is_none() {
+    // THE-2695: `standard` hides `~/.ssh` private keys, so it does not bind
+    // their link targets either; git over ssh goes through the ssh agent.
+    let hides_credentials = profile == SandboxProfile::Hardened;
+    if inject_host_toolchain && placement.is_local() && seal_home.is_none() && !hides_credentials {
         let mut covered: Vec<String> = mounts.iter().map(|m| m.dest.clone()).collect();
         if backend == Backend::Bwrap {
             covered.extend(BWRAP_SUBSTRATE.iter().map(|s| s.to_string()));
@@ -2511,6 +2521,28 @@ fn resolve_placed_with(
         DeployKeyPlan::Withheld(reason) => warn_git_fallback_once(&loc.path(), &reason),
     }
 
+    // THE-2695: the read-only `$HOME` a local `standard` pane sees (bwrap and
+    // OCI bind it, systemd shares the host tree) must not show credentials or
+    // the repositories beside this one. Sealed never mounts `$HOME`; `open`
+    // and remote placements are out of scope.
+    let hidden_paths = if hides_credentials
+        && placement.is_local()
+        && !loc.is_remote()
+        && (inject_host_toolchain || backend.profile().family == BackendFamily::Systemd)
+        && matches!(
+            cfg.file_access,
+            FileAccess::Worktree | FileAccess::WorktreePlusCaches
+        ) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        crate::sandbox_hidden::standard_hidden_paths(
+            std::path::Path::new(&home),
+            &worktree,
+            git_common.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
     let mut spec = SandboxSpec {
         backend,
         placement,
@@ -2601,6 +2633,7 @@ fn resolve_placed_with(
         // (the host's launch-spec builder) flips it on for daemon-backed panes.
         daemon_persistent: false,
         seal_home,
+        hidden_paths,
         // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
         egress: None,
     };
@@ -4685,6 +4718,28 @@ fn backend_enter_argv_guarded_with_env(
                     }
                 }
 
+                // THE-2695: `standard` hides credentials and sibling
+                // repositories that the read-only `$HOME` bind exposes. A path
+                // holding an explicit mount is kept (see `sandbox_hidden`).
+                for mask in crate::sandbox_hidden::host_hidden_masks(
+                    &spec.hidden_paths,
+                    &mount_refs,
+                    &explicit_dests,
+                ) {
+                    match mask {
+                        crate::sandbox_runtime_escape::EscapeMask::Tmpfs(dest) => {
+                            v.extend(["--tmpfs".into(), dest.display().to_string()]);
+                        }
+                        crate::sandbox_runtime_escape::EscapeMask::NullBind(dest) => {
+                            v.extend([
+                                "--ro-bind".into(),
+                                "/dev/null".into(),
+                                dest.display().to_string(),
+                            ]);
+                        }
+                    }
+                }
+
                 // THE-2011: the daemon exports its control socket into every
                 // session, but the control dir is masked above, so the variable
                 // would dangle. Unset it (in-sandbox control is unsupported).
@@ -4900,6 +4955,20 @@ fn backend_enter_argv_guarded_with_env(
                         "-p".into(),
                         format!("InaccessiblePaths=-{}", protected_dir.display()),
                     ]);
+                }
+                // THE-2695: `standard` hides credentials and sibling
+                // repositories; a path holding the worktree or a mount stays.
+                let mount_dests: Vec<&std::path::Path> = spec
+                    .mounts
+                    .iter()
+                    .map(|mount| std::path::Path::new(&mount.dest))
+                    .collect();
+                for property in crate::sandbox_hidden::systemd_hidden_props(
+                    &spec.hidden_paths,
+                    &spec.worktree,
+                    &mount_dests,
+                ) {
+                    v.extend(["-p".into(), property]);
                 }
             }
             for property in systemd_mount_props(spec).map_err(|message| {
@@ -5684,6 +5753,8 @@ fn oci_create_opts_in(
     // `config validate` warns). Other OCI runtimes are VMs whose shares cannot
     // carry a host unix socket, and Apple rejects unknown flags.
     v.extend(oci_runtime_escape_args(spec, runtime_dir));
+    // THE-2695: the credentials and sibling repositories `standard` hides.
+    v.extend(oci_hidden_path_args(spec));
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
     // which already does `--ro-bind /nix/store /nix/store`.
@@ -5837,6 +5908,35 @@ fn oci_runtime_escape_args(
             &explicit_dests,
         ),
     )
+}
+
+/// The local podman/docker args masking the paths a `standard` spec hides
+/// (THE-2695) wherever a bind exposes them. Same scope as
+/// `oci_runtime_escape_args`: local podman/docker only.
+fn oci_hidden_path_args(spec: &SandboxSpec) -> Vec<String> {
+    if spec.hidden_paths.is_empty()
+        || !spec.placement.is_local()
+        || !matches!(
+            spec.backend,
+            Backend::Podman | Backend::PodmanRootful | Backend::Docker
+        )
+    {
+        return Vec::new();
+    }
+    let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = spec
+        .mounts
+        .iter()
+        .filter(|m| oci_emits_mount(m))
+        .map(|m| (std::path::Path::new(&m.host), std::path::Path::new(&m.dest)))
+        .collect();
+    let mut explicit_dests: Vec<&std::path::Path> =
+        mount_refs.iter().map(|(_, dest)| *dest).collect();
+    explicit_dests.push(&spec.worktree);
+    crate::sandbox_runtime_escape::oci_mask_args(&crate::sandbox_hidden::host_hidden_masks(
+        &spec.hidden_paths,
+        &mount_refs,
+        &explicit_dests,
+    ))
 }
 
 /// When a VPN sidecar owns this worktree's network namespace (`sidecar`/`proxy`

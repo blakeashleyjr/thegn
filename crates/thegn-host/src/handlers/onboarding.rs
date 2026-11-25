@@ -40,6 +40,9 @@ pub(crate) struct OnboardingUi {
     pub ui: Option<OnboardingWizard>,
     pub wait: Option<(u32, bool)>,
     pub tour: Option<WelcomeTour>,
+    /// Unix seconds when the current wizard/tour flow began; pane spawn failures
+    /// recorded at or after it veto the success line.
+    pub started_at: Option<i64>,
 }
 
 impl OnboardingUi {
@@ -51,6 +54,7 @@ impl OnboardingUi {
     /// Open the welcome tour (palette `setup-wizard`), replacing an open wizard.
     pub(crate) fn open_tour(&mut self, cfg: &Config) {
         self.ui = None;
+        self.started_at = Some(thegn_core::util::now());
         self.tour = Some(WelcomeTour::new(cfg));
     }
 
@@ -127,6 +131,7 @@ pub(crate) fn startup(
             ui: wizard,
             wait: None,
             tour,
+            started_at: Some(thegn_core::util::now()),
         },
         rebuild,
     )
@@ -221,13 +226,38 @@ pub(crate) fn handle_key_event(
             }
             persist_done(completed);
             model.status = if completed {
-                "setup complete — re-run any time with `thegn setup`".into()
+                completion_status(
+                    "setup complete — re-run any time with `thegn setup`",
+                    ob.started_at,
+                    &model.panel.notifications,
+                )
             } else {
                 "setup dismissed — re-run any time with `thegn setup`".into()
             };
         }
     }
     applied
+}
+
+/// The status line for a finished flow: `success` unless a pane failed to spawn
+/// (an unread `process_failed` notification recorded since `started_at`), in
+/// which case the failure text (real error + log path) replaces the success claim.
+fn completion_status(
+    success: &str,
+    started_at: Option<i64>,
+    notifications: &[thegn_core::notification::Notification],
+) -> String {
+    let Some(since) = started_at else {
+        return success.to_string();
+    };
+    match notifications.iter().find(|n| {
+        n.kind == thegn_core::notification::NotificationKind::ProcessFailed
+            && !n.read
+            && n.created_at_ms >= since
+    }) {
+        Some(n) => format!("setup finished, but a pane failed to start: {}", n.message),
+        None => success.to_string(),
+    }
 }
 
 /// Feed one key to the welcome tour: live theme preview, probe spawns, and on
@@ -288,6 +318,7 @@ fn handle_tour_key(
             };
             save_tour_writes(writes, model, cfg, refresh_tx, waker, applied);
             if open_setup {
+                ob.started_at = Some(thegn_core::util::now());
                 ob.ui = Some(OnboardingWizard::new(cfg));
             }
         }
@@ -397,7 +428,16 @@ fn done_marker(completed: bool) -> &'static str {
 /// Write that marker into an open handle: the exact shape the DB task closes
 /// over, so a test can round-trip it against [`startup_db_state`].
 fn mark_done(db: &thegn_core::db::Db, completed: bool) -> anyhow::Result<()> {
-    db.set_ui_state("", crate::onboarding::UI_STATE_KEY, done_marker(completed))
+    db.set_ui_state("", crate::onboarding::UI_STATE_KEY, done_marker(completed))?;
+    // The tour and wizard own the keymap step but write a preset only when it
+    // changes. A run that keeps the default would leave no remembered choice, so
+    // the one-time keymap picker would return on the next launch (the marker
+    // above already retired first run). Record the default unless a choice is
+    // already remembered; an explicit pick is persisted by `apply_keymap_preset`.
+    if db.get_ui_state("", "keymap_preset")?.is_none() {
+        db.set_ui_state("", "keymap_preset", "default")?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,9 +794,56 @@ mod tests {
                 .as_deref(),
             Some("skipped")
         );
-        assert_eq!(startup_db_state(Some(&db)), (false, None));
+        // A skip that kept the default still remembers it, so the keymap picker
+        // does not take the tour's place on the next launch.
+        assert_eq!(
+            startup_db_state(Some(&db)),
+            (false, Some("default".to_string()))
+        );
 
         let (ui, _) = startup(&mut cfg, &mut menu, Some(&db));
         assert!(ui.tour.is_none(), "a skipped tour never auto-opens again");
+        assert!(
+            menu.is_none(),
+            "a remembered default opens no keymap picker"
+        );
+    }
+
+    /// A tour that saved an explicit preset keeps it: closing the tour must not
+    /// overwrite a remembered choice with the default.
+    #[test]
+    fn closing_the_tour_keeps_an_explicit_remembered_preset() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state("", "keymap_preset", "vscode").unwrap();
+        mark_done(&db, true).unwrap();
+        assert_eq!(
+            startup_db_state(Some(&db)),
+            (false, Some("vscode".to_string()))
+        );
+    }
+
+    #[test]
+    fn completion_status_reports_a_recorded_pane_failure_not_success() {
+        use thegn_core::notification::{Notification, NotificationKind};
+        let fail = |at: i64, read: bool| Notification {
+            id: 1,
+            kind: NotificationKind::ProcessFailed,
+            source_ref: "pane".into(),
+            message: "Shell failed to launch: boom. Log: /tmp/thegn.log".into(),
+            created_at_ms: at,
+            read,
+            worktree_path: String::new(),
+        };
+        let ok = "setup complete";
+        assert_eq!(completion_status(ok, Some(100), &[]), ok);
+        assert_eq!(completion_status(ok, Some(100), &[fail(50, false)]), ok);
+        assert_eq!(completion_status(ok, Some(100), &[fail(150, true)]), ok);
+        assert_eq!(completion_status(ok, None, &[fail(150, false)]), ok);
+        let shown = completion_status(ok, Some(100), &[fail(150, false)]);
+        assert!(
+            shown.contains("boom") && shown.contains("/tmp/thegn.log"),
+            "{shown}"
+        );
+        assert!(!shown.contains("setup complete"));
     }
 }

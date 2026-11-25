@@ -2448,7 +2448,7 @@ impl CiActionCtx<'_> {
                 };
             }
             // ShowLog drills in place inside the overlay and never reaches the loop.
-            DetailAction::ShowLog(_) => {}
+            DetailAction::ShowLog(_) | DetailAction::ShowNotification { .. } => {}
             // Intercepted by the loop's Act arm (it owns the panel locals);
             // unreachable here.
             DetailAction::OpenMergeQueueSection => {}

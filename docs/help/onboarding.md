@@ -63,7 +63,9 @@ nothing.
 | Sandbox backend | `sandbox.backend` in `config.toml`                     |
 | Default agent   | the order of `[[agents]]` in `config.toml`             |
 
-A choice that matches your current config writes nothing. The writes keep your
+Closing the tour also remembers the keymap as `default` when no keymap was
+chosen, so the keymap picker does not return on the next launch. A choice that
+matches your current config writes nothing. The writes keep your
 comments and every other key. If `config.toml` has no `[[agents]]` yet, the
 tour writes your pick followed by the built-in entries, so the plain shell
 stays available. A toast reports when the save finishes or fails.

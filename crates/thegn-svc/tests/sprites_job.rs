@@ -79,6 +79,7 @@ struct Mock {
     write_status: Arc<Mutex<Option<u16>>>,
     stale: Arc<Mutex<bool>>,
     write_delay_ms: Arc<Mutex<u64>>,
+    missing_parent: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,7 @@ struct State {
     write_status: Arc<Mutex<Option<u16>>>,
     stale: Arc<Mutex<bool>>,
     write_delay_ms: Arc<Mutex<u64>>,
+    missing_parent: Arc<Mutex<Option<String>>>,
     scripts: Arc<Mutex<VecDeque<Script>>>,
 }
 
@@ -103,6 +105,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
     let write_status = Arc::new(Mutex::new(None));
     let stale = Arc::new(Mutex::new(false));
     let write_delay_ms = Arc::new(Mutex::new(0));
+    let missing_parent = Arc::new(Mutex::new(None));
     let state = State {
         fs: Arc::clone(&fs),
         execs: Arc::clone(&execs),
@@ -111,6 +114,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
         write_status: Arc::clone(&write_status),
         stale: Arc::clone(&stale),
         write_delay_ms: Arc::clone(&write_delay_ms),
+        missing_parent: Arc::clone(&missing_parent),
         scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
     };
     thread::spawn(move || {
@@ -128,6 +132,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
         write_status,
         stale,
         write_delay_ms,
+        missing_parent,
     }
 }
 
@@ -145,6 +150,12 @@ fn plant_stale_files(mock: &Mock) {
 /// Refuse every `fs/write` with `status` — a denied transfer, not a denied exec.
 fn deny_writes(mock: &Mock, status: u16) {
     *mock.write_status.lock().unwrap() = Some(status);
+}
+
+/// Answer `404` to a write under `dir` until an exec runs `mkdir`, the way the
+/// fs write API behaves when the parent directory does not exist.
+fn require_parent(mock: &Mock, dir: &str) {
+    *mock.missing_parent.lock().unwrap() = Some(dir.to_owned());
 }
 
 fn script(out: Vec<Out>) -> Script {
@@ -186,6 +197,9 @@ fn serve(mut stream: TcpStream, state: State) {
             authorization: head.authorization.clone(),
         };
         state.execs.lock().unwrap().push(exec);
+        if params(&head.target, "cmd").iter().any(|arg| arg == "mkdir") {
+            *state.missing_parent.lock().unwrap() = None;
+        }
         let next = state.scripts.lock().unwrap().pop_front();
         match next {
             Some(script) => {
@@ -217,6 +231,13 @@ fn serve(mut stream: TcpStream, state: State) {
         let delay = *state.write_delay_ms.lock().unwrap();
         if delay > 0 {
             thread::sleep(Duration::from_millis(delay));
+        }
+        let missing = state.missing_parent.lock().unwrap().clone();
+        if let Some(dir) = missing
+            && path.starts_with(&format!("{dir}/"))
+        {
+            respond(&mut stream, 404, b"");
+            return;
         }
         let status = *state.write_status.lock().unwrap();
         if let Some(status) = status {
@@ -971,7 +992,7 @@ async fn a_rejected_handshake_is_provably_never_run_and_commits_no_spend() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("sprites-tgtest1"), "{why}");
@@ -1134,7 +1155,7 @@ async fn the_spend_envelope_stops_the_attempt_that_would_exceed_it() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("spend envelope exhausted"), "{why}");
@@ -1294,7 +1315,7 @@ async fn a_second_project_cannot_bind_a_sprite_the_first_one_holds() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("already bound to project"), "{why}");
@@ -1315,7 +1336,7 @@ async fn a_second_project_cannot_bind_a_sprite_the_first_one_holds() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("already bound to another project"), "{why}");
@@ -1467,7 +1488,7 @@ async fn a_transfer_over_its_own_budget_is_rejected_and_cleaned_up() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("transfer exceeded"), "{why}");
@@ -1492,7 +1513,7 @@ async fn a_denied_transfer_is_refused_before_a_command_can_run() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("403"), "{why}");
@@ -1522,7 +1543,7 @@ async fn a_checkout_holding_a_stray_file_is_never_run() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("does not hold exactly"), "{why}");
@@ -2033,7 +2054,7 @@ async fn a_token_cancelled_before_dispatch_never_sends_a_command() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert!(mock.execs.lock().unwrap().is_empty());
     assert_eq!(
         store.read(1).unwrap().unwrap().state,
@@ -2657,4 +2678,29 @@ fn a_row_without_a_lease_field_still_reads_and_stays_without_one() {
     let back: AttemptRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(back.lease, None);
     assert_eq!(store.read(1).unwrap().unwrap(), record);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_sprite_gets_its_marker_directory_made_before_the_owner_marker() {
+    // The first exec is the `mkdir -p`; the attempt itself then has no script
+    // and is refused after the transfer, which is all this test needs.
+    let mock = start_mock(vec![script(vec![session_info(), Out::Exit(0)])]);
+    require_parent(&mock, DEFAULT_CHECKOUT_ROOT);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store, outputs_options(DEADLINE));
+    let content = content();
+
+    let _outcome = runner
+        .run(Recipe::CargoBuild, &pinned(), &content, DEADLINE)
+        .await;
+
+    let execs = mock.execs.lock().unwrap().clone();
+    let make = params(&execs[0].target, "cmd");
+    assert_eq!(make[..3], ["mkdir", "-p", "--"], "{make:?}");
+    assert_eq!(make[3], DEFAULT_CHECKOUT_ROOT);
+    let marker = ProjectBinding::owner_marker(DEFAULT_CHECKOUT_ROOT);
+    assert_eq!(
+        mock.fs.lock().unwrap().get(&marker).map(Vec::as_slice),
+        Some(binding().project().as_bytes())
+    );
 }

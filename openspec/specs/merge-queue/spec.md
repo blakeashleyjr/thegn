@@ -832,3 +832,21 @@ cleanup, success messages, or automatic expiry sweeps.
 - **WHEN** automatic landing is disabled
 - **THEN** automatic attempts remain Ready while explicit manual integration can
   land only after a successful gate and target CAS.
+
+### Requirement: Merge-guard hook installs only with consent
+
+The system MUST NOT create or modify a repository's `pre-merge-commit` hook
+without an owner "yes" recorded for that repository. It MUST ask once per
+repository on an interactive start and remember the answer in the repository's
+git dir; a non-interactive start with no recorded answer MUST leave the hooks
+untouched. A guard hook of ours already installed MAY keep being refreshed.
+
+#### Scenario: First interactive start in a repo
+
+- **WHEN** thegn starts interactively in a repo with no recorded answer
+- **THEN** it asks before installing, and records yes or no
+
+#### Scenario: Declined or non-interactive
+
+- **WHEN** the recorded answer is no, or the start is non-interactive without an answer
+- **THEN** the hooks directory is not modified

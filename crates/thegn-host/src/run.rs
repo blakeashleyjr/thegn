@@ -343,14 +343,25 @@ fn apply_mode_status(
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
 /// is created in `~/.local/state/thegn/recordings/` and every frame pushed
 /// to the terminal is appended to it.
-/// Yank `text` into register `name` (in memory) and persist the affected
+/// Yank `text` into register `name` (in memory) and, when `persist` is set
+/// (`[clipboard] persist_registers`, default off), persist the affected
 /// registers to the DB so they survive a restart. `name` defaults to `"`; the
 /// yank also updates the default register (vim semantics), so an unnamed
 /// `PasteRegister` retrieves the most recent copy. The volatile `"+` clipboard
 /// register is never persisted (the caller writes the OS clipboard separately).
-fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text: String) {
+fn store_yank(
+    registers: &mut thegn_core::registers::Registers,
+    name: char,
+    text: String,
+    persist: bool,
+) {
     use thegn_core::registers::{DEFAULT, is_persistent};
     if !registers.yank(name, text.clone()) {
+        return;
+    }
+    // Copied text can carry secrets: it reaches the DB only when the user opted
+    // in with `[clipboard] persist_registers`.
+    if !persist {
         return;
     }
     // The in-memory register is already updated (same-session paste works now);
@@ -499,6 +510,50 @@ fn since_process_ms() -> u64 {
         .map_or(0, |t| t.elapsed().as_millis() as u64)
 }
 
+/// Ask once per repo whether to install the merge-guard hook, and remember the
+/// answer in the repo's git dir. Silent when already answered, when a guard of
+/// ours is already installed, outside a git repo, or without an interactive
+/// terminal (the hook then stays uninstalled and nothing is modified).
+fn ask_merge_guard_consent() {
+    use std::io::{BufRead, IsTerminal, Write};
+    use thegn_core::merge_guard as mg;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let common = thegn_core::util::git_common_dir(&cwd);
+    if !common.is_dir() {
+        return;
+    }
+    let ask = mg::decide(
+        true,
+        mg::ours_present(&common.join("hooks")),
+        mg::consent(&common),
+    ) == mg::Decision::Ask;
+    if !ask || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    if write!(
+        out,
+        "thegn can install a `pre-merge-commit` hook in {}/hooks that refuses a raw \
+         `git merge` of the main checkout from inside a sandbox (it points at `thegn \
+         integrate`). Install it? [y/N] ",
+        common.display()
+    )
+    .is_err()
+        || out.flush().is_err()
+    {
+        return;
+    }
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return;
+    }
+    let yes = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if let Err(e) = mg::record_consent(&common, yes) {
+        tracing::debug!(target: "thegn::startup", error = %e, "merge-guard consent not saved");
+    }
+}
+
 pub async fn main(
     cli: crate::Cli,
     admitted: std::sync::Arc<thegn_core::config_admission::AdmittedConfig>,
@@ -607,6 +662,12 @@ pub async fn main(
     // points at the log file.
     if let Some(g) = &_stderr_guard {
         g.register_crash_notice();
+    }
+
+    // Ask before touching a repo's hooks (cooked terminal, before the compositor
+    // owns the screen). The answer is remembered per repo; see `merge_guard`.
+    if admitted.config().git.merge_guard {
+        ask_merge_guard_consent();
     }
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
@@ -873,7 +934,7 @@ pub async fn main(
         "config loaded"
     );
     // Install/refresh the in-sandbox merge guard into the shared hooks dir
-    // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
+    // (`core.hooksPath` → the canonical `.git/hooks`), once the owner has said yes; it refuses
     // a raw `git merge` run against the canonical checkout from inside a sandbox
     // (where its FS view can be incoherent) and points at `thegn integrate`.
     // Chains a foreign hook, and installs *beside* (not over) a pre-commit
@@ -883,7 +944,21 @@ pub async fn main(
     if cfg.git.merge_guard {
         let guard_cwd = cwd.clone();
         tokio::task::spawn_blocking(move || {
-            let hooks = thegn_core::util::git_common_dir(&guard_cwd).join("hooks");
+            let common = thegn_core::util::git_common_dir(&guard_cwd);
+            let hooks = common.join("hooks");
+            // Never create or modify a repo's hooks without a recorded "yes"
+            // (an already-installed guard of ours keeps being refreshed).
+            let decision = thegn_core::merge_guard::decide(
+                true,
+                thegn_core::merge_guard::ours_present(&hooks),
+                thegn_core::merge_guard::consent(&common),
+            );
+            if decision != thegn_core::merge_guard::Decision::Install {
+                tracing::debug!(
+                    target: "thegn::startup", ?decision, "merge-guard hook not installed"
+                );
+                return;
+            }
             match thegn_core::merge_guard::install(&hooks) {
                 // Log the whole plan: `placement`/`restore_shim` are what tell you a
                 // pre-commit framework is in play, which is otherwise invisible until
@@ -3452,10 +3527,18 @@ fn load_loop_startup_prefs(
     thegn_core::registers::Registers,
     crate::monitor::MonitorPrefs,
 ) {
-    let registers = db
-        .and_then(|db| db.all_registers().ok())
-        .map(thegn_core::registers::Registers::from_pairs)
-        .unwrap_or_default();
+    // Yank retention is opt-in: when off, rows an earlier build left behind are
+    // deleted and nothing is loaded.
+    let registers = if cfg.clipboard.persist_registers {
+        db.and_then(|db| db.all_registers().ok())
+            .map(thegn_core::registers::Registers::from_pairs)
+            .unwrap_or_default()
+    } else {
+        if let Some(db) = db {
+            let _ = db.clear_registers(); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+        thegn_core::registers::Registers::default()
+    };
     let monitor = match db {
         Some(db) => crate::monitor::state::load(db, &cfg.monitor),
         None => crate::monitor::MonitorPrefs::from_config(&cfg.monitor),
@@ -19463,6 +19546,7 @@ async fn event_loop<T: Terminal>(
                                         &mut registers,
                                         thegn_core::registers::DEFAULT,
                                         text.clone(),
+                                        keymap.config().clipboard.persist_registers,
                                     );
                                     match copy_result {
                                         Ok(()) => toasts.info(
@@ -29022,6 +29106,7 @@ async fn event_loop<T: Terminal>(
                                             &mut registers,
                                             thegn_core::registers::DEFAULT,
                                             text.clone(),
+                                            keymap.config().clipboard.persist_registers,
                                         );
                                         match copy_result {
                                             Ok(()) => toasts.info(

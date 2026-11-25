@@ -349,6 +349,7 @@ pub(crate) fn refusal_text(refusal: &RunnerRefusal, admission: Duration) -> Stri
              local build; THEGN_JOB_LOCAL=1 runs this command locally on purpose",
             admission.as_secs()
         ),
+        RunnerRefusal::NotStarted(_) => format!("job not started: {refusal}"),
         _ => format!("job refused before dispatch, nothing ran: {refusal}"),
     }
 }

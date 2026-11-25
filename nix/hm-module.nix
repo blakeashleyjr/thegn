@@ -448,6 +448,7 @@ self: {
     clipboard.max_image_bytes = cfg.clipboardMaxImageBytes;
     clipboard.remote_dir = cfg.clipboardRemoteDir;
     clipboard.keep_hours = cfg.clipboardKeepHours;
+    clipboard.persist_registers = cfg.clipboardPersistRegisters;
     loc.enabled = cfg.locEnabled;
     loc.scan_interval_secs = cfg.locScanIntervalSecs;
     loc.max_scan_per_round = cfg.locMaxScanPerRound;
@@ -1178,6 +1179,12 @@ in {
       description = "Age in hours past which a pasted-image drop file is swept on the next paste. Unset (null) = the binary's default.";
     };
 
+    clipboardPersistRegisters = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Keep yanked text in the state database across restarts (default off: registers stay in memory). Unset (null) = the binary's default.";
+    };
+
     locEnabled = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1339,7 +1346,7 @@ in {
     gitMergeGuard = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
-      description = "Install the pre-merge-commit hook that refuses a merge into the canonical checkout from inside a thegn sandbox. Unset (null) = the binary's default.";
+      description = "Offer the pre-merge-commit hook (installed only after a once-per-repo yes) that refuses a merge into the canonical checkout from inside a thegn sandbox. Unset (null) = the binary's default.";
     };
 
     gitAutoFetch = lib.mkOption {

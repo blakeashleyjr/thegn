@@ -7,6 +7,39 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.136] — 2026-11-25
+
+The standard sandbox hides more of home, background behaviour that reaches the
+network or changes your repositories now asks first, and remote `thegn job run`
+works on fresh Sprites and Vercel sandboxes.
+
+### Added
+
+- A help page for installing and running thegn under WSL2.
+
+### Changed
+
+- The standard sandbox profile hides credential files, cloud CLI logins and sibling repositories, and
+  mounts `~/.claude` and `~/.codex` settings read-only.
+- Usage polling is opt-in. thegn asks before scanning the default repository roots and before installing
+  the merge-guard hook.
+- Copied text is no longer stored in the database unless clipboard register persistence is turned on.
+- Removing a clean worktree keeps its branch by default and says so.
+- Vercel job sandboxes may reach the Rust toolchain hosts, and a cargo job installs a minimal toolchain
+  and C linker when the image has none.
+
+### Fixed
+
+- A daemon that inherited a named profile's state root no longer nests `profiles/<name>` twice, which left
+  the UI rejecting the daemon and no shell starting.
+- Wrapper exit notices (systemd-run, bwrap, ssh) carry the real last error line, the log path and a recovery
+  step; repeated failures collapse into one row, and onboarding no longer reports success while panes fail.
+- Pasting into a terminal advances by the raw byte count.
+- Typing in the new-worktree wizard's program list no longer goes to the branch name.
+- Closing the tour remembers the default keymap; test and agent failure badges clear on the next success.
+- Sprites jobs create the marker directory and retry when the first write 404s on a fresh sprite; a failure
+  before dispatch reports "job not started".
+
 ## [0.1.0-alpha.135] — 2026-11-25
 
 A new remote environment opens its shell sooner: coding-agent install and the

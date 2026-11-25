@@ -365,6 +365,7 @@ pub mod sandbox_dormant;
 pub mod sandbox_events;
 pub mod sandbox_events_podman;
 pub mod sandbox_floor;
+pub mod sandbox_hidden;
 pub mod sandbox_intent;
 pub mod sandbox_inventory;
 pub mod sandbox_manage;

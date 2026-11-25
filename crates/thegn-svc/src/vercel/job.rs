@@ -153,7 +153,10 @@ pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 /// per-attempt `HOME`, then the recipe argv. It enters the checkout and `exec`s
 /// the recipe under `env -i`, keeping only proxy and CA variables from the
 /// sandbox environment, with a per-attempt `HOME`, `CARGO_HOME` and
-/// `CARGO_TARGET_DIR`. Any failure to get that far prints
+/// `CARGO_TARGET_DIR`. When the recipe is `cargo` and the image has none, it
+/// first installs a minimal rustup toolchain into the per-attempt home, and
+/// when the image has no C linker (`cc`) it installs one with the image's
+/// package manager (`sudo -n` when not root). Any failure to get that far prints
 /// [`LAUNCH_FAILED_MARKER`] on stderr and exits 125.
 pub const LAUNCH_SCRIPT: &str = r#"fail() { echo "thegn-job-launch-failed: $1" >&2; exit 125; }
 cwd=$1
@@ -163,6 +166,40 @@ rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
 [ -n "${PATH:-}" ] || fail path
 mkdir -p -- "$home/tmp" "$home/cargo" "$home/target" || fail dirs
 cd -- "$cwd" || fail cwd
+if [ "$1" = cargo ] && ! command -v cargo >/dev/null 2>&1; then
+    # The default sandbox image has no Rust toolchain: install a minimal one
+    # into the per-attempt home before the recipe starts.
+    command -v curl >/dev/null 2>&1 || fail "no-cargo-and-no-curl: the sandbox image has no Rust toolchain and cannot fetch one; use a runtime image that provides cargo"
+    rustup_home="$home/rustup"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$home/tmp/rustup-init.sh" \
+        || fail "rustup-download: the sandbox image has no Rust toolchain and rustup could not be downloaded"
+    RUSTUP_HOME="$rustup_home" CARGO_HOME="$home/cargo" sh "$home/tmp/rustup-init.sh" -y \
+        --profile minimal --default-toolchain stable --no-modify-path >&2 \
+        || fail "rustup-install: installing a minimal Rust toolchain failed"
+    PATH="$home/cargo/bin:$PATH"
+    command -v cargo >/dev/null 2>&1 || fail "no-cargo: cargo is missing after the rustup install"
+fi
+if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
+    # Rust links through `cc`; minimal images ship none.
+    sudo=
+    if [ "$(id -u)" != 0 ]; then
+        command -v sudo >/dev/null 2>&1 || fail "no C linker (cc) and not root and no sudo to install one"
+        sudo="sudo -n"
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        $sudo apt-get update -qq >&2             && $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends                 gcc libc6-dev >&2 || pkg_failed=apt-get
+    elif command -v dnf >/dev/null 2>&1; then
+        $sudo dnf install -y -q gcc >&2 || pkg_failed=dnf
+    elif command -v microdnf >/dev/null 2>&1; then
+        $sudo microdnf install -y gcc >&2 || pkg_failed=microdnf
+    elif command -v apk >/dev/null 2>&1; then
+        $sudo apk add --no-cache gcc musl-dev >&2 || pkg_failed=apk
+    else
+        fail "no C linker (cc) and no supported package manager (apt-get, dnf, microdnf, apk)"
+    fi
+    [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed"
+    command -v cc >/dev/null 2>&1 || fail "no C linker (cc) after the package install"
+fi
 for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
     SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE; do
     eval "val=\${$v:-}"
@@ -795,6 +832,12 @@ impl AttemptOptions {
             .saturating_add(SANDBOX_SLACK);
         u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
     }
+
+    /// The longest deadline whose sandbox fits a lifetime `ceiling`; zero when
+    /// the transfer budget and slack alone do not fit it.
+    fn longest_deadline_within(&self, ceiling: Duration) -> Duration {
+        ceiling.saturating_sub(self.transfer_budget.saturating_add(SANDBOX_SLACK))
+    }
 }
 
 /// One attempt's outcome, including the accounting a report needs.
@@ -1085,8 +1128,19 @@ impl VercelSelectedRunner {
         let timeout_ms = self.options.sandbox_timeout_ms(deadline);
         let ceiling = self.sandbox_ceiling();
         if Duration::from_millis(timeout_ms) > ceiling {
+            let fitting = self.options.longest_deadline_within(ceiling);
+            let remedy = if fitting.is_zero() {
+                "the transfer budget and slack alone exceed it: raise max_lifetime_secs".to_owned()
+            } else {
+                format!(
+                    "lower --deadline to {}s or less, or raise max_lifetime_secs",
+                    fitting.as_secs()
+                )
+            };
             return Err(RunnerRefusal::InvalidSpec(format!(
-                "the attempt needs a {}s sandbox (transfer budget {}s + deadline {}s + {}s                  slack) but the lifetime ceiling is {}s (the smaller of max_lifetime_secs and                  the plan's session maximum); lower the deadline or raise the ceiling",
+                "the attempt needs a {}s sandbox (transfer budget {}s + deadline {}s + {}s \
+                 slack) but the lifetime ceiling is {}s (the smaller of max_lifetime_secs and \
+                 the plan's session maximum); {remedy}",
                 timeout_ms / 1000,
                 self.options.transfer_budget.as_secs(),
                 deadline.as_secs(),
@@ -1109,7 +1163,12 @@ impl VercelSelectedRunner {
         if let Err(error) = self.persist(&record).await {
             return Err(self.reject(record, error, Cleanup::NotNeeded, None).await);
         }
-        if let Err(error) = self.provider.create_named(&name, timeout_ms).await {
+        let egress = thegn_core::vercel::egress::job_egress(&self.provider.spec.egress);
+        if let Err(error) = self
+            .provider
+            .create_named_with_egress(&name, timeout_ms, egress)
+            .await
+        {
             let cleanup = if super::definite_create_rejection(&error) {
                 Cleanup::NotNeeded
             } else {
@@ -1730,7 +1789,7 @@ impl VercelSelectedRunner {
 
     fn unavailable(&self, error: impl std::fmt::Display) -> RunnerRefusal {
         // `{:#}` keeps the cause chain: a refusal is the operator's only clue.
-        RunnerRefusal::RunnerUnavailable(format!("{}: {error:#}", self.alias))
+        RunnerRefusal::NotStarted(format!("{}: {error:#}", self.alias))
     }
 
     /// [`persist`](Self::persist) guarded by [`AttemptStore::mark_if_unchanged`].
@@ -2008,7 +2067,7 @@ impl SelectedRunner for VercelSelectedRunner {
             Ok(receipt) => receipt,
             // A cancel that closed the attempt before dispatch is recorded as
             // rejected; the route reads it back as a user cancel.
-            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+            Err(RunnerRefusal::NotStarted(_)) if token.is_cancelled() => {
                 return Ok(cancelled(self));
             }
             Err(refusal) => return Err(refusal),
@@ -2035,6 +2094,28 @@ mod tests {
         assert!(!LAUNCH_SCRIPT.contains("VERCEL"));
         assert!(!LAUNCH_SCRIPT.contains(".claude"));
         assert!(LAUNCH_SCRIPT.contains(crate::sprites::job::SELECTED_JOB_ENV));
+    }
+
+    #[test]
+    fn the_launcher_provisions_a_minimal_toolchain_when_cargo_is_missing() {
+        assert!(LAUNCH_SCRIPT.contains("sh.rustup.rs"));
+        assert!(LAUNCH_SCRIPT.contains("--profile minimal"));
+        assert!(LAUNCH_SCRIPT.contains("no-cargo"));
+    }
+
+    #[test]
+    fn the_launcher_installs_a_c_linker_when_cc_is_missing() {
+        assert!(LAUNCH_SCRIPT.contains("command -v cc"));
+        for pm in ["apt-get", "dnf", "microdnf", "apk"] {
+            assert!(LAUNCH_SCRIPT.contains(pm), "{pm}");
+        }
+        assert!(LAUNCH_SCRIPT.contains("sudo -n"));
+        assert!(LAUNCH_SCRIPT.contains("gcc libc6-dev"));
+        assert!(LAUNCH_SCRIPT.contains("fail \"no C linker (cc)"));
+        // The linker step runs after the toolchain step and before the exec.
+        let cc = LAUNCH_SCRIPT.find("command -v cc").unwrap();
+        assert!(LAUNCH_SCRIPT.find("sh.rustup.rs").unwrap() < cc);
+        assert!(cc < LAUNCH_SCRIPT.find("exec env -i").unwrap());
     }
 
     #[test]

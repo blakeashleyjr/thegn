@@ -59,3 +59,13 @@ Alternatives considered:
 - **portable-pty** is explicitly deferred. Its surface is about 8 files
   (`pane_pty.rs`, `pane.rs`, `daemon/session.rs`, `platform/*`) and it has no
   local patch. Re-evaluate it together with termwiz.
+
+## Changelog
+
+- THE-2689: `src/input.rs` bracketed-paste end handling advanced the read buffer by
+  the length of the lossily decoded string rather than the raw byte count. A paste
+  containing invalid UTF-8 (each bad byte becomes a 3-byte U+FFFD) consumed bytes
+  past the end marker, dropping or corrupting following input (and could underflow
+  the buffer length). It now advances by the raw index. Tests:
+  `bracketed_paste_with_invalid_utf8_keeps_following_input`,
+  `bracketed_paste_markers_split_across_reads`.

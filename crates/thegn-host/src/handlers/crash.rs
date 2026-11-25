@@ -102,6 +102,36 @@ pub(crate) fn crash_reason(tail: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(200).collect())
 }
 
+/// Inbox text for a failed non-agent pane. When the exiting program is only a
+/// runtime wrapper (`systemd-run`, `bwrap`, `ssh`, ...), its bare name and exit
+/// code say nothing, so name the pane's real last error instead, then point at
+/// the log file and a recovery step. Other programs keep the plain
+/// `<program> failed (exit N)` wording.
+pub(crate) fn process_failed_message(
+    program: &str,
+    exit_code: Option<i32>,
+    tail: &str,
+    log_path: &str,
+) -> String {
+    let label = if program.is_empty() {
+        "process"
+    } else {
+        program
+    };
+    let base = match exit_code {
+        Some(c) => format!("{label} failed (exit {c})"),
+        None => format!("{label} crashed"),
+    };
+    if !crate::pane::is_runtime_wrapper(program) {
+        return base;
+    }
+    let reason = crash_reason(tail).unwrap_or_else(|| "no error output captured".to_string());
+    format!(
+        "Shell failed to launch: {reason} ({base}). Log: {log_path}. \
+         Recovery: fix the cause above (run `thegn doctor`), then switch worktrees to retry."
+    )
+}
+
 /// Status shown when a sole shell keeps crashing on startup: names the real error
 /// when one was captured, else the generic backend/shell hint.
 pub(crate) fn keeps_crashing_status(tail: &str) -> String {
@@ -139,6 +169,31 @@ pub(crate) fn agent_exit_status(program: &str, code: Option<i32>, relaunch: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapper_failure_names_real_error_log_and_recovery() {
+        let msg = process_failed_message(
+            "systemd-run",
+            Some(1),
+            "daemon handshake failed: socket /run/x.sock refused\n",
+            "/state/thegn.log",
+        );
+        assert!(msg.contains("daemon handshake failed: socket /run/x.sock refused"));
+        assert!(msg.contains("/state/thegn.log"));
+        assert!(msg.contains("Recovery"));
+    }
+
+    #[test]
+    fn plain_program_failure_keeps_short_wording() {
+        assert_eq!(
+            process_failed_message("make", Some(2), "boom", "/l"),
+            "make failed (exit 2)"
+        );
+        assert_eq!(
+            process_failed_message("", None, "", "/l"),
+            "process crashed"
+        );
+    }
 
     #[test]
     fn reason_is_last_non_blank_line() {

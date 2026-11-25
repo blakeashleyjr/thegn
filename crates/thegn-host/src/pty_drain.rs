@@ -1361,6 +1361,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 let bus = (*ctx.event_bus).clone();
                 let nstate = std::sync::Arc::clone(ctx.notify_state);
                 let exited_session = exited_session.clone();
+                let crash_tail = crash_tail.clone();
                 tokio::task::spawn_blocking(move || {
                     let Ok(db) = thegn_core::db::Db::open() else {
                         return;
@@ -1490,6 +1491,17 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // already-terminal row is finished work: no
                         // re-notification.
                         if !already_terminal {
+                            if !failed
+                                && let Err(error) =
+                                    supersede_failures_after_success(&db, "agent_failed", &wt)
+                            {
+                                tracing::debug!(
+                                    target: "thegn::attention",
+                                    worktree = %wt,
+                                    %error,
+                                    "could not retire agent failure after clean run"
+                                );
+                            }
                             let kind = if failed { "agent_failed" } else { "agent_done" };
                             let base = thegn_core::util::basename(&wt);
                             let msg = format!(
@@ -1553,12 +1565,20 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     } else {
                         &program
                     };
-                    let msg = match (outcome, exit_code) {
-                        (ProcessOutcome::Failed, Some(c)) => {
-                            format!("{label} failed (exit {c})")
+                    let msg = match outcome {
+                        ProcessOutcome::Failed => {
+                            let log = thegn_core::util::xdg_state_home()
+                                .join("thegn/logs/thegn.log")
+                                .display()
+                                .to_string();
+                            crate::handlers::crash::process_failed_message(
+                                &program,
+                                exit_code,
+                                &crash_tail,
+                                &log,
+                            )
                         }
-                        (ProcessOutcome::Failed, None) => format!("{label} crashed"),
-                        (ProcessOutcome::TaskDone, _) => format!("{label} finished"),
+                        ProcessOutcome::TaskDone => format!("{label} finished"),
                     };
                     // Diagnostic hook: with routine shells + unreapable `None`
                     // exits suppressed in `classify_process_exit`, a
@@ -1878,7 +1898,31 @@ fn supersede_clean_process_failure(
 ) -> anyhow::Result<()> {
     if exit_code == Some(0) {
         db.mark_notification_read_by_source("process_failed", program, worktree)?;
+        if is_test_runner(program) {
+            supersede_failures_after_success(db, "test_failed", worktree)?;
+        }
     }
+    Ok(())
+}
+
+/// A clean run of a test runner retires the worktree's earlier `test_failed`
+/// rows. Matches the program basename only; the argv is not available here.
+fn is_test_runner(program: &str) -> bool {
+    let base = program.rsplit('/').next().unwrap_or(program);
+    matches!(
+        base,
+        "nextest" | "cargo-nextest" | "pytest" | "jest" | "vitest" | "go-test" | "rspec"
+    )
+}
+
+/// Mark a worktree's unread `kind` failure rows read once a later run of the
+/// same kind succeeded, so the sidebar alert badge drops.
+fn supersede_failures_after_success(
+    db: &thegn_core::db::Db,
+    kind: &str,
+    worktree: &str,
+) -> anyhow::Result<()> {
+    db.mark_kind_read_for_worktree(kind, worktree)?;
     Ok(())
 }
 
@@ -1900,6 +1944,43 @@ mod tests {
         supersede_clean_process_failure(&db, Some(0), "/wt/a", "make").unwrap();
 
         assert!(db.get_unread_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_test_run_supersedes_only_that_worktrees_test_failures() {
+        let db = Db::open_memory().unwrap();
+        db.put_notification("test_failed", "t", "3 failed", "/wt/a")
+            .unwrap();
+        db.put_notification("test_failed", "t", "3 failed", "/wt/b")
+            .unwrap();
+        db.put_notification("agent_failed", "x", "died", "/wt/a")
+            .unwrap();
+
+        supersede_clean_process_failure(&db, Some(1), "/wt/a", "pytest").unwrap();
+        assert_eq!(db.get_unread_notifications().unwrap().len(), 3);
+        supersede_clean_process_failure(&db, Some(0), "/wt/a", "make").unwrap();
+        assert_eq!(db.get_unread_notifications().unwrap().len(), 3);
+        supersede_clean_process_failure(&db, Some(0), "/wt/a", "/usr/bin/pytest").unwrap();
+
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 2);
+        assert!(unread.iter().any(|n| n.worktree_path == "/wt/b"));
+        assert!(unread.iter().any(|n| n.kind.as_str() == "agent_failed"));
+    }
+
+    #[test]
+    fn clean_agent_run_supersedes_agent_failures() {
+        let db = Db::open_memory().unwrap();
+        db.put_notification("agent_failed", "x", "died", "/wt/a")
+            .unwrap();
+        db.put_notification("agent_failed", "x", "died", "/wt/b")
+            .unwrap();
+
+        supersede_failures_after_success(&db, "agent_failed", "/wt/a").unwrap();
+
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].worktree_path, "/wt/b");
     }
 
     #[test]

@@ -647,6 +647,12 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    /// Delete every persisted register.
+    fn clear_registers(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM registers", [])?;
+        Ok(())
+    }
+
     /// Load every persisted register as `(name, value)` pairs.
     fn all_registers(&self) -> Result<Vec<(char, String)>> {
         let mut stmt = self.conn().prepare("SELECT name, value FROM registers")?;

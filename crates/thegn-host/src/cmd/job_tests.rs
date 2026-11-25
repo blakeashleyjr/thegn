@@ -257,3 +257,14 @@ fn an_unavailable_runner_refusal_names_the_bound_and_the_local_escape() {
     let other = refusal_text(&RunnerRefusal::WrongRunner, Duration::from_secs(30));
     assert!(!other.contains("THEGN_JOB_LOCAL"), "{other}");
 }
+
+#[test]
+fn a_not_started_refusal_reads_as_a_plain_failure() {
+    let text = refusal_text(
+        &RunnerRefusal::NotStarted("sprites-ci: no token".into()),
+        Duration::from_secs(30),
+    );
+    assert!(text.starts_with("job not started: "), "{text}");
+    assert!(!text.contains("unproven"), "{text}");
+    assert!(!text.contains("may have run"), "{text}");
+}

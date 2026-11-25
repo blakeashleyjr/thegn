@@ -37,6 +37,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/two-instances.md"),
     include_str!("../../../../docs/help/debugging.md"),
     include_str!("../../../../docs/help/upgrading-and-uninstalling.md"),
+    include_str!("../../../../docs/help/wsl2.md"),
     include_str!("../../../../docs/help/cli.md"),
     include_str!("../../../../docs/help/theming.md"),
     include_str!("../../../../docs/help/workflows.md"),
@@ -133,6 +134,24 @@ mod tests {
         assert!(
             reg.page("upgrading-and-uninstalling").is_some(),
             "the refusal message names a help page that is not registered"
+        );
+    }
+
+    #[test]
+    fn the_wsl2_install_page_is_registered_and_linked_from_index() {
+        let (reg, errors) = build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            reg.page("wsl2").is_some(),
+            "the WSL2 install page must be registered"
+        );
+        let index = SOURCES
+            .iter()
+            .find(|page| page.contains("\nid: index\n"))
+            .expect("index page");
+        assert!(
+            index.contains("[[wsl2]]"),
+            "index must point Windows users at the WSL2 page"
         );
     }
 

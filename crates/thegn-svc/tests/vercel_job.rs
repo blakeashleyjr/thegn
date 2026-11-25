@@ -861,7 +861,7 @@ async fn a_token_cancelled_before_dispatch_never_starts_the_command() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert_eq!(mock.count("POST", "/cmd"), 0, "no command was started");
     assert_eq!(
         store.read(1).unwrap().unwrap().state,
@@ -923,7 +923,7 @@ async fn a_team_or_project_mismatch_is_refused_before_any_create() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("refusing to claim"), "{why}");
@@ -1175,7 +1175,7 @@ async fn an_ambiguous_create_is_left_pending_and_never_dispatches() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert_eq!(mock.count("POST", "/cmd"), 0, "nothing was dispatched");
     let record = store.read(1).unwrap().unwrap();
     assert_eq!(record.state, AttemptState::Rejected);
@@ -1258,7 +1258,7 @@ async fn a_rejected_attempt_after_the_create_records_an_estimated_spend() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     let record = store.read(1).unwrap().unwrap();
     assert_eq!(record.state, AttemptState::Rejected);
     assert_eq!(record.cleanup, Cleanup::Done);
@@ -1334,6 +1334,44 @@ async fn the_sandbox_timeout_is_bounded_by_the_configured_lifetime_ceiling() {
         .unwrap();
     // 60 s transfer + 60 s deadline + 5 min slack = 420 s <= 600 s.
     assert_eq!(create.json()["timeout"], serde_json::json!(420_000u64));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refusal_names_the_deadline_that_fits_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    // The 900 s default transfer budget + 900 s deadline + 5 min slack = 2100 s > 1800 s.
+    let (mock, _fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = VercelSelectedRunner::with_options(
+        provider_with(&mock, 1800),
+        JobBinding::new("proj", TEAM, PROJECT).unwrap(),
+        store.clone(),
+        Box::new(Fixed(content())),
+        tokio::runtime::Handle::current(),
+        options(),
+    )
+    .unwrap();
+    let content = content();
+
+    let refusal = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            Duration::from_secs(900),
+        )
+        .await
+        .unwrap_err();
+
+    let RunnerRefusal::InvalidSpec(message) = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(
+        message.contains("lower --deadline to 600s or less, or raise max_lifetime_secs"),
+        "{message}"
+    );
+    assert!(!message.contains("  "), "no run of spaces: {message}");
+    assert!(mock.requests().is_empty(), "refused before any request");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
