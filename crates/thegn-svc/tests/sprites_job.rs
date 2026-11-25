@@ -1020,7 +1020,9 @@ async fn a_rejected_handshake_is_provably_never_run_and_commits_no_spend() {
         RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
-    assert!(why.contains("sprites-tgtest1"), "{why}");
+    // The user-facing refusal names the real sprite, never the runner alias.
+    assert!(why.starts_with("sprite tgtest1:"), "{why}");
+    assert!(!why.contains("sprites-"), "{why}");
     assert!(why.contains("401"), "{why}");
     // A definite 4xx answered before anything was dispatched: exactly one try,
     // and the ledger records the proof (state `rejected`), which is the only
@@ -2746,6 +2748,7 @@ async fn a_missing_sprite_is_named_plainly_not_as_a_404_chain() {
     assert!(text.contains("tgtest1"), "{text}");
     assert!(text.contains("thegn env up"), "{text}");
     assert!(!text.contains("404"), "{text}");
+    assert!(!text.contains("sprites-"), "{text}");
 }
 
 /// The launcher keeps the stock toolchain resolvable: `$CARGO_HOME/bin` holds
