@@ -248,9 +248,14 @@ fn hetzner_pagination(v: &serde_json::Value, page: u32) -> Result<(bool, Option<
         Some(value) if value.as_u64() == Some(u64::from(page) + 1) => true,
         _ => return Err(anyhow!("Hetzner inventory has a non-advancing page")),
     };
-    let total = pagination
-        .get("total_entries")
-        .and_then(serde_json::Value::as_u64);
+    let total = match pagination.get("total_entries") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("Hetzner inventory has malformed total_entries"))?,
+        ),
+    };
     Ok((has_next, total))
 }
 
@@ -414,6 +419,10 @@ mod tests {
             "next_page": null, "total_entries": 0
         }}});
         assert!(parse_server_page(&missing_servers, 1).is_err());
+        let malformed_total = serde_json::json!({"servers": [], "meta": {"pagination": {
+            "next_page": null, "total_entries": "unknown"
+        }}});
+        assert!(parse_server_page(&malformed_total, 1).is_err());
     }
 
     #[test]

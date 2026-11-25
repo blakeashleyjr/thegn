@@ -277,12 +277,18 @@ fn parse_inventory_page<T>(
 }
 
 fn digitalocean_pagination(v: &serde_json::Value) -> Result<(bool, Option<u64>)> {
-    if v.get("meta")
+    let meta = v
+        .get("meta")
         .and_then(serde_json::Value::as_object)
-        .is_none()
-    {
-        return Err(anyhow!("DigitalOcean inventory page is missing meta"));
-    }
+        .ok_or_else(|| anyhow!("DigitalOcean inventory page is missing meta"))?;
+    let total = match meta.get("total") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("DigitalOcean inventory page has malformed meta.total"))?,
+        ),
+    };
     let has_next = match v.get("links") {
         None | Some(serde_json::Value::Null) => false,
         Some(links) => {
@@ -290,10 +296,7 @@ fn digitalocean_pagination(v: &serde_json::Value) -> Result<(bool, Option<u64>)>
                 return Err(anyhow!("DigitalOcean inventory page has malformed links"));
             }
             let Some(pages) = links.get("pages") else {
-                return Ok((
-                    false,
-                    v.pointer("/meta/total").and_then(serde_json::Value::as_u64),
-                ));
+                return Ok((false, total));
             };
             let pages = pages
                 .as_object()
@@ -309,7 +312,6 @@ fn digitalocean_pagination(v: &serde_json::Value) -> Result<(bool, Option<u64>)>
             }
         }
     };
-    let total = v.pointer("/meta/total").and_then(serde_json::Value::as_u64);
     Ok((has_next, total))
 }
 
@@ -492,6 +494,10 @@ mod tests {
         assert!(parse_server_page(&serde_json::json!({"droplets": []}), 1).is_err());
         let missing_droplets = serde_json::json!({"meta": {"total": 0}});
         assert!(parse_server_page(&missing_droplets, 1).is_err());
+        let malformed_total = droplet_page(serde_json::json!([]), false, 0);
+        let mut malformed_total = malformed_total;
+        malformed_total["meta"]["total"] = serde_json::json!("unknown");
+        assert!(parse_server_page(&malformed_total, 1).is_err());
     }
 
     #[test]
