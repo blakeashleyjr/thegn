@@ -124,10 +124,13 @@
 - [x] 5.3 `thegn job shim` / `shim-install`: PATH wrapper, per-call decision,
       real-tool passthrough without the shim directory, recursion guard,
       fail-closed on refusal, explicit `THEGN_JOB_LOCAL=1` escape.
-- [ ] 5.4 Inject the shim directory into an agent pane's environment at launch
-      (today `eval "$(thegn job shim-install --dir D)"` in the terminal).
-- [ ] 5.5 Bounded admission wait for a transiently unavailable runner (today a
-      refusal fails immediately).
+- [x] 5.4 A host agent pane in a `route = "auto"` project with a bound runner
+      gets the managed shim directory (`$XDG_STATE_HOME/thegn/job-shim`, written
+      idempotently by the `shim-install` code) first on `PATH`, plus
+      `THEGN_JOB_SHIM_DIR`. No effect when `route` is not `auto`.
+- [x] 5.5 Bounded admission wait: a routed job waits up to `[jobs]
+admission_timeout_secs` (default 30, 0 = no wait) for an unavailable runner,
+      then fails closed with a message naming `THEGN_JOB_LOCAL=1`.
 - [ ] 5.6 Stock-harness probe on the Mac builder: record the pinned harness,
       OS and recipe that passed, and compare the explicit and automatic
       receipts. An explicit `job run` alone does not qualify the route.

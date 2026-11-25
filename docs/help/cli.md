@@ -638,6 +638,12 @@ lines that put it first on `PATH` (`eval "$(thegn job shim-install --dir
 `thegn job shim -- cargo <args>`, which decides per call; the shell runs
 compound and piped lines command by command, so each `cargo` is judged alone.
 
+You rarely need `shim-install` by hand: an agent pane started on the host in a
+`route = "auto"` project with a bound runner gets the wrapper directory
+(`$XDG_STATE_HOME/thegn/job-shim`, written for you) first on its `PATH`, and
+`THEGN_JOB_SHIM_DIR` set. Projects with `route = "off"` (the default) and
+sandboxed or remote panes are untouched.
+
 | Line                                                            | Result                                                               |
 | --------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `cargo build`, `cargo test`                                     | remote, at the worktree root, no extra arguments                     |
@@ -658,7 +664,9 @@ remotely and leaves no local `target/`.
 
 A qualified command that cannot reach its runner (denied, runner or capability
 missing, unavailable, or a lost acknowledgement) fails with the reason and a
-non-zero exit. It never falls back to a local compiler. `THEGN_JOB_LOCAL=1
+non-zero exit. It never falls back to a local compiler. A runner that is only
+transiently unavailable is waited for up to `[jobs] admission_timeout_secs`
+(default 30, `0` = do not wait) before the job fails closed. `THEGN_JOB_LOCAL=1
 cargo build` is the explicit, visible way to run one command locally. Inside a
 selected job (`THEGN_SELECTED_JOB=1`) the wrapper passes straight through, so
 nothing routes recursively. Which agent harness, OS and recipe passed live

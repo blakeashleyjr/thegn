@@ -245,3 +245,15 @@ fn the_route_report_reads_project_then_global_then_local() {
     assert!(bound.status.starts_with("invalid"), "{bound:?}");
     assert!(render_route(&bound).contains("reason: project binding"));
 }
+
+#[test]
+fn an_unavailable_runner_refusal_names_the_bound_and_the_local_escape() {
+    let text = refusal_text(
+        &RunnerRefusal::RunnerUnavailable("sprites-ci".into()),
+        Duration::from_secs(30),
+    );
+    assert!(text.contains("THEGN_JOB_LOCAL=1"), "{text}");
+    assert!(text.contains("30s"), "{text}");
+    let other = refusal_text(&RunnerRefusal::WrongRunner, Duration::from_secs(30));
+    assert!(!other.contains("THEGN_JOB_LOCAL"), "{other}");
+}

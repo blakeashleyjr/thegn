@@ -104,6 +104,9 @@ impl RunnerDirectory for SingleRunner<'_> {
 /// typed route. The outer error is a local failure before anything was sent
 /// (snapshot or spec); the inner result is the route's verdict.
 ///
+/// `admission` bounds how long an unavailable runner is waited for (see
+/// [`submit_admitted`]); `Duration::ZERO` fails at the first refusal.
+///
 /// Blocking: it walks the tree and the runner's `submit` blocks on its own
 /// runtime, so call it from a plain thread, never from a runtime worker.
 pub fn run_selected(
@@ -113,11 +116,56 @@ pub fn run_selected(
     root: &Path,
     deadline: Duration,
     cancel: &SelectedCancel,
+    admission: Duration,
 ) -> Result<Result<SelectedJobResult, SelectedFailure>> {
     let source = capture_digest(root)?;
     let spec = pinned_spec(alias, recipe, &source, deadline)?;
     let directory = SingleRunner::new(alias, runner);
-    Ok(submit_selected(&spec, &source, &directory, cancel))
+    Ok(submit_admitted(
+        &spec,
+        &source,
+        &directory,
+        cancel,
+        admission,
+        ADMISSION_POLL,
+    ))
+}
+
+/// How often an unavailable runner is asked again during the admission wait.
+const ADMISSION_POLL: Duration = Duration::from_millis(500);
+
+/// `submit_selected`, but a runner that is transiently unavailable (the
+/// directory cannot resolve it) is retried every `poll` for at most
+/// `admission` before the refusal is returned. Only that refusal, raised
+/// before anything was sent, is retried; every other verdict returns at once,
+/// so a job that may have run is never submitted twice. A cancel ends the wait.
+pub fn submit_admitted(
+    spec: &JobSpec,
+    source: &Digest,
+    directory: &dyn RunnerDirectory,
+    cancel: &SelectedCancel,
+    admission: Duration,
+    poll: Duration,
+) -> Result<SelectedJobResult, SelectedFailure> {
+    let started = std::time::Instant::now();
+    loop {
+        let verdict = submit_selected(spec, source, directory, cancel);
+        let unavailable = matches!(
+            verdict,
+            Err(SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(
+                _
+            )))
+        );
+        if !unavailable || cancel.is_cancelled() {
+            return verdict;
+        }
+        let waited = started.elapsed();
+        if waited >= admission {
+            return verdict;
+        }
+        // Blocking by design: the callers run on a plain worker thread.
+        std::thread::sleep(poll.min(admission - waited));
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +291,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(120),
             &cancel,
+            Duration::ZERO,
         )
         .unwrap()
         .unwrap();
@@ -264,6 +313,7 @@ mod tests {
             Path::new("/nonexistent/thegn-selected-job-root"),
             Duration::from_secs(5),
             &SelectedCancel::new(),
+            Duration::ZERO,
         )
         .unwrap_err();
         assert!(
@@ -286,10 +336,107 @@ mod tests {
             dir.path(),
             Duration::from_secs(5),
             &cancel,
+            Duration::ZERO,
         )
         .unwrap()
         .unwrap();
         assert_eq!(result.completion, SelectedCompletion::Cancelled);
         assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    /// A directory whose runner is unavailable for the first `down` lookups.
+    struct Flaky<'a> {
+        inner: &'a Recording,
+        down: std::sync::atomic::AtomicUsize,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RunnerDirectory for Flaky<'_> {
+        fn resolve(&self, alias: &str) -> Option<&dyn SelectedRunner> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.lookups.fetch_add(1, SeqCst);
+            let left = self.down.load(SeqCst);
+            if left > 0 {
+                self.down.store(left - 1, SeqCst);
+                return None;
+            }
+            (alias == self.inner.alias).then_some(self.inner as &dyn SelectedRunner)
+        }
+    }
+
+    fn flaky(runner: &Recording, down: usize) -> Flaky<'_> {
+        Flaky {
+            inner: runner,
+            down: std::sync::atomic::AtomicUsize::new(down),
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn admitted_spec(alias: &str) -> (JobSpec, Digest) {
+        let source = Digest::of(b"tree");
+        let spec = pinned_spec(alias, Recipe::CargoBuild, &source, Duration::from_secs(5)).unwrap();
+        (spec, source)
+    }
+
+    #[test]
+    fn a_runner_that_comes_up_within_the_bound_is_admitted() {
+        let runner = recording("sprites-ci", SelectedCompletion::Exited(0));
+        let directory = flaky(&runner, 2);
+        let (spec, source) = admitted_spec("sprites-ci");
+        let result = submit_admitted(
+            &spec,
+            &source,
+            &directory,
+            &SelectedCancel::new(),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(result.completion, SelectedCompletion::Exited(0));
+        assert_eq!(runner.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_runner_that_stays_down_fails_closed_after_the_bound() {
+        let runner = recording("sprites-ci", SelectedCompletion::Exited(0));
+        let directory = flaky(&runner, usize::MAX);
+        let (spec, source) = admitted_spec("sprites-ci");
+        let started = std::time::Instant::now();
+        let failure = submit_admitted(
+            &spec,
+            &source,
+            &directory,
+            &SelectedCancel::new(),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            SelectedFailure::Refused(RunnerRefusal::RunnerUnavailable(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_zero_bound_does_not_wait() {
+        let runner = recording("sprites-ci", SelectedCompletion::Exited(0));
+        let directory = flaky(&runner, usize::MAX);
+        let (spec, source) = admitted_spec("sprites-ci");
+        let failure = submit_admitted(
+            &spec,
+            &source,
+            &directory,
+            &SelectedCancel::new(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(matches!(failure, SelectedFailure::Refused(_)));
+        assert_eq!(
+            directory.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

@@ -254,6 +254,7 @@ pub(crate) fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
     let alias = runner.alias().to_owned();
     let recipe = args.recipe.recipe();
     let deadline = Duration::from_secs(args.deadline);
+    let admission = Duration::from_secs(cfg.jobs.admission_timeout_secs);
     thegn_core::msg::info(&format!(
         "running {} on {alias} (env {env_name}); Ctrl-C cancels",
         selected_job::recipe_name(recipe)
@@ -275,6 +276,7 @@ pub(crate) fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
                 &worktree,
                 deadline,
                 &cancel,
+                admission,
             )
         })
     };
@@ -310,7 +312,7 @@ pub(crate) fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
     let result = match outcome {
         Ok(result) => result,
         Err(SelectedFailure::Refused(refusal)) => {
-            bail!("job refused before dispatch, nothing ran: {refusal}")
+            bail!("{}", refusal_text(&refusal, admission))
         }
         Err(SelectedFailure::Unproven(refusal)) => {
             if matches!(refusal, RunnerRefusal::SourceMismatch { .. }) {
@@ -335,6 +337,20 @@ pub(crate) fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// The message for a refusal before dispatch. An unavailable runner names the
+/// bound that was waited and the explicit local escape.
+pub(crate) fn refusal_text(refusal: &RunnerRefusal, admission: Duration) -> String {
+    match refusal {
+        RunnerRefusal::RunnerUnavailable(_) => format!(
+            "job refused before dispatch, nothing ran: {refusal} (waited {}s for the runner to \
+             admit it; `[jobs] admission_timeout_secs` sets the bound). Nothing falls back to a \
+             local build; THEGN_JOB_LOCAL=1 runs this command locally on purpose",
+            admission.as_secs()
+        ),
+        _ => format!("job refused before dispatch, nothing ran: {refusal}"),
+    }
 }
 
 /// The process exit code for a terminal state: the recipe's own code when it
