@@ -17,6 +17,7 @@ const RUNGS: &[&str] = &["alpha.119", "alpha.125", "alpha.131"];
 /// Tables whose rows are the user's own work: they must exist, and be non-empty
 /// in the snapshot, whenever the old release had them.
 const KEY_TABLES: &[&str] = &["worktrees", "sessions", "layouts"];
+const SEEDED_TABLES: &[&str] = &["worktrees"];
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/db")
@@ -89,7 +90,10 @@ fn shipped_release_dbs_upgrade_without_losing_rows() {
             before_version > 0 && before_version <= SCHEMA_VERSION,
             "{rung}: snapshot user_version {before_version} is not a shipped schema"
         );
-        for key in KEY_TABLES {
+        // Only the seeded table must have rows: `wt new` writes worktrees, while
+        // layouts (and sessions, where the release has them) are written by the
+        // TUI and may be empty. Every table is still checked for lost rows below.
+        for key in SEEDED_TABLES {
             if let Some(n) = before.get(*key) {
                 assert!(
                     *n > 0,
