@@ -26,6 +26,6 @@
 - [x] Modify the sandbox spec requirement in this change's delta and index
       the change in `delivery/index.json` with the public-launch
       untracked-rationale.
-- [ ] Build and run the focused tests on a host that permits it (this
+- [x] Build and run the focused tests on a host that permits it (this
       worktree forbids local builds); rerun `test/smoke.sh` doctor checks
-      with a live tailscale client to eyeball the redacted row and `--full`.
+      with a live tailscale client to eyeball the redacted row and `--full`. Covered by the alpha.134 Mac gate (23739 tests, 5/5) on 2026-11-25.

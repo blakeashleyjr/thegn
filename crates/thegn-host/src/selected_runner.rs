@@ -469,37 +469,80 @@ fn has_pending_work(kind: EnvProviderKind, project: &str) -> bool {
     }
 }
 
-/// Start one background reconcile pass for the configured `[jobs] runner`: for
-/// each project ledger with unsettled attempts, build the runner and run
-/// `reconcile_pending`, logging what it settled. Inert (no thread, no I/O) when
-/// no runner is configured. Sprites and Vercel runners are stable-channel
-/// (every other provider env was already removed by the channel clamp). Must
-/// be called inside the daemon's runtime; the work runs on the blocking pool,
-/// never on the event loop.
-pub(crate) fn spawn_startup_reconcile(cfg: &Config) {
-    let env_name = cfg.jobs.runner.trim();
-    if env_name.is_empty() {
-        return;
-    }
-    let Some(env) = cfg.env.get(env_name) else {
+/// The envs a startup pass reconciles for, as `(name, provider table)`: the
+/// configured `[jobs] runner` first (it wins a ledger both it and another env
+/// could settle), then every other Sprites or Vercel env by name. An env of any
+/// other provider kind never owns a job ledger and is left out.
+fn reconcile_targets(cfg: &Config) -> Vec<(String, EnvProviderConfig)> {
+    let configured = cfg.jobs.runner.trim();
+    if !configured.is_empty() && !cfg.env.contains_key(configured) {
         tracing::warn!(
             target: "thegn::jobs",
-            env = env_name,
-            "[jobs] runner names an env that is not configured; no reconcile pass"
+            env = configured,
+            "[jobs] runner names an env that is not configured; reconciling the other envs only"
         );
-        return;
-    };
-    let env_name = env_name.to_owned();
-    let pc = env.provider.clone();
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || reconcile_configured(&env_name, &pc, &handle));
+    }
+    let mut names: Vec<&String> = cfg.env.keys().collect();
+    names.sort();
+    let first = names.iter().position(|name| name.as_str() == configured);
+    if let Some(index) = first {
+        let name = names.remove(index);
+        names.insert(0, name);
+    }
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let provider = &cfg.env.get(name)?.provider;
+            matches!(
+                EnvProviderKind::of(&provider.provider),
+                EnvProviderKind::Sprites | EnvProviderKind::Vercel
+            )
+            .then(|| (name.clone(), provider.clone()))
+        })
+        .collect()
 }
 
-/// One pass over the ledgers of the configured runner's provider kind.
-fn reconcile_configured(env_name: &str, pc: &EnvProviderConfig, handle: &tokio::runtime::Handle) {
+/// Start one background reconcile pass over the job ledgers of every Sprites or
+/// Vercel env (the configured `[jobs] runner` first): for each project ledger
+/// with unsettled attempts, build the runner and run `reconcile_pending`,
+/// logging what it settled. Ledgers left by an env whose runner changed, or by
+/// another project's runner, are covered too. Inert (no thread, no I/O) when no
+/// such env exists. Sprites and Vercel runners are stable-channel (every other
+/// provider env was already removed by the channel clamp). Must be called inside
+/// the daemon's runtime; the work runs on the blocking pool, never on the event
+/// loop.
+pub(crate) fn spawn_startup_reconcile(cfg: &Config) {
+    let targets = reconcile_targets(cfg);
+    if targets.is_empty() {
+        return;
+    }
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || reconcile_all(&targets, &handle));
+}
+
+/// One pass over every target env's ledgers. A ledger (kind, project) is
+/// settled once, by the first env that can build a runner for it; an env whose
+/// provider config or credentials no longer resolve is skipped with a log and
+/// never fails the pass.
+fn reconcile_all(targets: &[(String, EnvProviderConfig)], handle: &tokio::runtime::Handle) {
+    let mut done: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for (env_name, pc) in targets {
+        reconcile_configured(env_name, pc, handle, &mut done);
+    }
+}
+
+/// One pass over the ledgers of one env's provider kind, skipping ledgers in
+/// `done` and adding each one it settles.
+fn reconcile_configured(
+    env_name: &str,
+    pc: &EnvProviderConfig,
+    handle: &tokio::runtime::Handle,
+    done: &mut std::collections::HashSet<(String, String)>,
+) {
     let kind = EnvProviderKind::of(&pc.provider);
     for project in ledger_projects(kind) {
-        if !has_pending_work(kind, &project) {
+        let ledger = (pc.provider.trim().to_ascii_lowercase(), project.clone());
+        if done.contains(&ledger) || !has_pending_work(kind, &project) {
             continue;
         }
         let runner = match build_from(env_name, pc, &project, Path::new("."), handle.clone()) {
@@ -507,6 +550,7 @@ fn reconcile_configured(env_name: &str, pc: &EnvProviderConfig, handle: &tokio::
             Err(error) => {
                 tracing::warn!(
                     target: "thegn::jobs",
+                    env = env_name,
                     project = project.as_str(),
                     %error,
                     "cannot build the selected runner; its pending attempts stay unsettled"
@@ -514,6 +558,7 @@ fn reconcile_configured(env_name: &str, pc: &EnvProviderConfig, handle: &tokio::
                 continue;
             }
         };
+        done.insert(ledger);
         // `reconcile_pending` is async; this is a blocking-pool thread, so
         // blocking on the runtime handle is the sanctioned bridge. Reattach runs
         // after it, on the rows it left unsettled.
