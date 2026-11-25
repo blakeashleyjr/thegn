@@ -51,7 +51,11 @@ a PTY over a hermetic fixture of N worktrees (isolated `HOME`/XDG/gitconfig), le
 it settle, samples `/proc/<pid>/stat` over a window, and reports cores-used with a
 per-thread breakdown. Pass `--worktrees N` to size the fixture; the harness
 seeds its worktrees into the registry before the measured launch. This is the
-steady-state cost `just bench` (launch→first frame only) never sees.
+steady-state cost `just bench` (launch→first frame only) never sees. It also
+reports peak resident memory for the host and, in `soak-daemon`, the pane daemon
+as `rss_host_kb` / `rss_daemon_kb`; the fixed RSS ceiling stays unset until a
+measured run fixes it, because a guessed ceiling would either fail a healthy run
+or pass a leak.
 
 Enabled by a new run hook **`THEGN_BENCH_RUN_MS`**: runs the full loop (ticker,
 hydration, tokio pool included) for a fixed window, then exits via the existing

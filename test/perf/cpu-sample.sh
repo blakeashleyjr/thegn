@@ -15,6 +15,12 @@
 # the same instance's cores-used looked unremarkable. Counters that only ever grow
 # are invisible to a windowed CPU measurement, so they get their own ceilings.
 #
+# It also reports RESIDENT MEMORY for the host and — when a scenario starts one —
+# the pane daemon (THE-2664): the peak over the settled window plus the two
+# boundary samples, published as `rss_host_kb` / `rss_daemon_kb`. Memory has its
+# own fixed-ceiling knob (`--rss-ceiling`) but no default ceiling, because a
+# memory ceiling has to be fixed from a measured number, not an invented one.
+#
 # Usage:
 #   cpu-sample.sh [--scenario idle|steady-workload|soak|soak-daemon] [--bin PATH]
 #                 [--worktrees N] [--dirty N] [--settle-ms MS] [--window-ms MS]
@@ -22,7 +28,8 @@
 #                 [--zombie-ceiling N] [--child-growth-ceiling N]
 #                 [--fd-growth-ceiling N] [--thread-growth-ceiling N]
 #                 [--syscr-rate-ceiling N] [--db-fd-ceiling N]
-#                 [--thread-peak-ceiling N] [--no-lfs-fixture]
+#                 [--thread-peak-ceiling N] [--rss-ceiling KB]
+#                 [--no-lfs-fixture]
 #
 # Exit status: 0 ok; 2 over a ceiling (CPU or resource); 1 harness error.
 # TG_PERF_DROP_KEYS=1 is a negative control: discard workload keys and verify
@@ -57,6 +64,8 @@ esac
 
 # shellcheck source=test/perf/lib/env.sh disable=SC1091
 source "$HERE/lib/env.sh"
+# shellcheck source=test/perf/lib/rss.sh disable=SC1091
+source "$HERE/lib/rss.sh"
 # shellcheck source=test/perf/lib/fixture.sh disable=SC1091
 source "$HERE/lib/fixture.sh"
 # Portable `script`/`timeout` wrapping — the util-linux vs BSD split.
@@ -99,6 +108,13 @@ THREAD_GROWTH_CEILING=2
 # The thread ceiling sits under the incident's 71 so it would have caught it.
 DB_FD_CEILING=16
 THREAD_PEAK_CEILING=64
+# Resident-memory ceiling, in KiB, applied to the host and to the daemon
+# independently. DELIBERATELY EMPTY: every other ceiling here was fixed from a
+# measured number, and there is no recorded RSS value yet (THE-2664 reports it
+# first). A guessed default would either fail healthy runs or pass a real
+# regression, so the gate exists and stays unset until the first `--record` run
+# prints `rss_host_kb`; pass `--rss-ceiling KB` to enforce one.
+RSS_CEILING=""
 LFS_FIXTURE=0
 NO_LFS_FIXTURE=0
 # Reads per second. The incident sustained 26,063/s from the disk-size walk.
@@ -186,6 +202,10 @@ while [ $# -gt 0 ]; do
     ;;
   --thread-peak-ceiling)
     THREAD_PEAK_CEILING="$2"
+    shift 2
+    ;;
+  --rss-ceiling)
+    RSS_CEILING="$2"
     shift 2
     ;;
   --no-lfs-fixture)
@@ -616,6 +636,22 @@ res_sample() { # $1 = pid -> "children zombies fdtotal fddb fdproc fdsock fdpipe
     "$(proc_children "$1")" "$(proc_fds "$1")" "$(proc_threads "$1")" "$(proc_syscr "$1")"
 }
 
+# Peak resident memory over the window, sampled once a second rather than
+# inferred from the two boundary reads: memory climbs while hydration finishes
+# and settles again, so a ceiling that only ever sees the endpoints would miss
+# exactly the shape it exists to catch. The loop is bounded by the sample count,
+# so a killed run cannot leave it spinning, and it forks (costing the harness
+# CPU, never thegn's) rather than touching the target.
+rss_peak_sampler() { # $1 = pid, $2 = 1s samples, $3 = file to receive the peak
+  local pid="$1" samples="$2" out="$3" peak=0 v i
+  for ((i = 0; i < samples; i++)); do
+    v="$(proc_rss_kb "$pid")"
+    if [ "$v" -gt "$peak" ]; then peak="$v"; fi
+    sleep 1
+  done
+  printf '%s\n' "$peak" >"$out"
+}
+
 if [ "$SCENARIO" = steady-workload ] || [ "$SCENARIO" = soak ] || [ "$SCENARIO" = soak-daemon ]; then
   # Allow a first frame, then dismiss onboarding before counting dispatcher
   # output: onboarding-consumed keys do not reach the keymap logger.
@@ -753,6 +789,10 @@ THREAD_TABLE=""
 # Absent on darwin: none of these counters has a procfs-free equivalent, and
 # reporting an invented zero would read as "no leak" rather than "not measured".
 RES_JSON="null"
+# Same rule for memory: `ps -o rss=` is not part of the darwin branch's sample,
+# so an unmeasured RSS reports null rather than a fabricated zero.
+RSS_HOST_JSON="null"
+RSS_DAEMON_JSON="null"
 
 if [ "$SAMPLER" = proc ]; then
   # Settle, then capture the process + per-thread baseline at the SAME instant
@@ -789,6 +829,9 @@ if [ "$SAMPLER" = proc ]; then
   # Resources at window start — AFTER the settle, so hydration and the lazy opens
   # it triggers are already accounted and any growth from here is accumulation.
   read -r C0 Z0 FD0 FDDB0 FDPR0 FDSK0 FDPI0 TH0 SR0 <<<"$(res_sample "$PID")"
+  # Resident memory at the same window start. Sampled through the lib helper
+  # (procfs VmRSS; `ps -o rss=` on a platform without procfs).
+  RSS0="$(proc_rss_kb "$PID")"
   # The daemon, when this scenario started one. Sampled on the SAME axes: it is
   # the longest-lived process thegn runs, so it is the one where a per-event
   # leak compounds — and the one every other scenario is blind to.
@@ -808,6 +851,7 @@ if [ "$SAMPLER" = proc ]; then
   fi
   if [ -n "$DPID" ]; then
     read -r DC0 DZ0 DFD0 _ _ _ _ DTH0 _ <<<"$(res_sample "$DPID")"
+    DRSS0="$(proc_rss_kb "$DPID")"
   fi
   # Per-thread CPU **and** per-thread reads. Both, because they answer different
   # questions and the second one is what settled this investigation: the
@@ -837,6 +881,16 @@ if [ "$SAMPLER" = proc ]; then
     fi
     SPAWN_START_EPOCH="$(date +%s.%N)"
   fi
+  # One in-window RSS sampler per process, in the background so the CPU window
+  # stays exactly WINDOW_S long. Each writes its high-water to a file the end of
+  # the window reads; the jobs are bounded by the sample count and waited for.
+  RSS_SAMPLES="$(awk "BEGIN{ n = int(($WINDOW_MS + 999) / 1000); print (n < 1 ? 1 : n) }")"
+  rss_peak_sampler "$PID" "$RSS_SAMPLES" "$PERF_TMP/rss.host.peak" &
+  RSS_HOST_JOB=$!
+  if [ -n "${DPID:-}" ]; then
+    rss_peak_sampler "$DPID" "$RSS_SAMPLES" "$PERF_TMP/rss.daemon.peak" &
+    RSS_DAEMON_JOB=$!
+  fi
   sleep "$WINDOW_S"
   # A process that died inside the window measured nothing: its counters read
   # back as zero/negative and would pass every ceiling. Fail every scenario, not
@@ -862,8 +916,10 @@ if [ "$SAMPLER" = proc ]; then
   fi
   J1="$(proc_jiffies "$PID")"
   read -r C1 Z1 FD1 FDDB1 FDPR1 FDSK1 FDPI1 TH1 SR1 <<<"$(res_sample "$PID")"
+  RSS1="$(proc_rss_kb "$PID")"
   if [ -n "${DPID:-}" ] && [ -d "/proc/$DPID" ]; then
     read -r DC1 DZ1 DFD1 _ _ _ _ DTH1 _ <<<"$(res_sample "$DPID")"
+    DRSS1="$(proc_rss_kb "$DPID")"
   fi
   CORES_TOTAL="$(awk "BEGIN{printf \"%.4f\", ($J1-$J0)/($CLK_TCK*$WINDOW_S)}")"
   SYSCR_RATE="$(awk "BEGIN{printf \"%.1f\", ($SR1-$SR0)/$WINDOW_S}")"
@@ -911,6 +967,39 @@ if [ "$SAMPLER" = proc ]; then
     THREAD_TABLE="$THREAD_TABLE$c ${TN[$tid]} (tid $tid)"$'\n'
   done
   THREAD_JSON="[${THREAD_JSON%,}]"
+  # Collect the in-window RSS peaks only now: `wait` costs up to one sample, and
+  # doing it before the per-thread loop would push that loop's window past the
+  # process-level one, inflating every per-thread `cores` it reports. A sampler
+  # that could not write (the process vanished, the temp dir went away) leaves
+  # the file empty; the peak then rests on the two boundary samples, which is
+  # what an unmeasured window deserves.
+  wait "$RSS_HOST_JOB" 2>/dev/null || true
+  RSS_HOST_SAMPLED="$(cat "$PERF_TMP/rss.host.peak" 2>/dev/null || true)"
+  if [ -n "${DPID:-}" ]; then
+    wait "${RSS_DAEMON_JOB:-}" 2>/dev/null || true
+    RSS_DAEMON_SAMPLED="$(cat "$PERF_TMP/rss.daemon.peak" 2>/dev/null || true)"
+  fi
+  RSS_PEAK="$RSS0"
+  if [ "$RSS1" -gt "$RSS_PEAK" ]; then RSS_PEAK="$RSS1"; fi
+  case "${RSS_HOST_SAMPLED:-}" in
+  '' | *[!0-9]*) : ;;
+  *)
+    if [ "$RSS_HOST_SAMPLED" -gt "$RSS_PEAK" ]; then RSS_PEAK="$RSS_HOST_SAMPLED"; fi
+    ;;
+  esac
+  # Same for the daemon, when one was sampled.
+  if [ -n "${DRSS0:-}" ]; then
+    DRSS_PEAK="$DRSS0"
+    if [ "${DRSS1:-0}" -gt "$DRSS_PEAK" ]; then DRSS_PEAK="$DRSS1"; fi
+    case "${RSS_DAEMON_SAMPLED:-}" in
+    '' | *[!0-9]*) : ;;
+    *)
+      if [ "$RSS_DAEMON_SAMPLED" -gt "$DRSS_PEAK" ]; then DRSS_PEAK="$RSS_DAEMON_SAMPLED"; fi
+      ;;
+    esac
+  fi
+  RSS_HOST_JSON="${RSS_PEAK:-null}"
+  RSS_DAEMON_JSON="${DRSS_PEAK:-null}"
 else
   # darwin: `top -l 2 -s <window>` prints two samples; the SECOND is CPU%
   # averaged over the interval between them, which is the windowed measurement
@@ -993,7 +1082,7 @@ fi
 
 INPUT_JSON="${INPUT_JSON:-null}"
 perf_check_systemd_calls
-RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"worktrees_collected\":$WORKTREES_COLLECTED,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"$SCENARIO\",\"build\":\"$BUILD\",\"worktrees\":$WORKTREES,\"worktrees_collected\":$WORKTREES_COLLECTED,\"window_ms\":$WINDOW_MS,\"settle_used_ms\":${SETTLE_USED_MS:-$SETTLE_MS},\"cores_total\":$CORES_TOTAL,\"rss_host_kb\":$RSS_HOST_JSON,\"rss_daemon_kb\":$RSS_DAEMON_JSON,\"threads\":$THREAD_JSON,\"resources\":$RES_JSON,\"spawn_rate\":$SPAWN_JSON,\"input\":$INPUT_JSON,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 BASELINE="$BASELINE_DIR/$HOST_TAG.$SCENARIO.json"
 if [ "$RECORD" = 1 ]; then
@@ -1025,7 +1114,8 @@ else
     echo "  fds=$FD0 -> $FD1 (peak $FD_PEAK)"
     echo "    db=$FDDB0 -> $FDDB1   procfs=$FDPR0 -> $FDPR1   sock=$FDSK0 -> $FDSK1   pipe=$FDPI0 -> $FDPI1"
     echo "  threads=$TH0 -> $TH1 (peak $THREAD_PEAK)"
-    echo "  ceilings: db fd=$DB_FD_CEILING  thread peak=$THREAD_PEAK_CEILING  lfs fixture=$LFS_FIXTURE"
+    echo "  rss: host peak=${RSS_PEAK:-?} KiB   daemon peak=${DRSS_PEAK:-n/a} KiB"
+    echo "  ceilings: db fd=$DB_FD_CEILING  thread peak=$THREAD_PEAK_CEILING  rss=${RSS_CEILING:-unset}  lfs fixture=$LFS_FIXTURE"
     echo "  read syscalls=${SYSCR_RATE}/s"
     if [ -n "${DPID:-}" ]; then
       echo "  daemon pid=$DPID comm=${DCOMM:-?}: children=${DC0:-?} -> ${DC1:-?}   zombies=${DZ0:-?} -> ${DZ1:-?}   fds=${DFD0:-?} -> ${DFD1:-?}   threads=${DTH0:-?} -> ${DTH1:-?}"
@@ -1081,6 +1171,17 @@ if [ "$RES_JSON" != "null" ] && [ "$BUILD" != debug ]; then
     "thegn.db descriptors (main + WAL + shm) over the absolute ceiling (THE-700: 74 in the incident)"
   res_check thread_peak "$THREAD_PEAK" "$THREAD_PEAK_CEILING" \
     "thread high-water over the absolute ceiling (THE-700)"
+  # Memory is gated only once a real number fixes the ceiling: `RSS_CEILING` is
+  # empty by default because inventing one would either fail a healthy run or
+  # pass a leak. `--rss-ceiling KB` enforces it on both processes independently.
+  if [ -n "$RSS_CEILING" ]; then
+    res_check rss_host_kb "${RSS_PEAK:-0}" "$RSS_CEILING" \
+      "host resident memory over the fixed ceiling (THE-2664; fix the ceiling from a measured run, never from a failing one)"
+    if [ -n "${DRSS_PEAK:-}" ]; then
+      res_check rss_daemon_kb "$DRSS_PEAK" "$RSS_CEILING" \
+        "pane daemon resident memory over the fixed ceiling (THE-2664)"
+    fi
+  fi
   if awk "BEGIN{exit !($SYSCR_RATE > $SYSCR_RATE_CEILING)}"; then
     echo "FAIL: syscr_per_s=$SYSCR_RATE exceeds ceiling=$SYSCR_RATE_CEILING — a scan lane is probably saturated" >&2
     RES_FAIL=1
