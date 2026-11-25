@@ -32,6 +32,70 @@ pub(crate) fn set_owner_executable(_path: &std::path::Path) -> std::io::Result<(
     }
 }
 
+/// Whether the job shim's wrapper scripts and `exec` hand-off exist on this OS.
+pub(crate) const JOB_SHIM_SUPPORTED: bool = cfg!(unix);
+
+/// True when `path` is something the job shim may run: an executable file on
+/// unix, a file (or its `.exe` sibling) elsewhere.
+pub(crate) fn is_runnable_tool(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file() || path.with_extension("exe").is_file()
+    }
+}
+
+/// Make a job-shim wrapper script executable (mode 0755 on unix; no-op
+/// elsewhere, where the wrappers are never written).
+pub(crate) fn make_shim_executable(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Run the real tool with `PATH` replaced: `exec` on unix (the tool owns the
+/// terminal and signals); spawn, wait and exit with its status elsewhere.
+pub(crate) fn exec_tool(
+    real: &std::path::Path,
+    args: &[String],
+    path: &std::ffi::OsStr,
+    fallback_code: i32,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let _ = fallback_code;
+        // CLI verb, never on the compositor loop: exec replaces this process.
+        let err = std::process::Command::new(real)
+            .args(args)
+            .env("PATH", path)
+            .exec();
+        Err(err).with_context(|| format!("cannot run {}", real.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(real)
+            .args(args)
+            .env("PATH", path)
+            .status()
+            .with_context(|| format!("cannot run {}", real.display()))?;
+        std::process::exit(status.code().unwrap_or(fallback_code));
+    }
+}
+
 /// Prepare the Unix-only world-readable invitation fixture. Returns `false`
 /// on platforms where Unix permission bits do not apply.
 #[cfg(all(test, feature = "iroh"))]

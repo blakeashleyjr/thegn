@@ -372,6 +372,16 @@ pub const CATALOG: &[Slot] = &[
     ),
     // The recipe is a clap `ValueEnum` (`cargo-build`, `cargo-test`).
     slot("job run", "recipe", SourceKind::Structural),
+    // A shell line to classify: free text, nothing to enumerate.
+    slot(
+        "job match",
+        "line",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // The wrapped command line after `--`: free text.
+    slot("job shim", "argv", SourceKind::Reserved(Reserved::Freeform)),
+    // A directory path: the engine's filename completion serves it.
+    slot("job shim-install", "dir", SourceKind::Structural),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),

@@ -422,16 +422,8 @@ fn same_dir(entry: &Path, shim_dir: Option<&Path>) -> bool {
     })
 }
 
-#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file() || path.with_extension("exe").is_file()
+    crate::platform::is_runnable_tool(path)
 }
 
 /// The first executable `tool` in `entries`.
@@ -457,26 +449,8 @@ fn passthrough(argv: &[String]) -> Result<()> {
     exec_real(&real, &argv[1..], &new_path)
 }
 
-#[cfg(unix)]
 fn exec_real(real: &Path, args: &[String], path: &std::ffi::OsStr) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    // CLI verb, never on the compositor loop: exec replaces this process so
-    // the tool owns the terminal and signals.
-    let err = std::process::Command::new(real)
-        .args(args)
-        .env("PATH", path)
-        .exec();
-    Err(err).with_context(|| format!("cannot run {}", real.display()))
-}
-
-#[cfg(not(unix))]
-fn exec_real(real: &Path, args: &[String], path: &std::ffi::OsStr) -> Result<()> {
-    let status = std::process::Command::new(real)
-        .args(args)
-        .env("PATH", path)
-        .status()
-        .with_context(|| format!("cannot run {}", real.display()))?;
-    std::process::exit(status.code().unwrap_or(super::EXIT_ERROR));
+    crate::platform::exec_tool(real, args, path, super::EXIT_ERROR)
 }
 
 /// Single-quote `text` for a POSIX shell.
@@ -495,9 +469,7 @@ pub(crate) fn wrapper_script(exe: &Path, tool: &str) -> String {
 
 /// Write the wrappers into `dir` (created if missing; rewriting is idempotent)
 /// and return its canonical path.
-#[cfg(unix)]
 pub(crate) fn write_wrappers(dir: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().context("cannot locate the thegn binary")?;
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let dir = dir
@@ -507,7 +479,7 @@ pub(crate) fn write_wrappers(dir: &Path) -> Result<PathBuf> {
         let path = dir.join(tool);
         std::fs::write(&path, wrapper_script(&exe, tool))
             .with_context(|| format!("cannot write {}", path.display()))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        crate::platform::make_shim_executable(&path)
             .with_context(|| format!("cannot make {} executable", path.display()))?;
     }
     Ok(dir)
@@ -515,18 +487,15 @@ pub(crate) fn write_wrappers(dir: &Path) -> Result<PathBuf> {
 
 /// `thegn job shim-install --dir DIR`: write the wrappers and print the
 /// shell lines that put them first on PATH (`eval "$(…)"`-able).
-#[cfg(unix)]
 pub(crate) fn install(args: &ShimInstallArgs) -> Result<()> {
+    if !crate::platform::JOB_SHIM_SUPPORTED {
+        bail!("the shell shim needs a Unix host");
+    }
     let dir = write_wrappers(&args.dir)?;
     let quoted = sh_quote(&dir.display().to_string());
     outln!("export {}={}", SHIM_DIR_ENV, quoted);
     outln!("export PATH={}:\"$PATH\"", quoted);
     Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn install(_args: &ShimInstallArgs) -> Result<()> {
-    bail!("the shell shim needs a Unix host")
 }
 
 /// The directory thegn manages for automatic-route wrappers.
@@ -570,7 +539,9 @@ pub(crate) fn inject_pane_env(cfg: &Config, repo_root: &Path, env: &mut Vec<(Str
     if !pane_gets_shim(cfg, repo_root) {
         return;
     }
-    #[cfg(unix)]
+    if !crate::platform::JOB_SHIM_SUPPORTED {
+        return;
+    }
     match write_wrappers(&managed_shim_dir()) {
         Ok(dir) => {
             let base = std::env::var("PATH").unwrap_or_default();
@@ -582,8 +553,6 @@ pub(crate) fn inject_pane_env(cfg: &Config, repo_root: &Path, env: &mut Vec<(Str
             "automatic route: cannot install the job shim, pane stays unrouted"
         ),
     }
-    #[cfg(not(unix))]
-    let _unused_off_unix = env;
 }
 
 /// `thegn job match`: show the coverage of one shell line.

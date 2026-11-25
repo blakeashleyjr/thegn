@@ -238,16 +238,14 @@ fn blocking_environment_names_are_recognised() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn the_real_tool_is_found_outside_the_shim_directory() {
-    use std::os::unix::fs::PermissionsExt;
     let shim = tempfile::tempdir().unwrap();
     let real = tempfile::tempdir().unwrap();
     for dir in [shim.path(), real.path()] {
         let file = dir.join("cargo");
         std::fs::write(&file, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::make_shim_executable(&file).unwrap();
     }
     let entries: Vec<PathBuf> = [shim.path(), real.path()]
         .into_iter()
@@ -342,7 +340,6 @@ fn the_pane_path_falls_back_to_the_base_when_the_env_has_none() {
     assert!(env.contains(&("PATH".to_owned(), "/s:/usr/bin".to_owned())));
 }
 
-#[cfg(unix)]
 #[test]
 fn writing_the_wrappers_twice_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
