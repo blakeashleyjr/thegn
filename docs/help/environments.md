@@ -426,6 +426,9 @@ stay plan-only without the spend flags.
   unchanged: the worktree is not live, the env is poolable, nothing is bound
   yet, provisioning is pending and the sandbox floor holds. The pool stays
   opt-in (`[lifecycle.pool] size`). The TUI create path claims the same way.
+  `thegn env up` also claims with the pool off when a `ready` spare baked
+  against the repo's current `flake.lock` already exists, so a repeat first
+  open skips the cold create; a spare baked against an older lock is ignored.
 - **Agent CLI preflight.** After provisioning and before the open,
   `thegn agent run` runs `command -v <prog>` in the sandbox (60 s deadline). A
   missing CLI prints one warning that names the fix; it never blocks the run.
