@@ -111,7 +111,22 @@ pub enum MenuChoice {
     SandboxRunOnHost,
     /// Start a dormant container runtime (payload: its config-facing name).
     SandboxStartRuntime(String),
+    // one-time model-credential answer for an unset Sprites env.
+    ModelCredentialsForward(ModelCredentialTarget),
+    ModelCredentialsNotNow(ModelCredentialTarget),
+    ModelCredentialsNever(ModelCredentialTarget),
     Dismiss,
+}
+
+/// Which project+provider+worktree a model-credential answer applies to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCredentialTarget {
+    pub project: String,
+    pub provider: String,
+    pub worktree: String,
+    /// The tab to retry after the answer (the prompt was raised on it).
+    pub group: String,
+    pub tab: usize,
 }
 
 /// Why the menu exists (the loop uses this to rebuild on state change).
@@ -131,6 +146,7 @@ pub enum MenuKindTag {
     KeymapPicker,
     ShareReach,
     SandboxHalt,
+    ModelCredentialsConsent,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -815,6 +831,39 @@ pub fn sandbox_ask_menu(title: impl Into<String>, body: impl Into<String>) -> Me
             item(Some('r'), "retry bring-up", MenuChoice::SandboxRetry),
             item(Some('h'), "run on host", MenuChoice::SandboxRunOnHost),
             item(Some('n'), "dismiss", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(body)
+}
+
+/// The one-time model-credential question for an unset Sprites env. `[f]`
+/// forwards and remembers, `[n]` withholds for this launch only, `[x]` never
+/// forwards for this project+provider. `body` names the agents, the fixed env
+/// keys and the sandbox; it never contains a credential value.
+pub fn model_credentials_menu(
+    body: impl Into<String>,
+    target: ModelCredentialTarget,
+) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::ModelCredentialsConsent,
+        "forward model credentials?",
+        vec![
+            item(
+                Some('f'),
+                "forward, remember for this project",
+                MenuChoice::ModelCredentialsForward(target.clone()),
+            ),
+            item(
+                Some('n'),
+                "not now",
+                MenuChoice::ModelCredentialsNotNow(target.clone()),
+            ),
+            item(
+                Some('x'),
+                "never for this project",
+                MenuChoice::ModelCredentialsNever(target),
+            )
+            .danger(),
         ],
     )
     .with_body(body)

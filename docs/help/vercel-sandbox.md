@@ -141,8 +141,11 @@ model_credentials = "none"   # "none" | "upload" | "proxy" | "inject"
 
 Only your own config file can set it. The env wizard never writes a value other
 than `none`, `env create` has no flag for it, and a repo-local overlay cannot
-set it. It applies only to `provider = "vercel"`; on other providers it is
-refused (use `[sandbox.home] agents` there).
+set it. On Vercel it defaults to `none`. Sprites accepts the same `none` and
+`upload` values; leaving it unset there asks once per project whether to
+forward, and a headless launch withholds with a hint instead of asking (see
+[[environments]]). Other providers refuse the key (use `[sandbox.home] agents`
+there).
 
 | Mode     | What leaves the machine                                                                           |
 | -------- | ------------------------------------------------------------------------------------------------- |

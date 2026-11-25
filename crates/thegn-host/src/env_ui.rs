@@ -169,20 +169,26 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                     format!("{} · sends: {}", disclosure.mode, disclosure.leaves_machine),
                 );
             } else if is_provider && e.provider.provider.trim() == "sprites" {
-                let mode = if !e.provider.model_credentials_is_explicit() {
-                    thegn_core::config::ModelCredentials::Upload
+                if !e.provider.model_credentials_is_explicit() {
+                    push_detail(
+                        &mut detail,
+                        "credentials",
+                        format!(
+                            "unset · asks once per project at the first launch; set model_credentials = \"upload\" or \"none\" in [env.{name}.provider]"
+                        ),
+                    );
                 } else {
-                    e.provider.model_credentials
-                };
-                push_detail(
-                    &mut detail,
-                    "credentials",
-                    format!(
-                        "{} · sends: {}",
-                        mode,
-                        thegn_core::provider_credentials::sprites_disclosure(mode)
-                    ),
-                );
+                    let mode = e.provider.model_credentials;
+                    push_detail(
+                        &mut detail,
+                        "credentials",
+                        format!(
+                            "{} · sends: {}",
+                            mode,
+                            thegn_core::provider_credentials::sprites_disclosure(mode)
+                        ),
+                    );
+                }
             }
             if bound == Some(name.as_str()) {
                 push_detail(&mut detail, "bound", "this worktree".to_string());
@@ -984,6 +990,18 @@ mod tests {
         let mut cfg = Config::default();
         cfg.env
             .insert("sp".into(), provider_env("sprites", "SPRITES_TOKEN", ""));
+        let snaps = env_snapshots(&cfg, None);
+        let creds = snaps[0]
+            .detail
+            .iter()
+            .find(|(label, _)| label == "credentials")
+            .expect("credentials row");
+        assert!(creds.1.starts_with("unset"), "{creds:?}");
+        assert!(creds.1.contains("asks once per project"), "{creds:?}");
+
+        let sp = cfg.env.get_mut("sp").expect("sp env");
+        sp.provider.model_credentials = thegn_core::config::ModelCredentials::Upload;
+        sp.provider.mark_model_credentials_explicit();
         let snaps = env_snapshots(&cfg, None);
         let creds = snaps[0]
             .detail

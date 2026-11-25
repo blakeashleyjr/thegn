@@ -177,6 +177,7 @@ mod merge_remote;
 mod merge_sweep;
 mod metrics;
 mod mise_provider;
+mod model_credential_prompt;
 mod model_eq;
 mod model_proxy_daemon;
 mod monitor;

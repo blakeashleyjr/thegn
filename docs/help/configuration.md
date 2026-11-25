@@ -53,9 +53,10 @@ Workspace keybinds and the workspace editor setting are not applied from a
 bound block.
 
 `[env.<n>.provider] model_credentials` applies to Vercel and Sprites
-(`none` or `upload`; `proxy` and `inject` are refused). On Sprites, leaving it
-unset forwards credentials as before; set `none` to withhold them. See
-[[environments]] and [[vercel-sandbox]].
+(`none` or `upload`; `proxy` and `inject` are refused). On Vercel it defaults
+to `none`. On Sprites, leaving it unset asks once per project whether to
+forward; set `none` to withhold without asking or `upload` to forward without
+asking. See [[environments]] and [[vercel-sandbox]].
 
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The
