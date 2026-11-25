@@ -723,6 +723,13 @@
       "changes": [
         "restore-darwin-pinned-directory-listing"
       ]
+    },
+    {
+      "issue": "THE-2683",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "fix-relaunch-duplicate-panes"
+      ]
     }
   ]
 }
