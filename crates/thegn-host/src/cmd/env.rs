@@ -1628,14 +1628,9 @@ fn spawn_background_finish(wt: &str, sandbox: &str) -> Result<PathBuf> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     // The child is intentionally not waited on: it is the background finisher.
     #[allow(clippy::zombie_processes)]
-    cmd.spawn()?;
+    crate::platform::bundle_custody::spawn_detached_group(&mut cmd)?;
     Ok(log_path)
 }
 

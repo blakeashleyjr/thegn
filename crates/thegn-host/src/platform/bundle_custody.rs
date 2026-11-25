@@ -29,6 +29,14 @@ pub(crate) fn spawn_bundle_producer(
     cmd.spawn()
 }
 
+/// Spawn a detached background finisher in its own process group, so a
+/// terminal hangup or Ctrl-C in the parent's group does not reach it.
+pub(crate) fn spawn_detached_group(
+    cmd: &mut std::process::Command,
+) -> io::Result<std::process::Child> {
+    spawn_bundle_producer(cmd)
+}
+
 /// Kill the producer group while its leader still identifies that group.
 pub(crate) fn kill_bundle_producer(child: &mut std::process::Child) {
     #[cfg(unix)]
