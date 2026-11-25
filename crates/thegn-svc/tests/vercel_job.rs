@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -1482,6 +1483,62 @@ async fn reconcile_pending_cleans_a_terminal_row_whose_cleanup_is_pending() {
     assert_eq!(settled.state, state, "a terminal state is never rewritten");
     assert_eq!(settled.cleanup, Cleanup::Done);
     assert_eq!(mock.count("DELETE", &receipt.sandbox), deletes + 1);
+}
+
+/// A row another recovery settled between the pending pass's scan and its
+/// compare-and-swap is reported as superseded, as the Sprites executor does,
+/// not as cleaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_pending_reports_a_row_settled_during_the_pass_as_superseded() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let (_dir, store) = store();
+    let shared = Arc::new(Mutex::new(State::default()));
+    let inner = router(shared.clone(), script(vec![exit_line(0)]), b"built");
+    // Another recovery moves the scanned row on when the pass re-reads it.
+    let racing = Arc::new(AtomicBool::new(false));
+    let hook_store = store.clone();
+    let hook_racing = racing.clone();
+    let mock = Mock::start(move |req: &Recorded| {
+        if hook_racing.load(Ordering::SeqCst)
+            && req.method == "GET"
+            && req.path().starts_with("/v2/sandboxes/")
+            && !req.path().contains("/sessions/")
+            && let Some(mut row) = hook_store.read(1).ok().flatten()
+        {
+            row.cleanup = Cleanup::Done;
+            row.sandbox_deleted = true;
+            let _ = hook_store.mark(&row);
+        }
+        inner(req)
+    });
+    let runner = runner(&mock, store.clone());
+    let receipt = finished_attempt(&runner).await;
+    // Finished, but its sandbox delete did not complete.
+    shared.lock().unwrap().deleted = false;
+    let mut record = store.read(1).unwrap().unwrap();
+    record.cleanup = Cleanup::Pending;
+    record.sandbox_deleted = false;
+    store.mark(&record).unwrap();
+    let deletes = mock.count("DELETE", &receipt.sandbox);
+    racing.store(true, Ordering::SeqCst);
+
+    let touched = runner.reconcile_pending().await.unwrap();
+
+    assert_eq!(
+        touched,
+        vec![Reconciled {
+            attempt: 1,
+            outcome: ReconcileOutcome::Superseded
+        }]
+    );
+    let kept = store.read(1).unwrap().unwrap();
+    assert_eq!(kept.state, record.state, "the terminal verdict is kept");
+    assert_eq!(kept.cleanup, Cleanup::Done, "the newer state is kept");
+    assert_eq!(
+        mock.count("DELETE", &receipt.sandbox),
+        deletes,
+        "the pass does not delete a sandbox another recovery already settled"
+    );
 }
 
 #[test]

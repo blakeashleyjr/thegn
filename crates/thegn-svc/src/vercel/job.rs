@@ -1818,7 +1818,7 @@ impl VercelSelectedRunner {
     /// owner lease is live, or that is younger than its staleness age, is
     /// refused rather than killed under a run that may still be driving it.
     pub async fn cancel(&self, attempt: u64) -> Result<AttemptRecord> {
-        self.settle(attempt, true).await
+        Ok(self.settle_outcome(attempt, true).await?.0)
     }
 
     /// Reconcile an attempt left ambiguous or with cleanup pending (a crashed
@@ -1831,7 +1831,7 @@ impl VercelSelectedRunner {
     /// recovery changed in the meantime is left as it is (superseded) and
     /// returned as found, so a terminal `Finished` record is never overwritten.
     pub async fn reconcile(&self, attempt: u64) -> Result<AttemptRecord> {
-        self.settle(attempt, false).await
+        Ok(self.settle_outcome(attempt, false).await?.0)
     }
 
     /// [`reconcile`](Self::reconcile) every attempt of this binding that a crash
@@ -1866,8 +1866,9 @@ impl VercelSelectedRunner {
                 continue;
             }
             let attempt = record.attempt;
-            let outcome = match self.reconcile(attempt).await {
-                Ok(settled) if settled.cleanup == Cleanup::Pending => {
+            let outcome = match self.settle_outcome(attempt, false).await {
+                Ok((_, true)) => ReconcileOutcome::Superseded,
+                Ok((settled, false)) if settled.cleanup == Cleanup::Pending => {
                     ReconcileOutcome::StillPending
                 }
                 Ok(_) => ReconcileOutcome::Cleaned,
@@ -1886,7 +1887,12 @@ impl VercelSelectedRunner {
         Ok(touched)
     }
 
-    async fn settle(&self, attempt: u64, cancel: bool) -> Result<AttemptRecord> {
+    /// Settle `attempt` and report whether the compare-and-swap was lost, so a
+    /// caller that scanned the row (the pending pass) can report the outcome as
+    /// superseded rather than cleaned. The flag is also set when the row is
+    /// already settled on arrival: the scan found it outstanding, so a newer
+    /// state was kept. Callers that only return the record discard it.
+    async fn settle_outcome(&self, attempt: u64, cancel: bool) -> Result<(AttemptRecord, bool)> {
         let record = self
             .read_attempt(attempt)
             .await?
@@ -1894,7 +1900,7 @@ impl VercelSelectedRunner {
         // Recovery checks the recorded identity before any provider call.
         self.verify_scope(&record.team_id, &record.project_id)?;
         if record.is_terminal() && record.cleanup != Cleanup::Pending {
-            return Ok(record);
+            return Ok((record, true));
         }
         if !record.is_terminal() && !self.is_stale(&record, thegn_core::util::now_ms()) {
             bail!(
@@ -1921,7 +1927,7 @@ impl VercelSelectedRunner {
                     // Re-read right before the kill: a row its owner moved on is
                     // never killed.
                     if self.read_attempt(attempt).await?.as_ref() != Some(&expected) {
-                        return self.superseded(attempt).await;
+                        return Ok((self.superseded(attempt).await?, true));
                     }
                     self.kill_command(&record).await;
                     self.teardown(&name).await
@@ -1945,9 +1951,9 @@ impl VercelSelectedRunner {
         };
         record.sandbox_deleted = gone;
         if self.persist_if_unchanged(&expected, &record).await? {
-            Ok(record)
+            Ok((record, false))
         } else {
-            self.superseded(attempt).await
+            Ok((self.superseded(attempt).await?, true))
         }
     }
 
