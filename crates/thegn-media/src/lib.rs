@@ -462,7 +462,13 @@ async fn linux_auto_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     if let Some(c) = mpris_client(opts).await {
         sources.push(c);
     }
-    if let Some(c) = mpd_client(opts).await {
+    // The implicit default endpoint is never dialled by `auto`: that probe was
+    // a TCP connect to 127.0.0.1 on a first run, with no user intent behind it.
+    // MPD joins `auto` only when the endpoint was configured (`[media.mpd]`
+    // socket or `MPD_HOST`); `backend = "mpd"` always dials.
+    if auto_probes_mpd(&opts.mpd_socket)
+        && let Some(c) = mpd_client(opts).await
+    {
         sources.push(c);
     }
     // Only add mpv when its socket is actually present, else it just fails every
@@ -478,6 +484,16 @@ async fn linux_auto_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
             opts.players_priority.clone(),
         ))),
     }
+}
+
+/// The built-in MPD endpoint; matches `MpdMediaConfig::default()`.
+const DEFAULT_MPD_SOCKET: &str = "127.0.0.1:6600";
+
+/// Whether `auto` may dial MPD: only for an endpoint the user chose.
+#[cfg(any(target_os = "linux", test))]
+fn auto_probes_mpd(socket: &str) -> bool {
+    let socket = socket.trim();
+    !socket.is_empty() && socket != DEFAULT_MPD_SOCKET
 }
 
 /// macOS `auto`: the universal MediaRemote adapter when present, else the
@@ -646,6 +662,14 @@ mod resolve_tests {
             client_for(opts(BackendKind::Smtc)).await,
             Err(Unavailable::NotOnThisPlatform(BackendKind::Smtc))
         ));
+    }
+
+    #[test]
+    fn auto_does_not_probe_the_implicit_mpd_endpoint() {
+        assert!(!super::auto_probes_mpd("127.0.0.1:6600"));
+        assert!(!super::auto_probes_mpd(" "));
+        assert!(super::auto_probes_mpd("music.lan:6600"));
+        assert!(super::auto_probes_mpd("/run/mpd/socket"));
     }
 
     #[test]

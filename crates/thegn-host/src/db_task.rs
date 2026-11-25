@@ -20,8 +20,10 @@
 //! rows may still be queued. Queue overflow and critical loss are counted and
 //! reported both in-session and during shutdown.
 //!
-//! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
-//! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.
+//! The thread blocks on `recv()` (no polling, no `TerminalWaker` pulse). After a
+//! burst it wakes once, `IDLE_CLOSE` later, to close its connection so an idle
+//! process holds no writer `thegn.db` descriptors, then blocks again — zero
+//! steady idle wakes, and the 0%-idle contract is untouched.
 //!
 //! The FIFO is bounded. Overflow drops new best-effort writes and preserves
 //! the order of writes already queued; [`shutdown_flush`] exposes the total
@@ -46,6 +48,12 @@ type Job = Box<dyn FnOnce(&Db) + Send>;
 const MAX_QUEUED_JOBS: usize = 4096;
 #[cfg(test)]
 const MAX_QUEUED_JOBS: usize = 8;
+
+/// How long the writer keeps its connection open with nothing to do.
+#[cfg(not(test))]
+const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 enum Msg {
     Run(QueuedJob),
@@ -128,7 +136,24 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<Queu
     let mut db: Option<Db> = None;
     let mut warned = false;
     let mut retained = VecDeque::new();
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // While a connection is open, wait at most `IDLE_CLOSE` for the next
+        // job and then close it (a single wakeup after a burst, not a poll):
+        // an idle host keeps no `thegn.db` main/WAL/shm descriptors for the
+        // writer. The next job reopens lazily. Retained jobs keep it open.
+        let received = if db.is_some() && retained.is_empty() {
+            match rx.recv_timeout(IDLE_CLOSE) {
+                Ok(msg) => Ok(msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    db = None;
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            rx.recv().map_err(|_| ())
+        };
+        let Ok(msg) = received else { break };
         match msg {
             Msg::Run(job) => {
                 retain_job(&mut retained, job, &state);
