@@ -1113,6 +1113,18 @@ impl VercelProvider {
     /// name and the interactive default; a selected Job attempt passes its own
     /// per-attempt name and a deadline-derived timeout.
     pub(crate) async fn create_named(&self, name: &str, timeout_ms: u64) -> Result<SandboxHandle> {
+        self.create_named_with_egress(name, timeout_ms, self.spec.egress.clone())
+            .await
+    }
+
+    /// [`create_named`](Self::create_named) with an explicit egress allow list
+    /// (a selected Job widens the env's list for its toolchain hosts).
+    pub(crate) async fn create_named_with_egress(
+        &self,
+        name: &str,
+        timeout_ms: u64,
+        egress: Vec<String>,
+    ) -> Result<SandboxHandle> {
         let name = checked_name(name)?.to_string();
         // 1. Controller id (refuses before any request when unreadable).
         let controller = self.controller().await?;
@@ -1125,7 +1137,7 @@ impl VercelProvider {
             region: self.spec.region.clone(),
             timeout_ms,
             tags: policy::tags_for(&controller, &owner, &crate::vps::host_label()),
-            egress: self.spec.egress.clone(),
+            egress,
         };
         let body = api::create_body(&self.spec.scope, &plan);
         if !body.is_object() {

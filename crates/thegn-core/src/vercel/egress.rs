@@ -21,6 +21,39 @@ pub const REGISTRY_PRESET: &[&str] = &[
     "objects.githubusercontent.com",
 ];
 
+/// Hosts a selected cargo Job attempt needs on top of the env's allow list:
+/// rustup and the toolchain (`sh.rustup.rs`, `static.rust-lang.org`), the crates
+/// index and downloads, and the OS package mirrors the launcher uses to install
+/// a C linker (Ubuntu, Debian, Amazon Linux, Alpine). Exact names only.
+pub const JOB_TOOLCHAIN_HOSTS: &[&str] = &[
+    "sh.rustup.rs",
+    "static.rust-lang.org",
+    "index.crates.io",
+    "static.crates.io",
+    "crates.io",
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ports.ubuntu.com",
+    "deb.debian.org",
+    "security.debian.org",
+    "cdn.amazonlinux.com",
+    "dl-cdn.alpinelinux.org",
+];
+
+/// The allow list a selected Job sandbox is created with: the env's resolved
+/// list ([`resolve`]) plus [`JOB_TOOLCHAIN_HOSTS`], sorted and deduplicated.
+/// An allow-all env (`["*"]`) stays allow-all.
+pub fn job_egress(base: &[String]) -> Vec<String> {
+    if base.iter().any(|h| h == "*") {
+        return vec!["*".to_string()];
+    }
+    let mut out: Vec<String> = base.to_vec();
+    out.extend(JOB_TOOLCHAIN_HOSTS.iter().map(|h| (*h).to_string()));
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn err(reason: &'static str) -> AdmitError {
     AdmitError {
         field: "egress_allow",
@@ -81,6 +114,27 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn job_egress_adds_toolchain_hosts_to_a_deny_env() {
+        let d = job_egress(&[]);
+        for host in ["sh.rustup.rs", "static.rust-lang.org", "index.crates.io"] {
+            assert!(d.iter().any(|h| h == host), "{host}");
+        }
+        assert_eq!(
+            crate::vercel::api::network_policy_body(&d)["mode"],
+            "custom"
+        );
+        assert!(d.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn job_egress_keeps_user_hosts_and_allow_all() {
+        let d = job_egress(&s(&["example.com", "crates.io"]));
+        assert!(d.iter().any(|h| h == "example.com"));
+        assert_eq!(d.iter().filter(|h| *h == "crates.io").count(), 1);
+        assert_eq!(job_egress(&s(&["*"])), s(&["*"]));
     }
 
     #[test]
