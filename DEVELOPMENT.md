@@ -104,7 +104,15 @@ produce them.
   `THEGN_LOG=info` then grep `thegn::startup` (`since_process_ms` on the
   `config admitted` and `first frame submitted` lines covers the pre-runtime
   work; probe/session/db/theme/help lines carry their own `*_ms`). The bench
-  hook skips the outer-terminal probe (a pty has no emulator to answer it).
+  hook skips the outer-terminal probe (a pty has no emulator to answer it). It also exits
+  right after the first frame is flushed (terminal restored, then
+  `process::exit`, no joins/drops), so the number is time-to-first-frame, not
+  teardown. Pre-main cost (exec + dynamic load of the ~143 MB release binary) is
+  outside `since_start_ms`; `since_process_ms` starts at `run_main`. Options
+  not taken: `lto="fat"`/`codegen-units=1` (rejected in Cargo.toml: no measured
+  win), `panic="abort"` (kills the multiplexer on a thread panic); a smaller
+  binary (fewer deps, `opt-level="s"` on cold crates) is the main lever for
+  exec/page-fault time.
 - **Perf suite** (`docs/superpowers/specs/perf-suite.md`): runtime self-profiler
   (`THEGN_PERF=1` → `thegn::perf` rollup with wake-source + per-subsystem-CPU
   attribution + wake-storm warning), steady-state idle harness (`just bench-idle`,

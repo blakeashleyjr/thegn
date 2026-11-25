@@ -1567,6 +1567,16 @@ pub async fn main(
     result
 }
 
+/// `THEGN_BENCH_FIRST_FRAME_EXIT` fast exit: restore terminal modes and leave
+/// the process immediately so the measured time is time-to-first-frame.
+fn bench_first_frame_exit() -> ! {
+    let _ = crate::frame_writer::write_terminal_teardown(
+        b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
+    ); // best-effort: bench exit; the process is leaving regardless
+    thegn_core::log_trace::run_panic_restore_once();
+    std::process::exit(0)
+}
+
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
 /// effort; pin persistence never blocks the loop).
 pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session_id: &str) {
@@ -17704,10 +17714,12 @@ async fn event_loop<T: Terminal>(
                     "first frame submitted"
                 );
                 // Benchmark hook (`just bench`): exit right after the first
-                // real frame so hyperfine measures launch → first paint.
-                // `run::main` still tears down the alt screen + raw mode.
+                // real frame so hyperfine measures launch → first paint, not
+                // teardown. Restore the terminal (same bytes + shared panic
+                // restore as the normal teardown), then `process::exit`,
+                // skipping task joins and drops.
                 if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some() {
-                    return Ok(());
+                    bench_first_frame_exit();
                 }
                 crate::db_maintain::arm_after_first_frame();
                 // Deferred warms — AFTER the first flush so they never tax
