@@ -1403,6 +1403,38 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     })
 }
 
+/// The stable-channel refusal for a dev-only verb, naming the stable
+/// alternative where one exists (direct iroh -> plain `serve`/`pair new`).
+fn stable_refusal_message(verb: &str, feature_id: &str) -> String {
+    let alt = match verb {
+        "serve --iroh-direct" | "pair direct" => {
+            " On stable, use client/server instead: `thegn serve` to listen and `thegn pair new` to pair a client (then `thegn attach`)."
+        }
+        _ => "",
+    };
+    format!(
+        "`thegn {verb}` is a dev-channel feature ({feature_id}); this is the stable build. \
+         Run the dev build (`nix run .#dev`) or set THEGN_CHANNEL=dev to enable it.{alt}"
+    )
+}
+
+#[cfg(test)]
+mod stable_refusal_tests {
+    use super::stable_refusal_message;
+
+    #[test]
+    fn direct_iroh_refusal_names_the_stable_alternative() {
+        let m = stable_refusal_message("serve --iroh-direct", "remote");
+        assert!(
+            m.contains("thegn serve") && m.contains("thegn pair new"),
+            "{m}"
+        );
+        let m = stable_refusal_message("pair direct", "remote");
+        assert!(m.contains("thegn pair new"), "{m}");
+        assert!(!stable_refusal_message("host", "providers").contains("pair new"));
+    }
+}
+
 /// Verbs that install their own logging subscriber (daemon/serve) or must keep
 /// their stdout/stderr stream pristine for a framed protocol (the stdio
 /// bridges) — the generic CLI diagnostics install is skipped for these.
@@ -1431,11 +1463,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     if let Some((verb, feat)) = experimental_command(&command)
         && !feat.allowed_in(channel)
     {
-        anyhow::bail!(
-            "`thegn {verb}` is a dev-channel feature ({}); this is the stable build. \
-             Run the dev build (`nix run .#dev`) or set THEGN_CHANNEL=dev to enable it.",
-            feat.id(),
-        );
+        anyhow::bail!("{}", stable_refusal_message(verb, feat.id()));
     }
     // Only processes that actually own long-lived shared state are controllers;
     // a worktree-resolved `thegn dispatch report` is always a client.

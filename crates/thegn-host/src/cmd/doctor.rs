@@ -1876,9 +1876,8 @@ fn feature_state_line(
     } else if feature == thegn_core::channel::Feature::Remote && !feature.allowed_in(channel) {
         // SSH/mosh remote workspaces and `[sandbox.remote]` graduated out of
         // this gate; only Kubernetes placement and direct-iroh stay dev-only.
-        format!(
-            "{state}; SSH/mosh remote workspaces are stable and stay enabled (Kubernetes placement and direct iroh are dev-only)"
-        )
+        let _ = state;
+        "partly stable: stable = ssh/mosh remotes + client/server (serve/attach/pair); dev-only = Kubernetes placement, direct iroh".to_string()
     } else {
         state.to_string()
     }
@@ -9161,7 +9160,7 @@ args = ["--verbose"]
         );
         assert_eq!(
             feature_state_line(Feature::Remote, Channel::Stable),
-            "disabled (dev-only); SSH/mosh remote workspaces are stable and stay enabled (Kubernetes placement and direct iroh are dev-only)"
+            "partly stable: stable = ssh/mosh remotes + client/server (serve/attach/pair); dev-only = Kubernetes placement, direct iroh"
         );
         assert_eq!(
             feature_state_line(Feature::Observe, Channel::Stable),

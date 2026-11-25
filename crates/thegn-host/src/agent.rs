@@ -259,7 +259,7 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name, self.placement, self.reason, fix
             );
         }
-        use crate::env_halt::{HaltClass, classify_halt, remedy_text};
+        use crate::env_halt::{HaltClass, classify_halt, remedy_text_for};
         let class = classify_halt(&self.placement, &self.reason);
         if class != HaltClass::LocalRuntime && !self.ask {
             return write!(
@@ -269,13 +269,13 @@ impl std::fmt::Display for SandboxHalt {
                 self.env_name,
                 self.placement,
                 self.reason,
-                remedy_text(class, &self.env_name)
+                remedy_text_for(class, &self.env_name, &self.reason)
             );
         }
         let allow = if class != HaltClass::LocalRuntime {
             format!(
                 "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise {}",
-                remedy_text(class, &self.env_name)
+                remedy_text_for(class, &self.env_name, &self.reason)
             )
         } else if self.ask {
             "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()

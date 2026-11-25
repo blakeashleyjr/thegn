@@ -7,6 +7,14 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Stable-channel messages for remotes and client/server: `thegn doctor` shows the
+  remote row as partly stable (ssh/mosh remotes and client/server stable;
+  Kubernetes and direct iroh dev-only), a missing `mosh-server` gets an install
+  hint, `serve --iroh-direct`/`pair direct` name `thegn serve` + `thegn pair new`,
+  and a dropped Kubernetes env says it is dev-channel only.
+
 ### Added
 
 - Vercel sandboxes now deny network egress by default. `[env.<n>.provider]
