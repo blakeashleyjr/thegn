@@ -60,3 +60,39 @@ sandbox's lifetime has less than an hour left.
 
 - **WHEN** a sample's memory is at 95% of its limit
 - **THEN** its level is `warn`
+
+### Requirement: A background sampler watches running sandboxes
+
+thegn SHALL probe each running remote worktree sandbox about once a minute
+while a client is attached, store the latest and previous reading in the state
+DB, and MUST NOT probe a sandbox the provider reports cold, warm, stopped or of
+unknown state. A probe that fails or times out MUST store no sample and back
+that sandbox off for 5 minutes. Restart and OOM events, and a lifetime under
+one hour, SHALL each raise one notification and one `remote_events` journal row
+(500 rows and 30 days per sandbox). A restart whose cause is otherwise unknown
+SHALL be named from provider facts: idle sleep when the provider showed the
+sandbox cold between samples, lifetime expiry when it is past
+`max_lifetime_secs`.
+
+#### Scenario: A cold sandbox
+
+- **WHEN** the provider reports a sandbox cold
+- **THEN** the sampler runs no exec in it and stores no sample
+
+#### Scenario: An event is raised once
+
+- **WHEN** a restart is classified and the next sample is of the same boot
+- **THEN** one notification and one journal row exist for it, and none is
+  added by the later sample
+
+### Requirement: A lost exec stream names its cause
+
+When an exec stream ends without an exit status, thegn SHALL run one fresh
+probe, and when the boot id differs from the stored previous reading it MUST
+print the specific restart warning instead of `exec stream ended without an
+exit status`.
+
+#### Scenario: Stream ends across a reboot
+
+- **WHEN** a sprite exec stream drops and the probe shows a new boot id
+- **THEN** the line printed is the classified warning, not the bare message

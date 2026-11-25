@@ -3002,6 +3002,7 @@ pub(crate) fn build_model(
     crate::fly_reaper::tick(&app_cfg);
     crate::vercel_reaper::tick(&app_cfg);
     crate::sprites_reaper::tick(&app_cfg);
+    crate::remote_health_sampler::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
     let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);

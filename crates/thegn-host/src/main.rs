@@ -265,6 +265,7 @@ mod reaper_policy;
 mod recorder;
 mod refresh_schedule;
 mod remote_enqueue_auth;
+mod remote_health_sampler;
 mod remote_poll;
 mod remote_sync;
 mod remote_term;

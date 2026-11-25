@@ -24,13 +24,13 @@
 
 ## 3. Restart detection and warnings
 
-- [ ] 3.1 Host sampler: per running remote sandbox, cadence and back-off per
+- [x] 3.1 Host sampler: per running remote sandbox, cadence and back-off per
       design; keeps `prev_sample` / `sample`; never probes a cold sandbox.
-- [ ] 3.2 On exec stream end without an exit status, run one probe; a
+- [x] 3.2 On exec stream end without an exit status, run one probe; a
       changed boot id replaces the message with `warning(...)` (with THE-2710).
-- [ ] 3.3 Notifications for restart, OOM kill and lifetime < 1 h (once per
+- [x] 3.3 Notifications for restart, OOM kill and lifetime < 1 h (once per
       event, through the notifications producer).
-- [ ] 3.4 Restart cause from provider facts: idle sleep (API status cold
+- [x] 3.4 Restart cause from provider facts: idle sleep (API status cold
       between samples), lifetime expiry, provider recycle.
 
 ## 4. Sidebar
@@ -50,7 +50,8 @@
 
 ## 7. Journal, logs, processes, cost
 
-- [ ] 7.1 `remote_events` state-DB table (schema bump) fed by provision
+- [ ] 7.1 `remote_events` state-DB table (schema bump, v118, landed with 3.1; the
+      sampler feeds `restart`, `oom_kill`, `lifetime`) fed by provision
       steps, exec sessions, sampler events, checkpoints, env up/down, pulls.
 - [ ] 7.2 Latest provisioning and job logs one key away from the row / popup.
 - [ ] 7.3 Top processes by CPU / memory and `thegn job` attempts in the

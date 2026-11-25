@@ -2736,6 +2736,42 @@ pub(crate) fn verify_v117_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v118: `remote_health` (the sampler's latest and previous probe reading per
+/// remote sandbox) and `remote_events` (bounded restart / OOM journal),
+/// OpenSpec `remote-sandbox-visibility` (THE-2712). New tables only: a pre-v118
+/// database simply has no readings yet.
+pub(crate) fn migrate_v118(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_health (
+           sandbox_key TEXT PRIMARY KEY,
+           sampled_at_ms INTEGER NOT NULL,
+           sample TEXT,
+           prev_sample TEXT,
+           provider_state TEXT
+         );
+         CREATE TABLE IF NOT EXISTS remote_events (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           sandbox_key TEXT NOT NULL,
+           at_ms INTEGER NOT NULL,
+           kind TEXT NOT NULL,
+           detail TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE INDEX IF NOT EXISTS idx_remote_events_key ON remote_events(sandbox_key, id);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v118_schema(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT sandbox_key, sampled_at_ms, sample, prev_sample, provider_state \
+         FROM remote_health LIMIT 0",
+    )
+    .map_err(|e| anyhow::anyhow!("schema v118 incomplete: remote_health unusable ({e})"))?;
+    conn.prepare("SELECT id, sandbox_key, at_ms, kind, detail FROM remote_events LIMIT 0")
+        .map_err(|e| anyhow::anyhow!("schema v118 incomplete: remote_events unusable ({e})"))?;
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -5229,6 +5265,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(states, 1);
+    }
+
+    #[test]
+    fn v118_adds_the_remote_health_tables_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v117.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE remote_health; DROP TABLE remote_events;
+                     PRAGMA user_version=117;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let conn = upgraded.conn();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        super::verify_v118_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO remote_events(sandbox_key, at_ms, kind) VALUES('e/s', 1, 'restart')",
+            [],
+        )
+        .unwrap();
+        super::migrate_v118(conn).unwrap(); // a second pass keeps rows
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM remote_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]

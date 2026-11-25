@@ -206,8 +206,13 @@ pub enum RestartCause {
         used_bytes: Option<u64>,
         limit_bytes: Option<u64>,
     },
-    /// Nothing in the previous sample explains it (idle sleep, provider
-    /// recycle and lifetime expiry need provider events; see the design).
+    /// The provider reported the sandbox cold between the two samples: it
+    /// slept on idle and woke on the next request (see [`refine`]).
+    IdleSleep,
+    /// The sandbox is at or past its configured `max_lifetime_secs`.
+    LifetimeExpired,
+    /// Nothing in the previous sample or the provider facts explains it
+    /// (provider recycle needs provider events; see the design).
     Unknown,
 }
 
@@ -305,6 +310,10 @@ pub fn warning(what: &str, event: &HealthEvent) -> String {
             RestartCause::LikelyOutOfMemory { .. } => {
                 format!("{what} restarted: likely out of memory")
             }
+            RestartCause::IdleSleep => format!("{what} restarted: it slept while idle"),
+            RestartCause::LifetimeExpired => {
+                format!("{what} restarted: it reached its maximum lifetime")
+            }
             RestartCause::Unknown => format!("{what} restarted (cause unknown)"),
         },
         HealthEvent::OomKilled { kills } => {
@@ -317,6 +326,79 @@ pub fn warning(what: &str, event: &HealthEvent) -> String {
                 .collect();
             format!("{what} out of memory: kernel killed {}", named.join(", "))
         }
+    }
+}
+
+/// Time left below which the lifetime-expiry warning fires (one hour).
+pub const LIFETIME_WARN_SECS: i64 = 3_600;
+
+/// The state-DB key of one remote sandbox: its env name and provider id.
+pub fn sandbox_key(env: &str, id: &str) -> String {
+    format!("{env}/{id}")
+}
+
+/// Provider-side facts that tell an unexplained restart apart (design: "Restart
+/// and OOM classification").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderFacts {
+    /// The provider API reported the sandbox cold, warm or stopped at some
+    /// point between the two samples.
+    pub cold_between_samples: bool,
+    /// Seconds since the provider created the sandbox.
+    pub age_secs: Option<u64>,
+    /// The env's configured `max_lifetime_secs` (0 = none).
+    pub max_lifetime_secs: u64,
+}
+
+/// Replace a restart's `Unknown` cause with what the provider facts show:
+/// lifetime expiry first, then idle sleep. A likely-OOM cause is kept (the
+/// previous sample is stronger evidence) and non-restart events pass through.
+pub fn refine(event: HealthEvent, facts: &ProviderFacts) -> HealthEvent {
+    let HealthEvent::Restarted {
+        cause: RestartCause::Unknown,
+        uptime_secs,
+    } = &event
+    else {
+        return event;
+    };
+    let expired = facts.max_lifetime_secs > 0
+        && facts
+            .age_secs
+            .is_some_and(|age| age >= facts.max_lifetime_secs);
+    let cause = if expired {
+        RestartCause::LifetimeExpired
+    } else if facts.cold_between_samples {
+        RestartCause::IdleSleep
+    } else {
+        return event;
+    };
+    HealthEvent::Restarted {
+        cause,
+        uptime_secs: *uptime_secs,
+    }
+}
+
+/// The warning for a sandbox whose lifetime is nearly or already used up
+/// (`left_secs` negative = overdue); `None` while at least
+/// [`LIFETIME_WARN_SECS`] remain.
+pub fn lifetime_warning(what: &str, left_secs: i64) -> Option<String> {
+    if left_secs >= LIFETIME_WARN_SECS {
+        None
+    } else if left_secs <= 0 {
+        Some(format!("{what} is past its maximum lifetime"))
+    } else {
+        Some(format!(
+            "{what} reaches its maximum lifetime in {}",
+            short_duration(left_secs as u64)
+        ))
+    }
+}
+
+/// The journal `kind` of an event (`restart` / `oom_kill`, per the design).
+pub fn event_kind(event: &HealthEvent) -> &'static str {
+    match event {
+        HealthEvent::Restarted { .. } => "restart",
+        HealthEvent::OomKilled { .. } => "oom_kill",
     }
 }
 
@@ -522,5 +604,84 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
         assert_eq!(short_duration(7 * 60 + 5), "7m");
         assert_eq!(short_duration(2 * 3600 + 5 * 60), "2h 5m");
         assert_eq!(short_duration(3 * 86_400 + 4 * 3600), "3d 4h");
+    }
+
+    #[test]
+    fn refine_names_the_restart_cause_from_provider_facts() {
+        let unknown = HealthEvent::Restarted {
+            cause: RestartCause::Unknown,
+            uptime_secs: Some(5),
+        };
+        let cause = |e: HealthEvent| match e {
+            HealthEvent::Restarted { cause, .. } => cause,
+            other => panic!("not a restart: {other:?}"),
+        };
+        let cold = ProviderFacts {
+            cold_between_samples: true,
+            ..ProviderFacts::default()
+        };
+        assert_eq!(
+            cause(refine(unknown.clone(), &cold)),
+            RestartCause::IdleSleep
+        );
+        let expired = ProviderFacts {
+            cold_between_samples: true,
+            age_secs: Some(7200),
+            max_lifetime_secs: 3600,
+        };
+        assert_eq!(
+            cause(refine(unknown.clone(), &expired)),
+            RestartCause::LifetimeExpired
+        );
+        let young = ProviderFacts {
+            age_secs: Some(60),
+            max_lifetime_secs: 3600,
+            ..ProviderFacts::default()
+        };
+        assert_eq!(
+            cause(refine(unknown.clone(), &young)),
+            RestartCause::Unknown
+        );
+        // A likely-OOM cause and a non-restart event are never rewritten.
+        let oom = HealthEvent::Restarted {
+            cause: RestartCause::LikelyOutOfMemory {
+                used_bytes: None,
+                limit_bytes: None,
+            },
+            uptime_secs: None,
+        };
+        assert_eq!(refine(oom.clone(), &expired), oom);
+        let kill = HealthEvent::OomKilled { kills: Vec::new() };
+        assert_eq!(refine(kill.clone(), &expired), kill);
+        assert_eq!(
+            warning("sprite", &refine(unknown, &cold)),
+            "sprite restarted: it slept while idle"
+        );
+    }
+
+    #[test]
+    fn lifetime_warning_table() {
+        assert_eq!(lifetime_warning("sprite", LIFETIME_WARN_SECS), None);
+        assert_eq!(
+            lifetime_warning("sprite", 1_500).as_deref(),
+            Some("sprite reaches its maximum lifetime in 25m")
+        );
+        assert_eq!(
+            lifetime_warning("sprite", 0).as_deref(),
+            Some("sprite is past its maximum lifetime")
+        );
+        assert_eq!(
+            lifetime_warning("sprite", -5).as_deref(),
+            Some("sprite is past its maximum lifetime")
+        );
+    }
+
+    #[test]
+    fn sandbox_key_and_event_kind() {
+        assert_eq!(sandbox_key("sx", "s-1"), "sx/s-1");
+        assert_eq!(
+            event_kind(&HealthEvent::OomKilled { kills: Vec::new() }),
+            "oom_kill"
+        );
     }
 }

@@ -152,6 +152,7 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
     }
     let selected = pick_sprites_env_named(id, &candidates, record_account.as_deref())
         .map_err(|error| anyhow!(error))?;
+    let env_name = candidates[selected].0.clone();
     let provider = providers
         .into_iter()
         .nth(selected)
@@ -161,13 +162,13 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
     ) {
-        let code = run_tty(&provider, id, argv)?;
+        let code = run_tty(&provider, &env_name, id, argv)?;
         std::process::exit(code);
     }
     // Current-thread: one network call does not need a worker per core.
     // See `agent::provider_runtime`.
     let rt = crate::agent::provider_runtime()?;
-    let code = rt.block_on(run_streaming(&provider, id, argv))?;
+    let code = rt.block_on(run_streaming(&provider, &env_name, id, argv))?;
     std::process::exit(code);
 }
 
@@ -286,6 +287,12 @@ pub(crate) fn lost_line(id: &str, cause: &str) -> String {
     format!(
         "thegn: sprite {id} exec stream lost ({cause}); the sprite may have suspended — the remote process did not survive"
     )
+}
+
+/// The line printed when a probe explained the lost stream: the specific
+/// warning replaces the bare "stream ended" cause.
+pub(crate) fn explained_lost_line(warning: &str) -> String {
+    format!("thegn: {warning}; the remote process did not survive")
 }
 
 /// A usable PTY size: termwiz can report 0×0 for a not-yet-sized pty.
@@ -506,6 +513,26 @@ pub(crate) fn coalesce_input(
 // decision above is pure and unit-tested; this only moves bytes.
 // ---------------------------------------------------------------------------
 
+/// The bare message of an exec stream that closed without an exit frame.
+const STREAM_ENDED: &str = "exec stream ended without an exit status";
+
+/// The PTY driver's own wording for the same condition (a prefix: it may be
+/// followed by a reattach reason).
+const STREAM_ENDED_PREFIX: &str = "stream ended without an exit status";
+
+/// The classified restart warning for a stream that ended without an exit
+/// status, when one fresh probe shows the sandbox rebooted (THE-2712).
+async fn explain_stream_end(provider: &Provider, env: &str, id: &str) -> Option<String> {
+    crate::remote_health_sampler::explain_lost_stream(
+        provider,
+        "sprites",
+        env,
+        id,
+        thegn_core::util::now_ms(),
+    )
+    .await
+}
+
 /// How one exec stream ended.
 enum StreamEnd {
     /// The remote process exited with this code.
@@ -542,7 +569,7 @@ impl Drop for TtyGuard {
 
 /// Stream a non-tty exec: stdout as it arrives (no cap), remote stderr to
 /// stderr at the end, a non-terminal stdin forwarded then half-closed.
-async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
+async fn run_streaming(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Result<i32> {
     let spec = ExecSpec {
         argv,
         tty: false,
@@ -601,7 +628,14 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
     let verdict_result = tokio::time::timeout(Duration::from_secs(3), verdict).await;
     let result = match verdict_result {
         Ok(Ok(Some(fault))) => Err(anyhow::Error::new(fault)),
-        _ => frame_result.map_err(anyhow::Error::msg),
+        _ => match frame_result {
+            Err(message) if message == STREAM_ENDED => Err(anyhow::Error::msg(
+                explain_stream_end(provider, env, id)
+                    .await
+                    .unwrap_or(message),
+            )),
+            other => other.map_err(anyhow::Error::msg),
+        },
     };
     let rendered = stderr.render();
     let total = stderr.total();
@@ -650,14 +684,14 @@ async fn stream_frames(
             }
         }
     }
-    Err("exec stream ended without an exit status".to_string())
+    Err(STREAM_ENDED.to_string())
 }
 
 /// Stream `argv` in sprite `id` over a PTY exec with the local tty in raw mode.
 /// Returns the code to exit with (the remote's, or [`EXIT_REMOTE_LOST`]); the
 /// tty is restored before this returns on every path. Subprocess/network seam
 /// (`cov_ignore`).
-fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
+fn run_tty(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Result<i32> {
     // Mouse + bracketed paste stay the REMOTE app's call: its own output sets
     // those modes on the outer terminal, so termwiz must not force them on.
     let hints = ProbeHints::new_from_env()
@@ -709,8 +743,17 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     match outcome {
         Ok(code) => Ok(code),
         Err(cause) => {
+            let warning = if cause.starts_with(STREAM_ENDED_PREFIX) {
+                rt.block_on(explain_stream_end(provider, env, id))
+            } else {
+                None
+            };
+            let line = match warning {
+                Some(warning) => explained_lost_line(&warning),
+                None => lost_line(id, &cause),
+            };
             let mut out = std::io::stdout();
-            let _ = writeln!(out, "{}", lost_line(id, &cause)); // best-effort: stdout write: the pane may already be gone
+            let _ = writeln!(out, "{line}"); // best-effort: stdout write: the pane may already be gone
             let _ = out.flush(); // best-effort: flush: display-only
             Ok(EXIT_REMOTE_LOST)
         }
@@ -747,7 +790,7 @@ async fn drive(
             StreamEnd::Dropped => {}
         }
         attempt = attempts_after_stream(attempt, started.elapsed());
-        let mut cause = "stream ended without an exit status".to_string();
+        let mut cause = STREAM_ENDED_PREFIX.to_string();
         session = loop {
             if !should_reattach(false, session_id.as_deref(), attempt) {
                 if session_id.is_none() {
@@ -923,9 +966,10 @@ fn tty_loop<T: Terminal>(
 mod tests {
     use super::{
         EXIT_REMOTE_LOST, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes, StreamEnd,
-        WAKE_NOTICE_AFTER, attempts_after_stream, coalesce_input, encode_input, hold_ceiling,
-        hold_task_from, lost_line, pick_sprites_env, pty_size, pump, reconnect_delays,
-        should_reattach, stream_frames, tty_env, tty_mode, with_slow_notice,
+        WAKE_NOTICE_AFTER, attempts_after_stream, coalesce_input, encode_input,
+        explained_lost_line, hold_ceiling, hold_task_from, lost_line, pick_sprites_env, pty_size,
+        pump, reconnect_delays, should_reattach, stream_frames, tty_env, tty_mode,
+        with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
@@ -958,6 +1002,16 @@ mod tests {
         assert_eq!(attempts_after_stream(3, REATTACH_BUDGET_RESET), 0);
         assert_eq!(attempts_after_stream(3, Duration::from_secs(5)), 3);
         assert_eq!(attempts_after_stream(0, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn explained_lost_line_carries_the_specific_warning() {
+        let line = explained_lost_line("sprite restarted: it slept while idle");
+        assert_eq!(
+            line,
+            "thegn: sprite restarted: it slept while idle; the remote process did not survive"
+        );
+        assert!(!line.contains("stream ended"));
     }
 
     #[test]
