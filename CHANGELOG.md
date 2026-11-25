@@ -7,6 +7,25 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.138] — 2026-11-25
+
+Cloud spend in the top bar now includes Sprites, and Lead can be set up from inside thegn.
+
+### Added
+
+- Lead can be set up from inside the app, and is available on the stable channel as a preview.
+- A clean-install release smoke test checks that a fresh install starts without leftover state.
+
+### Changed
+
+- Sprites are priced from the account's usage, and sprites this host did not create count toward spend.
+- A pending database migration is announced at most once a day.
+- `thegn env up` with the warm pool off still claims a ready spare when its lock is fresh.
+
+### Fixed
+
+- Sprite errors name the real sprite rather than an internal handle.
+
 ## [0.1.0-alpha.137] — 2026-11-25
 
 Remote environments report their health, Sprite and Vercel jobs survive dropped
