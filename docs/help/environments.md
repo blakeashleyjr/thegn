@@ -449,7 +449,9 @@ Vercel environments; the Fly and machine0 parts need the dev channel
   with `created_at` set to now, so lifetime counts from adoption. It refuses a
   record owned by another controller, account or provider, refuses when
   `max_instances` is reached, and says "already recorded" if the sprite is
-  already yours. It never touches the sprite itself.
+  already yours. It never touches the sprite itself. Stable and dev instances
+  keep separate ledgers, so a sprite one made is refused by the other; the
+  refusal names this command, so run it from the instance that needs the sprite.
 - **Daily loop.** `thegn agent run --wait --pull` runs the agent, pulls the
   commits back and, on a Fly or machine0 env that bills while started,
   stops the machine and prints `stopped <name> (it bills while started)`.

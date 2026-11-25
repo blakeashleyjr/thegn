@@ -273,7 +273,7 @@ pub fn prove_owned_at(
             "sprites: {name} is recorded by another controller/account; refusing to treat it as ours"
         ),
         None => bail!(
-            "sprites: thegn has no record of creating {name}; refusing to delete it. Delete it in the Sprites dashboard if it is yours."
+            "sprites: thegn has no record of creating {name}; refusing to delete it (it may belong to another thegn instance, e.g. stable vs dev). If it is yours: thegn env adopt {name} --env <env>"
         ),
     }
 }
@@ -559,7 +559,7 @@ mod tests {
         let error = prove_owned_at(dir.path(), &scope(), "sx-none", &[]).unwrap_err();
         assert_eq!(
             format!("{error:#}"),
-            "sprites: thegn has no record of creating sx-none; refusing to delete it. Delete it in the Sprites dashboard if it is yours."
+            "sprites: thegn has no record of creating sx-none; refusing to delete it (it may belong to another thegn instance, e.g. stable vs dev). If it is yours: thegn env adopt sx-none --env <env>"
         );
         assert!(
             registry::read_checked_at(dir.path(), "sx-none")
