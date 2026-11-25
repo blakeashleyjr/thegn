@@ -225,6 +225,7 @@ All A/B or machine-dependent; none are in CI. They refuse a stale or debug binar
 | `bench-micro`       | `*args` | Criterion micro-benchmarks across the workspace.                | Mac   | OK     |
 | `bench-micro-svc`   | `*args` | Git hot-path benches (`thegn-svc --bench git_hot`).             | Mac   | OK     |
 | `perf`              |         | Umbrella: `bench`, `bench-idle`, `bench-micro`.                 | Mac   | OK     |
+| `perf-compare`      | `*args` | thegn vs tmux vs zellij: startup, cat/yes, idle CPU + RSS.      | Mac   | OK     |
 | `perf-flood`        | `*args` | Switch/input latency under an output flood.                     | Mac   | OK     |
 | `perf-t3`           | `*args` | Workspace-switch latency.                                       | Mac   | OK     |
 | `perf-selftest`     |         | Perf harness internals check; part of `lint`.                   | light | OK     |
