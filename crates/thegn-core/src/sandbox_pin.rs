@@ -84,11 +84,12 @@ pub const fn explain(profile: SandboxProfile) -> ProfileExplain {
             title: "Standard",
             one_liner: "Accident guard, not a hostile-agent boundary.",
             hides: &[
-                "Files outside the worktree are read-only.",
-                "Home stays readable, including credentials, ~/.ssh and cloud tokens.",
+                "Files outside the worktree are read-only; agent settings stay read-only.",
+                "Hides ~/.ssh keys, cloud CLI logins, token files and repos beside this one.",
+                "Does not stop a hostile agent: the rest of home is readable and the network is open.",
             ],
             network: "Network and VPN attachments work.",
-            credentials: "Credentials in your read-only home remain visible.",
+            credentials: "Well-known credential files are hidden; the SSH agent and the agent's own login stay usable.",
             agents: "Local, SSH and provider work; default capabilities remain.",
             extra: &[
                 "Root is read-only; new privileges blocked (not on Apple container); a 512-process limit on podman, docker and systemd only.",

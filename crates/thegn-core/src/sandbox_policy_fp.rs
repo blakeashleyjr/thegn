@@ -168,6 +168,11 @@ pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
             "false"
         },
     );
+    // THE-2695: the masks `standard` lays over its read-only `$HOME`. Encoded
+    // only when present, so specs without them keep their v2 identity.
+    for value in sorted_values(spec.hidden_paths.iter().map(String::as_str)) {
+        field(&mut encoded, "hidden_path", value);
+    }
     // FileAccess has no stable label method yet; its Debug form is the enum's
     // explicit variant name and is covered by the v1 bump rule above.
     field(
@@ -383,6 +388,19 @@ mod tests {
         assert_ne!(
             policy_fingerprint(&original, false),
             policy_fingerprint(&original, true)
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_on_hidden_paths() {
+        let original = spec();
+        let hidden = SandboxSpec {
+            hidden_paths: vec!["/home/test/.aws".into()],
+            ..original.clone()
+        };
+        assert_ne!(
+            policy_fingerprint(&original, false),
+            policy_fingerprint(&hidden, false)
         );
     }
 

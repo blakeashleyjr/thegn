@@ -580,15 +580,18 @@ fn compose_inner(
                 if let Some(dir) = account::effective_config_dir(p) {
                     // No thegn-managed account, but the agent still writes runtime
                     // state (session-env, todos, shell snapshots) into its inherited
-                    // config dir. Under a read-only $HOME that fails EROFS, so carve it
-                    // read-write path-preserving — parity with the managed path above.
-                    fold_cred_dir(
-                        p.home_env,
-                        &dir,
-                        &mut overrides,
-                        &mut mounts,
-                        &mut ensure_dirs,
-                    );
+                    // config dir. Under a read-only $HOME that fails EROFS, so carve
+                    // that state read-write path-preserving. THE-2695: only the
+                    // runtime state; the user's settings, hooks and plugins in the
+                    // inherited dir stay read-only.
+                    overrides.insert(p.home_env.to_string(), dir.clone());
+                    for path in crate::sandbox_mounts::agent_runtime_state_paths(
+                        p.id,
+                        p.auth_marker,
+                        std::path::Path::new(&dir),
+                    ) {
+                        push_mount(&mut mounts, &path.to_string_lossy());
+                    }
                 }
             }
             Err(error) => {
@@ -1572,11 +1575,14 @@ mod tests {
             drawer_cwd: None,
         });
         // No `[[accounts]]` for claude and no active pointer: thegn doesn't
-        // manage it. The agent's inherited config dir (existing on disk) must
-        // still be folded read-write so it can write session-env etc. under a
-        // read-only $HOME.
+        // manage it. The agent's runtime state in its inherited config dir
+        // (existing on disk) must still be folded read-write so it can write
+        // session-env etc. under a read-only $HOME; its settings must not.
         let dir = std::env::temp_dir().join(format!("tg-unmanaged-cfg-{}", crate::util::now()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("todos")).unwrap();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+        std::fs::write(dir.join(".credentials.json"), b"{}").unwrap();
         let dir_s = dir.to_string_lossy().into_owned();
         let r = {
             let _env = crate::testenv::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir_s.as_str())]);
@@ -1585,11 +1591,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
 
         assert_eq!(get(&r.overrides, "CLAUDE_CONFIG_DIR"), Some(dir_s.as_str()));
+        let rw = |name: &str| {
+            let path = dir.join(name).to_string_lossy().into_owned();
+            r.mounts.iter().any(|m| m.dest == path && !m.ro)
+        };
+        assert!(rw("todos"), "runtime state must be a read-write overmount");
         assert!(
-            r.mounts.iter().any(|m| m.dest == dir_s && !m.ro),
-            "config dir must be a read-write path-preserving overmount"
+            rw(".credentials.json"),
+            "the login file is refreshed in place"
         );
-        assert!(r.ensure_dirs.contains(&dir_s));
+        assert!(!rw("settings.json"), "settings stay read-only");
+        assert!(!rw("hooks"), "hooks stay read-only");
+        assert!(
+            !r.mounts.iter().any(|m| m.dest == dir_s),
+            "the whole config dir is never carved"
+        );
     }
 
     #[test]

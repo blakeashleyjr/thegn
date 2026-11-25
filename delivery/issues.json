@@ -730,6 +730,13 @@
       "changes": [
         "fix-relaunch-duplicate-panes"
       ]
+    },
+    {
+      "issue": "THE-2695",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "hide-credentials-in-standard-sandbox"
+      ]
     }
   ]
 }

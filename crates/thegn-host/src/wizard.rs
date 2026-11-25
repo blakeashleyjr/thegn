@@ -763,7 +763,8 @@ impl NewWorktreeWizard {
             } else {
                 vec![
                     explanation.one_liner,
-                    "Home stays readable, including credentials, ~/.ssh and cloud tokens.",
+                    "Hides ~/.ssh keys, cloud CLI logins, token files and repos beside this one.",
+                    "The rest of home stays readable; files outside the worktree are read-only.",
                     explanation.network,
                     "SSH/provider envs and run-on-host work.",
                 ]
