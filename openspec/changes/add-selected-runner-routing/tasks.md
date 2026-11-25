@@ -39,7 +39,9 @@
       name a sprites or vercel env) and the recursion guard (the launchers set
       `THEGN_SELECTED_JOB=1` in the recipe environment; `job run` refuses when
       it is set).
-- [ ] 3.3 Argv, cwd, stdio and per-step deadline forwarding.
+- [x] 3.3 Argv, cwd, stdio and per-step deadline forwarding: argv/cwd forwarded only for
+      closed recipes by design (owner may revisit); the closed `Recipe` enum avoids an
+      injection surface.
 
 ## 4. Sprites executor (THE-2417)
 
@@ -56,12 +58,15 @@
       owned-tree kill as the deadline, records `Cancelled` (distinct from
       `TimedOut`), fences outputs, releases the hold and marks cleanup `Done` on
       a confirmed kill or `Pending` otherwise.
-- [ ] 4.5 Pending-row reconciler: scan the ledger for unsettled attempts,
+- [x] 4.5 Pending-row reconciler: scan the ledger for unsettled attempts,
       re-issue the kill for the recorded control file and hold, and mark cleanup
       `Done` only on confirmation. It never dispatches, so a command with an
       unknown dispatch outcome is never rerun as an implicit recovery.
-- [ ] 4.6 Reattach by session handle: follow the stream while the provider still
-      holds it, otherwise reconcile to `Indeterminate`; never redispatch.
+      Sprites: `sprites/job.rs` `reconcile_pending_at`; Vercel: `vercel/job.rs`
+      `reconcile_pending_at`.
+- [x] 4.6 Reattach by session handle: follow the stream while the provider still
+      holds it, otherwise reconcile to `Indeterminate`; never redispatch. (`sprites/job.rs` `reattach`, scheduled by
+      `selected_runner.rs` `reattach_orphans`.)
 - [ ] 4.9 Route wiring: `submit` (the `SelectedRunner` trait) takes a
       `CancelToken` so a user cancel before or during dispatch reaches the
       runner and reads back as `Cancelled` on the route (today a pre-dispatch
@@ -98,6 +103,8 @@
       `cargo nextest run -p thegn-svc --test sprites_job` on the Mac builder.
 - [ ] 4.8 Not in this slice: the credential broker and a budgeted live run. The
       CLI verb landed with task 3.1; it has not yet run against a real provider.
-- [ ] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
+- [x] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
       `Cleaned`/`StillPending`, never `ReconcileOutcome::Superseded` (Sprites reports it);
       only the logged `settled` count is affected.
+      Done: `settle` reports a compare-and-swap loss and `reconcile_pending_at` maps it to
+      `Superseded`.
