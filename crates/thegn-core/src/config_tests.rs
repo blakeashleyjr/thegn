@@ -3446,18 +3446,22 @@ fn validate_str_catches_wholesale_type_error() {
 fn clamp_to_channel_keeps_lead_set_up_in_app_as_preview() {
     use crate::channel::{Channel, Feature};
 
-    let mut cfg = Config::default();
-    cfg.lead = Some(crate::config_lead::LeadConfig {
-        agent: "claude".into(),
-        preview: true,
-        ..Default::default()
-    });
+    let mut cfg = Config {
+        lead: Some(crate::config_lead::LeadConfig {
+            agent: "claude".into(),
+            preview: true,
+            ..Default::default()
+        }),
+        ..Config::default()
+    };
     let clamped = cfg.clamp_to_channel(Channel::Stable);
     assert!(cfg.lead.is_some());
     assert!(!clamped.contains(&Feature::Lead));
 
-    let mut plain = Config::default();
-    plain.lead = Some(crate::config_lead::LeadConfig::default());
+    let mut plain = Config {
+        lead: Some(crate::config_lead::LeadConfig::default()),
+        ..Config::default()
+    };
     assert!(
         plain
             .clamp_to_channel(Channel::Stable)

@@ -521,7 +521,10 @@ pub(crate) fn spawn_job(
             .send(crate::hydrate::RefreshKind::LeadSetup(Box::new(done)))
             .is_ok()
         {
-            let _ = waker.wake(); // best-effort: waker pulse
+            if let Err(error) = waker.wake() {
+                // Best-effort: the loop also wakes on its own ticker.
+                tracing::debug!(target: "thegn::lead", %error, "lead setup: waker pulse failed");
+            }
         }
     });
 }

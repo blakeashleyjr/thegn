@@ -8902,13 +8902,11 @@ async fn event_loop<T: Terminal>(
                 &pending_db_tx,
                 &waker,
             ) {
-                crate::lead::group::JumpOutcome::Handled => {}
                 crate::lead::group::JumpOutcome::Setup => {
                     // Not configured or not ready: the guided in-app setup.
                     active_menu = Some(crate::lead::setup::begin(&crate::lead::setup::RealHost {
                         cfg: keymap.config(),
                     }));
-                    dirty = true;
                 }
                 crate::lead::group::JumpOutcome::Activate(t) => {
                     let (hydrate, _pending) = activate_row!(t);

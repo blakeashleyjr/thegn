@@ -114,8 +114,6 @@ pub(crate) fn is_setup_target(target: &RowTarget, cfg: &thegn_core::config::Conf
 
 /// Result of [`jump`] for the caller.
 pub(crate) enum JumpOutcome {
-    /// Nothing more to do.
-    Handled,
     /// The Lead is not set up (or not ready): open the in-app setup flow.
     Setup,
     /// Activate this row target.
