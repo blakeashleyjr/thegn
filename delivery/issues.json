@@ -744,6 +744,13 @@
       "changes": [
         "hide-credentials-in-standard-sandbox"
       ]
+    },
+    {
+      "issue": "THE-2712",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "remote-sandbox-visibility"
+      ]
     }
   ]
 }

@@ -73,7 +73,8 @@ pub enum Action {
         json: bool,
     },
     /// One sprite's status, URL auth and (with --policy) memory policy, read
-    /// from the Sprites API without exec (`--policy` may wake a cold sprite).
+    /// from the Sprites API without exec (`--policy` may wake a cold sprite;
+    /// `--probe` runs one health exec inside it).
     Inspect(super::fleet_inspect::InspectArgs),
 }
 
