@@ -8,6 +8,7 @@ pub(crate) mod group;
 pub(crate) mod launch;
 pub(crate) mod login;
 pub(crate) mod mcp;
+pub(crate) mod setup;
 pub(crate) mod skill;
 pub(crate) mod status;
 pub(crate) mod wake;

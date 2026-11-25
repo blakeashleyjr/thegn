@@ -8897,12 +8897,18 @@ async fn event_loop<T: Terminal>(
                 keymap.config(),
                 &mut session,
                 &mut panes,
-                &mut model.status,
                 &model.sidebar_db_terminals,
                 &pending_db_tx,
                 &waker,
             ) {
                 crate::lead::group::JumpOutcome::Handled => {}
+                crate::lead::group::JumpOutcome::Setup => {
+                    // Not configured or not ready: the guided in-app setup.
+                    active_menu = Some(crate::lead::setup::begin(&crate::lead::setup::RealHost {
+                        cfg: keymap.config(),
+                    }));
+                    dirty = true;
+                }
                 crate::lead::group::JumpOutcome::Activate(t) => {
                     let (hydrate, _pending) = activate_row!(t);
                     sb.focus_active_row(&mut model);
@@ -21306,6 +21312,41 @@ async fn event_loop<T: Terminal>(
                                     crate::handlers::onboarding::apply_wire_offer(tag, arg)
                             {
                                 model.status = status;
+                                dirty = true;
+                                continue;
+                            }
+                            // The guided Lead setup (Alt i): one row per step.
+                            if let menu::MenuChoice::Confirm { tag, arg } = &choice
+                                && *tag == crate::lead::setup::TAG
+                            {
+                                let applied = crate::lead::setup::apply(
+                                    &mut crate::lead::setup::RealHost {
+                                        cfg: keymap.config(),
+                                    },
+                                    arg,
+                                );
+                                if let Some(status) = applied.status {
+                                    model.status = status;
+                                }
+                                if let Some(next) = applied.menu {
+                                    active_menu = Some(next);
+                                }
+                                if let Some(argv) = applied.tab
+                                    && crate::actions::open_argv_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &argv,
+                                        None,
+                                        chrome.center,
+                                    )
+                                {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                                if applied.open_lead {
+                                    jump_lead!();
+                                }
                                 dirty = true;
                                 continue;
                             }

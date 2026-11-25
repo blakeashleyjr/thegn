@@ -1277,6 +1277,19 @@
       "archive_path": "openspec/changes/archive/2026-09-30-isolate-maintenance-regression-fixtures/"
     },
     {
+      "change": "lead-in-app-setup",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2725",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Guided in-app Lead setup: agent, prerequisites, config, daemon restart, login, doctor, open, reset.",
+      "delivered_at": "2026-11-25"
+    },
+    {
       "change": "make-sidebar-mode-visible",
       "lifecycle": "archived",
       "archive_path": "openspec/changes/archive/2026-10-22-make-sidebar-mode-visible/",
