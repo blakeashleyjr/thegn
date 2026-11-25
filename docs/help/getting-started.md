@@ -22,7 +22,10 @@ project, worktree, and pane position.
 4. If `Alt` chords do nothing, check your terminal setup; on macOS, configure
    Option as Alt. See [[terminal-compatibility]].
 5. Press `Alt-W` to open or clone a repository, then `Alt-w` to create a
-   worktree and choose what to run.
+   worktree and choose what to run. The program list shows only the coding
+   agents found on your `PATH` (or with a config directory in `$HOME`), tools,
+   and a shell. If none is found it shows an install hint; install one such as
+   `claude` or `codex`, run it once to log in, and reopen `Alt-w`.
 6. Press `Ctrl-Space` to open the [[command-palette]], or `F1` for help.
 7. Run `thegn config edit` when you want to change a default.
 

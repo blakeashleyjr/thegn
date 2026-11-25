@@ -1694,6 +1694,29 @@ fn choices_lists_agents_then_tools_then_shell() {
 }
 
 #[test]
+fn picker_keeps_only_detected_known_agents_and_custom_entries() {
+    let cfg = cfg_with(
+        &[
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("mine", "my-agent --x"),
+        ],
+        &[("lazygit", "lazygit")],
+    );
+    let kept = filter_undetected_agents(&cfg, choices(&cfg), &["claude".to_string()]);
+    assert_eq!(kept, vec!["claude", "mine", "lazygit", "shell"]);
+    assert!(!has_no_agent(&cfg, &kept));
+}
+
+#[test]
+fn picker_with_no_detected_agent_reports_the_empty_state() {
+    let cfg = cfg_with(&[("claude", "claude"), ("shell", "__shell__")], &[]);
+    let kept = filter_undetected_agents(&cfg, choices(&cfg), &[]);
+    assert_eq!(kept, vec!["shell"]);
+    assert!(has_no_agent(&cfg, &kept));
+}
+
+#[test]
 fn choices_does_not_duplicate_an_explicit_shell() {
     let cfg = cfg_with(&[], &[("shell", "bash")]);
     assert_eq!(choices(&cfg), vec!["shell"]);
