@@ -113,6 +113,9 @@ pub(crate) fn startup(
     let wizard = requested.then(|| OnboardingWizard::new(cfg));
     let tour = (first_run && !requested).then(|| WelcomeTour::new(cfg));
     let mut rebuild = false;
+    if !first_run && !requested && active_menu.is_none() {
+        *active_menu = existing_user_wire_offer(db, cfg);
+    }
     if cfg.keymap_preset.is_empty() || cfg.keymap_preset == "default" {
         match remembered_preset {
             Some(remembered) if remembered != "default" => {
@@ -135,6 +138,66 @@ pub(crate) fn startup(
         },
         rebuild,
     )
+}
+
+/// `ui_state` key recording that the existing-user wiring offer was shown.
+const WIRE_OFFER_KEY: &str = "agent_wire_offer";
+/// The confirm tag of the wiring offer (arg: comma-joined agent kinds).
+pub(crate) const WIRE_OFFER_TAG: &str = "agent-wire";
+
+/// The one-time offer to an existing user (the tour is already done) whose
+/// detected agents are not wired for thegn. Marks itself shown before it
+/// returns, so it appears once whatever the answer; nothing is written until
+/// the user confirms. `None` when already offered, no DB, or nothing to offer.
+fn existing_user_wire_offer(
+    db: Option<&thegn_core::db::Db>,
+    cfg: &Config,
+) -> Option<crate::menu::MenuOverlay> {
+    let db = db?;
+    if !matches!(db.get_ui_state("", WIRE_OFFER_KEY), Ok(None)) {
+        return None;
+    }
+    let kinds = crate::cmd::mcp_proxy_cmd::unwired_detected_agents(cfg);
+    let menu = wire_offer_menu(&kinds)?;
+    if db.set_ui_state("", WIRE_OFFER_KEY, "1").is_err() {
+        return None; // cannot remember it: never nag on every launch
+    }
+    Some(menu)
+}
+
+/// The confirm menu for wiring `kinds`; `None` for an empty list.
+fn wire_offer_menu(kinds: &[String]) -> Option<crate::menu::MenuOverlay> {
+    if kinds.is_empty() {
+        return None;
+    }
+    Some(crate::menu::confirm_menu(
+        "Set up your agents for thegn?",
+        format!(
+            "{} {} detected but not wired. Writes marked MCP entries and lifecycle hooks to \
+             their settings; undo any time with `thegn mcp wire --remove`. Asked once.",
+            kinds.join(" + "),
+            if kinds.len() == 1 { "is" } else { "are" }
+        ),
+        WIRE_OFFER_TAG,
+        kinds.join(","),
+        false,
+    ))
+}
+
+/// Run a confirmed wiring offer; `None` when `tag` is not the offer's.
+pub(crate) fn apply_wire_offer(tag: &str, arg: &str) -> Option<String> {
+    if tag != WIRE_OFFER_TAG {
+        return None;
+    }
+    let kinds: Vec<String> = arg
+        .split(',')
+        .filter(|k| !k.is_empty())
+        .map(String::from)
+        .collect();
+    Some(match crate::cmd::mcp_proxy_cmd::wire_kinds(&kinds) {
+        Ok(lines) => format!("agents wired for thegn ({} writes)", lines.len()),
+        Err(e) => format!("agent wiring failed: {e}"),
+    })
 }
 
 /// Read startup markers from the already-open handle. A missing DB or a failed
@@ -367,6 +430,9 @@ fn save_tour_writes(
                     command,
                     keep,
                 } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
+                WriteOp::WireAgents { kinds } => {
+                    crate::cmd::mcp_proxy_cmd::wire_kinds(&kinds).map(|_| ())
+                }
                 other => Err(anyhow::anyhow!("the welcome tour cannot write {other:?}")),
             };
             if let Err(e) = r {
@@ -508,6 +574,9 @@ fn run_effects(
                 command,
                 keep,
             } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
+            WriteOp::WireAgents { kinds } => {
+                crate::cmd::mcp_proxy_cmd::wire_kinds(&kinds).map(|_| ())
+            }
         };
         match r {
             Ok(()) => wrote += 1,
@@ -671,13 +740,16 @@ fn probe_forge() -> ForgeStatus {
 /// harness, so off the loop.
 fn probe_agents() -> Vec<AgentInfo> {
     // off-loop: inside spawn_blocking
+    let unwired = crate::cmd::mcp_proxy_cmd::unwired_detected_agents(&Config::default());
     thegn_core::harness::HARNESSES
         .iter()
         .map(|h| {
             let command = h.interactive_command().to_string();
             let program = command.split_whitespace().next().unwrap_or("").to_string();
+            let id = h.id().to_string();
             AgentInfo {
-                id: h.id().to_string(),
+                unwired: unwired.contains(&id),
+                id,
                 name: h.display_name().to_string(),
                 path: thegn_core::util::which_path(&program),
                 command,
@@ -756,6 +828,23 @@ mod tests {
         let empty = thegn_core::db::Db::open_memory().unwrap();
         assert_eq!(startup_db_state(Some(&empty)), (true, None));
         assert_eq!(startup_db_state(None), (false, None));
+    }
+
+    #[test]
+    fn wire_offer_is_one_time_and_only_for_something_to_offer() {
+        assert!(wire_offer_menu(&[]).is_none());
+        let menu = wire_offer_menu(&["claude".to_string(), "codex".to_string()]).unwrap();
+        assert!(matches!(
+            menu.items().first().map(|i| &i.choice),
+            Some(crate::menu::MenuChoice::Confirm { tag: WIRE_OFFER_TAG, arg })
+                if arg == "claude,codex"
+        ));
+        assert_eq!(apply_wire_offer("other", "claude"), None);
+        // Already offered, or no DB: never offered again.
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state("", WIRE_OFFER_KEY, "1").unwrap();
+        assert!(existing_user_wire_offer(Some(&db), &Config::default()).is_none());
+        assert!(existing_user_wire_offer(None, &Config::default()).is_none());
     }
 
     /// THE-2610: the tour is the first-run default, and skipping it (Esc / the

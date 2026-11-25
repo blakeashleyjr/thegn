@@ -749,6 +749,15 @@
       "summary": "Admit only bounded complete clipboard sets with generation-fenced pending ownership."
     },
     {
+      "change": "agent-integrations-out-of-box",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-11-25",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2714 (Public launch: Monday 2026-11-30) owns this change, but that project is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "Coding agents get thegn's everyday skill and both MCP entries (proxy and serve, Codex TOML included) from one wire command; lifecycle hooks (host and remote sandboxes), Hermes (YAML adapter, registry harness), remote-environment wiring and a one-time offer to existing users are in."
+    },
+    {
       "change": "atomic-fold-outcomes",
       "archive_path": "openspec/changes/archive/2026-10-19-atomic-fold-outcomes/",
       "lifecycle": "archived",

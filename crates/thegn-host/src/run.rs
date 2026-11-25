@@ -21283,6 +21283,15 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            // The one-time wiring offer for an existing user.
+                            if let menu::MenuChoice::Confirm { tag, arg } = &choice
+                                && let Some(status) =
+                                    crate::handlers::onboarding::apply_wire_offer(tag, arg)
+                            {
+                                model.status = status;
+                                dirty = true;
+                                continue;
+                            }
                             // The fleet popup's confirmed stop/destroy: run
                             // `thegn env down [--stop] --worktree=<wt>` in a
                             // visible tab, so the CLI's pull-back, refusals and

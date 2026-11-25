@@ -35,12 +35,18 @@ selectors agree:
   (at least one pipeline stage is configured).
 - `when` contains the current phase: `create`, `startup`, or `explicit`.
 
-The shipped registry contains `lead`, `mq`, `pipeline`, and `supervise`; gates:
-lead `always`, mq `merge_queue`, pipeline `pipeline`, supervise `always`. `lead`
-seeds only on explicit seeding and into the Lead's notes dir. `lead` is the operating
-notes for the Lead tab (tools: `overview_get`, `dispatches_put`, `sessions_open`,
-`approvals_request`, `merge_drain`, `automations_put`). Use `[skills].exclude` to
-withhold a name from every harness.
+The shipped registry contains `lead`, `mq`, `pipeline`, `supervise`, and
+`thegn`; gates: lead `always`, mq `merge_queue`, pipeline `pipeline`, supervise
+`always`, thegn `always`. `lead` seeds only on explicit seeding and into the
+Lead's notes dir. `lead` is the operating notes for the Lead tab (tools:
+`overview_get`, `dispatches_put`, `sessions_open`, `approvals_request`,
+`merge_drain`, `automations_put`). `thegn` is the everyday guide every agent
+gets: where it is (`thegn info`, `thegn env show`), how builds and tests reach
+the project's runner (`thegn job route`), how to land or queue a branch, how
+to ask for attention (`thegn notify push`), how to start a helper agent
+(`thegn agent run`), and what the sandbox will refuse. See [[agent-integrations]]
+for everything each agent gets. Use `[skills].exclude` to withhold a name from
+every harness.
 
 ## Writing a package
 

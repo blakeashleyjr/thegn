@@ -162,7 +162,7 @@ mod tests {
     fn embedded_list_metadata_is_deterministic() {
         let loaded = crate::skill_seed::load_registry(&Config::default());
         let names: Vec<&str> = loaded.registry.iter().map(|(name, _)| name).collect();
-        assert_eq!(names, ["lead", "mq", "pipeline", "supervise"]);
+        assert_eq!(names, ["lead", "mq", "pipeline", "supervise", "thegn"]);
         assert!(loaded.diagnostics.is_empty());
     }
 }
