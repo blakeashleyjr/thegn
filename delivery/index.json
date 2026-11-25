@@ -1203,6 +1203,18 @@
       "summary": "Sprites model_credentials grant, destroy proof, exec deadline, close snapshot and literal search default; live checks open."
     },
     {
+      "change": "hide-zero-fleet-meter",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2705",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The top-right fleet $/h meter hides while its burn is zero; [bars] fleet_always_show keeps it; render tests at several widths."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

@@ -4075,29 +4075,31 @@ fn fleet_widget_text_and_tone() {
     // No snapshot: absent (the default-listed id takes no columns).
     assert!(masthead_widget("fleet", &FrameModel::default()).is_none());
     // Nothing listed, nothing burning: absent.
-    assert_eq!(fleet_widget(&fleet_snap(0, 0.0, 0, 0)), None);
+    assert_eq!(fleet_widget(&fleet_snap(0, 0.0, 0, 0), true), None);
     // Burn, two decimals, quiet tone.
     assert_eq!(
-        fleet_widget(&fleet_snap(2, 0.456, 0, 0)),
+        fleet_widget(&fleet_snap(2, 0.456, 0, 0), false),
         Some(("$0.46/h".to_string(), false))
     );
-    // Listed but all stopped still shows the (zero) burn.
+    // Listed but all stopped: a zero burn is hidden by default, and shown
+    // once `[bars] fleet_always_show` is on.
+    assert_eq!(fleet_widget(&fleet_snap(1, 0.0, 0, 0), false), None);
     assert_eq!(
-        fleet_widget(&fleet_snap(1, 0.0, 0, 0)),
+        fleet_widget(&fleet_snap(1, 0.0, 0, 0), true),
         Some(("$0.00/h".to_string(), false))
     );
     // Sub-cent floor.
     assert_eq!(
-        fleet_widget(&fleet_snap(1, 0.004, 0, 0)).map(|(t, _)| t),
+        fleet_widget(&fleet_snap(1, 0.004, 0, 0), false).map(|(t, _)| t),
         Some("<$0.01/h".to_string())
     );
     // Unpriced rows are counted after the burn.
     assert_eq!(
-        fleet_widget(&fleet_snap(3, 1.0, 2, 0)).map(|(t, _)| t),
+        fleet_widget(&fleet_snap(3, 1.0, 2, 0), false).map(|(t, _)| t),
         Some("$1.00/h +2".to_string())
     );
     // An orphan warns: amber tone plus the warn mark.
-    let (text, warn) = fleet_widget(&fleet_snap(1, 0.5, 0, 1)).unwrap();
+    let (text, warn) = fleet_widget(&fleet_snap(1, 0.5, 0, 1), false).unwrap();
     assert!(warn);
     assert!(text.starts_with("$0.50/h "), "{text}");
     assert!(text.ends_with(crate::caps::active_glyphs().warn), "{text}");
@@ -4112,10 +4114,13 @@ fn fleet_widget_text_and_tone() {
             env: "e".into(),
             id: "tg-gone".into(),
         });
-    assert_eq!(fleet_widget(&missing).map(|(_, w)| w), Some(true));
+    assert_eq!(fleet_widget(&missing, false).map(|(_, w)| w), Some(true));
     // A budget breach warns; the text is unchanged apart from the warn mark.
     let mut over = fleet_snap(2, 3.2, 0, 0);
-    assert_eq!(fleet_widget(&over), Some(("$3.20/h".to_string(), false)));
+    assert_eq!(
+        fleet_widget(&over, false),
+        Some(("$3.20/h".to_string(), false))
+    );
     over.cost
         .budget
         .push(thegn_core::placement::fleet_cost::BudgetBreach {
@@ -4125,7 +4130,7 @@ fn fleet_widget_text_and_tone() {
             limit: 3.0,
         });
     assert_eq!(
-        fleet_widget(&over),
+        fleet_widget(&over, false),
         Some((
             format!("$3.20/h {}", crate::caps::active_glyphs().warn),
             true
@@ -4158,7 +4163,44 @@ fn fleet_widget_not_amber_for_down_and_unrecorded_only() {
             env: "e".into(),
             id: "tg-down".into(),
         });
-    assert_eq!(fleet_widget(&snap), Some(("$0.00/h".to_string(), false)));
+    assert_eq!(
+        fleet_widget(&snap, true),
+        Some(("$0.00/h".to_string(), false))
+    );
+    assert_eq!(fleet_widget(&snap, false), None);
+}
+
+#[test]
+fn fleet_zero_burn_render_hidden_at_each_width_unless_always_show() {
+    // Listed VMs, all stopped: the zero `$/h` meter is absent from the masthead
+    // at every width by default, and comes back with `fleet_always_show`.
+    let render = |always_show: bool, cols: usize| {
+        let chrome = layout::compute(cols, 10, false, false);
+        let model = FrameModel {
+            fleet: Some(std::sync::Arc::new(fleet_snap(1, 0.0, 0, 0))),
+            stats: thegn_metrics::StatsSnapshot {
+                cpu_pct: Some(12),
+                ..Default::default()
+            },
+            bars: thegn_core::config::BarsConfig {
+                top_right: vec!["cpu".into(), "fleet".into(), "clock".into()],
+                fleet_always_show: always_show,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut s = Surface::new(cols, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        lines(&s)[0].clone()
+    };
+    for cols in [200usize, 120, 80, 60] {
+        let hidden = render(false, cols);
+        assert!(!hidden.contains("$0.00/h"), "{cols} cols: {hidden:?}");
+    }
+    for cols in [200usize, 120] {
+        let shown = render(true, cols);
+        assert!(shown.contains("$0.00/h"), "{cols} cols: {shown:?}");
+    }
 }
 
 #[test]
