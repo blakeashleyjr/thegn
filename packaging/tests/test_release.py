@@ -45,13 +45,15 @@ class ReleaseRendererTests(unittest.TestCase):
         names = list(self.manifest["archive"]["root_files"])
         names[0] = target_config.get("binary", self.manifest["project"]["binary"])
         names = [name for name in names if name != missing]
+        if target_config["platform"] != "unix":
+            names.remove("thegn-musl")
         if target_config["platform"] == "unix":
             with tarfile.open(archive, "w:gz") as output:
                 for name in names:
                     content = f"fixture:{name}\n".encode()
                     info = tarfile.TarInfo(name)
                     info.size = len(content)
-                    info.mode = 0o755 if name == "thegn" else 0o644
+                    info.mode = 0o755 if name in ("thegn", "thegn-musl") else 0o644
                     info.mtime = 0
                     output.addfile(info, io.BytesIO(content))
         else:
@@ -134,6 +136,7 @@ class ReleaseRendererTests(unittest.TestCase):
         self.assertIn(f'version "{self.version}"', formula)
         self.assertIn(checksums["aarch64-apple-darwin"], formula)
         self.assertIn('bin.install "thegn"', formula)
+        self.assertIn('bin.install "thegn-musl"', formula)
         self.assertIn('license any_of: ["MIT", "Apache-2.0"]', formula)
         self.assertIn('depends_on "gh" => :optional', formula)
 
@@ -151,6 +154,7 @@ class ReleaseRendererTests(unittest.TestCase):
         for text in (deb, rpm):
             self.assertIn("dst: /usr/bin/thegn", text)
             self.assertIn("dst: /usr/bin/tg", text)
+            self.assertIn("dst: /usr/bin/thegn-musl", text)
             self.assertIn("LICENSE-MIT", text)
             self.assertIn("LICENSE-APACHE", text)
             self.assertIn("  - git", text)
@@ -191,7 +195,7 @@ class ReleaseRendererTests(unittest.TestCase):
         with tarfile.open(archive_path, "w:gz") as output:
             for name in self.manifest["archive"]["root_files"]:
                 info = tarfile.TarInfo(name)
-                if name == "thegn":
+                if name in ("thegn", "thegn-musl"):
                     info.type = tarfile.SYMTYPE
                     info.linkname = "/etc/passwd"
                     output.addfile(info)
@@ -227,7 +231,7 @@ class ReleaseRendererTests(unittest.TestCase):
 
     def test_rejects_extra_archive_file_and_directory(self) -> None:
         entries = [
-            (name, f"fixture:{name}\n".encode(), 0o755 if name == "thegn" else 0o644)
+            (name, f"fixture:{name}\n".encode(), 0o755 if name in ("thegn", "thegn-musl") else 0o644)
             for name in self.manifest["archive"]["root_files"]
         ]
         self.write_tar_asset([*entries, ("evil.sh", b"echo bad\n", 0o755)])
@@ -240,7 +244,7 @@ class ReleaseRendererTests(unittest.TestCase):
 
     def test_rejects_archive_member_count_over_limit(self) -> None:
         entries = [
-            (name, f"fixture:{name}\n".encode(), 0o755 if name == "thegn" else 0o644)
+            (name, f"fixture:{name}\n".encode(), 0o755 if name in ("thegn", "thegn-musl") else 0o644)
             for name in self.manifest["archive"]["root_files"]
         ]
         entries.extend((f"extra-{index}", b"x", 0o644) for index in range(61))
@@ -268,7 +272,7 @@ class ReleaseRendererTests(unittest.TestCase):
             (
                 name,
                 b"\0" * (1024 * 1024) if name == "README.md" else f"fixture:{name}\n".encode(),
-                0o755 if name == "thegn" else 0o644,
+                0o755 if name in ("thegn", "thegn-musl") else 0o644,
             )
             for name in self.manifest["archive"]["root_files"]
         ]
@@ -285,7 +289,7 @@ class ReleaseRendererTests(unittest.TestCase):
                         f"fixture:{name}\n".encode(),
                         unsafe_mode
                         if name == unsafe_name
-                        else (0o755 if name == "thegn" else 0o644),
+                        else (0o755 if name in ("thegn", "thegn-musl") else 0o644),
                     )
                     for name in self.manifest["archive"]["root_files"]
                 ]
@@ -652,7 +656,7 @@ class TrustedDigestTests(unittest.TestCase):
                 content = f"substituted:{name}\n".encode()
                 info = tarfile.TarInfo(name)
                 info.size = len(content)
-                info.mode = 0o755 if name == "thegn" else 0o644
+                info.mode = 0o755 if name in ("thegn", "thegn-musl") else 0o644
                 info.mtime = 0
                 output.addfile(info, io.BytesIO(content))
         digest = release._sha256(replacement)
@@ -829,7 +833,7 @@ class StagedPayloadTests(unittest.TestCase):
         for name in names:
             self.assertEqual(contents[name], (output / name).read_bytes())
             self.assertEqual(hashlib.sha256(contents[name]).hexdigest(), staged[name])
-            expected_mode = 0o755 if name == "thegn" else 0o644
+            expected_mode = 0o755 if name in ("thegn", "thegn-musl") else 0o644
             self.assertEqual(expected_mode, stat.S_IMODE((output / name).stat().st_mode))
         self.assertEqual([], list(parent.glob(".stage-*")))
 
@@ -891,7 +895,7 @@ class StagedPayloadTests(unittest.TestCase):
                 content = f"fixture:{name}\n".encode()
                 info = tarfile.TarInfo(name)
                 info.size = len(content)
-                info.mode = 0o755 if name == "thegn" else 0o644
+                info.mode = 0o755 if name in ("thegn", "thegn-musl") else 0o644
                 output.addfile(info, io.BytesIO(content))
             content = b"extra"
             info = tarfile.TarInfo("extra")
@@ -939,6 +943,9 @@ class StagedPayloadTests(unittest.TestCase):
         binary = payload / "usr/bin/thegn"
         binary.parent.mkdir(parents=True)
         binary.write_bytes((self.temp / "package/stage/thegn").read_bytes())
+        (binary.parent / "thegn-musl").write_bytes(
+            (self.temp / "package/stage/thegn-musl").read_bytes()
+        )
         (binary.parent / "tg").symlink_to("/usr/bin/thegn")
         licenses = payload / "usr/share/licenses/thegn"
         licenses.mkdir(parents=True)
@@ -996,7 +1003,7 @@ class StagedPayloadTests(unittest.TestCase):
             release.verify_package_payload(digests, payload, "rpm")
 
     def test_staged_digest_loader_rejects_malformed_input(self) -> None:
-        names = ("thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md")
+        names = ("thegn", "thegn-musl", "LICENSE-MIT", "LICENSE-APACHE", "README.md")
         valid = {name: "a" * 64 for name in names}
         cases = (
             ("array", [], "JSON object"),
@@ -1270,7 +1277,7 @@ class ReleaseAssetManifestTests(unittest.TestCase):
 
 
 class ArchiveLimitBoundaryTests(unittest.TestCase):
-    REQUIRED = ["thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]
+    REQUIRED = ["thegn", "thegn-musl", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1308,7 +1315,7 @@ class ArchiveLimitBoundaryTests(unittest.TestCase):
 
     def root_entries(self, content=lambda name: f"fixture:{name}\n".encode()) -> list[tuple[str, bytes, int]]:
         return [
-            (name, content(name), 0o755 if name == "thegn" else 0o644)
+            (name, content(name), 0o755 if name in ("thegn", "thegn-musl") else 0o644)
             for name in self.REQUIRED
         ]
 
@@ -1374,7 +1381,7 @@ class ArchiveLimitBoundaryTests(unittest.TestCase):
                 info = tarfile.TarInfo(name)
                 info.mode = mode
                 info.size = len(content)
-                if name == "thegn":
+                if name in ("thegn", "thegn-musl"):
                     info.pax_headers = {"GNU.sparse.major": "1"}
                 archive.addfile(info, io.BytesIO(content))
         with self.assertRaisesRegex(release.ReleaseError, "is a sparse file"):
@@ -1401,10 +1408,10 @@ class ArchiveLimitBoundaryTests(unittest.TestCase):
         for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
             with self.subTest(platform=platform):
                 path = writer(entries)
-                with mock.patch.object(release, "MAX_MEMBERS", 6):
+                with mock.patch.object(release, "MAX_MEMBERS", 7):
                     self.assertIsNone(self.validate(path, platform))
-                with mock.patch.object(release, "MAX_MEMBERS", 5):
-                    with self.assertRaisesRegex(release.ReleaseError, "exceeds 5 members"):
+                with mock.patch.object(release, "MAX_MEMBERS", 6):
+                    with self.assertRaisesRegex(release.ReleaseError, "exceeds 6 members"):
                         self.validate(path, platform)
 
     def test_path_length_limit_boundary(self) -> None:

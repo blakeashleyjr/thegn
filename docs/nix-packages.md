@@ -16,6 +16,10 @@ one currently built by each attribute.
 
 ## Bridge discovery
 
+Release archives, Homebrew and the deb/rpm/AUR packages ship the same bridge as
+`thegn-musl` beside `thegn` (x86_64 Linux musl; Sprites and Vercel sandboxes are
+x86_64 Linux, including when the host is a Mac).
+
 The host checks `THEGN_BRIDGE_BINARY` first, then looks for an adjacent
 `thegn-musl` next to the running executable. If neither is available, it runs
 without a resident bridge. `thegn doctor` reports `artifact none` and says

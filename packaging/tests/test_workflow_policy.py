@@ -43,7 +43,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_release_source_checkouts_use_admitted_sha(self) -> None:
         workflow = read_workflow("release.yml")
         expected = "${{ needs.admit.outputs.sha }}"
-        for job_name in ("build", "upload", "completions", "package", "verify-manifest"):
+        for job_name in ("bridge", "build", "upload", "completions", "package", "verify-manifest"):
             checkouts = [
                 step
                 for step in workflow["jobs"][job_name]["steps"]
@@ -326,6 +326,20 @@ class WorkflowPolicyTests(unittest.TestCase):
             'git archive "$TRUSTED_WORKFLOW_SHA" .github/actions/ci-setup', script
         )
         self.assertIn("rm -rf .github/actions/ci-setup", script)
+
+    def test_every_archive_ships_the_resident_bridge(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        self.assertIn("bridge", jobs["build"]["needs"])
+        self.assertEqual({"contents": "read"}, jobs["bridge"].get("permissions"))
+        steps = jobs["build"]["steps"]
+        action = next(
+            step for step in steps
+            if step.get("uses", "").startswith("taiki-e/upload-rust-binary-action@")
+        )
+        self.assertIn("bridge/thegn-musl", action["with"]["include"])
+        upload = jobs["bridge"]["steps"][-1]
+        # Must not match the upload broker's `release-*` download pattern.
+        self.assertFalse(upload["with"]["name"].startswith("release-"))
 
     def test_build_jobs_are_read_only(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]

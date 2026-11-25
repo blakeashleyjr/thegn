@@ -12,6 +12,11 @@ contexts: [panel:environments]
 
 Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
 
+Sprites and Vercel panes push a static `thegn-musl` bridge into the sandbox. Release
+archives and Homebrew ship it next to `thegn` and the host finds it automatically;
+set `THEGN_BRIDGE_BINARY` to override, and run `thegn doctor` if it reports
+`artifact none`.
+
 Sprites and [[vercel-sandbox]] environments are supported on the stable
 channel. SSH, Kubernetes, every other cloud provider, `[host.*]` and
 `thegn fleet` are dev channel only (see [[release-channels]]). Where this page

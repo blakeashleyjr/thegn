@@ -18,7 +18,11 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    provider bridge — because building the bridge doubles the job. `nix profile
 install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    so it must be proven before a tag even though no release asset comes from it.
-5. **Rehearse the build locally** before tagging:
+5. **Rehearse the build locally** before tagging. Every archive must carry the
+   resident bridge `thegn-musl`: the workflow's `bridge` job builds it once and
+   each target archive includes it; `just release-artifacts` takes it from
+   `THEGN_BRIDGE_BINARY` or the `just bridge` output and refuses to build
+   without one.
 
    ```sh
    just release-artifacts v<version>   # local archive + checksum

@@ -9,6 +9,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
+- Every release archive (Linux gnu and musl, macOS) and the Homebrew, AUR, deb
+  and rpm packages now ship the static x86_64-linux-musl resident bridge as
+  `thegn-musl` beside `thegn`, so Sprites and Vercel panes work from a release
+  install without a Nix build. The host finds it next to its own executable
+  (`THEGN_BRIDGE_BINARY` still overrides), and `thegn doctor` explains how to
+  fix a missing one.
 - The first launch opens a full-screen welcome tour: the workspace model on a
   small live diagram, a theme you see applied as you scroll, an honest table of
   what each sandbox tier protects with the backends that work on this machine,
