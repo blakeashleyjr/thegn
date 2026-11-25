@@ -236,6 +236,21 @@ pub(crate) fn lanes_with_persisted_paths(
     lanes
 }
 
+/// Drop worktrees whose directory is gone, then every lane left with none.
+///
+/// The roster stays in the DB as history; only the sidebar view forgets lanes
+/// whose worktrees were closed, removed, or merged and pruned. `exists` is the
+/// filesystem probe (injected so the fold stays testable).
+pub(crate) fn prune_missing_lanes(lanes: Vec<Lane>, exists: impl Fn(&str) -> bool) -> Vec<Lane> {
+    lanes
+        .into_iter()
+        .filter_map(|mut lane| {
+            lane.worktrees.retain(|worktree| exists(&worktree.path));
+            (!lane.worktrees.is_empty()).then_some(lane)
+        })
+        .collect()
+}
+
 /// The grouping identity before unprefixed-provider ambiguity is resolved.
 fn lane_identity(d: &AgentDispatch) -> Option<LaneId> {
     let issue = d.issue_id.trim();
@@ -493,6 +508,23 @@ mod tests {
         let out = lanes(&rows);
         assert_eq!(out[0].worktrees.len(), 1);
         assert_eq!(out[0].worktrees[0].at_ms, 1_000);
+    }
+
+    #[test]
+    fn lanes_whose_worktrees_are_gone_are_pruned() {
+        let rows = vec![
+            dispatch(1, "THE-1", "/wt/gone", AgentDispatchStatus::Merged, 1_000),
+            dispatch(2, "THE-2", "/wt/live", AgentDispatchStatus::Done, 2_000),
+            dispatch(3, "THE-2", "/wt/gone2", AgentDispatchStatus::Done, 3_000),
+        ];
+        let paths = vec!["/wt/gone3".to_string(), "/wt/live".to_string()];
+        let out = prune_missing_lanes(lanes_with_persisted_paths(&rows, &paths), |p| {
+            p == "/wt/live"
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "THE-2");
+        assert_eq!(out[0].worktrees.len(), 1);
+        assert_eq!(out[0].worktrees[0].path, "/wt/live");
     }
 
     #[test]
