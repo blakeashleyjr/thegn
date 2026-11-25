@@ -2154,6 +2154,38 @@ fn stats_cluster_drops_date_then_gpu_when_tight() {
 }
 
 #[test]
+fn stats_cluster_sheds_in_documented_order_across_widths() {
+    let order = [
+        "date", "weather", "fleet", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+        "battery", "net", "clock", "mem", "cpu",
+    ];
+    // Config order is arbitrary; shedding follows the ladder, not position.
+    let parts: Vec<(String, usize)> = order
+        .iter()
+        .rev()
+        .map(|id| (id.to_string(), 6usize))
+        .collect();
+    let mut last_kept = usize::MAX;
+    for avail in (1..=cluster_width(&parts, &(0..parts.len()).collect::<Vec<_>>())).rev() {
+        let kept = fit_stats_cluster(&parts, avail);
+        assert!(kept.len() <= last_kept);
+        last_kept = kept.len();
+        let names: Vec<&str> = kept.iter().map(|&i| parts[i].0.as_str()).collect();
+        // A widget that is still shown means every harder-to-shed one is too.
+        for (rank, id) in order.iter().enumerate() {
+            if names.contains(id) {
+                for later in &order[rank + 1..] {
+                    assert!(names.contains(later), "{later} shed before {id}: {names:?}");
+                }
+            }
+        }
+        if names.contains(&"date") {
+            assert!(names.contains(&"cpu"), "{names:?}");
+        }
+    }
+}
+
+#[test]
 fn masthead_brand_breakpoints() {
     assert_eq!(masthead_brand_cols(160), BRAND_FULL_COLS);
     assert_eq!(masthead_brand_cols(96), BRAND_FULL_COLS);
