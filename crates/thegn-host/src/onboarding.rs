@@ -6,7 +6,7 @@
 //! backend, appearance, and a coding agent, ending on a getting-started tour.
 //! Every step is skippable; a step only writes config when the user changed a
 //! value (skip = keep defaults). Re-runnable any time via the palette's
-//! "Setup wizard…" or the `thegn setup` subcommand; steps pre-fill from the
+//! "Welcome tour…" (then `a`) or the `thegn setup` subcommand; steps pre-fill from the
 //! effective config so a re-run edits rather than resets.
 //!
 //! Pure over its inputs: renders + handles keys on the event loop (zero idle
@@ -107,6 +107,18 @@ pub enum ProbeRequest {
     Sandbox(Vec<String>),
     /// Reachability of a just-written ssh host (`user@box:port`).
     Host { name: String, ssh: String },
+    /// Which coding-agent harnesses are on `PATH` (the welcome tour).
+    Agents,
+}
+
+/// One coding-agent harness as the welcome tour sees it: the registry id, its
+/// display name, the interactive command, and where it was found on `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub path: Option<String>,
 }
 
 /// A probe's answer, delivered via `RefreshKind::Onboarding`.
@@ -123,6 +135,8 @@ pub enum ProbeResult {
         ok: bool,
         detail: String,
     },
+    /// Per registered harness, in registry order.
+    Agents(Vec<AgentInfo>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +189,14 @@ pub enum WriteOp {
         host: String,
         token: String,
         token_is_ref: bool,
+    },
+    /// `config_write::promote_agent`: make `name` the first `[[agents]]`
+    /// entry. `keep` is the effective agent list, written behind it only when
+    /// the file has no `[[agents]]` yet.
+    PromoteAgent {
+        name: String,
+        command: String,
+        keep: Vec<(String, String)>,
     },
 }
 
@@ -395,8 +417,9 @@ impl OnboardingWizard {
                 self.forge = Probe::Done(s);
             }
             ProbeResult::Sandbox(rows) => self.sandbox_avail = Probe::Done(rows),
-            // Host reachability lands in the status bar (the step has advanced).
-            ProbeResult::Host { .. } => {}
+            // Host reachability lands in the status bar (the step has advanced);
+            // the agent probe belongs to the welcome tour.
+            ProbeResult::Host { .. } | ProbeResult::Agents(_) => {}
         }
     }
 
@@ -1052,7 +1075,7 @@ impl OnboardingWizard {
                 note("sandboxing, and appearance. Every step is optional — nothing is"),
                 note("written unless you change it."),
                 blank(),
-                note("Re-run any time: `thegn setup`, or \"Setup wizard…\" in the palette."),
+                note("Re-run any time: `thegn setup`, or the palette's \"Welcome tour…\" then a."),
             ],
             Step::Paths => vec![
                 self.text_row(

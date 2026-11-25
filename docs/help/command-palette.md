@@ -43,8 +43,10 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
   project.
 - **New environment…** — the add-environment wizard (`[env.<name>]`: cloud,
   ssh or local).
-- **Setup wizard…** — re-run first-launch setup (forge auth, hosts, sandbox,
-  appearance); the same as `thegn setup`.
+- **Welcome tour…** — reopen the first-run [[onboarding]] tour (theme,
+  sandbox tier, default agent, key drill). Press `a` on its first screen for
+  the classic setup wizard (forge auth, issue trackers, hosts), which
+  `thegn setup` also opens.
 
 All of these are ordinary actions — bind a chord to any of them with
 `[keybinds]` (e.g. `connect-root = "Alt ."`).

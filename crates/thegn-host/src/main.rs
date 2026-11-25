@@ -356,6 +356,7 @@ mod voice_worker;
 mod vps_bridge;
 mod vps_reaper;
 mod warmcache;
+mod welcome;
 mod wire;
 mod wizard;
 mod worker_failure;

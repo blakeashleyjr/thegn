@@ -1,0 +1,43 @@
+name: onboarding_skip
+# First-run welcome tour, skip-all: Esc on the first screen closes the tour,
+# saves nothing, and the shell behind it takes input straight away.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [kitty]
+  sizes: ["80x24"]
+spawn:
+  - sh
+  - -c
+  - |
+    set -e
+    unset THEGN_SKIP_ONBOARDING
+    export XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
+    mkdir -p "$XDG_CONFIG_HOME/thegn"
+    printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$XDG_CONFIG_HOME/thegn/config.toml"
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  THEGN_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+steps:
+  - expect_visible: {text: "Every git worktree a tab.", timeout_ms: 20000}
+  - key: {key: "escape"}
+  - expect_visible: {text: "nothing saved", timeout_ms: 5000}
+  - expect_not_visible: {text: "Every git worktree a tab.", timeout_ms: 5000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - write_line: "echo tour-skipped"
+  - expect_count: {text: "tour-skipped", min: 2, timeout_ms: 10000}
+  - check_file:
+      path: "{case_tmp}/thegn/logs/thegn.log"
+      reject_re: "ERROR|thread '.*' panicked|subtract with overflow|index out of bounds"

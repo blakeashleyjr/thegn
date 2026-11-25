@@ -42,7 +42,7 @@ action-connect-root = Connect to root — jump to this pane's worktree
 action-clone-open = Clone and open — paste a git URL
 action-new-environment = New environment… (cloud / ssh / local)
 action-toolchain-install = Install worktree toolchain
-action-setup-wizard = Setup wizard… (forge / hosts / sandbox / appearance)
+action-setup-wizard = Welcome tour… (theme / sandbox / agent / keys; a = classic setup)
 action-enter-replay = Replay pane history
 action-export-cast = Export pane replay as cast
 action-toggle-recorder = Toggle session recorder

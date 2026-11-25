@@ -11,6 +11,7 @@ use thegn_core::help::{HelpRegistry, ValidationError};
 pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/index.md"),
     include_str!("../../../../docs/help/getting-started.md"),
+    include_str!("../../../../docs/help/onboarding.md"),
     include_str!("../../../../docs/help/workspaces-and-worktrees.md"),
     include_str!("../../../../docs/help/sidebar.md"),
     include_str!("../../../../docs/help/terminal-and-panes.md"),

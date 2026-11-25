@@ -14,14 +14,17 @@ project, worktree, and pane position.
 
 1. Install git, then start `thegn`. The flake and `./install.sh` also install
    `tg`; the release tarball contains only `thegn`.
-2. Run `thegn doctor` and review the detected capabilities, channel, and
+2. The first launch opens the [[onboarding]] tour: the workspace model, a
+   theme, a sandbox tier, a default agent and a short key drill, in about two
+   minutes. `Esc` skips it; reopen it from the palette with **Welcome tour…**.
+3. Run `thegn doctor` and review the detected capabilities, channel, and
    sandbox backend.
-3. If `Alt` chords do nothing, check your terminal setup; on macOS, configure
+4. If `Alt` chords do nothing, check your terminal setup; on macOS, configure
    Option as Alt. See [[terminal-compatibility]].
-4. Press `Alt-W` to open or clone a repository, then `Alt-w` to create a
+5. Press `Alt-W` to open or clone a repository, then `Alt-w` to create a
    worktree and choose what to run.
-5. Press `Ctrl-Space` to open the [[command-palette]], or `F1` for help.
-6. Run `thegn config edit` when you want to change a default.
+6. Press `Ctrl-Space` to open the [[command-palette]], or `F1` for help.
+7. Run `thegn config edit` when you want to change a default.
 
 ## The mental model
 

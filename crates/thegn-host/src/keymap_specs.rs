@@ -145,12 +145,16 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "setup-wizard",
-        label: "Setup wizard… (forge / hosts / sandbox / appearance)",
+        label: "Welcome tour… (theme / sandbox / agent / keys; a = classic setup)",
         message_key: "action-setup-wizard",
         hint: "setup",
         default_chords: &[],
         palette: true,
         keywords: &[
+            "welcome",
+            "tour",
+            "agent",
+            "theme",
             "setup",
             "wizard",
             "onboarding",

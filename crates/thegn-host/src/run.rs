@@ -28466,10 +28466,7 @@ async fn event_loop<T: Terminal>(
                                     });
                                 }
                             }
-                            Action::SetupWizard => {
-                                onboarding.ui =
-                                    Some(crate::onboarding::OnboardingWizard::new(keymap.config()));
-                            }
+                            Action::SetupWizard => onboarding.open_tour(keymap.config()),
                             Action::NewWorkspace => {
                                 let key = run_palette_db::PaletteKey {
                                     kind: run_palette_db::PaletteKind::WorkspacePickerSeed,

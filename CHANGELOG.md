@@ -7,6 +7,17 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The first launch opens a full-screen welcome tour: the workspace model on a
+  small live diagram, a theme you see applied as you scroll, an honest table of
+  what each sandbox tier protects with the backends that work on this machine,
+  a default coding agent picked from the ones installed, and a drill on your
+  real key chords. Every screen can be skipped, `Esc` leaves at once, and
+  nothing is saved until the last screen shows the exact changes. Reopen it
+  from the palette with **Welcome tour…**; `thegn setup` still opens the
+  classic setup wizard.
+
 ## [0.1.0-alpha.131] — 2026-11-24
 
 ### Added

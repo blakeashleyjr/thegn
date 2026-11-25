@@ -14,10 +14,11 @@ use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::hydrate::RefreshKind;
 use crate::onboarding::{
-    Effects, ForgeStatus, OnboardingWizard, Outcome, ProbeRequest, ProbeResult, WriteOp,
+    AgentInfo, Effects, ForgeStatus, OnboardingWizard, Outcome, ProbeRequest, ProbeResult, WriteOp,
 };
 use crate::panes::Panes;
 use crate::session::Session;
+use crate::welcome::{TourOutcome, WelcomeTour};
 use thegn_core::config::Config;
 use thegn_core::store::WorkspaceStore;
 
@@ -30,24 +31,38 @@ pub(crate) struct Applied {
     pub spawned: bool,
 }
 
-/// The loop's onboarding state, one local: the wizard slot plus the pane it is
-/// suspended behind (`gh auth login` / agent setup) as `(pane id, is_login)`.
+/// The loop's onboarding state, one local: the wizard slot, the pane it is
+/// suspended behind (`gh auth login` / agent setup) as `(pane id, is_login)`,
+/// and the full-screen welcome tour (first run / the palette). The tour and
+/// the wizard are never open together: the tour hands off to the wizard.
 #[derive(Default)]
 pub(crate) struct OnboardingUi {
     pub ui: Option<OnboardingWizard>,
     pub wait: Option<(u32, bool)>,
+    pub tour: Option<WelcomeTour>,
 }
 
 impl OnboardingUi {
-    /// The wizard owns keyboard/paste input (open and not suspended).
+    /// The tour or wizard owns keyboard/paste input (open and not suspended).
     pub(crate) fn active(&self) -> bool {
-        self.ui.is_some() && self.wait.is_none()
+        (self.ui.is_some() || self.tour.is_some()) && self.wait.is_none()
+    }
+
+    /// Open the welcome tour (palette `setup-wizard`), replacing an open wizard.
+    pub(crate) fn open_tour(&mut self, cfg: &Config) {
+        self.ui = None;
+        self.tour = Some(WelcomeTour::new(cfg));
     }
 
     /// Route a bracketed paste to the wizard; `false` when it isn't active.
+    /// The tour has no text fields: it swallows a paste so the text never
+    /// lands in the pane hidden behind it.
     pub(crate) fn paste(&mut self, text: &str) -> bool {
         if self.wait.is_some() {
             return false;
+        }
+        if self.tour.is_some() {
+            return true;
         }
         match self.ui.as_mut() {
             Some(w) => {
@@ -58,19 +73,26 @@ impl OnboardingUi {
         }
     }
 
-    /// Render the wizard overlay unless suspended behind its login/agent tab.
+    /// Render the tour (full screen) or the wizard overlay, unless suspended
+    /// behind the wizard's login/agent tab.
     pub(crate) fn render(&self, surface: &mut termwiz::surface::Surface, screen: Rect) {
-        if let (Some(w), None) = (&self.ui, &self.wait) {
+        if self.wait.is_some() {
+            return;
+        }
+        if let Some(t) = &self.tour {
+            t.render(surface, screen);
+        } else if let Some(w) = &self.ui {
             w.render(surface, screen);
         }
     }
 }
 
-/// Startup arming, replacing the run.rs first-launch block: open the wizard on
-/// first run (no `ui_state` marker) or when `thegn setup` requested it;
-/// otherwise apply a remembered keymap preset (returns `true` → caller
-/// rebuilds the keymap) or arm the one-time keymap picker. The picker is
-/// skipped while the wizard is armed — the wizard has its own keymap step.
+/// Startup arming, replacing the run.rs first-launch block: open the welcome
+/// tour on first run (no `ui_state` marker), or the setup wizard when
+/// `thegn setup` requested it; otherwise apply a remembered keymap preset
+/// (returns `true` → caller rebuilds the keymap) or arm the one-time keymap
+/// picker. The picker is skipped while either is armed — both have their own
+/// keymap choice.
 pub(crate) fn startup(
     cfg: &mut Config,
     active_menu: &mut Option<crate::menu::MenuOverlay>,
@@ -80,17 +102,12 @@ pub(crate) fn startup(
     // normal UI: a first-run wizard (or the keymap-preset picker below) is modal
     // and would otherwise swallow driven keystrokes. Skips both.
     if std::env::var_os("THEGN_SKIP_ONBOARDING").is_some() {
-        return (
-            OnboardingUi {
-                ui: None,
-                wait: None,
-            },
-            false,
-        );
+        return (OnboardingUi::default(), false);
     }
     let requested = crate::onboarding::setup_requested();
     let (first_run, remembered_preset) = startup_db_state(db);
-    let wizard = (requested || first_run).then(|| OnboardingWizard::new(cfg));
+    let wizard = requested.then(|| OnboardingWizard::new(cfg));
+    let tour = (first_run && !requested).then(|| WelcomeTour::new(cfg));
     let mut rebuild = false;
     if cfg.keymap_preset.is_empty() || cfg.keymap_preset == "default" {
         match remembered_preset {
@@ -99,7 +116,9 @@ pub(crate) fn startup(
                 rebuild = true;
             }
             Some(_) => {} // remembered "default" — no overlay, no picker
-            None if wizard.is_none() => *active_menu = Some(crate::menu::keymap_preset_menu()),
+            None if wizard.is_none() && tour.is_none() => {
+                *active_menu = Some(crate::menu::keymap_preset_menu())
+            }
             None => {}
         }
     }
@@ -107,6 +126,7 @@ pub(crate) fn startup(
         OnboardingUi {
             ui: wizard,
             wait: None,
+            tour,
         },
         rebuild,
     )
@@ -145,6 +165,20 @@ pub(crate) fn handle_key_event(
     waker: &TerminalWaker,
 ) -> Applied {
     let mut applied = Applied::default();
+    if ob.tour.is_some() {
+        handle_tour_key(
+            key,
+            mods,
+            ob,
+            model,
+            cfg,
+            user_themes,
+            refresh_tx,
+            waker,
+            &mut applied,
+        );
+        return applied;
+    }
     let Some(w) = ob.ui.as_mut() else {
         return applied;
     };
@@ -194,6 +228,139 @@ pub(crate) fn handle_key_event(
         }
     }
     applied
+}
+
+/// Feed one key to the welcome tour: live theme preview, probe spawns, and on
+/// close the marker, the palette revert (unless a theme was saved), the writes
+/// and the optional hand-off to the setup wizard.
+#[allow(clippy::too_many_arguments)] // mirrors handle_key_event's loop context
+fn handle_tour_key(
+    key: &KeyCode,
+    mods: Modifiers,
+    ob: &mut OnboardingUi,
+    model: &mut FrameModel,
+    cfg: &mut Config,
+    user_themes: &[thegn_core::theme_user::UserTheme],
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    applied: &mut Applied,
+) {
+    let Some(t) = ob.tour.as_mut() else {
+        return;
+    };
+    match t.handle_key(key, mods) {
+        TourOutcome::Pending => {}
+        TourOutcome::Do(fx) => {
+            if let Some(name) = fx.preview_theme {
+                crate::chrome::set_palette(onboarding_palette(cfg, &name, user_themes));
+            }
+            for req in fx.probes {
+                spawn_probe(req, refresh_tx.clone(), waker.clone());
+            }
+        }
+        TourOutcome::Close {
+            completed,
+            writes,
+            open_setup,
+        } => {
+            ob.tour = None;
+            persist_done();
+            let saves_theme = writes
+                .iter()
+                .any(|w| matches!(w, WriteOp::Set { key, .. } if key == "theme.preset"));
+            // Unsaved preview → back to the configured palette. A saved theme
+            // keeps the preview; the config watcher reconciles `cfg`.
+            if !saves_theme {
+                crate::chrome::set_palette(onboarding_palette(cfg, &cfg.theme.preset, user_themes));
+            }
+            let n = writes.len();
+            model.status = match (completed, n) {
+                (false, _) => {
+                    "welcome tour closed, nothing saved — reopen it from the palette".into()
+                }
+                (true, 0) => {
+                    "welcome tour done, nothing to save — reopen it from the palette".into()
+                }
+                (true, _) => format!(
+                    "welcome tour: saving {n} setting{}…",
+                    if n == 1 { "" } else { "s" }
+                ),
+            };
+            save_tour_writes(writes, model, cfg, refresh_tx, waker, applied);
+            if open_setup {
+                ob.ui = Some(OnboardingWizard::new(cfg));
+            }
+        }
+    }
+}
+
+/// Apply the tour's writes: the keymap preset on the loop (a `ui_state` write
+/// through `db_task`, like the wizard), every config-file write off the loop
+/// in one `spawn_blocking`, reported back as a toast. Each op is one
+/// `config_write` call, so unrelated keys and comments survive.
+fn save_tour_writes(
+    writes: Vec<WriteOp>,
+    model: &mut FrameModel,
+    cfg: &mut Config,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    applied: &mut Applied,
+) {
+    let mut file_ops = Vec::new();
+    for op in writes {
+        match op {
+            WriteOp::KeymapPreset(preset) => {
+                model.status = super::apply_keymap_preset(&preset, cfg);
+                applied.keymap_changed = true;
+            }
+            other => file_ops.push(other),
+        }
+    }
+    if file_ops.is_empty() {
+        return;
+    }
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        // off-loop: each config_write call locks, reads and rewrites the file
+        let path = Config::path();
+        let n = file_ops.len();
+        let mut errs: Vec<String> = Vec::new();
+        for op in file_ops {
+            let r = match op {
+                WriteOp::Set { key, value } => {
+                    thegn_core::config_write::set_key(&path, &key, &value)
+                }
+                WriteOp::PromoteAgent {
+                    name,
+                    command,
+                    keep,
+                } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
+                other => Err(anyhow::anyhow!("the welcome tour cannot write {other:?}")),
+            };
+            if let Err(e) = r {
+                errs.push(e.to_string());
+            }
+        }
+        let (message, priority) = if errs.is_empty() {
+            (
+                format!(
+                    "Saved {n} setting{} to {}",
+                    if n == 1 { "" } else { "s" },
+                    path.display()
+                ),
+                thegn_core::notification::Priority::Notice,
+            )
+        } else {
+            (
+                format!("Welcome tour: save failed — {}", errs.join("; ")),
+                thegn_core::notification::Priority::Alert,
+            )
+        };
+        if tx.send(RefreshKind::Toast { message, priority }).is_ok() {
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
+    });
 }
 
 /// Resolve a token to the value written into config: an empty token stays
@@ -283,6 +450,11 @@ fn run_effects(
             } => resolve_token(&format!("forge-{name}"), &token, token_is_ref).and_then(|tref| {
                 thegn_core::config_write::upsert_forge(&path, &name, &kind, &host, &tref)
             }),
+            WriteOp::PromoteAgent {
+                name,
+                command,
+                keep,
+            } => thegn_core::config_write::promote_agent(&path, &name, &command, &keep),
         };
         match r {
             Ok(()) => wrote += 1,
@@ -393,6 +565,10 @@ pub(crate) fn apply_probe(
         };
         return true;
     }
+    if let Some(t) = ob.tour.as_mut() {
+        t.apply_probe(result);
+        return true;
+    }
     match ob.ui.as_mut() {
         Some(w) => {
             w.apply_probe(result);
@@ -414,6 +590,7 @@ pub(crate) fn spawn_probe(
             ProbeRequest::Forge => ProbeResult::Forge(probe_forge()),
             ProbeRequest::Sandbox(chain) => ProbeResult::Sandbox(probe_sandbox(&chain)),
             ProbeRequest::Host { name, ssh } => probe_host(name, &ssh),
+            ProbeRequest::Agents => ProbeResult::Agents(probe_agents()),
         };
         if tx.send(RefreshKind::Onboarding(Box::new(result))).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -434,6 +611,26 @@ fn probe_forge() -> ForgeStatus {
         Err(thegn_core::forge::ForgeError::NotInstalled) => ForgeStatus::NotInstalled,
         Err(_) => ForgeStatus::NotAuthenticated,
     }
+}
+
+/// Every registered coding-agent harness and where its interactive program is
+/// on `PATH` (the welcome tour's Agents chapter). A stat per `PATH` entry per
+/// harness, so off the loop.
+fn probe_agents() -> Vec<AgentInfo> {
+    // off-loop: inside spawn_blocking
+    thegn_core::harness::HARNESSES
+        .iter()
+        .map(|h| {
+            let command = h.interactive_command().to_string();
+            let program = command.split_whitespace().next().unwrap_or("").to_string();
+            AgentInfo {
+                id: h.id().to_string(),
+                name: h.display_name().to_string(),
+                path: thegn_core::util::which_path(&program),
+                command,
+            }
+        })
+        .collect()
 }
 
 /// PATH presence per chain entry ("host"/"none" need no binary and are
