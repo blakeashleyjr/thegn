@@ -37,6 +37,7 @@ pub mod env_adopt;
 pub mod env_image;
 pub mod env_pool;
 pub mod env_reap;
+pub mod env_status;
 pub mod env_sync_retry;
 pub mod events;
 pub mod fleet;

@@ -126,7 +126,7 @@ fn fleet_list_json(
     Ok(value)
 }
 
-fn sanitize_json(value: &mut serde_json::Value) {
+pub(crate) fn sanitize_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => *text = sanitize_text(text, 4096),
         serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_json),

@@ -163,6 +163,18 @@ impl ControlApi for FakeApi {
             }))
         })
     }
+    fn env_status<'a>(
+        &'a self,
+        worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<serde_json::Value>> {
+        self.record(&format!("env_status:{worktree}"));
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "sandbox_id": "sb1",
+                "health": { "level": "ok" },
+            }))
+        })
+    }
     fn record_session<'a>(
         &'a self,
         session: &'a str,

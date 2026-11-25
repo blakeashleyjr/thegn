@@ -1135,6 +1135,20 @@ pub trait ControlApi: Send + Sync + 'static {
         })
     }
 
+    /// Read-only remote sandbox health of one worktree (`env.status`): the
+    /// existing `thegn env status --json` report, so the control surface cannot
+    /// drift from the CLI model.
+    fn env_status<'a>(
+        &'a self,
+        _worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "remote sandbox health is not available",
+            ))
+        })
+    }
+
     /// Worktrees registered with thegn (`worktrees.list`). Defaulted like the
     /// calendar verbs so transport-only impls and test fakes need no wiring.
     fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<WorktreeInfo>>> {

@@ -467,6 +467,19 @@ while idle`, or `it reached its maximum lifetime`), a new kernel OOM kill
   uptime and lifetime left. Nothing is shown for a sandbox that has not been
   sampled, and a failed probe shows `unknown` with its reason, never a
   made-up reading.
+  `--probe` also works for a Vercel, VPS, Fly or machine0 env: pass the
+  sandbox id from `fleet list` as the name and the provider's own listing is
+  used instead of the Sprites API.
+- **Status for this worktree.** `thegn env status [--watch] [--interval SECS]
+[--json]` reports the current worktree's remote sandbox on any exec-capable
+  provider: provider state, size and region, time left before
+  `max_lifetime_secs`, estimated cost (hourly burn and accrued), and the same
+  health probe. A sandbox the provider reports cold, stopped or suspended is
+  not probed (a probe would wake and bill it); its health shows `unknown` with
+  that reason. `--watch` refreshes every 5 s (`--interval`, at least 1) and
+  prints a line when a restart or an out-of-memory kill is detected between
+  two probes. The same report is served read-only as `GET /v1/env/status` and
+  the MCP tool `env_status` (read scope; both take an optional `worktree`).
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.

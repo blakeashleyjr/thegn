@@ -809,7 +809,7 @@ async fn fetch_state(
             let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
             serde_json::to_value(reply).map_err(|e| e.to_string())
         }
-        "git.status" | "merge.list" => {
+        "git.status" | "merge.list" | "env.status" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let worktree = str_arg(args, "worktree")
                 .map(std::path::PathBuf::from)
@@ -1453,6 +1453,7 @@ mod tests {
         // THE-2020: the provider fleet inventory read (no daemon required at
         // CLI scope, but the MCP tool routes through the daemon's HTTP route).
         "fleet.list",
+        "env.status",
         "sessions.list",
         "worktrees.list",
         "worktrees.sandbox_profile",

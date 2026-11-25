@@ -15,12 +15,19 @@
 
 ## 2. `thegn env status`
 
-- [ ] 2.1 `thegn env status [--watch] [--json]` for the current worktree's
+- [x] 2.1 `thegn env status [--watch] [--json]` for the current worktree's
       remote sandbox on any exec-capable provider (Sprites, Vercel, VPS, Fly,
       machine0), via `Provider::run_exec_within`; `--watch` re-probes every
-      5 s and prints restart / OOM events as they are classified.
-- [ ] 2.2 `fleet inspect --probe` for non-sprites providers (provider-neutral
-      id resolution from the fleet listing).
+      5 s and prints restart / OOM events as they are classified. A sandbox the
+      provider reports asleep is never probed — **unit tests**: asleep-state
+      table, report lines with cost, watch events once per restart, clap parse.
+- [x] 2.2 `fleet inspect --probe` for non-sprites providers (provider-neutral
+      id resolution from the fleet listing) — **unit tests**: lifetime from ms,
+      noun in warnings, clap parse.
+- [x] 2.3 Control API `GET /v1/env/status` (`env.status`, read scope) and MCP
+      `env_status`, the CLI JSON report; Lead confinement refuses it (it execs
+      in a remote sandbox) — route table, capability catalog, scope and
+      confinement ratchets and `control-api.md` updated.
 
 ## 3. Restart detection and warnings
 
@@ -52,6 +59,8 @@
       drill-in stays open (needs the journal, 7.x) — **unit tests**: columns
       appear only with a reading.
 - [ ] 6.2 Control API / MCP `remote.health` (sample, level, events).
+- [ ] 6.1 Fleet popup health column and drill-in.
+- [ ] 6.2 Control API / MCP `remote.health` (sample, level, events) — the sample and level landed as `env.status` (2.3); events follow the journal (7.1).
 
 ## 7. Journal, logs, processes, cost
 

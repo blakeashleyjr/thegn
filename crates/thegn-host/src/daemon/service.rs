@@ -1951,6 +1951,25 @@ impl DaemonService {
 }
 
 impl ControlApi for DaemonService {
+    fn env_status<'a>(
+        &'a self,
+        worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<serde_json::Value>> {
+        Box::pin(async move {
+            self.confine_worktree(worktree).await?;
+            let config = self.config.clone();
+            let wt = worktree.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::cmd::env_status::control_report(&config, &wt)
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("env status task failed: {error}"))
+            })?
+            .map_err(|error| ControlError::Unavailable(error.to_string()))
+        })
+    }
+
     fn fleet_list(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
         let config = self.config.clone();
         Box::pin(async move {
