@@ -37,7 +37,9 @@ pub fn setup_requested() -> bool {
     SETUP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The `ui_state` key marking the wizard as seen (scope `""`). Any value.
+/// The `ui_state` key retiring first run (scope `""`). Absent on a fresh
+/// install; afterwards `completed` or `skipped`, recording how the first-run
+/// surface closed. Any value counts as seen.
 pub const UI_STATE_KEY: &str = "onboarding_done";
 
 /// The wizard's steps, in order.

@@ -26,7 +26,9 @@ dispatch line changes (it opens the tour).
 Keys: `Enter` accept and continue, `Tab` skip the chapter (its choice is
 reset to the current config), `Shift-Tab`/`Backspace` back, `↑↓` choose,
 `←→` secondary choice, `Esc`/`Ctrl-C` leave the tour without writing. In the
-Keys chapter every other key is a drill attempt.
+Keys chapter every other key is a drill attempt. The `esc · skip tour`
+control painted under the header on every chapter is that same leave, so the
+way out is never only a footer hint.
 
 ## Probes (off the loop)
 
@@ -82,8 +84,8 @@ page. Multi-key chords cannot be drilled and are shown as text.
 
 ## Accessibility
 
-- Fits 80x24: header (1 row), body (≤ 20 rows), footer (1 row). Below 60x18 it
-  shows a compact notice with the Esc/Enter keys.
+- Fits 80x24: header (1 row), the skip control row, body (≤ 20 rows), footer
+  (1 row). Below 60x18 it shows a compact notice with the Esc/Enter keys.
 - No colour-only meaning; ASCII glyph fallback via `active_glyphs()`.
 - No motion.
 
@@ -92,7 +94,7 @@ page. Multi-key chords cannot be drilled and are shown as text.
 Unchanged detection (`ui_state` key `onboarding_done` absent). First run now
 opens the tour instead of the wizard; `thegn setup` still opens the wizard.
 `THEGN_SKIP_ONBOARDING` still suppresses both. The marker is written when the
-tour closes either way.
+tour closes either way, recording `completed` or `skipped`.
 
 ## Left out (not solid by Monday)
 

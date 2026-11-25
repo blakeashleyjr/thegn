@@ -9,6 +9,7 @@
 - [x] 1.5 Agents chapter: off-loop harness PATH probe, installed-only pick
 - [x] 1.6 Remote chapter: explanation and later-setup commands only
 - [x] 1.7 Finish chapter: diff of pending writes, three next steps, `a` hand-off
+- [x] 1.8 Always-visible skip control on every chapter; closing records `completed`/`skipped`
 
 ## 2. Wiring
 
@@ -23,3 +24,4 @@
 - [x] 3.3 Muse spec `35-onboarding.yaml`: happy path and skip-all
 - [ ] 3.4 Compile, `cargo nextest run -p thegn-host welcome`, and the muse spec on the remote builder
 - [ ] 3.5 Manual pass at 80x24, `NO_COLOR=1`, and `[theme] glyphs = ascii`
+- [x] 3.6 Docs: the skip control and the recorded outcome in `docs/help/onboarding.md`

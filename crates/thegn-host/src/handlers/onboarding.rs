@@ -219,7 +219,7 @@ pub(crate) fn handle_key_event(
             if !completed {
                 crate::chrome::set_palette(onboarding_palette(cfg, &cfg.theme.preset, user_themes));
             }
-            persist_done();
+            persist_done(completed);
             model.status = if completed {
                 "setup complete — re-run any time with `thegn setup`".into()
             } else {
@@ -264,7 +264,7 @@ fn handle_tour_key(
             open_setup,
         } => {
             ob.tour = None;
-            persist_done();
+            persist_done(completed);
             let saves_theme = writes
                 .iter()
                 .any(|w| matches!(w, WriteOp::Set { key, .. } if key == "theme.preset"));
@@ -379,12 +379,25 @@ fn resolve_token(secret_name: &str, token: &str, is_ref: bool) -> anyhow::Result
 }
 
 /// Mark the wizard as seen so it stops auto-opening.
-fn persist_done() {
-    crate::db_task::persist(|db| {
-        if let Err(error) = db.set_ui_state("", crate::onboarding::UI_STATE_KEY, "1") {
+fn persist_done(completed: bool) {
+    crate::db_task::persist(move |db| {
+        if let Err(error) = mark_done(db, completed) {
             tracing::debug!(target: "thegn::onboarding", %error, "could not persist onboarding completion");
         }
     });
+}
+
+/// The `ui_state` value recording how the first-run surface closed. Any value
+/// retires first run — that is the whole contract — but spelling the outcome
+/// out keeps "did they finish, or skip off the top?" answerable later.
+fn done_marker(completed: bool) -> &'static str {
+    if completed { "completed" } else { "skipped" }
+}
+
+/// Write that marker into an open handle: the exact shape the DB task closes
+/// over, so a test can round-trip it against [`startup_db_state`].
+fn mark_done(db: &thegn_core::db::Db, completed: bool) -> anyhow::Result<()> {
+    db.set_ui_state("", crate::onboarding::UI_STATE_KEY, done_marker(completed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -703,5 +716,47 @@ mod tests {
         let empty = thegn_core::db::Db::open_memory().unwrap();
         assert_eq!(startup_db_state(Some(&empty)), (true, None));
         assert_eq!(startup_db_state(None), (false, None));
+    }
+
+    /// THE-2610: the tour is the first-run default, and skipping it (Esc / the
+    /// skip control) records a marker that stops it auto-opening again.
+    #[test]
+    fn first_run_opens_the_tour_and_a_skip_never_reopens_it() {
+        // `startup` honours THEGN_SKIP_ONBOARDING (the e2e recipes set it) and
+        // a unit-test run must not, or this asserts on the wrong surface.
+        assert!(
+            std::env::var_os("THEGN_SKIP_ONBOARDING").is_none(),
+            "unset THEGN_SKIP_ONBOARDING: it suppresses the first-run surface"
+        );
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        let mut menu: Option<crate::menu::MenuOverlay> = None;
+
+        let (mut ui, rebuild) = startup(&mut cfg, &mut menu, Some(&db));
+        assert!(!rebuild);
+        assert!(ui.tour.is_some(), "first run auto-opens the welcome tour");
+
+        // Esc is the skip control's chord: it closes without writing a setting.
+        let mut tour = ui.tour.take().expect("the tour was armed");
+        assert!(matches!(
+            tour.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            TourOutcome::Close {
+                completed: false,
+                ..
+            }
+        ));
+
+        // The marker the close path persists is the one that retires first run.
+        mark_done(&db, false).unwrap();
+        assert_eq!(
+            db.get_ui_state("", crate::onboarding::UI_STATE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("skipped")
+        );
+        assert_eq!(startup_db_state(Some(&db)), (false, None));
+
+        let (ui, _) = startup(&mut cfg, &mut menu, Some(&db));
+        assert!(ui.tour.is_none(), "a skipped tour never auto-opens again");
     }
 }

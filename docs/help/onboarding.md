@@ -8,7 +8,8 @@ parent: getting-started
 
 The first time thegn starts, it opens a full-screen welcome tour. It takes
 about two minutes. Each of its eight screens can be skipped, and nothing is
-saved until the last one.
+saved until the last one. Every screen carries an `esc · skip tour` control
+under its title, so leaving never depends on finding the chord in the footer.
 
 | Key                      | What it does                                          |
 | ------------------------ | ----------------------------------------------------- |
@@ -17,7 +18,11 @@ saved until the last one.
 | `Shift-Tab`, `Backspace` | Go back one screen                                    |
 | `↑` `↓` (or `j` `k`)     | Choose in a list                                      |
 | `←` `→`                  | The second choice on a screen (keymap, backend)       |
-| `Esc`, `Ctrl-C`          | Leave the tour now; nothing is saved                  |
+| `Esc`, `Ctrl-C`          | Leave the tour now, from any screen; nothing is saved |
+
+The `esc · skip tour` control under each title names the same chord as the
+`Esc` row above: one press closes the whole tour from any screen and writes
+nothing.
 
 ## The screens
 
@@ -67,7 +72,9 @@ To undo a change, run `thegn config edit`, or open the tour again.
 
 ## Opening it again
 
-The tour opens once, on the first launch. To see it again, open the
+The tour opens once, on the first launch. Closing it — finished on the last
+screen, or skipped from any of them — records whether you finished or skipped
+it, and either way it does not open by itself again. To see it again, open the
 [[command-palette]] and run **Welcome tour…**. `thegn setup` opens the
 classic setup wizard. Headless and test launches set
 `THEGN_SKIP_ONBOARDING=1` to skip both.

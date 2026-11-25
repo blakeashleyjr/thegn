@@ -40,6 +40,8 @@ steps:
   # 1 Welcome
   - expect_visible: {text: "Every git worktree a tab.", timeout_ms: 20000}
   - expect_visible: {text: "1/8"}
+  # The skip control is painted on every chapter, not only in the footer.
+  - expect_visible: {text: "skip tour"}
   - key: {key: "enter"}
   # 2 Workspace: the diagram, and up/down walks its parts.
   - expect_visible: {text: "the workspace model", timeout_ms: 5000}
@@ -56,6 +58,7 @@ steps:
   - expect_visible: {text: "sandboxes, honestly", timeout_ms: 5000}
   - expect_visible: {text: "outside worktree"}
   - expect_visible: {text: "No tier stops a kernel exploit"}
+  - expect_visible: {text: "skip tour"}
   - key: {key: "enter"}
   # 5 Agents (whatever is on PATH here; nothing is picked).
   - expect_visible: {text: "your coding agent", timeout_ms: 5000}
@@ -65,6 +68,8 @@ steps:
   - key: {key: "enter"}
   # 7 Keys: the real new-worktree chord reacts on the practice diagram.
   - expect_visible: {text: "keys you'll use daily", timeout_ms: 5000}
+  # Even the drill keeps the way out on screen.
+  - expect_visible: {text: "skip tour"}
   - key: {key: "q", mods: [alt]}
   - expect_visible: {text: "That was Alt-q", timeout_ms: 5000}
   - key: {key: "w", mods: [alt]}
