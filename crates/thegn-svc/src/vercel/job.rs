@@ -182,7 +182,19 @@ if [ "$1" = cargo ] && ! command -v cargo >/dev/null 2>&1; then
     command -v cargo >/dev/null 2>&1 || fail "no-cargo: cargo is missing after the rustup install"
 fi
 if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
+    # Rust links through `cc`: reuse gcc or clang when the image has one rather
+    # than installing (a deny-egress sandbox cannot reach a package repository).
+    for alt in gcc clang; do
+        if command -v "$alt" >/dev/null 2>&1; then
+            mkdir -p -- "$home/shim" && ln -s "$(command -v "$alt")" "$home/shim/cc" \
+                && PATH="$home/shim:$PATH"
+            break
+        fi
+    done
+fi
+if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
     # Rust links through `cc`; minimal images ship none.
+    echo "thegn-job-launch: installing a C linker" >&2
     sudo=
     if [ "$(id -u)" != 0 ]; then
         command -v sudo >/dev/null 2>&1 || fail "no C linker (cc) and not root and no sudo to install one"
@@ -199,7 +211,7 @@ if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
     else
         fail "no C linker (cc) and no supported package manager (apt-get, dnf, microdnf, apk)"
     fi
-    [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed"
+    [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed (the sandbox may deny egress to the package repository; use a runtime image that ships a C toolchain)"
     command -v cc >/dev/null 2>&1 || fail "no C linker (cc) after the package install"
 fi
 if [ "$1" = cargo ]; then
@@ -914,6 +926,26 @@ fn attempt_argv(recipe: Recipe, checkout: &str, home: &str) -> Vec<String> {
     argv
 }
 
+/// Most stderr bytes kept in a ledger row's `error`.
+const ERROR_STDERR_BYTES: usize = 1024;
+
+/// The last [`ERROR_STDERR_BYTES`] of stderr, trimmed, for the ledger row.
+fn stderr_excerpt(stderr: &Tail) -> String {
+    let text = stderr.render();
+    let text = text.trim();
+    if text.is_empty() {
+        return "(no stderr captured)".to_owned();
+    }
+    if text.len() <= ERROR_STDERR_BYTES {
+        return text.to_owned();
+    }
+    let mut start = text.len() - ERROR_STDERR_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &text[start..])
+}
+
 /// The bounded log tail: stdout, then the stderr tail for a non-zero exit. The
 /// flag says the included stderr tail already dropped earlier bytes.
 fn compose_log(stdout: &str, stderr: &Tail, exit: Option<i32>) -> (String, bool) {
@@ -1481,6 +1513,24 @@ impl VercelSelectedRunner {
             },
             (false, None) => SelectedCompletion::Indeterminate,
         };
+        // The exit code and the last stderr bytes always reach the ledger
+        // row: a launcher failure is otherwise an indeterminate row with no
+        // exit and no error, and nothing says why.
+        if launch_failed {
+            record.error = Some(format!(
+                "launcher failed before the recipe started (exit {}): {}",
+                exit.unwrap_or(125),
+                stderr_excerpt(&stderr)
+            ));
+        } else if completion == SelectedCompletion::Indeterminate && !fenced {
+            let prior = record.error.take().unwrap_or_default();
+            let sep = if prior.is_empty() { "" } else { "; " };
+            let exit = exit.map_or_else(|| "none".to_owned(), |code| code.to_string());
+            record.error = Some(format!(
+                "{prior}{sep}no terminal exit proven (exit {exit}); stderr tail: {}",
+                stderr_excerpt(&stderr)
+            ));
+        }
         // A fenced run never overwrites the row whoever settled it wrote.
         let guard = fenced.then(|| record.clone());
         Ok(self
@@ -2150,6 +2200,25 @@ mod tests {
         let cc = LAUNCH_SCRIPT.find("command -v cc").unwrap();
         assert!(LAUNCH_SCRIPT.find("sh.rustup.rs").unwrap() < cc);
         assert!(cc < LAUNCH_SCRIPT.find("exec env -i").unwrap());
+    }
+
+    #[test]
+    fn the_launcher_reuses_gcc_or_clang_as_cc_before_installing() {
+        let shim = LAUNCH_SCRIPT.find("for alt in gcc clang").unwrap();
+        assert!(shim < LAUNCH_SCRIPT.find("installing a C linker").unwrap());
+        assert!(LAUNCH_SCRIPT.contains("$home/shim/cc"));
+    }
+
+    #[test]
+    fn stderr_excerpt_keeps_the_tail_and_marks_silence() {
+        let mut tail = Tail::new(STDERR_TAIL_CAP);
+        assert_eq!(stderr_excerpt(&tail), "(no stderr captured)");
+        tail.push("x".repeat(ERROR_STDERR_BYTES + 50).as_bytes());
+        tail.push(b"\nlast line\n");
+        let excerpt = stderr_excerpt(&tail);
+        assert!(excerpt.starts_with("..."));
+        assert!(excerpt.ends_with("last line"));
+        assert!(excerpt.len() <= ERROR_STDERR_BYTES + 3);
     }
 
     #[test]
