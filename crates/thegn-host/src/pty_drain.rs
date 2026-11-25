@@ -1361,6 +1361,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 let bus = (*ctx.event_bus).clone();
                 let nstate = std::sync::Arc::clone(ctx.notify_state);
                 let exited_session = exited_session.clone();
+                let crash_tail = crash_tail.clone();
                 tokio::task::spawn_blocking(move || {
                     let Ok(db) = thegn_core::db::Db::open() else {
                         return;
@@ -1553,12 +1554,20 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     } else {
                         &program
                     };
-                    let msg = match (outcome, exit_code) {
-                        (ProcessOutcome::Failed, Some(c)) => {
-                            format!("{label} failed (exit {c})")
+                    let msg = match outcome {
+                        ProcessOutcome::Failed => {
+                            let log = thegn_core::util::xdg_state_home()
+                                .join("thegn/logs/thegn.log")
+                                .display()
+                                .to_string();
+                            crate::handlers::crash::process_failed_message(
+                                &program,
+                                exit_code,
+                                &crash_tail,
+                                &log,
+                            )
                         }
-                        (ProcessOutcome::Failed, None) => format!("{label} crashed"),
-                        (ProcessOutcome::TaskDone, _) => format!("{label} finished"),
+                        ProcessOutcome::TaskDone => format!("{label} finished"),
                     };
                     // Diagnostic hook: with routine shells + unreapable `None`
                     // exits suppressed in `classify_process_exit`, a

@@ -397,7 +397,16 @@ fn done_marker(completed: bool) -> &'static str {
 /// Write that marker into an open handle: the exact shape the DB task closes
 /// over, so a test can round-trip it against [`startup_db_state`].
 fn mark_done(db: &thegn_core::db::Db, completed: bool) -> anyhow::Result<()> {
-    db.set_ui_state("", crate::onboarding::UI_STATE_KEY, done_marker(completed))
+    db.set_ui_state("", crate::onboarding::UI_STATE_KEY, done_marker(completed))?;
+    // The tour and wizard own the keymap step but write a preset only when it
+    // changes. A run that keeps the default would leave no remembered choice, so
+    // the one-time keymap picker would return on the next launch (the marker
+    // above already retired first run). Record the default unless a choice is
+    // already remembered; an explicit pick is persisted by `apply_keymap_preset`.
+    if db.get_ui_state("", "keymap_preset")?.is_none() {
+        db.set_ui_state("", "keymap_preset", "default")?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,9 +763,31 @@ mod tests {
                 .as_deref(),
             Some("skipped")
         );
-        assert_eq!(startup_db_state(Some(&db)), (false, None));
+        // A skip that kept the default still remembers it, so the keymap picker
+        // does not take the tour's place on the next launch.
+        assert_eq!(
+            startup_db_state(Some(&db)),
+            (false, Some("default".to_string()))
+        );
 
         let (ui, _) = startup(&mut cfg, &mut menu, Some(&db));
         assert!(ui.tour.is_none(), "a skipped tour never auto-opens again");
+        assert!(
+            menu.is_none(),
+            "a remembered default opens no keymap picker"
+        );
+    }
+
+    /// A tour that saved an explicit preset keeps it: closing the tour must not
+    /// overwrite a remembered choice with the default.
+    #[test]
+    fn closing_the_tour_keeps_an_explicit_remembered_preset() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.set_ui_state("", "keymap_preset", "vscode").unwrap();
+        mark_done(&db, true).unwrap();
+        assert_eq!(
+            startup_db_state(Some(&db)),
+            (false, Some("vscode".to_string()))
+        );
     }
 }

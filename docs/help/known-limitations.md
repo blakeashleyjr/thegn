@@ -28,8 +28,9 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   services bound on your Mac; `network = "host"` is refused too (`nat` is the
   supported mode). Use podman or docker for offline or sealed worktrees. See
   [[sandbox-network]].
-- **Windows is deferred, with no published binary.** Use a supported Linux
-  build instead.
+- **Windows is deferred, with no published binary.** Use the Linux build
+  inside WSL2 instead; see [[wsl2]]. WSL2 is not yet verified by the
+  maintainers.
 - **Windows hosts: Win32-OpenSSH has no connection sharing (ControlMaster).**
   thegn opens one ssh connection per control call there. This is not verified
   on hardware yet. On any OS, a control socket path longer than 84 bytes (a

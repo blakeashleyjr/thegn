@@ -1333,7 +1333,9 @@ impl InputParser {
                     if let Some(idx) = self.buf.find_subsequence(offset, end_paste) {
                         let pasted =
                             String::from_utf8_lossy(&self.buf.as_slice()[0..idx]).to_string();
-                        self.buf.advance(pasted.len() + end_paste.len());
+                        // Advance by the raw byte count: lossy decoding replaces each invalid
+                        // byte with a 3-byte U+FFFD, so `pasted.len()` can exceed `idx`.
+                        self.buf.advance(idx + end_paste.len());
                         callback(InputEvent::Paste(pasted));
                         self.state = InputState::Normal;
                     } else {
@@ -1824,6 +1826,38 @@ mod test {
                 .unwrap(),
             "\x1bOP".to_string()
         );
+    }
+
+    #[test]
+    fn bracketed_paste_with_invalid_utf8_keeps_following_input() {
+        let mut p = InputParser::new();
+        let mut inputs = vec![];
+        p.parse(b"\x1b[200~a\xff\xfeb\x1b[201~xyz", |e| inputs.push(e), false);
+        assert_eq!(
+            inputs[0],
+            InputEvent::Paste("a\u{fffd}\u{fffd}b".to_owned())
+        );
+        let rest: String = inputs[1..]
+            .iter()
+            .filter_map(|e| match e {
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char(c),
+                    ..
+                }) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rest, "xyz");
+    }
+
+    #[test]
+    fn bracketed_paste_markers_split_across_reads() {
+        let mut p = InputParser::new();
+        let mut inputs = vec![];
+        for chunk in [&b"\x1b[20"[..], b"0~ab\x1b[2", b"01", b"~"] {
+            p.parse(chunk, |e| inputs.push(e), true);
+        }
+        assert_eq!(vec![InputEvent::Paste("ab".to_owned())], inputs);
     }
 
     #[test]

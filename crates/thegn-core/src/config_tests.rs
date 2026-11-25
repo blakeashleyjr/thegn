@@ -618,6 +618,10 @@ fn clipboard_defaults_are_on_with_a_10mib_cap() {
     assert_eq!(c.max_image_bytes, 10 * 1024 * 1024);
     assert_eq!(c.remote_dir, "~/.cache/thegn/paste");
     assert_eq!(c.keep_hours, 24);
+    assert!(
+        !c.persist_registers,
+        "copied text stays out of the DB by default"
+    );
 }
 
 #[test]
@@ -630,6 +634,8 @@ fn parses_clipboard_table() {
     assert_eq!(cfg.clipboard.max_image_bytes, 2048);
     assert_eq!(cfg.clipboard.remote_dir, "/srv/drop");
     assert_eq!(cfg.clipboard.keep_hours, 6);
+    let on: Config = toml::from_str("[clipboard]\npersist_registers = true\n").unwrap();
+    assert!(on.clipboard.persist_registers);
 }
 
 #[test]
