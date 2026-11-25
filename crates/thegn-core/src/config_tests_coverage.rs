@@ -1476,8 +1476,9 @@ fn post_process_populates_default_agents_and_tools() {
     );
     assert!(c.tools.iter().any(|t| t.name == "lazygit"));
     assert!(c.tools.iter().any(|t| t.name == "editor"));
-    // repo_roots defaults to [workspaces_dir] when unset.
-    assert_eq!(c.repo_roots, vec![c.workspaces_dir.clone()]);
+    // repo_roots stays empty when unset: nothing is scanned until the user
+    // answers the first-run question.
+    assert!(c.repo_roots.is_empty());
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
