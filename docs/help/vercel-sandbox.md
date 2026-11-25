@@ -35,6 +35,9 @@ size = "2"
 - When a terminal pane opens, thegn writes the admitted interactive host (and the
   `/health` host, or a refused host) once to stderr and at `info` in the log.
   Only the host is written, never the URL query or the ticket.
+- Network egress is **denied by default**: a new sandbox cannot reach any
+  host. `egress = "registries"` allows only package registries and git hosts;
+  `egress = "allow-all"` opens it. See [Network egress](#network-egress).
 - `max_instances` defaults to 2; `max_lifetime_secs` defaults to 24 hours.
 
 ## What works
@@ -170,9 +173,37 @@ refused (use `[sandbox.home] agents` there).
   that fails and exactly one vercel env exists, that one is used; otherwise
   upload is skipped with one warning (mode `none` behaviour).
 
+## Network egress
+
+A Vercel sandbox gets **no network access by default**: `curl example.com`
+fails inside it. thegn sends the policy when it creates the sandbox and sends it
+again every time a stopped sandbox resumes, so a resumed sandbox never runs on a
+stale policy. If the policy cannot be applied on resume, the sandbox is not
+handed out.
+
+```toml
+[env.cloud.provider]
+egress = "registries"            # deny (default) | registries | allow-all
+egress_allow = ["example.com"]   # extra hosts for deny and registries
+```
+
+| `egress`     | Reachable from the sandbox                                                                                                                                                                                 |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deny`       | Nothing, plus any `egress_allow` hosts. The default.                                                                                                                                                       |
+| `registries` | `crates.io`, `static.crates.io`, `index.crates.io`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com`, plus `egress_allow`. |
+| `allow-all`  | Everything. Code in the sandbox can reach any host. An explicit choice.                                                                                                                                    |
+
+`egress_allow` uses the host-pattern grammar from [[sandbox-network]]: `x.com`
+is the apex and every subdomain, `*.x.com` subdomains only, `=x.com` exactly
+that host. `*` and port suffixes are refused; choose `allow-all` to open
+egress. Set it at creation with `thegn env create <name> --provider vercel
+--egress registries`, or pick it in the new-environment wizard under
+**network**. Only your own config can set these keys; a repo `.thegn.toml`
+cannot. Changes take effect on the next create or resume.
+
 ### Egress policy
 
-An allow list from `[sandbox.network]` is sent to Vercel as a custom policy;
+The model-login narrowing below is a separate, tighter step. An allow list from `[sandbox.network]` is sent to Vercel as a custom policy;
 `*` means allow everything. An egress change is applied to the sandbox and to
 its running or starting session, and a failed session update is an error.
 

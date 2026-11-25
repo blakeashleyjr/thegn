@@ -525,6 +525,14 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
                      interactive_host_suffixes applies only to provider = \"vercel\""
                 ));
             }
+            if env.provider.egress != crate::config::SandboxEgress::Deny
+                || !env.provider.egress_allow.is_empty()
+            {
+                errors.push(format!(
+                    "env.{env_name}.provider.egress: egress and egress_allow apply only to \
+                     provider = \"vercel\""
+                ));
+            }
         }
         errors.extend(
             login_homes_errors(&env.provider.login_homes)

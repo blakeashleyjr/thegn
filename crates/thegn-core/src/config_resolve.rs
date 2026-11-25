@@ -3891,6 +3891,7 @@ mod tests {
         assert!(!schema.contains("interactive_host_suffixes"), "{schema}");
         assert!(!schema.contains("login_homes"), "{schema}");
         assert!(!schema.contains("lifetime_reap"), "{schema}");
+        assert!(!schema.contains("egress_allow"), "{schema}");
 
         let cfg: Config = toml::from_str(
             r#"
@@ -3929,6 +3930,11 @@ mod tests {
             assert!(effective.interactive_host_suffixes.is_empty(), "{overlay}");
             assert!(effective.login_homes.is_empty(), "{overlay}");
             assert!(!effective.lifetime_reap, "{overlay}");
+            assert_eq!(
+                effective.egress,
+                crate::config::SandboxEgress::Deny,
+                "{overlay}"
+            );
         }
     }
 

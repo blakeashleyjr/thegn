@@ -9,6 +9,11 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
+- Vercel sandboxes now deny network egress by default. `[env.<n>.provider]
+egress = "registries"` allows only package registries and git hosts,
+  `"allow-all"` opens it, and `egress_allow` adds hosts. The policy is applied
+  on create and on every resume; the new-environment wizard and
+  `thegn env create --egress` offer the choice.
 - The first launch opens a full-screen welcome tour: the workspace model on a
   small live diagram, a theme you see applied as you scroll, an honest table of
   what each sandbox tier protects with the backends that work on this machine,

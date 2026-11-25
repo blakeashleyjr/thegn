@@ -157,6 +157,10 @@ pub enum Action {
         /// Image/snapshot template (e.g. `image:<ref>` for Fly, `snapshot:<id>` for VPS).
         #[arg(long)]
         template: Option<String>,
+        /// Sandbox network egress (vercel only): `deny` (default), `registries`
+        /// (deny + package registries and git hosts) or `allow-all`.
+        #[arg(long)]
+        egress: Option<String>,
         #[arg(long)]
         max_instances: Option<i64>,
         #[arg(long)]
@@ -267,6 +271,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             team_id,
             project_id,
             template,
+            egress,
             max_instances,
             max_lifetime,
             auto_provision,
@@ -283,6 +288,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             team_id,
             project_id,
             template,
+            egress,
             max_instances,
             max_lifetime,
             auto_provision,
@@ -319,6 +325,8 @@ pub(crate) struct CreateArgs {
     pub team_id: Option<String>,
     pub project_id: Option<String>,
     pub template: Option<String>,
+    /// Vercel only: `deny` | `registries` | `allow-all`.
+    pub egress: Option<String>,
     pub max_instances: Option<i64>,
     pub max_lifetime: Option<i64>,
     pub auto_provision: bool,
@@ -343,6 +351,17 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
         other => anyhow::bail!(
             "unknown --provider {other:?} \
              (local|ssh|fly|digitalocean|hetzner|daytona|sprites|machine0|vercel)"
+        ),
+    };
+
+    let egress = match a.egress.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(_) if kind != "vercel" => anyhow::bail!("--egress applies only to --provider vercel"),
+        Some(v) => Some(
+            thegn_core::config::SandboxEgress::from_str_validated(v)
+                .map_err(|e| anyhow::anyhow!("--egress: {e}"))?
+                .as_str()
+                .to_string(),
         ),
     };
 
@@ -375,6 +394,7 @@ pub(crate) fn create_env(a: CreateArgs) -> Result<()> {
         max_instances: a.max_instances,
         max_lifetime_secs: a.max_lifetime,
         auto_provision: a.auto_provision.then_some(true),
+        egress,
         ssh_host: a.ssh_host,
         sandbox_backend: a.sandbox,
     };
@@ -2490,6 +2510,35 @@ mod vercel_surface_tests {
             text.contains("api_key_env = \"env:VERCEL_TOKEN\""),
             "{text}"
         );
+    }
+
+    #[test]
+    fn create_vercel_writes_the_egress_choice_and_refuses_others() {
+        let _state = crate::testenv::IsolatedState::new();
+        create_env(CreateArgs {
+            name: "vc".into(),
+            provider: "vercel".into(),
+            egress: Some("registries".into()),
+            token_env: Some("VERCEL_TOKEN".into()),
+            ..Default::default()
+        })
+        .expect("create");
+        let text = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(text.contains("egress = \"registries\""), "{text}");
+        let bad = CreateArgs {
+            name: "vc2".into(),
+            provider: "vercel".into(),
+            egress: Some("open".into()),
+            ..Default::default()
+        };
+        assert!(create_env(bad).is_err());
+        let other = CreateArgs {
+            name: "f".into(),
+            provider: "fly".into(),
+            egress: Some("deny".into()),
+            ..Default::default()
+        };
+        assert!(create_env(other).is_err());
     }
 
     #[test]

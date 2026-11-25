@@ -22,6 +22,14 @@ only enforced deny, and `*` in `network_block` means offline — see
 launch (standalone sandboxed terminals included), at `thegn env provision`, and
 in `thegn doctor`.
 
+### Vercel sandboxes: deny by default
+
+Unlike the advisory `[sandbox]` lists, a Vercel sandbox's network is enforced
+by Vercel and **denied by default**. `[env.<n>.provider] egress` picks `deny`
+(default), `registries` (package registries and git hosts only) or `allow-all`,
+and `egress_allow` adds hosts in the grammar below. The policy is applied on
+create and on every resume. See [[vercel-sandbox]].
+
 ### Host patterns
 
 Entries in `network_allow` and `network_block` share one grammar:

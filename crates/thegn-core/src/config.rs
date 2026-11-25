@@ -4021,7 +4021,8 @@ impl Config {
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvProviderKind, EnvSshConfig, MetricsConfig, MetricsTarget,
     MetricsTargetKind, ModelCredentials, NixInstaller, ProviderConnect, ProviderExecMode,
-    provider_scale_to_zero, provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
+    SandboxEgress, provider_scale_to_zero, provider_self_suspends, ssh_reached_provider_kind,
+    vps_provider_kind,
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
