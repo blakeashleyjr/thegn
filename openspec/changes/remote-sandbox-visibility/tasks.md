@@ -35,17 +35,22 @@
 
 ## 4. Sidebar
 
-- [ ] 4.1 Remote worktree row: health dot (`ok` / `warn` / `unknown`) and a
-      warning badge from the sampler's latest level.
+- [x] 4.1 Remote worktree row: health dot (`ok` / `warn` / `unknown`) and a
+      warning badge from the sampler's latest level (read from
+      `remote_health::global()`; slice 3's sampler feeds it) — **unit tests**:
+      dot per level, clipped warning.
 
 ## 5. Observe tab
 
-- [ ] 5.1 Remote section: CPU load, memory used / limit and pressure, disk,
-      from the sampler's ring of samples.
+- [x] 5.1 Remote section: CPU load, memory used / limit and pressure, disk,
+      from the sampler's ring of samples — **unit tests**: sparklines at five
+      widths, empty without a reading, error shown without a sample.
 
 ## 6. Fleet popup, API, MCP
 
-- [ ] 6.1 Fleet popup health column and drill-in.
+- [x] 6.1 Fleet popup health columns (`mem`, `up`, `life`) and warnings block;
+      drill-in stays open (needs the journal, 7.x) — **unit tests**: columns
+      appear only with a reading.
 - [ ] 6.2 Control API / MCP `remote.health` (sample, level, events).
 
 ## 7. Journal, logs, processes, cost

@@ -445,6 +445,16 @@ environments.
   probe could not run; the reason is printed). Warnings name the cause, for
   example `sprite out of memory: kernel killed rustc 3.7 GB`, and a lifetime
   under an hour. With `--json` the same report is the `health` object.
+- **Where health shows.** A remote worktree row in the sidebar carries a
+  health dot (green `ok`, amber `warn`, faint `unknown`) and, when there is
+  one, the warning text. The fleet popup adds `mem`, `up` and `life` columns
+  (memory percent, uptime, lifetime left) and lists each warning below the
+  table; they appear once any listed sandbox has been sampled. The panel's
+  telemetry section (the Observe view) shows a `REMOTE` block for the focused
+  worktree: CPU, memory and disk with a sparkline of the recent samples, plus
+  uptime and lifetime left. Nothing is shown for a sandbox that has not been
+  sampled, and a failed probe shows `unknown` with its reason, never a
+  made-up reading.
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.

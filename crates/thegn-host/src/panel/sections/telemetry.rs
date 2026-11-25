@@ -4,6 +4,7 @@
 //! gutter, the per-core sparkrow, and humanized net rates.
 
 use thegn_core::pipeline_report::display_cell;
+use thegn_core::remote_health::HealthSource;
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 use unicode_width::UnicodeWidthChar;
@@ -37,6 +38,132 @@ fn all_rows(ctx: &SectionCtx) -> Vec<PanelRow> {
         normal(ctx)
     };
     rows.extend(loop_block(ctx));
+    let key = focused_worktree_path(ctx);
+    let reading = key.and_then(|k| thegn_core::remote_health::global().reading(k));
+    rows.extend(remote_block(
+        ctx.cols,
+        ctx.deep(),
+        reading.as_ref(),
+        now_ms(),
+    ));
+    rows
+}
+
+/// The focused worktree's path (the health cache key), if the tab is known.
+fn focused_worktree_path<'a>(ctx: &'a SectionCtx) -> Option<&'a str> {
+    ctx.model
+        .sidebar_db_worktrees
+        .iter()
+        .find(|w| w.tab_name == ctx.model.worktree)
+        .map(|w| w.path.as_str())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A sparkline `w` cells wide of the newest `w` values, padded on the left
+/// with the lowest block so a short history keeps its right edge.
+fn spark_row(series: &[f32], w: usize) -> String {
+    let tail = &series[series.len().saturating_sub(w)..];
+    let mut vals = vec![0.0; w - tail.len()];
+    vals.extend_from_slice(tail);
+    viz::sparkline(&vals)
+}
+
+/// The REMOTE sub-block: the focused worktree's sandbox health with live
+/// CPU / memory / disk sparklines from the sampler's ring. Empty when the
+/// worktree has no sandbox reading (a local worktree shows nothing).
+fn remote_block(
+    cols: usize,
+    deep: bool,
+    reading: Option<&thegn_core::remote_health::HealthReading>,
+    now_ms: i64,
+) -> Vec<PanelRow> {
+    use thegn_core::remote_health::{HealthLevel, short_duration};
+    let Some(r) = reading else {
+        return Vec::new();
+    };
+    let (tone, word) = match r.level() {
+        HealthLevel::Ok => (hue(Hue::Green), "ok"),
+        HealthLevel::Warn => (hue(Hue::Amber), "warn"),
+        HealthLevel::Unknown => (g(), "unknown"),
+    };
+    let mut rows = vec![
+        PanelRow::blank(),
+        PanelRow::plain(Line::split(
+            vec![seg(g2(), "REMOTE").bold()],
+            vec![seg(tone, word)],
+        )),
+    ];
+    if let Some(note) = r.note() {
+        let clip = thegn_core::pipeline_report::display_clip(
+            &display_cell(note),
+            cols.saturating_sub(2).max(8),
+        );
+        rows.push(PanelRow::plain(Line::segs(vec![sp(1), seg(tone, clip)])));
+    }
+    let Some(sample) = r.sample.as_ref() else {
+        return rows;
+    };
+    let gw = cols.saturating_sub(if deep { 18 } else { 20 }).clamp(6, 40);
+    let pct = |p: Option<u64>| p.map_or_else(|| " -".to_string(), |p| format!("{p:>3}%"));
+    let cpu_pct = sample.load.zip(sample.cpus).map(|(l, c)| {
+        if c == 0 {
+            0
+        } else {
+            (l[0] / f64::from(c) * 100.0).round() as u64
+        }
+    });
+    let mut metric = |label: &str, value: String, series: Vec<f32>, tone: Tok| {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(g2(), format!("{label} ")).bold(),
+            seg(t(), format!("{value} ")),
+            seg(tone, spark_row(&series, gw)),
+        ])));
+    };
+    metric("CPU", pct(cpu_pct), r.cpu_series(), hue(Hue::Teal));
+    metric(
+        "MEM",
+        pct(sample.memory_percent()),
+        r.mem_series(),
+        hue(Hue::Purple),
+    );
+    metric(
+        "DSK",
+        pct(sample.disk_percent()),
+        r.disk_series(),
+        hue(Hue::Amber),
+    );
+    if let Some((used, limit)) = sample.memory() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(
+                g(),
+                format!(
+                    "{}/{} mem",
+                    thegn_core::remote_health::gb(used),
+                    thegn_core::remote_health::gb(limit)
+                ),
+            ),
+        ])));
+    }
+    let mut facts = Vec::new();
+    if let Some(up) = sample.uptime_secs {
+        facts.push(format!("up {}", short_duration(up)));
+    }
+    if let Some(left) = r.lifetime_left_at(now_ms) {
+        facts.push(format!("{} left", short_duration(left)));
+    }
+    if !facts.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(d(), facts.join(" · ")),
+        ])));
+    }
     rows
 }
 
@@ -789,5 +916,82 @@ mod tests {
             ..Default::default()
         });
         assert!(rendered.contains("p95 1.0ms · p99 8.2ms"), "{rendered}");
+    }
+
+    fn remote_text(
+        cols: usize,
+        deep: bool,
+        r: Option<&thegn_core::remote_health::HealthReading>,
+    ) -> Vec<String> {
+        remote_block(cols, deep, r, 0)
+            .iter()
+            .map(|row| match &row.line {
+                Line::Segs(v) => v.iter().map(|s| s.text.clone()).collect::<String>(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    let j = |v: &Vec<crate::seg::Seg>| {
+                        v.iter().map(|s| s.text.clone()).collect::<String>()
+                    };
+                    format!("{} {}", j(l), j(r))
+                }
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remote_block_renders_sparklines_at_every_width() {
+        use thegn_core::remote_health::{HealthCache, HealthSample, HealthSource};
+        let cache = HealthCache::default();
+        for i in 0..10u64 {
+            cache.record(
+                "/wt/r",
+                HealthSample {
+                    load: Some([i as f64 / 10.0, 0.0, 0.0]),
+                    cpus: Some(2),
+                    uptime_secs: Some(7_500),
+                    mem_total_kib: Some(4_000_000),
+                    mem_available_kib: Some(1_000_000),
+                    disk_total_kib: Some(100),
+                    disk_used_kib: Some(40),
+                    ..Default::default()
+                },
+                0,
+                (i == 9).then(|| "sprite restarted: likely out of memory".to_string()),
+                Some(5_400),
+            );
+        }
+        let r = cache.reading("/wt/r").unwrap();
+        for cols in [10usize, 24, 40, 80, 140] {
+            for deep in [false, true] {
+                let lines = remote_text(cols, deep, Some(&r));
+                let all = lines.join("\n");
+                assert!(all.contains("REMOTE"), "{cols}: {all}");
+                assert!(all.contains("warn"), "{cols}: {all}");
+                assert!(all.contains("CPU") && all.contains("MEM") && all.contains("DSK"));
+                assert!(all.contains("75%") && all.contains("40%"), "{cols}: {all}");
+                assert!(
+                    all.contains("up 2h 5m") && all.contains("1h 30m left"),
+                    "{all}"
+                );
+                for l in &lines {
+                    let w = unicode_width::UnicodeWidthStr::width(l.as_str());
+                    assert!(w <= cols.max(30) + 12, "{cols}: {w} {l:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_block_is_empty_without_a_reading_and_says_why_on_error() {
+        assert!(remote_text(40, false, None).is_empty());
+        let c = thegn_core::remote_health::HealthCache::default();
+        c.record_error("/wt/e", "exec refused".into(), 0);
+        let r = thegn_core::remote_health::HealthSource::reading(&c, "/wt/e").unwrap();
+        let all = remote_text(40, false, Some(&r)).join("\n");
+        assert!(
+            all.contains("unknown") && all.contains("exec refused"),
+            "{all}"
+        );
+        assert!(!all.contains("CPU"), "no fabricated sample: {all}");
     }
 }
