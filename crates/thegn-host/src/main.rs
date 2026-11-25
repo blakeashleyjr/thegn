@@ -1418,23 +1418,6 @@ fn stable_refusal_message(verb: &str, feature_id: &str) -> String {
     )
 }
 
-#[cfg(test)]
-mod stable_refusal_tests {
-    use super::stable_refusal_message;
-
-    #[test]
-    fn direct_iroh_refusal_names_the_stable_alternative() {
-        let m = stable_refusal_message("serve --iroh-direct", "remote");
-        assert!(
-            m.contains("thegn serve") && m.contains("thegn pair new"),
-            "{m}"
-        );
-        let m = stable_refusal_message("pair direct", "remote");
-        assert!(m.contains("thegn pair new"), "{m}");
-        assert!(!stable_refusal_message("host", "providers").contains("pair new"));
-    }
-}
-
 /// Verbs that install their own logging subscriber (daemon/serve) or must keep
 /// their stdout/stderr stream pristine for a framed protocol (the stdio
 /// bridges) — the generic CLI diagnostics install is skipped for these.
@@ -1865,3 +1848,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
 }
 
 // cache probe
+
+#[cfg(test)]
+mod stable_refusal_tests {
+    use super::stable_refusal_message;
+
+    #[test]
+    fn direct_iroh_refusal_names_the_stable_alternative() {
+        let m = stable_refusal_message("serve --iroh-direct", "remote");
+        assert!(
+            m.contains("thegn serve") && m.contains("thegn pair new"),
+            "{m}"
+        );
+        let m = stable_refusal_message("pair direct", "remote");
+        assert!(m.contains("thegn pair new"), "{m}");
+        assert!(!stable_refusal_message("host", "providers").contains("pair new"));
+    }
+}

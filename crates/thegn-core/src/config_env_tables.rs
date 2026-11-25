@@ -1104,7 +1104,11 @@ mod tests {
         assert_eq!(pc.egress, SandboxEgress::Deny);
         assert!(pc.egress_allow.is_empty());
         assert!(pc.is_default());
-        for mode in SandboxEgress::ALL {
+        for mode in &[
+            SandboxEgress::Deny,
+            SandboxEgress::Registries,
+            SandboxEgress::AllowAll,
+        ] {
             let pc: EnvProviderConfig = toml::from_str(&format!(
                 "egress = {:?}\negress_allow = [\"a.com\"]\n",
                 mode.as_str()

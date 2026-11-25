@@ -71,6 +71,11 @@ pub(crate) enum Outcome {
 }
 
 /// Explain on stderr, then ask (interactive) or print the command (non-interactive).
+#[allow(clippy::disallowed_macros)] // CLI prompt on stderr before the TUI starts
+#[expect(
+    clippy::disallowed_methods,
+    reason = "CLI refusal path runs before the event loop starts; waits on `daemon stop`"
+)]
 pub(crate) fn report(stale: &StaleDaemon) -> Outcome {
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     eprintln!("thegn: {}", explanation(stale));
