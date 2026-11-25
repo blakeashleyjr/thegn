@@ -696,8 +696,11 @@ in the background, with progress on the status line (`background setup: <step>�
 On Vercel the agent install and snapshot also run after the prompt now.
 
 - An agent launched meanwhile waits for its CLI and login before it starts.
-- `thegn env up` still waits for everything. `thegn env up --shell-ready`
-  returns as soon as a shell can open.
+- `thegn env up` in a terminal returns as soon as a shell can open and finishes
+  the background steps in a detached `thegn env up --wait` (log:
+  `$XDG_STATE_HOME/thegn/provider/deferred/<sandbox>.up.log`); a failure shows in
+  `thegn env show`. Scripts (no terminal) and `--wait` wait for everything;
+  `--shell-ready` returns without starting the background run.
 - Each phase of a cold create (sandbox create, boot wait, workspace, clone, …)
   prints its duration on stderr (`provision: <step> — done (N.N s)`), and the
   create, boot and home-probe phases are also logged with `elapsed_ms` under the

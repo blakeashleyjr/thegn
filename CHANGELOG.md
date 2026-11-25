@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+- `thegn env up` in a terminal now returns once a shell can open and finishes coding-agent install, logins and the snapshot in a detached background run; `--wait` (and any non-terminal run) still waits for everything.
+
 ## [0.1.0-alpha.132] — 2026-11-24
 
 Restart thegn after upgrading. If an older daemon still holds the database,

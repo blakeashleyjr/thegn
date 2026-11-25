@@ -1231,7 +1231,7 @@ CREATED=1
 # background setup (agents, history, checkpoint) separately, so the run reports
 # where the cold start goes.
 step 3 "provision sprite (env up --shell-ready)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up --shell-ready
-step 3a "background setup finishes (env up)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up
+step 3a "background setup finishes (env up --wait)" in_repo "$THEGN_BIN" "${MIN_RAM_SET[@]}" env up --wait
 step 3b "exactly one ready sprites ledger record (plan step 3)" name_from_ledger
 echo "sprite: $SPRITE_NAME"
 step 4 "sprite workspace HEAD matches the local lane HEAD" head_matches
