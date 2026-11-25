@@ -4920,6 +4920,8 @@ failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ 
 # `--runner <env>`). `config validate` refuses a name that is not such an env.
 # [jobs]
 # runner = ""
+# admission_timeout_secs = 30   # a routed job waits this long for the runner to admit it,
+#                               # then fails closed (THEGN_JOB_LOCAL=1 runs it locally); 0 = no wait
 #
 # Per-project binding: a trusted `[project.<slug>.jobs]` block overrides the
 # global runner for that project only (a repo's `.thegn.*` overlay cannot set

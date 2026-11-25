@@ -6955,6 +6955,8 @@ pub fn launch_spec_full(
     // paths are materialized as one ordinary PATH value.
     if outcome.spec.is_none() && !provider_active {
         apply_activation_host(&mut spec, &activation);
+        // Automatic route: after activation, so the shim directory stays first.
+        crate::cmd::job_shim::inject_pane_env(cfg, &repo_root, &mut spec.env);
     }
     // Record what this launch ACTUALLY enters, for every surface that displays
     // containment. `spec.backend` is argv-derived (see `compose_spec`), so this

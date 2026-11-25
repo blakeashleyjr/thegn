@@ -493,18 +493,16 @@ pub(crate) fn wrapper_script(exe: &Path, tool: &str) -> String {
     )
 }
 
-/// `thegn job shim-install --dir DIR`: write the wrappers and print the
-/// shell lines that put them first on PATH (`eval "$(…)"`-able).
+/// Write the wrappers into `dir` (created if missing; rewriting is idempotent)
+/// and return its canonical path.
 #[cfg(unix)]
-pub(crate) fn install(args: &ShimInstallArgs) -> Result<()> {
+pub(crate) fn write_wrappers(dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().context("cannot locate the thegn binary")?;
-    std::fs::create_dir_all(&args.dir)
-        .with_context(|| format!("cannot create {}", args.dir.display()))?;
-    let dir = args
-        .dir
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let dir = dir
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", args.dir.display()))?;
+        .with_context(|| format!("cannot resolve {}", dir.display()))?;
     for tool in SHIM_TOOLS {
         let path = dir.join(tool);
         std::fs::write(&path, wrapper_script(&exe, tool))
@@ -512,6 +510,14 @@ pub(crate) fn install(args: &ShimInstallArgs) -> Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("cannot make {} executable", path.display()))?;
     }
+    Ok(dir)
+}
+
+/// `thegn job shim-install --dir DIR`: write the wrappers and print the
+/// shell lines that put them first on PATH (`eval "$(…)"`-able).
+#[cfg(unix)]
+pub(crate) fn install(args: &ShimInstallArgs) -> Result<()> {
+    let dir = write_wrappers(&args.dir)?;
     let quoted = sh_quote(&dir.display().to_string());
     outln!("export {}={}", SHIM_DIR_ENV, quoted);
     outln!("export PATH={}:\"$PATH\"", quoted);
@@ -521,6 +527,63 @@ pub(crate) fn install(args: &ShimInstallArgs) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn install(_args: &ShimInstallArgs) -> Result<()> {
     bail!("the shell shim needs a Unix host")
+}
+
+/// The directory thegn manages for automatic-route wrappers.
+pub(crate) fn managed_shim_dir() -> PathBuf {
+    thegn_core::util::xdg_state_home().join("thegn/job-shim")
+}
+
+/// True when `repo_root`'s project opted into the automatic route AND has a
+/// runner bound: the only case an agent pane gets the shim directory.
+pub(crate) fn pane_gets_shim(cfg: &Config, repo_root: &Path) -> bool {
+    cfg.repo_job_route(repo_root) == RouteMode::Auto
+        && !cfg.repo_job_runner(repo_root).env.is_empty()
+}
+
+/// Put `shim_dir` first on the pane's `PATH` and record it in
+/// `THEGN_JOB_SHIM_DIR`. `PATH` starts from the pane env's own value when it
+/// has one (toolchain activation sets it), else from `base_path`.
+pub(crate) fn prepend_shim_env(env: &mut Vec<(String, String)>, shim_dir: &Path, base_path: &str) {
+    let dir = shim_dir.display().to_string();
+    let base = env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map_or_else(|| base_path.to_owned(), |(_, value)| value.clone());
+    env.retain(|(key, _)| key != "PATH" && key != SHIM_DIR_ENV);
+    let path = if base.is_empty() {
+        dir.clone()
+    } else {
+        format!("{dir}:{base}")
+    };
+    env.push((SHIM_DIR_ENV.to_owned(), dir));
+    env.push(("PATH".to_owned(), path));
+}
+
+/// Launch-time hook for a host agent pane: when the project routes
+/// automatically and has a runner, install the wrappers under the managed
+/// directory and prepend it to the pane's `PATH`. Off by default; a failure to
+/// write the wrappers leaves the pane unrouted (the build then runs locally,
+/// visibly, as it does today) and is logged.
+pub(crate) fn inject_pane_env(cfg: &Config, repo_root: &Path, env: &mut Vec<(String, String)>) {
+    if !pane_gets_shim(cfg, repo_root) {
+        return;
+    }
+    #[cfg(unix)]
+    match write_wrappers(&managed_shim_dir()) {
+        Ok(dir) => {
+            let base = std::env::var("PATH").unwrap_or_default();
+            prepend_shim_env(env, &dir, &base);
+        }
+        Err(error) => tracing::warn!(
+            target: "thegn::job",
+            error = %format!("{error:#}"),
+            "automatic route: cannot install the job shim, pane stays unrouted"
+        ),
+    }
+    #[cfg(not(unix))]
+    let _ = env;
 }
 
 /// `thegn job match`: show the coverage of one shell line.

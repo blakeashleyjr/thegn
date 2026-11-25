@@ -308,3 +308,47 @@ fn the_shim_verbs_parse() {
     assert!(parse(&["job", "shim"]).is_err());
     assert!(parse(&["job", "shim-install"]).is_err());
 }
+
+#[test]
+fn a_pane_gets_no_shim_unless_the_project_routes_automatically() {
+    let cfg = Config::default();
+    assert!(!pane_gets_shim(&cfg, Path::new("/repo")));
+    let mut env = vec![("PATH".to_owned(), "/bin".to_owned())];
+    inject_pane_env(&cfg, Path::new("/repo"), &mut env);
+    assert_eq!(env, vec![("PATH".to_owned(), "/bin".to_owned())]);
+}
+
+#[test]
+fn the_shim_directory_goes_first_on_the_pane_path() {
+    let mut env = vec![
+        ("LANG".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), "/act/bin:/bin".to_owned()),
+    ];
+    prepend_shim_env(&mut env, Path::new("/state/job-shim"), "/ignored");
+    let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    assert_eq!(get("PATH"), Some("/state/job-shim:/act/bin:/bin"));
+    assert_eq!(get(SHIM_DIR_ENV), Some("/state/job-shim"));
+    assert_eq!(get("LANG"), Some("C"));
+    // Composing twice does not stack or duplicate the directory variable.
+    prepend_shim_env(&mut env, Path::new("/state/job-shim"), "/ignored");
+    assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+    assert_eq!(env.iter().filter(|(k, _)| k == SHIM_DIR_ENV).count(), 1);
+}
+
+#[test]
+fn the_pane_path_falls_back_to_the_base_when_the_env_has_none() {
+    let mut env = Vec::new();
+    prepend_shim_env(&mut env, Path::new("/s"), "/usr/bin");
+    assert!(env.contains(&("PATH".to_owned(), "/s:/usr/bin".to_owned())));
+}
+
+#[cfg(unix)]
+#[test]
+fn writing_the_wrappers_twice_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("shim");
+    let first = write_wrappers(&target).unwrap();
+    let second = write_wrappers(&target).unwrap();
+    assert_eq!(first, second);
+    assert!(is_executable(&first.join("cargo")));
+}

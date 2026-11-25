@@ -11,14 +11,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{EnvConfig, EnvProviderKind};
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct JobsConfig {
     /// The `[env.<name>]` that runs `thegn job run`. Its provider must be
     /// `sprites` or `vercel`. Empty = no runner selected (`job run` then needs
     /// `--runner <env>`).
     pub runner: String,
+    /// Seconds a routed job waits for the runner to admit it before failing
+    /// closed (a runner that is transiently unavailable). 0 = do not wait.
+    pub admission_timeout_secs: u64,
 }
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            runner: String::new(),
+            admission_timeout_secs: DEFAULT_ADMISSION_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Default bound on the admission wait of a routed job.
+pub const DEFAULT_ADMISSION_TIMEOUT_SECS: u64 = 30;
 
 impl JobsConfig {
     /// Semantic checks: a selected runner must be a configured Sprites or Vercel
@@ -97,6 +112,7 @@ impl JobsOverlay {
     pub fn validate(&self, prefix: &str, envs: &BTreeMap<String, EnvConfig>) -> Vec<String> {
         let mut errs = JobsConfig {
             runner: self.runner.clone().unwrap_or_default(),
+            ..JobsConfig::default()
         }
         .validate(prefix, envs);
         if let Some(route) = self.route.as_deref()
@@ -223,6 +239,7 @@ mod tests {
         envs.insert("fl".to_string(), env("fly"));
         let jobs = |runner: &str| JobsConfig {
             runner: runner.into(),
+            ..JobsConfig::default()
         };
         assert!(jobs("sp").validate("jobs", &envs).is_empty());
         assert!(jobs("vx").validate("jobs", &envs).is_empty());
@@ -232,5 +249,15 @@ mod tests {
         let missing = jobs("nope").validate("jobs", &envs);
         assert_eq!(missing.len(), 1);
         assert!(missing[0].contains("no [env.nope]"), "{missing:?}");
+    }
+
+    #[test]
+    fn the_admission_wait_defaults_to_thirty_seconds_and_parses() {
+        assert_eq!(JobsConfig::default().admission_timeout_secs, 30);
+        let parsed: JobsConfig = toml::from_str("admission_timeout_secs = 5").unwrap();
+        assert_eq!(parsed.admission_timeout_secs, 5);
+        assert!(parsed.runner.is_empty());
+        let empty: JobsConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.admission_timeout_secs, 30);
     }
 }

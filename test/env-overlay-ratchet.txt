@@ -18,6 +18,8 @@
 # writes, so every key stays file-only.
 # jobs.runner — names the env that executes remote build/test recipes: an
 # explicit reviewed file choice, never an ambient launcher switch.
+# jobs.admission_timeout_secs — owner policy for how long a routed build waits on its
+# runner; a reviewed file choice, never an ambient launcher switch.
 # agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
 # list item, like `provider`; an env knob cannot address one entry of a list.
 # agents.drawer_* — structured per-entry drawer metadata; list entries have no
@@ -212,6 +214,7 @@ issues.move_on_merge
 issues.provider
 issues.providers
 issues.ttl_secs
+jobs.admission_timeout_secs
 jobs.runner
 keymap_preset
 lead.account

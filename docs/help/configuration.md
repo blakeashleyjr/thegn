@@ -203,6 +203,10 @@ build or test recipe. It must name an `[env.<name>]` whose provider is
 empty by default, and `thegn job run --runner <env>` overrides it for one run.
 The choice is explicit: there is no placement fallback to another runner.
 
+`[jobs] admission_timeout_secs` (default 30, `0` = no wait) bounds how long a
+routed job waits for an unavailable runner to admit it; after that it fails
+closed and names `THEGN_JOB_LOCAL=1` as the explicit local escape.
+
 A project can bind its own runner in your own config:
 `[project.<slug>.jobs] runner = "<env name>"` (the legacy `[workspace.<slug>.jobs]`
 spelling works too). It wins over `[jobs] runner` for that project only, so two
