@@ -291,9 +291,11 @@ has a symlink in any component below `$HOME` is skipped with a warning, never
 followed; the pane launches without it. `$HOME` itself may be reached through
 a system link (`/home -> /var/home`).
 
-> `~/.keychain` is carved writable for `standard` panes but **not** for
-> `sealed` ones: it holds scripts your host login shells later _source_,
-> so a writable copy from a sealed sandbox would be a persistence vector.
+> `~/.keychain` and `~/.claude-profiles` are read-only in every sandbox
+> profile: they hold scripts and agent configuration your host later _sources_
+> or runs, so a writable copy would be a persistence vector. Edit them from a
+> host shell. A HOME-swapping profile wrapper run inside a pane needs its own
+> profile directory added to `[sandbox] mounts`.
 
 The daemon socket normally lives under `$XDG_RUNTIME_DIR/thegn`. With that
 variable unset, it uses a vetted private runtime directory, then a private

@@ -220,10 +220,10 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
 /// the resolve-time covered-check ([`keep_cfg_mount`]) lets a read-write
 /// directory *or* existing file overmount the read-only `$HOME`.
 ///
-/// `~/.keychain` (which stores shell scripts your host login shells later
-/// *source*) is carved only for non-sealed profiles: a writable `~/.keychain`
-/// from the sealed agent profile would be a persistence vector into the host
-/// session — exactly what the read-only `$HOME` exists to prevent.
+/// `~/.keychain` (shell scripts host login shells later *source*) and
+/// `~/.claude-profiles` (other profiles' executable config) are never carved
+/// writable: either would be a persistence vector into the host session —
+/// exactly what the read-only `$HOME` exists to prevent.
 pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
@@ -330,15 +330,12 @@ pub fn xdg_carveout_report_at(
     // many shells still write. Deliberately narrow: source trees, ~/.ssh,
     // ~/.config, and the rest of $HOME stay read-only.
     let mut rels: Vec<&str> = vec!["tmp", ".zsh_history", ".bash_history"];
-    // Interactive/hardened only — never the sealed agent:
-    //   `~/.keychain` stores scripts host login shells later *source*.
-    //   `~/.claude-profiles` is where HOME-swapping coding-agent profile wrappers
-    //     (e.g. `claude-profile` / `claude-multiplex`, which `export
-    //     HOME=$HOME/.claude-profiles/<name>` then exec the agent) keep each
-    //     profile's config + session state. thegn mounts $HOME read-only and
-    //     can't predict that per-profile subdir, so the agent's `session-env`
-    //     mkdir dies EROFS without this carve. Off for sealed: a network=none
-    //     agent must not get write access to the host's real credential dirs.
+    // Interactive/hardened only — never the sealed agent. `~/.keychain` (scripts
+    // host login shells *source*) and `~/.claude-profiles` (other profiles'
+    // executable config and HOME-swapping wrappers) are deliberately NOT carved
+    // writable (THE-2139): a sandbox write there is host code execution later.
+    // A HOME-swapping profile run inside a pane needs an explicit
+    // `[sandbox] mounts` grant for its own profile dir.
     //   `~/.claude/projects` is the SHARED base each HOME-swapped profile symlinks
     //     its own `projects/` into — it holds the cross-profile agent memory +
     //     session transcripts the profile wrappers deliberately share. The rest of
@@ -350,8 +347,6 @@ pub fn xdg_carveout_report_at(
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
     ) {
-        rels.push(".keychain");
-        rels.push(".claude-profiles");
         rels.push(".claude/projects");
     }
     // `$HOME` itself is trusted even when reached through a system link
@@ -486,7 +481,7 @@ pub fn xdg_carveout_report_at(
     // read-only, so a pane cannot rewrite what the host agent later runs.
     // `effective_config_dir` returns `Some` only for a dir that already exists.
     // Off for sealed: an untrusted network=none agent must not get write access
-    // to the host's real credential dirs (same posture as `~/.keychain` above).
+    // to the host's real credential dirs (same posture as the shell-state carves above).
     if !matches!(
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
@@ -2010,30 +2005,33 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    /// Whether any carve of `home` for `profile` has a host path under `rel`.
+    fn carves_rel(profile: SandboxProfile, home: &Path, rel: &str) -> bool {
+        let no_env = |_: &str| None;
+        let (mounts, _) = xdg_carveout_report_at(profile, home, &no_env);
+        let target = home.join(rel);
+        mounts
+            .iter()
+            .any(|m| Path::new(&m.host).starts_with(&target))
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn keychain_carved_for_hardened_not_sealed() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        // Only meaningful when ~/.keychain actually exists on this host.
-        if home.is_empty() || !std::path::Path::new(&home).join(".keychain").exists() {
-            return;
+    fn standard_keychain_not_writable() {
+        let td = private_tempdir();
+        let home = td.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".keychain")).unwrap();
+        for profile in [
+            SandboxProfile::Hardened,
+            SandboxProfile::Sealed,
+            SandboxProfile::SealedTunnel,
+        ] {
+            assert!(
+                !carves_rel(profile, &home, ".keychain"),
+                "~/.keychain must not be carved writable"
+            );
         }
-        let has_keychain = |profile| {
-            default_writable_carveouts(profile)
-                .iter()
-                .any(|m| m.host.ends_with("/.keychain"))
-        };
-        assert!(
-            has_keychain(SandboxProfile::Hardened),
-            "hardened profile should carve ~/.keychain writable"
-        );
-        assert!(
-            !has_keychain(SandboxProfile::Sealed),
-            "sealed agent profile must NOT carve ~/.keychain (persistence vector)"
-        );
-        assert!(
-            !has_keychain(SandboxProfile::SealedTunnel),
-            "sealed-tunnel profile must NOT carve ~/.keychain"
-        );
     }
 
     #[test]
@@ -2061,40 +2059,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn claude_profiles_carved_for_hardened_not_sealed() {
-        // HOME-swapping profile wrappers (claude-profile / claude-multiplex) put
-        // each profile's config+session under ~/.claude-profiles/<name>; it must
-        // be writable so the agent's `session-env` mkdir doesn't EROFS — but NOT
-        // for the sealed agent. Only meaningful when the dir exists on this host.
-        let home = std::env::var("HOME").unwrap_or_default();
-        // Symlinked carve paths are skipped (never followed), so only a
-        // link-free dir on this host is expected to be carved.
-        if home.is_empty()
-            || !std::path::Path::new(&home)
-                .join(".claude-profiles")
-                .is_dir()
-            || !carve_path_is_link_free(&std::path::Path::new(&home).join(".claude-profiles"))
-        {
-            return;
+    fn standard_claude_profiles_not_writable() {
+        let td = private_tempdir();
+        let home = td.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".claude-profiles/work")).unwrap();
+        for profile in [
+            SandboxProfile::Hardened,
+            SandboxProfile::Sealed,
+            SandboxProfile::SealedTunnel,
+        ] {
+            assert!(
+                !carves_rel(profile, &home, ".claude-profiles"),
+                "~/.claude-profiles must not be carved writable"
+            );
         }
-        let has = |profile| {
-            default_writable_carveouts(profile)
-                .iter()
-                .any(|m| m.host.ends_with("/.claude-profiles") && !m.ro)
-        };
-        assert!(
-            has(SandboxProfile::Hardened),
-            "hardened profile should carve ~/.claude-profiles writable"
-        );
-        assert!(
-            !has(SandboxProfile::Sealed),
-            "sealed agent profile must NOT carve ~/.claude-profiles"
-        );
-        assert!(
-            !has(SandboxProfile::SealedTunnel),
-            "sealed-tunnel profile must NOT carve ~/.claude-profiles"
-        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_projects_still_writable_in_standard() {
+        let td = private_tempdir();
+        let home = td.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        assert!(carves_rel(
+            SandboxProfile::Hardened,
+            &home,
+            ".claude/projects"
+        ));
+        assert!(!carves_rel(
+            SandboxProfile::Sealed,
+            &home,
+            ".claude/projects"
+        ));
     }
 
     #[test]
