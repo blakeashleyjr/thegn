@@ -359,6 +359,24 @@ fn admit_spec(spec: &VercelSpec) -> Result<()> {
     Ok(())
 }
 
+/// A clear message when a refused create names the plan's vCPU limit (Hobby
+/// allows at most 4; the API answers `resources.vcpus should be <= 4`), so the
+/// operator sees which setting to lower rather than a bare HTTP 400.
+fn vcpu_limit_hint(err: &anyhow::Error, configured: u32) -> Option<String> {
+    let text = format!("{err:#}");
+    let at = text.find("vcpus should be <=")?;
+    let limit: String = text[at + "vcpus should be <=".len()..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let limit = limit.parse::<u32>().ok()?;
+    Some(format!(
+        "vercel: create refused: provider.size = {configured} exceeds this plan's limit of \
+         {limit} vCPUs; set provider.size to {limit} or less (or upgrade the Vercel plan)"
+    ))
+}
+
 /// The HTTP status a control-plane error carries, if it names one: a
 /// `reqwest` status in the chain, else a 3-digit code after `(`, `HTTP ` or
 /// `status ` in the rendered text (`… failed (422 Unprocessable Entity)`).
@@ -1235,7 +1253,9 @@ impl VercelProvider {
             }
             Err(error) if definite_create_rejection(&error) => {
                 self.remove_record(&name).await;
-                return Err(error.context("vercel: create refused"));
+                let context = vcpu_limit_hint(&error, self.spec.vcpus)
+                    .unwrap_or_else(|| "vercel: create refused".to_owned());
+                return Err(error.context(context));
             }
             Err(error) => {
                 self.cleanup_after_failed_create(&name).await;
@@ -1369,6 +1389,15 @@ mod provider_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vcpu_limit_hint_names_setting_and_limit() {
+        let err = anyhow!("create failed (400 Bad Request): resources.vcpus should be <= 4");
+        let hint = vcpu_limit_hint(&err, 8).expect("hint");
+        assert!(hint.contains("provider.size = 8"), "{hint}");
+        assert!(hint.contains("limit of 4 vCPUs"), "{hint}");
+        assert!(vcpu_limit_hint(&anyhow!("HTTP 400: bad name"), 8).is_none());
+    }
 
     #[test]
     fn token_debug_is_redacted() {

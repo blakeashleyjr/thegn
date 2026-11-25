@@ -14,6 +14,14 @@
 //! give the sandbox a bounded window to come back (`wait_ready`) so the cascade
 //! turns into a single warned-and-recovered blip.
 
+/// Removes the `/homeless-shelter` directory a previous nix build leaves behind
+/// in sandboxes without namespaces (nix's sandbox auto-disables, so its
+/// builds run as the sandbox user with `HOME=/homeless-shelter`); a later
+/// `nix develop` refuses to start while it exists. Best-effort, never fails
+/// the step (falls back to `sudo -n` when not root).
+const HOMELESS_SHELTER_CLEANUP: &str = "[ -e /homeless-shelter ] && \
+(rm -rf /homeless-shelter 2>/dev/null || sudo -n rm -rf /homeless-shelter 2>/dev/null || true);";
+
 /// Build the `/bin/sh -lc` argv for a provisioning exec step. The provider exec
 /// env is non-login (no `$USER`), so the installer's `profile.d` hook is a
 /// no-op — each step must put the nix/tool dirs on `PATH` itself for a later
@@ -33,7 +41,8 @@ pub(crate) fn exec_login_argv(script: &str) -> Vec<String> {
             // it — so on a fresh sandbox (no nix yet) it aborted EVERY step.
             "[ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && \
              . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; \
-             export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
+             export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
+             {HOMELESS_SHELTER_CLEANUP} {script} 2>&1"
         ),
     ]
 }
@@ -154,6 +163,16 @@ pub(crate) fn step_signals_sandbox_restart(err: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_argv_clears_leftover_homeless_shelter() {
+        let argv = exec_login_argv("nix develop .#ci");
+        let at = argv[2].find("rm -rf /homeless-shelter").expect("cleanup");
+        assert!(
+            at < argv[2].find("nix develop").unwrap(),
+            "runs before the step"
+        );
+    }
 
     #[test]
     fn login_argv_sources_daemon_profile_and_folds_stderr() {
