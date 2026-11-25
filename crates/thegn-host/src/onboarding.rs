@@ -297,7 +297,14 @@ pub struct OnboardingWizard {
 
 impl OnboardingWizard {
     pub fn new(cfg: &Config) -> Self {
-        let repo_roots = cfg.repo_roots.join(", ");
+        // Unset roots mean "not answered yet": prefill the defaults but keep the
+        // baseline empty so confirming them persists the answer.
+        let init_repo_roots = cfg.repo_roots.join(", ");
+        let repo_roots = if cfg.repo_roots.is_empty() {
+            thegn_core::config::DEFAULT_REPO_ROOTS.join(", ")
+        } else {
+            init_repo_roots.clone()
+        };
         let backend = cfg.sandbox.backend.as_str().to_string();
         let profile = cfg.sandbox.profile.as_str().to_string();
         let theme = if cfg.theme.preset.is_empty() {
@@ -364,7 +371,7 @@ impl OnboardingWizard {
             step: Step::Welcome,
             focus: Field::ForgeAction, // unused until a fielded step; reset on entry
             init_worktrees_dir: cfg.worktrees_dir.clone(),
-            init_repo_roots: repo_roots.clone(),
+            init_repo_roots,
             init_theme: theme.clone(),
             init_keymap: keymap.clone(),
             init_backend: backend.clone(),
@@ -1479,7 +1486,37 @@ mod tests {
     const NONE: Modifiers = Modifiers::NONE;
 
     fn wiz() -> OnboardingWizard {
-        OnboardingWizard::new(&Config::default())
+        // Roots already answered, so a skip-through writes nothing.
+        OnboardingWizard::new(&Config {
+            repo_roots: vec!["~/code".into()],
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn unanswered_roots_prefill_defaults_and_persist_on_confirm() {
+        let mut w = OnboardingWizard::new(&Config::default());
+        assert_eq!(w.repo_roots, "~/code, ~/src");
+        goto(&mut w, Step::Paths);
+        w.move_focus(1);
+        match enter(&mut w) {
+            Outcome::Do(e) => assert!(e.writes.contains(&WriteOp::SetArray {
+                key: "repo_roots".into(),
+                items: vec!["~/code".into(), "~/src".into()],
+            })),
+            o => panic!("expected Do, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn answered_roots_are_not_rewritten() {
+        let mut w = wiz();
+        goto(&mut w, Step::Paths);
+        w.move_focus(1);
+        match enter(&mut w) {
+            Outcome::Do(e) => assert!(e.writes.is_empty()),
+            o => panic!("expected Do, got {o:?}"),
+        }
     }
 
     fn typ(w: &mut OnboardingWizard, s: &str) {

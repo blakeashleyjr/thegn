@@ -151,6 +151,10 @@ pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
 /// Maximum bytes read from a file-backed SecretRef by the config resolvers.
 pub const FILE_SECRET_REF_MAX_BYTES: u64 = 64 * 1024;
 
+/// Repository discovery roots the first-run wizard offers (prefilled, never
+/// scanned until the user confirms them and `repo_roots` is persisted).
+pub const DEFAULT_REPO_ROOTS: [&str; 2] = ["~/code", "~/src"];
+
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
@@ -6943,9 +6947,9 @@ impl Config {
         }
         self.worktrees_dir = paths.expand_tilde(&self.worktrees_dir);
         self.workspaces_dir = paths.expand_tilde(&self.workspaces_dir);
-        if self.repo_roots.is_empty() {
-            self.repo_roots = vec![self.workspaces_dir.clone()];
-        }
+        // An unset `repo_roots` stays empty: the picker scans nothing outside
+        // repos the user opened explicitly until first-run setup records the
+        // roots they chose (prefilled from `DEFAULT_REPO_ROOTS`).
         self.repo_roots = self
             .repo_roots
             .iter()

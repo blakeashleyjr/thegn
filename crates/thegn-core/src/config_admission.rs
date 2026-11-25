@@ -1211,23 +1211,9 @@ fn projected_path_expansion_size(
     }
     account(&cfg.worktrees_dir, true)?;
     account(&cfg.workspaces_dir, true)?;
-    if cfg.repo_roots.is_empty() {
-        // post_process_inner first copies the expanded workspaces_dir here,
-        // then expands that copy as a repo root too.
-        let implicit_root_bytes = match expanded_path_json_len(&cfg.workspaces_dir, home)? {
-            Some(expanded) => expanded,
-            None => json_string_content_len(&cfg.workspaces_dir)?,
-        };
-        new_path_bytes = new_path_bytes
-            .checked_add(implicit_root_bytes)
-            .ok_or(ConfigAdmissionError::Oversized)?;
-        new_path_bytes = new_path_bytes
-            .checked_add(2)
-            .ok_or(ConfigAdmissionError::Oversized)?;
-    } else {
-        for root in &cfg.repo_roots {
-            account(root, true)?;
-        }
+    // An unset `repo_roots` stays empty (no implicit root is added).
+    for root in &cfg.repo_roots {
+        account(root, true)?;
     }
 
     projected_serialized_size(serialized_bytes, old_path_bytes, new_path_bytes)
