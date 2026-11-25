@@ -1084,6 +1084,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_main() -> anyhow::Result<()> {
+    run::mark_process_start();
     // Private worker bypasses normal config/channel/UI startup. Only an
     // explicit parent launch can feed the bounded request on stdin.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--voice-worker")) {

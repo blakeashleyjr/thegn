@@ -482,11 +482,33 @@ fn sync_panel_docs(
     // subprocess per entry for a document nothing displayed.)
 }
 
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Stamp the process-start origin for the startup waterfall. Called first in
+/// `run_main`, so `since_process_ms` covers the pre-runtime work (argv, state
+/// migration, config admission, DB open/migrate) that `since_start_ms` (which
+/// starts inside [`main`]) cannot see. Idempotent; first call wins.
+pub(crate) fn mark_process_start() {
+    let _ = PROCESS_START.set(std::time::Instant::now()); // best-effort: first-set-wins origin stamp
+}
+
+/// Milliseconds since [`mark_process_start`] (0 if it was never called).
+fn since_process_ms() -> u64 {
+    PROCESS_START
+        .get()
+        .map_or(0, |t| t.elapsed().as_millis() as u64)
+}
+
 pub async fn main(
     cli: crate::Cli,
     admitted: std::sync::Arc<thegn_core::config_admission::AdmittedConfig>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
+    tracing::info!(
+        target: "thegn::startup",
+        since_process_ms = since_process_ms(),
+        "config admitted (pre-terminal: argv, migration, config, DB open)"
+    );
 
     // Name this thread as the loop so `Db::open` can tell a frame-freezing open
     // from a harmless background one (THE-179). Before anything else touches the
@@ -666,7 +688,22 @@ pub async fn main(
     // level our own `CSI > 4 ; 2 m` push actually achieved, not an inference
     // from `TERM`). Bounded so a non-responding terminal never stalls launch;
     // `None` ⇒ env-only, and unknown always means "assume it works".
-    let term_probe = crate::probe::probe_outer_terminal();
+    // `THEGN_BENCH_FIRST_FRAME_EXIT` runs under a pty with no terminal emulator
+    // behind it, so the probe would always burn its whole 80 ms budget waiting
+    // for replies that can never come — a harness artifact, not launch cost.
+    let probe_t0 = std::time::Instant::now();
+    let term_probe = if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some() {
+        None
+    } else {
+        crate::probe::probe_outer_terminal()
+    };
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        probe_ms = probe_t0.elapsed().as_millis() as u64,
+        answered = term_probe.is_some(),
+        "outer-terminal probe done"
+    );
     if let Some(p) = &term_probe {
         tracing::info!(
             target: "thegn::startup",
@@ -768,7 +805,9 @@ pub async fn main(
     })
     .await?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let session_t0 = std::time::Instant::now();
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
+    let session_ms = session_t0.elapsed().as_millis() as u64;
     // The refresh channel is created HERE rather than at the ticker spawn below
     // because the startup heal thread needs the sender first. Channel-creation
     // order is behavior-neutral: `refresh_rx` still moves into `event_loop` and
@@ -809,6 +848,7 @@ pub async fn main(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
         worktrees = session.worktrees.len(),
+        session_ms,
         "session loaded"
     );
 
@@ -838,19 +878,24 @@ pub async fn main(
     // (where its FS view can be incoherent) and points at `thegn integrate`.
     // Chains a foreign hook, and installs *beside* (not over) a pre-commit
     // framework's shim. See `thegn_core::merge_guard`.
+    // Off-loop: `git_common_dir` stats/reads `.git` and `install` rewrites hook
+    // files — blocking fs I/O that nothing in the first frame depends on.
     if cfg.git.merge_guard {
-        let hooks = thegn_core::util::git_common_dir(&cwd).join("hooks");
-        match thegn_core::merge_guard::install(&hooks) {
-            // Log the whole plan: `placement`/`restore_shim` are what tell you a
-            // pre-commit framework is in play, which is otherwise invisible until
-            // a merge fails.
-            Ok(plan) => tracing::debug!(
-                target: "thegn::startup", ?plan, dir = %hooks.display(), "merge-guard hook"
-            ),
-            Err(e) => tracing::debug!(
-                target: "thegn::startup", error = %e, "merge-guard hook install skipped"
-            ),
-        }
+        let guard_cwd = cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            let hooks = thegn_core::util::git_common_dir(&guard_cwd).join("hooks");
+            match thegn_core::merge_guard::install(&hooks) {
+                // Log the whole plan: `placement`/`restore_shim` are what tell you a
+                // pre-commit framework is in play, which is otherwise invisible until
+                // a merge fails.
+                Ok(plan) => tracing::debug!(
+                    target: "thegn::startup", ?plan, dir = %hooks.display(), "merge-guard hook"
+                ),
+                Err(e) => tracing::debug!(
+                    target: "thegn::startup", error = %e, "merge-guard hook install skipped"
+                ),
+            }
+        });
     }
     // Reconcile configured skills into persisted local worktrees. The adapter
     // immediately hands the bounded filesystem work to a Background thread;
@@ -875,6 +920,14 @@ pub async fn main(
     let host_cache_port = _nix_cache.as_ref().map(|h| h.port);
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
+    // The help registry parses and validates ~60 embedded pages plus the two
+    // generated ones — pure CPU, needed only when help is first opened. Build
+    // it on the blocking pool, overlapping terminal/DB/hydration startup; the
+    // loop joins it once it is already done (see `event_loop`).
+    let help_task = {
+        let help_cfg = keymap.config().clone();
+        tokio::task::spawn_blocking(move || crate::help::pages::registry_logged(&help_cfg))
+    };
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
     // overlaps (panel shadows global) are intentional and logged at debug.
     {
@@ -892,7 +945,14 @@ pub async fn main(
     }
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
     // the first frame, including a configured user theme from the off-loop scan.
+    let theme_t0 = std::time::Instant::now();
     let (theme_users, theme_warnings) = theme_store.initial_catalog().await;
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        waited_ms = theme_t0.elapsed().as_millis() as u64,
+        "theme catalog joined"
+    );
     for warning in theme_warnings {
         tracing::warn!(target: "thegn::theme", "{warning}");
     }
@@ -907,7 +967,14 @@ pub async fn main(
     // Open the DB once here so the first frame has the full workspace list
     // (instead of only live-session entries). Reuse this handle in event_loop
     // for startup reads, then drop it before the loop. None falls back gracefully.
+    let startup_db_t0 = std::time::Instant::now();
     let startup_db = thegn_core::db::Db::open().ok(); // best-effort: best-effort cache: startup list only; None falls back gracefully (comment above)
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        open_ms = startup_db_t0.elapsed().as_millis() as u64,
+        "startup db opened"
+    );
     // Keep a default "local" terminal so the sidebar section stays populated.
     crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
     let mut model = build_initial_model(&session, startup_db.as_ref());
@@ -1312,6 +1379,7 @@ pub async fn main(
         event_bus,
         host_cache_port,
         startup_db,
+        help_task,
     )
     .await;
     clipboard.shutdown();
@@ -6963,6 +7031,7 @@ async fn event_loop<T: Terminal>(
     // each provider worktree's reverse tunnel forwards to it.
     host_cache_port: Option<u16>,
     startup_db: Option<thegn_core::db::Db>,
+    help_task: tokio::task::JoinHandle<thegn_core::help::HelpRegistry>,
 ) -> Result<()> {
     crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
     // The worker may have failed before the loop started (including a startup
@@ -8175,8 +8244,19 @@ async fn event_loop<T: Terminal>(
     let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // The embedded help registry (authored pages + the generated keybindings
     // and config-reference pages); rebuilt on config reload so rebinds show.
-    let mut help_registry =
-        std::sync::Arc::new(crate::help::pages::registry_logged(&current_config));
+    // Built off-loop since launch (see `main`); a failed join (panic in the
+    // builder) degrades to an inline rebuild rather than losing help.
+    let help_t0 = std::time::Instant::now();
+    let mut help_registry = std::sync::Arc::new(match help_task.await {
+        Ok(registry) => registry,
+        Err(_) => crate::help::pages::registry_logged(&current_config),
+    });
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        waited_ms = help_t0.elapsed().as_millis() as u64,
+        "help registry joined"
+    );
     panel_ui.help.reg = Some(help_registry.clone());
     // Notification routing runtime (rules / DND / modes / sound). Threaded to
     // every dispatch site; the loop consumes the latched bell + reads DND/mode
@@ -17529,6 +17609,7 @@ async fn event_loop<T: Terminal>(
                 tracing::info!(
                     target: "thegn::startup",
                     since_start_ms = start.elapsed().as_millis() as u64,
+                    since_process_ms = since_process_ms(),
                     "first frame submitted"
                 );
                 // Benchmark hook (`just bench`): exit right after the first
