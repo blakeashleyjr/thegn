@@ -312,6 +312,8 @@ pub const CATALOG: &[Slot] = &[
     slot("env set", "worktree_pos", SourceKind::Worktree),
     slot("env show", "worktree", SourceKind::Worktree),
     slot("env show", "worktree_pos", SourceKind::Worktree),
+    slot("env status", "worktree", SourceKind::Worktree),
+    slot("env status", "worktree_pos", SourceKind::Worktree),
     slot("env snapshot", "worktree", SourceKind::Worktree),
     slot("env snapshot", "worktree_pos", SourceKind::Worktree),
     slot("env snapshots", "worktree", SourceKind::Worktree),
@@ -364,6 +366,12 @@ pub const CATALOG: &[Slot] = &[
         "name",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // `env status --interval` is a count of seconds: no enumerable source.
+    slot(
+        "env status",
+        "interval",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     // `job run --deadline` is a count of seconds: no enumerable source.
     slot(
         "job run",
@@ -382,6 +390,38 @@ pub const CATALOG: &[Slot] = &[
     slot("job shim", "argv", SourceKind::Reserved(Reserved::Freeform)),
     // A directory path: the engine's filename completion serves it.
     slot("job shim-install", "dir", SourceKind::Structural),
+    // Agent lifecycle hook: values come from the agent's own hook runner.
+    slot(
+        "agent hook",
+        "agent",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "agent hook",
+        "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "agent hook",
+        "payload",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // Detached sprite sessions: server-issued ids and a duration.
+    slot(
+        "sprite-exec",
+        "attach",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "sprite-exec",
+        "status",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "sprite-exec",
+        "max",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),

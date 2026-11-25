@@ -7,6 +7,43 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.137] — 2026-11-25
+
+Remote environments report their health, Sprite and Vercel jobs survive dropped
+connections, and coding agents can be wired to thegn in one step.
+
+### Added
+
+- A remote health model: a sidebar dot and popup per remote environment, `thegn env status --watch`,
+  `thegn fleet inspect --probe`, and `env.status` on the control API and MCP.
+- `thegn sprite-exec --detach`, `--attach` and `--status`, for server-side runs that outlive the client.
+- Agent integrations: a thegn skill, `mcp wire` support for thegn's MCP server with Codex and Hermes
+  adapters, Claude and Codex lifecycle hooks through `thegn agent hook`, and the same wiring inside remote
+  environments. The tour is offered with one key.
+- Tabs move left and right with Shift-Alt-←/→ or by dragging on the tab strip; a pane can break out into
+  its own tab (Ctrl-Alt-Shift-b) or move to the previous or next tab (Ctrl-Alt-Shift-←/→) without
+  restarting.
+- The right panel shows layout keys and the focused zone's keys from the live keymap
+  (`[panel] layout_hints`, `[panel] context_hints`).
+
+### Changed
+
+- The masthead fleet cost per hour includes metered AI spend and hides at zero unless
+  `[bars] fleet_always_show` is set.
+- Narrow panel tab strips shorten labels before hiding tabs, and never hide the active tab or `work`.
+- Sandbox caches are private or read-only per sandbox.
+- Remote provisioning runs independent steps at the same time.
+- Vercel cargo jobs are bounded by the sandbox's memory.
+
+### Fixed
+
+- Short-lived database connections are capped process-wide, so a startup burst no longer parks many
+  open file descriptors.
+- Sprite exec streams stay alive when idle and reattach after a drop.
+- A Sprites job's `CARGO_HOME` links to the real toolchain; a missing sprite is named plainly.
+- A Vercel job records its exit status and error output even when the attempt is indeterminate.
+- Leftover `/homeless-shelter` paths on Vercel sandboxes are cleaned up; stale pipeline lanes are dropped.
+
 ## [0.1.0-alpha.136] — 2026-11-25
 
 The standard sandbox hides more of home, background behaviour that reaches the

@@ -407,7 +407,14 @@ fn collect_attention_inner(
     // pipeline worktree may have old/finished stage rows beyond its window.
     // This distinct DB read is unbounded and only returns durable pipeline
     // worktree paths; lane names still come from the roster when available.
-    let pipeline_worktree_paths = db.pipeline_worktree_paths().unwrap_or_default();
+    // Closed worktrees (directory gone) leave Pipelines; roster history stays in
+    // the DB and is simply not shown (THE-2713).
+    let pipeline_worktree_paths: Vec<String> = db
+        .pipeline_worktree_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| std::path::Path::new(path).exists())
+        .collect();
     static TRUNCATION_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     if truncated && !TRUNCATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -432,8 +439,10 @@ fn collect_attention_inner(
         .iter()
         .map(|path| crate::sidebar_pipeline::path_identity(path))
         .collect();
-    status.pipeline_lanes =
-        crate::sidebar_pipeline::lanes_with_persisted_paths(&roster, &pipeline_worktree_paths);
+    status.pipeline_lanes = crate::sidebar_pipeline::prune_missing_lanes(
+        crate::sidebar_pipeline::lanes_with_persisted_paths(&roster, &pipeline_worktree_paths),
+        |path| std::path::Path::new(path).exists(),
+    );
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
     // Live raised hands (OSC 9 / OSC 777), one small table read like the two

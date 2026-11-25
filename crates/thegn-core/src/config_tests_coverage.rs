@@ -757,6 +757,11 @@ fn bars_config_defaults() {
     assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
     assert_eq!(b.date_format, "%a %b %-d");
     assert_eq!(b.clock_format, "%H:%M");
+    // The zero-burn fleet meter auto-hides unless opted in.
+    assert!(!b.fleet_always_show);
+    let on: BarsConfig = toml::from_str("fleet_always_show = true").unwrap();
+    assert!(on.fleet_always_show);
+    assert_eq!(on.top_right, b.top_right);
 }
 
 #[test]

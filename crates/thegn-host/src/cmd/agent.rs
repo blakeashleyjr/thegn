@@ -27,6 +27,22 @@ use thegn_core::outln;
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
+    /// Lifecycle-hook entry point written by `thegn mcp wire` into Claude's
+    /// and Codex's settings: reports a finished turn (`stop`) or a request
+    /// for you (`attention`) to the daemon over the control socket, so the
+    /// sidebar dot and attention queue are exact. Always exits 0 and prints
+    /// nothing: a hook must never disturb the agent.
+    #[command(hide = true)]
+    Hook {
+        /// The agent kind calling the hook (`claude`, `codex`).
+        agent: String,
+        /// `stop` (turn finished) or `attention` (needs you); anything else
+        /// is ignored.
+        event: String,
+        /// Trailing payload (Codex appends its event JSON here).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        payload: Vec<String>,
+    },
     /// What each agent entry and pipeline stage actually launches as: harness,
     /// model, env keys, permission count (compact; `--json` for scripts).
     List {
@@ -138,6 +154,14 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
+        Action::Hook {
+            agent,
+            event,
+            payload,
+        } => {
+            hook(cfg, &agent, &event, &payload);
+            Ok(())
+        }
         Action::List { json } => list(cfg, json),
         Action::Sessions {
             worktree,
@@ -178,6 +202,99 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             super::agent_spawn::result(cfg, super::agent_spawn::ResultArgs { row, session, json })
         }
     }
+}
+
+/// The notification a hook event becomes: `(title, urgency)`; `None` for an
+/// event thegn does not report. `attention` is `alert` urgency, which the
+/// daemon files as `agent_attention` (the blocked tier); a finished turn is
+/// the normal `agent_done` notice.
+pub(crate) fn hook_note(
+    agent: &str,
+    event: &str,
+    message: &str,
+) -> Option<(String, Option<&'static str>)> {
+    match event {
+        "stop" => Some((format!("{agent} finished its turn"), None)),
+        "attention" => {
+            let title = if message.is_empty() {
+                format!("{agent} needs you")
+            } else {
+                format!("{agent}: {message}")
+            };
+            Some((title, Some("alert")))
+        }
+        _ => None,
+    }
+}
+
+/// The source ref a hook push carries: the daemon reads the worktree after
+/// the `@` (see `notify_push`), since the wire note has no worktree field.
+pub(crate) fn hook_source(agent: &str, worktree: &str) -> String {
+    format!("agent-hook:{agent}@{worktree}")
+}
+
+/// Pull `cwd` and `message` out of a hook's JSON payload (Claude: stdin).
+pub(crate) fn hook_payload_fields(raw: &str) -> (Option<String>, String) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (None, String::new());
+    };
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    (text("cwd"), text("message").unwrap_or_default())
+}
+
+/// Best-effort: every failure (no daemon, bad payload) is swallowed.
+fn hook(cfg: &Config, agent: &str, event: &str, payload: &[String]) {
+    use std::io::{IsTerminal, Read};
+    let mut raw = payload.last().cloned().unwrap_or_default();
+    if raw.is_empty() && agent == "claude" && !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        if let Err(error) = std::io::stdin().take(64 * 1024).read_to_string(&mut buf) {
+            // A hook must never fail the agent: an unreadable payload is just empty.
+            tracing::debug!(target: "thegn::agent", %error, "agent hook: payload read failed");
+        }
+        raw = buf;
+    }
+    let (cwd, message) = hook_payload_fields(&raw);
+    let Some((title, urgency)) = hook_note(agent, event, &message) else {
+        return;
+    };
+    let dir = cwd
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let worktree = dir
+        .as_deref()
+        .map(|d| {
+            thegn_core::repo::worktree_root_for_cwd(d)
+                .unwrap_or_else(|| d.to_path_buf())
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let note = thegn_svc::control::PushedNote {
+        title,
+        body: String::new(),
+        urgency: urgency.map(str::to_string),
+        source: Some(hook_source(agent, &worktree)),
+        automation_origin: None,
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    if let Err(error) = rt.block_on(hook_push(cfg, &note)) {
+        // Best-effort: a hook with no reachable daemon must not fail the agent.
+        tracing::debug!(target: "thegn::agent", error = %format!("{error:#}"), "agent hook: push failed");
+    }
+}
+
+async fn hook_push(cfg: &Config, note: &thegn_svc::control::PushedNote) -> Result<()> {
+    let client = super::session::connect(cfg).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), client.notify_push(note))
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon did not answer"))??;
+    Ok(())
 }
 
 /// One resolved row of `agent list`: an entry (`stage = None`) or a stage.
@@ -311,4 +428,40 @@ fn sessions(cfg: &Config, worktree: Option<&str>, harness: Option<&str>, json: b
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+
+    #[test]
+    fn stop_is_a_done_notice_and_attention_is_an_alert() {
+        assert_eq!(
+            hook_note("claude", "stop", "ignored"),
+            Some(("claude finished its turn".to_string(), None))
+        );
+        assert_eq!(
+            hook_note("claude", "attention", "Allow Bash?"),
+            Some(("claude: Allow Bash?".to_string(), Some("alert")))
+        );
+        assert_eq!(
+            hook_note("codex", "attention", ""),
+            Some(("codex needs you".to_string(), Some("alert")))
+        );
+        assert_eq!(hook_note("claude", "working", ""), None);
+    }
+
+    #[test]
+    fn payload_fields_read_cwd_and_message_and_tolerate_garbage() {
+        let (cwd, msg) = hook_payload_fields(r#"{"cwd":"/w/a","message":"hi","x":1}"#);
+        assert_eq!(cwd.as_deref(), Some("/w/a"));
+        assert_eq!(msg, "hi");
+        assert_eq!(hook_payload_fields("not json"), (None, String::new()));
+        assert_eq!(hook_payload_fields(""), (None, String::new()));
+    }
+
+    #[test]
+    fn source_carries_the_worktree_after_the_at() {
+        assert_eq!(hook_source("claude", "/w/a"), "agent-hook:claude@/w/a");
+    }
 }

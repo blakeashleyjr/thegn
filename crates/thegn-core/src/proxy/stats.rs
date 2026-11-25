@@ -172,6 +172,90 @@ fn scope_of(r: &ModelProxyRequestRow) -> String {
     "global".to_string()
 }
 
+/// Trailing window for the metered-AI burn rate: spend over the last hour is
+/// `$/h` directly.
+pub const AI_BURN_WINDOW_MS: i64 = 3_600_000;
+
+/// Metered AI spend for one `backend/model`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AiModelSpend {
+    /// `backend/backend_model`.
+    pub name: String,
+    pub burn_hourly: f64,
+    pub today: f64,
+    pub mtd: f64,
+}
+
+/// Metered (pay-per-token) AI spend from proxy audit rows: the trailing-hour
+/// burn, today and month to date (UTC, like the VM totals), split per model.
+/// Subscription-covered rows are free and never counted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AiSpend {
+    pub burn_hourly: f64,
+    pub today: f64,
+    pub mtd: f64,
+    pub by_model: Vec<AiModelSpend>,
+    /// Some counted cost was computed from the pricing table, not reported by
+    /// the upstream.
+    pub estimated: bool,
+    /// Some metered request had usage but no known price (its cost is missing
+    /// from the totals).
+    pub unpriced: u64,
+}
+
+/// Rolls audit rows (any order) into [`AiSpend`] at `now_ms`; `day_start_ms` and
+/// `month_start_ms` are the UTC boundaries. Pure.
+pub fn ai_spend(
+    rows: &[ModelProxyRequestRow],
+    now_ms: i64,
+    day_start_ms: i64,
+    month_start_ms: i64,
+) -> AiSpend {
+    use std::collections::BTreeMap;
+    let mut out = AiSpend::default();
+    let mut models: BTreeMap<String, AiModelSpend> = BTreeMap::new();
+    for r in rows {
+        if r.cost_source == "subscription" || r.ts_ms < month_start_ms || r.ts_ms > now_ms {
+            continue;
+        }
+        if r.cost_source == "unknown" {
+            out.unpriced += 1;
+            continue;
+        }
+        let cost = if r.cost_usd.is_finite() {
+            r.cost_usd.max(0.0)
+        } else {
+            0.0
+        };
+        if cost <= 0.0 {
+            continue;
+        }
+        if r.cost_source == "estimate" {
+            out.estimated = true;
+        }
+        let entry = models
+            .entry(format!("{}/{}", r.backend, r.backend_model))
+            .or_insert_with_key(|name| AiModelSpend {
+                name: name.clone(),
+                ..AiModelSpend::default()
+            });
+        entry.mtd += cost;
+        out.mtd += cost;
+        if r.ts_ms >= day_start_ms {
+            entry.today += cost;
+            out.today += cost;
+        }
+        if now_ms - r.ts_ms < AI_BURN_WINDOW_MS {
+            entry.burn_hourly += cost;
+            out.burn_hourly += cost;
+        }
+    }
+    let mut by_model: Vec<AiModelSpend> = models.into_values().collect();
+    by_model.sort_by(|a, b| b.mtd.total_cmp(&a.mtd).then(a.name.cmp(&b.name)));
+    out.by_model = by_model;
+    out
+}
+
 /// Rolls a set of audit rows (any order) into the full stats view.
 pub fn rollup(rows: &[ModelProxyRequestRow]) -> Rollup {
     use std::collections::BTreeMap;
@@ -347,5 +431,41 @@ mod tests {
         assert_eq!(v["totals"]["requests"], 1);
         assert_eq!(v["by_backend"][0]["name"], "a");
         assert_eq!(v["by_backend"][0]["tokens_per_sec"], 100.0);
+    }
+
+    fn spend_row(ts: i64, model: &str, cost: f64, source: &str) -> ModelProxyRequestRow {
+        ModelProxyRequestRow {
+            ts_ms: ts,
+            backend: "anthropic".into(),
+            backend_model: model.into(),
+            cost_usd: cost,
+            cost_source: source.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ai_spend_windows_models_and_provenance() {
+        let hour = AI_BURN_WINDOW_MS;
+        let now = 100 * hour;
+        let day = now - 5 * hour;
+        let month = now - 50 * hour;
+        let rows = vec![
+            spend_row(now - hour / 2, "opus", 0.5, "estimate"),
+            spend_row(now - 2 * hour, "opus", 1.0, "header"),
+            spend_row(now - 10 * hour, "haiku", 2.0, "header"),
+            spend_row(now - 60 * hour, "haiku", 9.0, "header"),
+            spend_row(now - hour / 2, "opus", 7.0, "subscription"),
+            spend_row(now - hour / 2, "opus", 0.0, "unknown"),
+        ];
+        let s = ai_spend(&rows, now, day, month);
+        assert!((s.burn_hourly - 0.5).abs() < 1e-9);
+        assert!((s.today - 1.5).abs() < 1e-9);
+        assert!((s.mtd - 3.5).abs() < 1e-9);
+        assert!(s.estimated);
+        assert_eq!(s.unpriced, 1);
+        assert_eq!(s.by_model[0].name, "anthropic/haiku");
+        assert!((s.by_model[1].today - 1.5).abs() < 1e-9);
+        assert_eq!(ai_spend(&[], now, day, month), AiSpend::default());
     }
 }

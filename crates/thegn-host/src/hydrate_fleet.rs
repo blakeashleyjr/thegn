@@ -47,7 +47,8 @@ impl LastRead {
     pub(crate) fn of(snap: &FleetSnapshot) -> Self {
         Self {
             at_ms: snap.generated_ms,
-            running: running_rows(&snap.view),
+            // Metered AI burning in the trailing hour keeps the cadence live.
+            running: running_rows(&snap.view) + usize::from(snap.ai.burn_hourly > 0.0),
         }
     }
 }
@@ -150,6 +151,7 @@ fn failed_snapshot(reason: &str, now_ms: i64) -> FleetSnapshot {
             now_ms,
         ),
         view,
+        ai: Default::default(),
     }
 }
 

@@ -861,10 +861,13 @@ pub async fn main(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
     let daemon_cfg = cfg.daemon.clone();
-    tokio::task::spawn_blocking(move || {
+    // Filesystem work (private run dir + locator files) that nothing before the
+    // event loop reads: overlap it with session/theme/DB/hydration startup and
+    // join it just before the loop, so it is still published before any pane
+    // can launch without sitting serially on the launch→first-frame path.
+    let control_publish_task = tokio::task::spawn_blocking(move || {
         crate::daemon::control_publish::publish_for_config(&daemon_cfg);
-    })
-    .await?;
+    });
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let session_t0 = std::time::Instant::now();
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
@@ -1144,6 +1147,10 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
+            // The container sweep below shells out to podman/docker for seconds;
+            // the rows are all it needs, so release the connection first
+            // (THE-2630: a held handle at the idle-bench sample).
+            drop(db);
             if !gc_wanted_without_repo_overlay
                 && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
                     &startup_gc_cfg,
@@ -1410,6 +1417,8 @@ pub async fn main(
 
     let resident_supervisor =
         thegn_svc::plugin::ResidentSupervisor::new(tokio::runtime::Handle::current());
+    // Join the overlapped control-locator publish (normally long finished).
+    control_publish_task.await?;
     let result = event_loop(
         resident_supervisor.clone(),
         &mut buf,
@@ -1560,6 +1569,16 @@ pub async fn main(
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
+}
+
+/// `THEGN_BENCH_FIRST_FRAME_EXIT` fast exit: restore terminal modes and leave
+/// the process immediately so the measured time is time-to-first-frame.
+fn bench_first_frame_exit() -> ! {
+    let _ = crate::frame_writer::write_terminal_teardown(
+        b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
+    ); // best-effort: bench exit; the process is leaving regardless
+    thegn_core::log_trace::run_panic_restore_once();
+    std::process::exit(0)
 }
 
 /// Persist the supervisor's live pin set to `session_state.pin_state` (best
@@ -8040,6 +8059,9 @@ async fn event_loop<T: Terminal>(
     // frame (title bar) and focuses the pane (drag model rule 2 applied to
     // panes: press arms, motion commits). Esc cancels.
     let mut pane_lift: Option<(crate::center::PaneId, usize, usize, bool)> = None;
+    // Tab-strip drag-to-reorder: a press on a tab chip arms it with that tab's
+    // index; releasing over a different chip moves the tab there.
+    let mut tab_lift: Option<usize> = None;
     // Files-panel → pane drag (THE-135): a press on a Files FILE row arms it
     // (the click still selects the row); motion off the press cell makes it a
     // drag; a release over a center pane types the shell-quoted path there
@@ -15939,6 +15961,7 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        model.drawer_focused = focus.drawer();
         let drawer_bar = drawer_bar_state(&current_config, &drawer_runtime, drawer);
         if model.drawer_bar != drawer_bar {
             model.drawer_bar = drawer_bar;
@@ -17699,10 +17722,12 @@ async fn event_loop<T: Terminal>(
                     "first frame submitted"
                 );
                 // Benchmark hook (`just bench`): exit right after the first
-                // real frame so hyperfine measures launch → first paint.
-                // `run::main` still tears down the alt screen + raw mode.
+                // real frame so hyperfine measures launch → first paint, not
+                // teardown. Restore the terminal (same bytes + shared panic
+                // restore as the normal teardown), then `process::exit`,
+                // skipping task joins and drops.
                 if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some() {
-                    return Ok(());
+                    bench_first_frame_exit();
                 }
                 crate::db_maintain::arm_after_first_frame();
                 // Deferred warms — AFTER the first flush so they never tax
@@ -17980,6 +18005,30 @@ async fn event_loop<T: Terminal>(
                         pane_lift = None;
                         model.pane_drag = None;
                         mouse_left_down = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
+
+                // Tab-strip drag-to-reorder: motion is ignored; the release over
+                // another chip of the strip commits the move, anywhere else
+                // cancels. Wheel samples during the hold are not a release.
+                if let Some(from) = tab_lift
+                    && !m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                    && !m.mouse_buttons.contains(MouseButtons::HORZ_WHEEL)
+                {
+                    if !left {
+                        tab_lift = None;
+                        mouse_left_down = false;
+                        if chrome.center_tabs.contains(mx, my)
+                            && let Some(to) =
+                                crate::chrome::center_tab_hit(&model, chrome.center_tabs, mx)
+                            && session.move_tab_to(from, to)
+                        {
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            persist_session_layout(&mut session, &panes);
+                            need_relayout = true;
+                        }
                         dirty = true;
                     }
                     continue;
@@ -18870,6 +18919,7 @@ async fn event_loop<T: Terminal>(
                             && i < g.tabs.len()
                         {
                             g.active_tab = i;
+                            tab_lift = Some(i);
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
@@ -21247,6 +21297,15 @@ async fn event_loop<T: Terminal>(
                                         );
                                     }
                                 }
+                                dirty = true;
+                                continue;
+                            }
+                            // The one-time wiring offer for an existing user.
+                            if let menu::MenuChoice::Confirm { tag, arg } = &choice
+                                && let Some(status) =
+                                    crate::handlers::onboarding::apply_wire_offer(tag, arg)
+                            {
+                                model.status = status;
                                 dirty = true;
                                 continue;
                             }
@@ -28385,6 +28444,40 @@ async fn event_loop<T: Terminal>(
                                 ) == crate::handlers::pane_geometry::SwapOutcome::Swapped
                                 {
                                     need_relayout = true;
+                                }
+                            }
+                            // Tab/pane rearranging: pure `Session` ops. Panes keep
+                            // their ids, so no PTY is touched — only the layout.
+                            Action::MoveTabLeft | Action::MoveTabRight => {
+                                if session.move_active_tab(action == Action::MoveTabRight) {
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                }
+                            }
+                            Action::BreakPaneToTab => {
+                                if session.break_pane_to_tab(focused) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                } else {
+                                    model.status =
+                                        "Pane is the tab's only pane — nothing to break out"
+                                            .to_string();
+                                }
+                            }
+                            Action::MovePaneToPrevTab | Action::MovePaneToNextTab => {
+                                if session.move_pane_to_adjacent_tab(
+                                    focused,
+                                    action == Action::MovePaneToNextTab,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    persist_session_layout(&mut session, &panes);
+                                    need_relayout = true;
+                                } else {
+                                    model.status = "No tab there to move the pane to".to_string();
                                 }
                             }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`

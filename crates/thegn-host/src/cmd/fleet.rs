@@ -73,7 +73,8 @@ pub enum Action {
         json: bool,
     },
     /// One sprite's status, URL auth and (with --policy) memory policy, read
-    /// from the Sprites API without exec (`--policy` may wake a cold sprite).
+    /// from the Sprites API without exec (`--policy` may wake a cold sprite;
+    /// `--probe` runs one health exec inside it).
     Inspect(super::fleet_inspect::InspectArgs),
 }
 
@@ -125,7 +126,7 @@ fn fleet_list_json(
     Ok(value)
 }
 
-fn sanitize_json(value: &mut serde_json::Value) {
+pub(crate) fn sanitize_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => *text = sanitize_text(text, 4096),
         serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_json),
@@ -1721,6 +1722,7 @@ mod tests {
             generated_ms: NOW,
             view,
             cost,
+            ai: Default::default(),
         };
         let json = fleet_list_json(&snapshot, agents).unwrap();
 

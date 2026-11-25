@@ -23,6 +23,7 @@ use crate::chrome::{FrameModel, S};
 use crate::fleet_read::FleetSnapshot;
 use crate::seg::Tok;
 use thegn_core::placement::fleet_cost::{self, BudgetLevel};
+use thegn_core::remote_health::{self, HealthLevel, HealthReading, HealthSource};
 use thegn_core::theme::Hue;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -241,9 +242,101 @@ fn heading(label: impl Into<String>, note: Option<String>) -> Section {
     }
 }
 
+/// The metered-AI block: pay-per-token spend from the model proxy's audit
+/// rows (subscription plans stay in the usage gauge), split per model, with a
+/// plain note when part of it is estimated or unpriced. Empty when the proxy
+/// recorded no metered spend this month.
+fn ai_sections(ai: &thegn_core::proxy::stats::AiSpend) -> Vec<Section> {
+    if ai.mtd <= 0.0 && ai.unpriced == 0 {
+        return Vec::new();
+    }
+    let mut kv: Vec<(String, String, Tok)> = vec![(
+        "AI burn".to_string(),
+        format!("{}/h", usd(ai.burn_hourly, 4)),
+        Tok::Slot(S::Text),
+    )];
+    kv.push(("AI today (UTC)".to_string(), usd(ai.today, 2), dim()));
+    kv.push(("AI month to date".to_string(), usd(ai.mtd, 2), dim()));
+    for model in ai.by_model.iter().take(MAX_ROWS) {
+        kv.push((
+            model.name.clone(),
+            format!(
+                "{}/h · {} today · {} mtd",
+                usd(model.burn_hourly, 4),
+                usd(model.today, 2),
+                usd(model.mtd, 2)
+            ),
+            dim(),
+        ));
+    }
+    let mut secs = vec![
+        spacer(),
+        heading(
+            "metered AI (model proxy)",
+            Some("trailing hour · pay-per-token only".to_string()),
+        ),
+        Section::KeyVal(kv),
+    ];
+    if ai.estimated {
+        secs.push(heading(
+            "some AI cost is estimated from the price table, not billed",
+            None,
+        ));
+    }
+    if ai.unpriced > 0 {
+        secs.push(heading(
+            format!(
+                "{} request(s) had no known price and are not counted",
+                ai.unpriced
+            ),
+            None,
+        ));
+    }
+    secs
+}
+
 /// The section stack and its row cursor (pure; `now_ms` is injected for the
 /// age column).
 fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
+    build_sections_with(snap, now_ms, thegn_core::remote_health::global())
+}
+
+/// The health cells of one row: `mem`, `up`, `life` (tones: memory amber when
+/// under pressure, lifetime amber under an hour). `-` for a missing fact.
+fn health_cells(reading: &HealthReading, now_ms: i64) -> Vec<Cell> {
+    let sample = reading.sample.as_ref();
+    let mem = sample.and_then(|s| s.memory_percent());
+    let hot = mem.is_some_and(|p| p >= remote_health::MEM_PRESSURE_PERCENT);
+    let left = reading.lifetime_left_at(now_ms);
+    let short =
+        left.is_some_and(|l| i64::try_from(l).is_ok_and(|l| l < remote_health::LIFETIME_WARN_SECS));
+    vec![
+        text(
+            mem.map_or_else(|| "-".to_string(), |p| format!("{p}%")),
+            if hot { Tok::Hue(Hue::Amber) } else { dim() },
+        ),
+        text(
+            sample
+                .and_then(|s| s.uptime_secs)
+                .map_or_else(|| "-".to_string(), remote_health::short_duration),
+            dim(),
+        ),
+        text(
+            left.map_or_else(|| "-".to_string(), remote_health::short_duration),
+            if short { Tok::Hue(Hue::Amber) } else { dim() },
+        ),
+    ]
+}
+
+/// [`build_sections`] with the health source injected (tests use a local
+/// cache; the popup reads the process-wide one). The `mem` / `up` / `life`
+/// columns and the warnings block appear only when some listed row has a
+/// reading, so a fleet with no sampled sandbox renders exactly as before.
+fn build_sections_with(
+    snap: &FleetSnapshot,
+    now_ms: i64,
+    health: &dyn HealthSource,
+) -> SectionsDetail {
     let (view, cost) = (&snap.view, &snap.cost);
     let mut secs = Vec::new();
     let mut cursor = None;
@@ -275,6 +368,13 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
     } else {
         let mut rows = Vec::new();
         let mut acts = Vec::new();
+        let readings: Vec<Option<HealthReading>> = view
+            .rows
+            .iter()
+            .take(MAX_ROWS)
+            .map(|row| row.worktree.as_deref().and_then(|wt| health.reading(wt)))
+            .collect();
+        let show_health = readings.iter().any(Option::is_some);
         for (index, row) in view.rows.iter().enumerate().take(MAX_ROWS) {
             acts.push(row_acts(row));
             let priced = cost.per_row.get(index).filter(|c| c.id == row.id);
@@ -295,7 +395,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
                 None if row.unrecorded => text("UNRECORDED", dim()),
                 None => text("ORPHAN", Tok::Hue(Hue::Amber)),
             };
-            rows.push(vec![
+            let mut cells = vec![
                 text(format!("{}/{}", row.provider, row.env), Tok::Slot(S::Text)),
                 text(row.id.clone(), Tok::Slot(S::Text)),
                 text(row.state.clone().unwrap_or_else(|| "-".into()), state_tone),
@@ -304,28 +404,63 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
                 text(accrued, dim()),
                 worktree,
                 text(crate::cmd::fleet::age(row.created_ms, now_ms), dim()),
-            ]);
+            ];
+            if show_health {
+                cells.extend(match &readings[index] {
+                    Some(r) => health_cells(r, now_ms),
+                    None => vec![text("-", dim()), text("-", dim()), text("-", dim())],
+                });
+            }
+            rows.push(cells);
         }
         cursor = Some(SectionsCursor {
             table: secs.len(),
             rows: acts,
         });
         secs.push(Section::Table(TableSection {
-            header: [
-                "provider/env",
-                "id",
-                "state",
-                "size",
-                "$/h",
-                "accrued",
-                "worktree",
-                "age",
-            ]
-            .map(String::from)
-            .to_vec(),
+            header: {
+                let mut header: Vec<String> = [
+                    "provider/env",
+                    "id",
+                    "state",
+                    "size",
+                    "$/h",
+                    "accrued",
+                    "worktree",
+                    "age",
+                ]
+                .map(String::from)
+                .to_vec();
+                if show_health {
+                    header.extend(["mem", "up", "life"].map(String::from));
+                }
+                header
+            },
             rows,
             sel: None,
         }));
+        let warnings: Vec<(String, String, Tok)> = view
+            .rows
+            .iter()
+            .zip(&readings)
+            .filter_map(|(row, reading)| {
+                let reading = reading.as_ref()?;
+                let note = reading.note()?;
+                let tone = match reading.level() {
+                    HealthLevel::Ok => dim(),
+                    HealthLevel::Warn | HealthLevel::Unknown => Tok::Hue(Hue::Amber),
+                };
+                Some((
+                    format!("{}/{}", row.provider, row.id),
+                    thegn_core::pipeline_report::display_cell(note),
+                    tone,
+                ))
+            })
+            .collect();
+        if !warnings.is_empty() {
+            secs.push(heading("health warnings", None));
+            secs.push(Section::KeyVal(warnings));
+        }
         let more = view.rows.len().saturating_sub(MAX_ROWS);
         if more > 0 {
             secs.push(heading(format!("+{more} more"), None));
@@ -381,6 +516,7 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
         ));
     }
     secs.push(Section::KeyVal(totals));
+    secs.extend(ai_sections(&snap.ai));
 
     if !view.partial.is_empty() {
         secs.push(spacer());
@@ -421,8 +557,8 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
 mod tests {
     use super::{
         BudgetLevel, Cell, DetailAction, Hue, MAX_ROWS, S, Section, Tok, UnicodeWidthStr,
-        build_sections, clip_start, confirm_menu, confirm_text, fleet_down_argv, fleet_down_tag,
-        refresh_open, started_status, stop_for_tag,
+        build_sections, build_sections_with, clip_start, confirm_menu, confirm_text,
+        fleet_down_argv, fleet_down_tag, refresh_open, started_status, stop_for_tag,
     };
     use crate::fleet_read::FleetSnapshot;
     use thegn_core::placement::fleet_cost::{
@@ -448,6 +584,7 @@ mod tests {
             generated_ms: NOW - 60_000,
             view,
             cost,
+            ai: Default::default(),
         }
     }
 
@@ -563,6 +700,56 @@ mod tests {
         let wide = clip_start("\u{4f60}\u{597d}\u{4e16}\u{754c}", 6);
         assert!(UnicodeWidthStr::width(wide.as_str()) <= 6, "{wide}");
         assert!(wide.ends_with('\u{754c}'));
+    }
+
+    #[test]
+    fn health_columns_and_warnings_appear_only_with_a_reading() {
+        use thegn_core::remote_health::{HealthCache, HealthSample};
+        let view = FleetView {
+            rows: vec![row("tg-a", Some("/wt/a")), row("tg-b", Some("/wt/b"))],
+            ..FleetView::default()
+        };
+        let sn = snap(view);
+        let none = HealthCache::default();
+        let plain = build_sections_with(&sn, NOW, &none).sections;
+        let Section::Table(t) = plain
+            .iter()
+            .find(|s| matches!(s, Section::Table(_)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(t.header.len(), 8, "no readings → the old columns");
+
+        let cache = HealthCache::default();
+        cache.record(
+            "/wt/a",
+            HealthSample {
+                uptime_secs: Some(3 * 3600 + 120),
+                mem_total_kib: Some(1000),
+                mem_available_kib: Some(50),
+                ..Default::default()
+            },
+            NOW,
+            Some("sprite restarted: likely out of memory".into()),
+            Some(1800),
+        );
+        let secs = build_sections_with(&sn, NOW, &cache).sections;
+        let lines = texts(&secs);
+        assert!(
+            lines.iter().any(|l| l.ends_with("|95%|3h 2m|30m")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.ends_with("|-|-|-")),
+            "an unsampled row shows dashes: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "fly/tg-a=sprite restarted: likely out of memory"),
+            "{lines:?}"
+        );
     }
 
     #[test]

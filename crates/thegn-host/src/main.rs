@@ -11,6 +11,7 @@ mod actions;
 mod agent;
 mod agent_configs;
 mod agent_home;
+mod agent_integrate;
 mod agent_output;
 mod agent_run;
 mod agent_ssh;
@@ -255,6 +256,7 @@ mod provider_git;
 mod provider_workdir;
 mod provision_bg;
 mod provision_gate;
+mod provision_overlap;
 mod provision_recover;
 mod pty_drain;
 mod push_notify;
@@ -265,6 +267,7 @@ mod reaper_policy;
 mod recorder;
 mod refresh_schedule;
 mod remote_enqueue_auth;
+mod remote_health_sampler;
 mod remote_poll;
 mod remote_sync;
 mod remote_term;
@@ -927,6 +930,23 @@ pub enum Command {
         /// (`90s`, `30m`, `4h`, or bare seconds; capped at 24h). Off by default.
         #[arg(long, value_name = "DUR", value_parser = parse_hold_duration)]
         hold: Option<std::time::Duration>,
+        /// Start the command as a server-side session that outlives this
+        /// client, print its session id and return. The sprite stays awake
+        /// while it runs, for at most `--max`. Background work started with a
+        /// plain exec (`nohup … &`) does not survive its session.
+        #[arg(long, conflicts_with_all = ["hold", "attach", "status"])]
+        detach: bool,
+        /// With `--detach`: the longest the command may keep the sprite awake
+        /// and run after this client leaves (default 4h; capped at 24h).
+        #[arg(long, value_name = "DUR", value_parser = parse_hold_duration, requires = "detach")]
+        max: Option<std::time::Duration>,
+        /// Reattach to a detached session: stream its output from the start
+        /// and exit with its code.
+        #[arg(long, value_name = "SESSION", conflicts_with_all = ["hold", "status"])]
+        attach: Option<String>,
+        /// Print whether a detached session is running or its exit code.
+        #[arg(long, value_name = "SESSION", conflicts_with = "hold")]
+        status: Option<String>,
         /// Command to run (empty ⇒ a login shell).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -1810,7 +1830,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::VpsSsh { name, cmd } => vps_bridge::run(&cfg, &name, &cmd),
         Command::Machine0Ssh { name, cmd } => machine0_bridge::run(&cfg, &name, &cmd),
-        Command::SpriteExec { id, hold, cmd } => sprite_bridge::run(&cfg, &id, &cmd, hold),
+        Command::SpriteExec {
+            id,
+            hold,
+            detach,
+            max,
+            attach,
+            status,
+            cmd,
+        } => match (detach, attach, status) {
+            (true, _, _) => sprite_bridge::run_detach(&cfg, &id, &cmd, max),
+            (false, Some(session), _) => sprite_bridge::run_attach(&cfg, &id, &session),
+            (false, None, Some(session)) => sprite_bridge::run_status(&cfg, &id, &session),
+            (false, None, None) => sprite_bridge::run(&cfg, &id, &cmd, hold),
+        },
         Command::VercelExec { id, cmd } => vercel_bridge::run(&cfg, &id, &cmd),
         Command::SandboxArgv { target } => {
             // Resolve like every other worktree-scoped verb (explicit →

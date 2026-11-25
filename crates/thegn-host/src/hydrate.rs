@@ -3002,6 +3002,7 @@ pub(crate) fn build_model(
     crate::fly_reaper::tick(&app_cfg);
     crate::vercel_reaper::tick(&app_cfg);
     crate::sprites_reaper::tick(&app_cfg);
+    crate::remote_health_sampler::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
     let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);
@@ -3161,6 +3162,8 @@ pub(crate) fn build_model(
         sidebar_db_terminals,
         disk_warn_threshold_gb: app_cfg.disk.warn_threshold_gb,
         procs_disabled: !app_cfg.monitor.processes,
+        layout_hints_off: !app_cfg.panel.layout_hints,
+        context_hints_off: !app_cfg.panel.context_hints,
         active_worktree_disk: sidebar_status
             .disk_sizes
             .get(cwd.to_string_lossy().as_ref())

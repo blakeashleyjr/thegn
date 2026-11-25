@@ -167,8 +167,8 @@ mod tests {
             .unwrap();
         assert!(claude.configured && claude.supported);
         assert_eq!(claude.project_root.as_deref(), Some(".claude/skills"));
-        // mq, pipeline, supervise and lead.
-        assert_eq!(claude.absent, 4);
+        // mq, pipeline, supervise, lead and thegn.
+        assert_eq!(claude.absent, 5);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["harnesses"][1]["id"], "claude");
     }

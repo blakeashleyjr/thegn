@@ -226,6 +226,9 @@ been verified live against the real Sprites API yet.
   about 20 seconds. `thegn env up` prints each phase with its elapsed time
   (for example `Install coding agents — done (51.2 s)`) and a total at the end;
   the loading card shows the same phases with a hint under the slow ones.
+  The repository seed and the Nix and direnv installs run at the same time, so
+  two phases can be running at once; the dev shell build and your setup start
+  when both are done, and a failed seed or Nix check still stops the create.
   Typical phases: boot 0.4 s, workspace and repository seed 3 s, setup 12 s,
   coding-agent install 45 to 60 s (the agent CLIs download in parallel), agent
   logins 10 s, snapshot 4 s. Later opens are fast: a sprite that is asleep wakes
@@ -308,6 +311,22 @@ another person). If it is yours: thegn env adopt X --env <env>`. Run that
   bill. After a crash the worst case is the ceiling plus 5 minutes. If `curl` or
   the socket is missing in the VM, one line is printed and the command runs
   unheld.
+- **Background work does not survive its exec session.** A process a plain
+  `sprite-exec` (or `agent run`) starts with `nohup … &` or `setsid` is not
+  guaranteed to outlive that session: Sprites can stop it when the session
+  ends, and nothing keeps the sprite awake for it. Use
+  `thegn sprite-exec <sprite> --detach [--max <dur>] -- <cmd>` instead. It
+  starts the command as its own server-side exec session, prints the session
+  id and returns at once. The command runs inside the keep-awake heartbeat
+  above, so the sprite stays awake while it runs, independent of any client,
+  for at most `--max` (default 4 hours, capped at 24 hours); the same value is
+  asked of the server as `max_run_after_disconnect`. Follow it with
+  `sprite-exec <sprite> --attach <session>` (streams the output from the start,
+  reattaches across dropped streams and exits with the command's code) and
+  `sprite-exec <sprite> --status <session>` (prints `running`, `finished exit
+N`, or `not found`; exit 75 when the session is gone). A detached command has
+  no stdin. If `curl` or the socket is missing in the VM the command still
+  runs, unheld, and the sprite may sleep. Sprites only.
 - **Size.** Sprites have a fixed 8 vCPU; `size`, `min_vcpu`, `gpu` and `nvme`
   are ignored and validate warns. `min_ram_gb > 0` sets the sprite's memory
   limit to `min_ram_gb * 1024` MB (no autoscale) once, at create. The policy is
@@ -430,12 +449,56 @@ environments.
   (`retry-pullbacks`, no default chord) runs the same code as
   `thegn env sync-retry`, off the loop, and posts one toast with the counts. It
   never destroys a sandbox.
-- **Inspect.** `thegn fleet inspect <sprite> --env <S> [--policy] [--json]`
+- **Inspect.** `thegn fleet inspect <sprite> --env <S> [--policy] [--probe] [--json]`
   reads one sprite from the org-level API: name, status, `created_at` and URL
   auth, with a warning when URL auth is public. It never runs or resumes the
   sprite. `--policy` also reads the memory policy and your configured
   `min_ram_gb`; that read is separate because it may wake a cold sprite. Its
   errors never print the request URL.
+- **Live health.** `--probe` runs one short read-only command inside the
+  sprite (this wakes a cold sprite) and adds its health: CPU load and cores,
+  memory used against the limit (the cgroup limit when one is set) with memory
+  pressure, disk use of `/`, uptime and boot id, and the time left before
+  `max_lifetime_secs`. The health is `ok`, `warn` (memory or disk at 90% or
+  more, or the kernel killed a process for memory this boot) or `unknown` (the
+  probe could not run; the reason is printed). Warnings name the cause, for
+  example `sprite out of memory: kernel killed rustc 3.7 GB`, and a lifetime
+  under an hour. With `--json` the same report is the `health` object.
+- **Background health sampler.** While thegn runs, it probes each running
+  provider sandbox that belongs to a worktree about once a minute (every
+  5 minutes after a failed or timed-out probe). A sandbox the provider reports
+  cold, warm or stopped is never probed, since that would wake and bill it. A
+  changed boot id raises one notification naming the cause (`sprite restarted:
+likely out of memory (3.7 GB of 4.0 GB used before the restart)`, `it slept
+while idle`, or `it reached its maximum lifetime`), a new kernel OOM kill
+  raises one naming the process and its size, and a sandbox with under an hour
+  of lifetime left raises one. Each is also kept in a bounded per-sandbox event
+  journal (500 events, 30 days). When a `thegn sprite-exec` stream ends without
+  an exit status and a fresh probe shows a new boot id, the specific warning is
+  printed instead of `exec stream ended without an exit status`.
+- **Where health shows.** A remote worktree row in the sidebar carries a
+  health dot (green `ok`, amber `warn`, faint `unknown`) and, when there is
+  one, the warning text. The fleet popup adds `mem`, `up` and `life` columns
+  (memory percent, uptime, lifetime left) and lists each warning below the
+  table; they appear once any listed sandbox has been sampled. The panel's
+  telemetry section (the Observe view) shows a `REMOTE` block for the focused
+  worktree: CPU, memory and disk with a sparkline of the recent samples, plus
+  uptime and lifetime left. Nothing is shown for a sandbox that has not been
+  sampled, and a failed probe shows `unknown` with its reason, never a
+  made-up reading.
+  `--probe` also works for a Vercel, VPS, Fly or machine0 env: pass the
+  sandbox id from `fleet list` as the name and the provider's own listing is
+  used instead of the Sprites API.
+- **Status for this worktree.** `thegn env status [--watch] [--interval SECS]
+[--json]` reports the current worktree's remote sandbox on any exec-capable
+  provider: provider state, size and region, time left before
+  `max_lifetime_secs`, estimated cost (hourly burn and accrued), and the same
+  health probe. A sandbox the provider reports cold, stopped or suspended is
+  not probed (a probe would wake and bill it); its health shows `unknown` with
+  that reason. `--watch` refreshes every 5 s (`--interval`, at least 1) and
+  prints a line when a restart or an out-of-memory kill is detected between
+  two probes. The same report is served read-only as `GET /v1/env/status` and
+  the MCP tool `env_status` (read scope; both take an optional `worktree`).
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.
@@ -662,6 +725,10 @@ Interactive remote transports share one rule, and a new one should adopt it.
 - **Self-calibrating.** It acts only on a connection that has already answered
   a ping, and only for interactive panes. A server that never answers pings is
   left alone, so a quiet but healthy session is never cut.
+- **Idle keepalive.** Every exec socket, interactive or not, also sends a
+  WebSocket ping every 15 s so a proxy never reaps a quiet stream (a build
+  printing nothing for minutes). A connection that has answered a ping and then
+  sends nothing for 45 s is treated as dropped and reattached.
 - **`TCP_NODELAY`** is set on the exec and proxy sockets, so a keystroke is not
   held back to be batched.
 
@@ -812,6 +879,14 @@ stderr (stdout no longer carries the stderr tail or the 1 MiB marker) and
 forwards a non-terminal stdin. TTY mode runs only when stdin and stdout are
 both terminals. Provisioning (`run_exec`) is unchanged.
 
+When a non-tty stream drops without an exit status, `sprite-exec` reattaches to
+the session the server announced, after 1, 2, 4, 8 and 15 s, printing one line
+per attempt on stderr. It asks the server to resume after the stdout and stderr
+bytes already received, so stdout is not repeated, and it never runs the command
+again. Stdin a dropped session did not take is sent to the next one. When every
+attempt fails it exits with `exec stream ended without an exit status` and the
+last reattach error.
+
 ## Parity run summary
 
 `test/remote-parity.sh` ends with a `RUN SUMMARY` block listing each step's
@@ -823,6 +898,8 @@ Not confirmed against a live provider:
 
 - the guest has the `C.UTF-8` locale;
 - the shape of the server's replay on reattach;
+- whether a non-tty session outlives a dropped socket long enough to reattach,
+  and how the server honours `output_offset`;
 - the largest WebSocket message the server accepts;
 - whether an open, idle exec keeps a sprite awake;
 - whether Sprites applies the cols and rows in the exec URL itself (the explicit

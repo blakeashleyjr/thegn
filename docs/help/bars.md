@@ -31,8 +31,10 @@ The brand block and the app-tab chips on the left, and the
 the bar focused, `←/→` walks the stats and `↵` opens the stat's history popup
 — `Esc`, `q`, or a click outside dismisses it. Clicking the empty right half
 of the bar cycles the `[stats] refresh_rates` cadence. The cluster sheds
-stats softest-first as the terminal narrows, `date` first, then `weather`,
-then `fleet`, and `clock` among the last to go — so the
+stats softest-first as the terminal narrows, in this order: `date`,
+`weather`, `fleet`, `uptime`, `load`, `freq`, `swap`, `temp`, `disk`, `gpu`,
+`battery`, `net`, `clock`, `mem`, `cpu` — so `cpu`, `mem` and `clock` are
+the last to go and the
 calendar stays reachable from the bar even on a cramped terminal; the brand
 and the active app chip always keep their cells.
 
@@ -77,7 +79,10 @@ The `fleet` widget shows the estimated hourly burn of your provider VMs
 inventoried and each VM is priced from the bundled price table or your
 `[placement.price]` overrides. `+N` counts VMs with no known price. It turns
 amber with a warning mark when a VM has no worktree (an orphan) or a
-worktree's recorded VM is no longer listed by its provider. Clicking it opens
+worktree's recorded VM is no longer listed by its provider. While the burn is
+zero (every listed VM stopped, or no provider usage yet) and nothing needs a
+warning or a price, the widget is hidden to keep the bar quiet; set
+`fleet_always_show = true` in `[bars]` to keep the `$0.00/h` meter on the bar. Clicking it opens
 the **fleet** popup: each VM's provider and env, id, state, size, `$/h`,
 accrued cost, worktree (or `ORPHAN`) and age, then the totals (per-provider
 hourly, today, month to date, and the next 24 h / 30 d at the current burn),
@@ -85,6 +90,14 @@ and any env that could not be read. When a `[placement.fleet_budget.*]`
 limit is reached, a `budget` section at the top lists each provider's burn
 against its limit (amber at `warn_hourly`, red at `max_hourly`, where new
 sandboxes are refused). Long worktree paths show their tail. Every amount is an estimate, not a bill.
+
+The meter is one combined burn: provider VMs plus **metered AI spend**, the
+pay-per-token cost the model proxy recorded over the trailing hour (see
+[AI account usage](ai-usage.md)). Subscription plans are not counted; they stay
+in the usage gauge. The hide-at-zero rule applies to the total. The popup adds
+a **metered AI** block with the AI burn, today (UTC), month to date, and a row
+per backend/model; it says when a cost is estimated from the price table or a
+request had no known price. With the model proxy off, AI spend is zero.
 
 In the popup, `↑`/`↓` (or `j`/`k`) select a VM. On a VM bound to a worktree,
 `s` stops it and `d` destroys it, each after a confirmation. Stop parks the VM
@@ -148,8 +161,11 @@ always counted. Clicking the widget performs the same files-drawer toggle as
   affordance rather than an alert.
 
 When the bar is too narrow for everything, the free-text status message is
-clipped first, then widgets and the quieter badges are shed — the `✋`,
-`LOCKED` and daemon chips are never the ones to go.
+clipped first, then items are shed in this order: the `loc`, `tests`, `pr`
+and `disk` widgets, `status`, other widgets, then the quieter badges (media,
+ingress, disk warning, network, usage, notifications, PR queue, merge queue,
+CI, zoom, maximized, sync, attention) — the `✋`, `LOCKED`, help and daemon
+chips are never the ones to go.
 
 The `loc` and `disk` widgets are **measured in the background**, not computed
 per frame: a `du` and a `tokei` walk are both far too slow to sit on the render

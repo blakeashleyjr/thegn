@@ -1,0 +1,5 @@
+- [x] 1. Idle keepalive ping and silent-socket drop in the exec driver
+- [x] 2. Non-tty reattach URL with `output_offset`; `attach_exec_streaming`
+- [x] 3. `sprite-exec` streaming mode reattaches, carries stdin and the stderr tail
+- [x] 4. Unit tests and a fake-server replay test; help page
+- [ ] 5. Verify against a live sprite that a quiet held build survives past 15 minutes and a forced drop reattaches

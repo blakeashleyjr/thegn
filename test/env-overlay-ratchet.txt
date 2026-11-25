@@ -116,6 +116,7 @@ bars.bottom_left
 bars.bottom_right
 bars.clock_format
 bars.date_format
+bars.fleet_always_show
 bars.top_left
 bars.top_right
 calendar.agenda_rows
@@ -333,7 +334,9 @@ palette.content_search_hidden
 palette.file_max_results
 palette.symbol_max_results
 panel.collapse_on_escape
+panel.context_hints
 panel.half_ratio
+panel.layout_hints
 panel.sections
 panel.width
 pins.args

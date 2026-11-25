@@ -665,6 +665,57 @@ pub fn is_deferred_step(id: &str) -> bool {
     DEFERRED_STEP_IDS.contains(&id)
 }
 
+/// Steps that put the repository into the workdir: the seed or clone, then the
+/// steps that only touch the checkout it made (THE-2708).
+const REPO_LANE_STEP_IDS: &[&str] = &[
+    "bundle_seed",
+    "clone",
+    "git_exclude",
+    "local_parity",
+    "snapshot_restore",
+];
+
+/// Steps that never read the workdir: they install Nix and direnv under `/nix`
+/// and `$HOME` (THE-2708). The dev shell build reads the repo's flake, so it is
+/// not one of them.
+const TOOL_LANE_STEP_IDS: &[&str] = &["nix", "nix_verify", "direnv"];
+
+/// Two adjacent plan ranges an applier may run at the same time: the repository
+/// lane and the tool-install lane. Each lane keeps its own order, and every step
+/// after `tools.end` waits for both lanes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlapWindow {
+    pub repo: std::ops::Range<usize>,
+    pub tools: std::ops::Range<usize>,
+}
+
+/// Find the repository lane (from `bundle_seed` or `clone` through the steps
+/// that only touch the checkout) and the Nix/direnv lane directly after it.
+/// `None` when either lane is empty. Pure.
+pub fn overlap_window(steps: &[ProvisionStep]) -> Option<OverlapWindow> {
+    let start = steps
+        .iter()
+        .position(|step| matches!(step.id.as_str(), "bundle_seed" | "clone"))?;
+    let mut mid = start + 1;
+    while steps
+        .get(mid)
+        .is_some_and(|step| REPO_LANE_STEP_IDS.contains(&step.id.as_str()))
+    {
+        mid += 1;
+    }
+    let mut end = mid;
+    while steps
+        .get(end)
+        .is_some_and(|step| TOOL_LANE_STEP_IDS.contains(&step.id.as_str()))
+    {
+        end += 1;
+    }
+    (end > mid).then_some(OverlapWindow {
+        repo: start..mid,
+        tools: mid..end,
+    })
+}
+
 /// Marker contents: done, and foreground-done-with-deferred-pending.
 pub const MARKER_DONE: &[u8] = b"ok\n";
 pub const MARKER_DEFERRED: &[u8] = b"deferred\n";
@@ -2701,6 +2752,79 @@ mod tests {
         assert_eq!(worktree, "/home/u/wt");
         assert_eq!(workdir, "/workspace");
         assert_eq!(branch, "feat");
+    }
+
+    #[test]
+    fn overlap_window_pairs_the_repo_lane_with_nix_and_direnv() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            direnv: true,
+            direnv_uses_flake: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            branch: Some("feat".into()),
+            local_parity: Some("/home/u/wt".into()),
+            bundle_seed: Some(BundleSeed {
+                worktree: "/home/u/wt".into(),
+                branch: "feat".into(),
+            }),
+            setup: vec!["echo hi".into()],
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let w = overlap_window(&p.steps).expect("a seeded Nix plan overlaps");
+        assert_eq!(
+            &ids[w.repo.clone()],
+            &["bundle_seed", "git_exclude", "local_parity"],
+            "{ids:?}"
+        );
+        assert_eq!(
+            &ids[w.tools.clone()],
+            &["nix", "nix_verify", "direnv"],
+            "{ids:?}"
+        );
+        assert_eq!(w.repo.end, w.tools.start);
+        // The dev shell build reads the repo's flake: it waits for both lanes.
+        assert_eq!(ids[w.tools.end], "devshell", "{ids:?}");
+    }
+
+    #[test]
+    fn overlap_window_covers_the_origin_clone_too() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            skip_devshell_warm: true,
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let w = overlap_window(&p.steps).expect("overlap");
+        assert_eq!(&ids[w.repo.clone()], &["clone", "git_exclude"], "{ids:?}");
+        assert_eq!(&ids[w.tools.clone()], &["nix", "nix_verify"], "{ids:?}");
+        assert_eq!(w.tools.end, ids.len(), "{ids:?}");
+    }
+
+    #[test]
+    fn overlap_window_is_none_without_a_repo_or_a_nix_lane() {
+        // No repository step at all.
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        assert!(overlap_window(&plan(&req, &PlanOpts::default()).steps).is_none());
+        // A repository but no Nix tier: nothing to overlap with.
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            ..Default::default()
+        };
+        assert!(overlap_window(&plan(&EnvRequirements::default(), &opts).steps).is_none());
     }
 
     #[test]

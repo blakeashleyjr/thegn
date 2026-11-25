@@ -744,6 +744,34 @@
       "changes": [
         "hide-credentials-in-standard-sandbox"
       ]
+    },
+    {
+      "issue": "THE-2704",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "dynamic-key-discovery"
+      ]
+    },
+    {
+      "issue": "THE-2705",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "hide-zero-fleet-meter"
+      ]
+    },
+    {
+      "issue": "THE-2707",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "meter-ai-spend-in-fleet-burn"
+      ]
+    },
+    {
+      "issue": "THE-2712",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "remote-sandbox-visibility"
+      ]
     }
   ]
 }

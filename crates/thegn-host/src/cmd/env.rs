@@ -36,6 +36,10 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
+    /// Live health of a worktree's remote sandbox: provider state, lifetime
+    /// left, cost and one health probe (never wakes a sandbox the provider
+    /// reports asleep). `--watch` refreshes and prints restart / OOM events.
+    Status(super::env_status::StatusArgs),
     /// Select an environment for a worktree (persists to the DB).
     Set {
         /// The `[env.<name>]` to use.
@@ -230,6 +234,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(cfg, json),
         Action::Show { target } => show(cfg, target.get()),
+        Action::Status(args) => super::env_status::run(cfg, args),
         Action::Set {
             name,
             workspace,

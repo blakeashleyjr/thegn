@@ -80,6 +80,7 @@ struct Mock {
     stale: Arc<Mutex<bool>>,
     write_delay_ms: Arc<Mutex<u64>>,
     missing_parent: Arc<Mutex<Option<String>>>,
+    absent: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone)]
@@ -92,6 +93,7 @@ struct State {
     stale: Arc<Mutex<bool>>,
     write_delay_ms: Arc<Mutex<u64>>,
     missing_parent: Arc<Mutex<Option<String>>>,
+    absent: Arc<Mutex<bool>>,
     scripts: Arc<Mutex<VecDeque<Script>>>,
 }
 
@@ -106,6 +108,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
     let stale = Arc::new(Mutex::new(false));
     let write_delay_ms = Arc::new(Mutex::new(0));
     let missing_parent = Arc::new(Mutex::new(None));
+    let absent = Arc::new(Mutex::new(false));
     let state = State {
         fs: Arc::clone(&fs),
         execs: Arc::clone(&execs),
@@ -115,6 +118,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
         stale: Arc::clone(&stale),
         write_delay_ms: Arc::clone(&write_delay_ms),
         missing_parent: Arc::clone(&missing_parent),
+        absent: Arc::clone(&absent),
         scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
     };
     thread::spawn(move || {
@@ -133,6 +137,7 @@ fn start_mock(scripts: Vec<Script>) -> Mock {
         stale,
         write_delay_ms,
         missing_parent,
+        absent,
     }
 }
 
@@ -156,6 +161,11 @@ fn deny_writes(mock: &Mock, status: u16) {
 /// fs write API behaves when the parent directory does not exist.
 fn require_parent(mock: &Mock, dir: &str) {
     *mock.missing_parent.lock().unwrap() = Some(dir.to_owned());
+}
+
+/// Make the sprite itself not exist: every fs call and the sprite lookup answer `404`.
+fn remove_sprite(mock: &Mock) {
+    *mock.absent.lock().unwrap() = true;
 }
 
 fn script(out: Vec<Out>) -> Script {
@@ -221,6 +231,21 @@ fn serve(mut stream: TcpStream, state: State) {
             }
             None => respond(&mut stream, 500, b""),
         }
+        return;
+    }
+    if head.method == "GET" && !route.contains("/fs/") {
+        // `GET /v1/sprites/<name>`: the sprite lookup.
+        let name = route.rsplit('/').next().unwrap_or_default();
+        if *state.absent.lock().unwrap() {
+            respond(&mut stream, 404, b"");
+        } else {
+            let body = serde_json::json!({"name": name, "status": "running"}).to_string();
+            respond(&mut stream, 200, body.as_bytes());
+        }
+        return;
+    }
+    if *state.absent.lock().unwrap() {
+        respond(&mut stream, 404, b"");
         return;
     }
     let Some(path) = param(&head.target, "path") else {
@@ -2702,5 +2727,58 @@ async fn a_fresh_sprite_gets_its_marker_directory_made_before_the_owner_marker()
     assert_eq!(
         mock.fs.lock().unwrap().get(&marker).map(Vec::as_slice),
         Some(binding().project().as_bytes())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_sprite_is_named_plainly_not_as_a_404_chain() {
+    let mock = start_mock(Vec::new());
+    remove_sprite(&mock);
+    let (_dir, store) = store();
+    let runner = runner(&mock, store, outputs_options(DEADLINE));
+
+    let outcome = runner
+        .run(Recipe::CargoBuild, &pinned(), &content(), DEADLINE)
+        .await;
+
+    let text = format!("{outcome:?}");
+    assert!(text.contains("does not exist"), "{text}");
+    assert!(text.contains("tgtest1"), "{text}");
+    assert!(text.contains("thegn env up"), "{text}");
+    assert!(!text.contains("404"), "{text}");
+}
+
+/// The launcher keeps the stock toolchain resolvable: `$CARGO_HOME/bin` holds
+/// links to the caller's real cargo home binaries.
+#[test]
+fn the_launcher_links_the_real_toolchain_into_the_job_cargo_home() {
+    if !cfg!(target_os = "linux") || !have("setsid") {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let checkout = work.path().join("co");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let real = work.path().join("realcargo");
+    std::fs::create_dir_all(real.join("bin")).unwrap();
+    std::fs::write(real.join("bin/cargo"), "#!/bin/sh\n").unwrap();
+    let cache = work.path().join("cache");
+    let output = launcher(
+        &work.path().join("ctl/k.pid"),
+        &checkout,
+        &work.path().join("home/k"),
+        &cache,
+    )
+    .args(["/bin/sh", "-c", "true"])
+    .env("CARGO_HOME", &real)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(cache.join("cargo/bin/cargo")).is_ok(),
+        "cargo must resolve under the job CARGO_HOME"
     );
 }

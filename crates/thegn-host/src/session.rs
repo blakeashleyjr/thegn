@@ -1268,6 +1268,137 @@ impl Session {
         }
     }
 
+    /// Swap the active tab one slot left (`right == false`) or right in its
+    /// group, keeping it active. No wrap: a move past either end is a no-op.
+    /// Ordinal-style titles are renumbered so chips keep reading "1 2 3" by
+    /// position. Returns whether the order changed.
+    pub fn move_active_tab(&mut self, right: bool) -> bool {
+        let Some(g) = self.active_group_mut() else {
+            return false;
+        };
+        let from = g.active_tab.min(g.tabs.len().saturating_sub(1));
+        let to = if right {
+            from + 1
+        } else {
+            match from.checked_sub(1) {
+                Some(t) => t,
+                None => return false,
+            }
+        };
+        if g.tabs.is_empty() || to >= g.tabs.len() {
+            return false;
+        }
+        g.tabs.swap(from, to);
+        g.active_tab = to;
+        g.renumber();
+        true
+    }
+
+    /// Move the active group's tab at `from` to slot `to` (drag-to-reorder on
+    /// the tab strip) and make it active. Out-of-range indexes and `from == to`
+    /// are no-ops. Returns whether the order changed.
+    pub fn move_tab_to(&mut self, from: usize, to: usize) -> bool {
+        let Some(g) = self.active_group_mut() else {
+            return false;
+        };
+        if from == to || from >= g.tabs.len() || to >= g.tabs.len() {
+            return false;
+        }
+        let tab = g.tabs.remove(from);
+        g.tabs.insert(to, tab);
+        g.active_tab = to;
+        g.renumber();
+        true
+    }
+
+    /// Detach `pane` from `src` and hand its per-pane hints (cwd, command,
+    /// provider session, scrollback) to `dst`. The pane id (and so its live
+    /// PTY / session) is unchanged.
+    fn transfer_pane_state(src: &mut Tab, dst: &mut Tab, pane: u32) {
+        if let Some(v) = src.pane_cwds.remove(&pane) {
+            dst.pane_cwds.insert(pane, v);
+        }
+        if let Some(v) = src.pane_cmds.remove(&pane) {
+            dst.pane_cmds.insert(pane, v);
+        }
+        if let Some(v) = src.pane_sessions.remove(&pane) {
+            dst.pane_sessions.insert(pane, v);
+        }
+        if let Some(v) = src.pane_scrollback.remove(&pane) {
+            dst.pane_scrollback.insert(pane, v);
+        }
+        src.focus_history.retain(|p| *p != pane);
+    }
+
+    /// Move the active tab's `pane` into a brand-new tab placed right after the
+    /// active one, and focus that tab. The pane keeps its id, so its PTY stays
+    /// alive. A no-op (`false`) when the tab holds only that pane or the pane
+    /// is not in the tab.
+    pub fn break_pane_to_tab(&mut self, pane: u32) -> bool {
+        let Some(g) = self.active_group_mut() else {
+            return false;
+        };
+        let ai = g.active_tab.min(g.tabs.len().saturating_sub(1));
+        let Some(src) = g.tabs.get_mut(ai) else {
+            return false;
+        };
+        if !src.center.pane_ids().contains(&pane) || !src.center.remove(pane) {
+            return false;
+        }
+        src.after_pane_closed(pane);
+        src.grow = crate::center::Grow::Tiled;
+        let mut tab = Tab::new((ai + 2).to_string());
+        tab.center = CenterTree::Leaf(pane);
+        Self::transfer_pane_state(src, &mut tab, pane);
+        tab.focus_pane(pane);
+        g.tabs.insert(ai + 1, tab);
+        g.active_tab = ai + 1;
+        g.renumber();
+        true
+    }
+
+    /// Move the active tab's `pane` into the neighbouring tab (previous or
+    /// next, no wrap) beside that tab's focused pane, and switch to it. The
+    /// pane keeps its id so its PTY stays alive. A no-op (`false`) at the end
+    /// of the strip, when the source holds only that pane, or when the pane is
+    /// not in the active tab.
+    pub fn move_pane_to_adjacent_tab(&mut self, pane: u32, next: bool) -> bool {
+        let Some(g) = self.active_group_mut() else {
+            return false;
+        };
+        let ai = g.active_tab.min(g.tabs.len().saturating_sub(1));
+        let di = if next {
+            ai + 1
+        } else {
+            match ai.checked_sub(1) {
+                Some(d) => d,
+                None => return false,
+            }
+        };
+        if g.tabs.is_empty() || di >= g.tabs.len() {
+            return false;
+        }
+        if !g.tabs[ai].center.pane_ids().contains(&pane) || !g.tabs[ai].center.remove(pane) {
+            return false;
+        }
+        // `ai != di`, so split the slice to borrow both tabs mutably.
+        let (lo, hi) = g.tabs.split_at_mut(ai.max(di));
+        let (src, dst) = if ai < di {
+            (&mut lo[ai], &mut hi[0])
+        } else {
+            (&mut hi[0], &mut lo[di])
+        };
+        src.after_pane_closed(pane);
+        src.grow = crate::center::Grow::Tiled;
+        dst.grow = crate::center::Grow::Tiled;
+        let anchor = dst.focused_pane;
+        dst.center.adopt_beside(anchor, pane);
+        Self::transfer_pane_state(src, dst, pane);
+        dst.focus_pane(pane);
+        g.active_tab = di;
+        true
+    }
+
     /// Close the active tab. The final tab in a worktree is intentionally not
     /// removed here: callers must use `close_active_group` / CloseWorktree for
     /// that explicit destructive transition so CloseTab cannot accidentally
@@ -2831,5 +2962,113 @@ mod tests {
             active: 0,
         };
         assert_eq!(empty_id.workspace_slug_hint(), None);
+    }
+
+    /// Three tabs "1 2 3": tab 0 holds panes 1+2 split, tab 1 pane 3, tab 2 pane 4.
+    fn rearrange_session() -> Session {
+        let mut g = WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app");
+        g.tabs = vec![Tab::new("1"), Tab::new("2"), Tab::new("3")];
+        g.tabs[0].center = CenterTree::Leaf(1);
+        g.tabs[0].center.split(1, Dir::Row, 2);
+        g.tabs[0].focused_pane = 2;
+        g.tabs[1].center = CenterTree::Leaf(3);
+        g.tabs[1].focused_pane = 3;
+        g.tabs[2].center = CenterTree::Leaf(4);
+        g.tabs[2].focused_pane = 4;
+        Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![g],
+            active: 0,
+        }
+    }
+
+    fn tab_panes(s: &Session) -> Vec<Vec<u32>> {
+        s.worktrees[0]
+            .tabs
+            .iter()
+            .map(|t| t.center.pane_ids())
+            .collect()
+    }
+
+    #[test]
+    fn move_active_tab_reorders_without_wrapping() {
+        let mut s = rearrange_session();
+        assert!(!s.move_active_tab(false), "no wrap past the left edge");
+        assert!(s.move_active_tab(true));
+        assert_eq!(s.worktrees[0].active_tab, 1);
+        assert_eq!(tab_panes(&s), vec![vec![3], vec![1, 2], vec![4]]);
+        assert!(s.move_active_tab(true));
+        assert!(!s.move_active_tab(true), "no wrap past the right edge");
+        assert_eq!(tab_panes(&s), vec![vec![3], vec![4], vec![1, 2]]);
+        assert_eq!(s.worktrees[0].active_tab, 2);
+        let titles: Vec<&str> = s.worktrees[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn move_tab_to_drags_a_tab_to_a_slot() {
+        let mut s = rearrange_session();
+        assert!(!s.move_tab_to(1, 1));
+        assert!(!s.move_tab_to(0, 3));
+        assert!(s.move_tab_to(0, 2));
+        assert_eq!(tab_panes(&s), vec![vec![3], vec![4], vec![1, 2]]);
+        assert_eq!(s.worktrees[0].active_tab, 2);
+        assert!(s.move_tab_to(2, 0));
+        assert_eq!(tab_panes(&s), vec![vec![1, 2], vec![3], vec![4]]);
+    }
+
+    #[test]
+    fn tab_order_survives_the_layout_snapshot() {
+        let mut s = rearrange_session();
+        assert!(s.move_active_tab(true));
+        let snap = s.layout_snapshot("sess", 0);
+        let order: Vec<i64> = snap.tabs.iter().map(|t| t.ordinal).collect();
+        assert_eq!(order, vec![0, 1, 2]);
+        let panes: Vec<String> = snap.tabs.iter().map(|t| t.pane_tree.clone()).collect();
+        assert_eq!(Tab::from_row(&snap.tabs[1]).center.pane_ids(), vec![1, 2]);
+        assert_eq!(Tab::from_row(&snap.tabs[0]).center.pane_ids(), vec![3]);
+        assert_eq!(panes.len(), 3);
+        assert_eq!(snap.groups[0].active_tab, 1);
+    }
+
+    #[test]
+    fn break_pane_to_tab_keeps_the_pane_id() {
+        let mut s = rearrange_session();
+        s.worktrees[0].tabs[0]
+            .pane_cwds
+            .insert(2, "/tmp/app/sub".into());
+        assert!(s.break_pane_to_tab(2));
+        assert_eq!(tab_panes(&s), vec![vec![1], vec![2], vec![3], vec![4]]);
+        assert_eq!(s.worktrees[0].active_tab, 1);
+        assert_eq!(s.worktrees[0].tabs[1].focused_pane, 2);
+        assert_eq!(
+            s.worktrees[0].tabs[1].pane_cwds.get(&2).map(String::as_str),
+            Some("/tmp/app/sub")
+        );
+        assert!(s.worktrees[0].tabs[0].pane_cwds.is_empty());
+        // A tab's only pane cannot be broken out.
+        assert!(!s.break_pane_to_tab(2));
+    }
+
+    #[test]
+    fn move_pane_to_adjacent_tab_keeps_the_pane_id() {
+        let mut s = rearrange_session();
+        assert!(
+            !s.move_pane_to_adjacent_tab(2, false),
+            "no tab before the first"
+        );
+        assert!(s.move_pane_to_adjacent_tab(2, true));
+        assert_eq!(tab_panes(&s), vec![vec![1], vec![3, 2], vec![4]]);
+        assert_eq!(s.worktrees[0].active_tab, 1);
+        assert_eq!(s.worktrees[0].tabs[1].focused_pane, 2);
+        // Moving back left leaves tab 1 with its original pane.
+        assert!(s.move_pane_to_adjacent_tab(2, false));
+        assert_eq!(tab_panes(&s), vec![vec![1, 2], vec![3], vec![4]]);
+        // A tab's last pane stays put.
+        assert!(!s.move_pane_to_adjacent_tab(4, false));
     }
 }

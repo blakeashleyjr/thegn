@@ -9,6 +9,11 @@
 pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
     ("me", "—", "{pairing_id, label, scopes}"),
     ("fleet.list", "—", "{generated_ms, view, cost, agents}"),
+    (
+        "env.status",
+        "WorktreeQuery",
+        "{generated_ms, worktree, env, provider, sandbox_id, state, cost, health}",
+    ),
     ("sessions.list", "—", "{sessions:[SessionInfo]}"),
     ("sessions.open", "OpenSpec", "SessionInfo"),
     ("sessions.fork", "ForkSpec", "SessionInfo"),

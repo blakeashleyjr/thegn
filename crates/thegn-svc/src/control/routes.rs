@@ -35,6 +35,7 @@ pub static ROUTES: &[Route] = &[
     route("/v1/pair", &[], || post(http::pair)),
     route("/v1/me", &["me"], || get(http::me)),
     route("/v1/fleet", &["fleet.list"], || get(http::fleet_list)),
+    route("/v1/env/status", &["env.status"], || get(http::env_status)),
     route("/v1/sessions", &["sessions.list", "sessions.open"], || {
         get(http::list_sessions).post(http::open_session)
     }),
@@ -247,6 +248,7 @@ pub static ROUTES: &[Route] = &[
 pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("me", "GET", "/v1/me"),
     ("fleet.list", "GET", "/v1/fleet"),
+    ("env.status", "GET", "/v1/env/status"),
     ("sessions.list", "GET", "/v1/sessions"),
     ("sessions.open", "POST", "/v1/sessions"),
     ("sessions.fork", "POST", "/v1/sessions/fork"),

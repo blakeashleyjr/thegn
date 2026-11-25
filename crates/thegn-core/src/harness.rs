@@ -353,11 +353,13 @@ static CLAUDE: Claude = Claude;
 static AIDER: Aider = Aider;
 static ANTIGRAVITY: Antigravity = Antigravity;
 static PI: Pi = Pi;
+static HERMES: Hermes = Hermes;
 
 /// The supported harnesses. Closed: an id outside it is an error, never a
 /// guessed command. Ordered so the account-switcher projection
 /// ([`crate::account::providers`]) keeps its historical `[codex, claude]` order.
-pub const HARNESSES: &[&'static dyn Harness] = &[&CODEX, &CLAUDE, &AIDER, &ANTIGRAVITY, &PI];
+pub const HARNESSES: &[&'static dyn Harness] =
+    &[&CODEX, &CLAUDE, &AIDER, &ANTIGRAVITY, &PI, &HERMES];
 
 /// Look a harness up by id. `None` for an id outside the closed registry.
 pub fn harness(id: &str) -> Option<&'static dyn Harness> {
@@ -646,6 +648,43 @@ impl Harness for Pi {
     }
 }
 
+// --- hermes (interactive launch only) ---------------------------------------
+
+/// Nous Research's `hermes` agent (`hermes-agent`). Launch is the bare `hermes`
+/// command; remote environments already install it (`envplan`). ASSUMPTIONS,
+/// unverified against a live agent: its state lives in `~/.hermes` (relocatable
+/// via `HERMES_HOME`, as the credential carry already assumes), its config is
+/// `~/.hermes/config.yaml` with a top-level `mcp_servers:` mapping, and it reads
+/// skills from `~/.hermes/skills/<name>/SKILL.md` (user level; no project-local
+/// skill root is attested, so there is no [`SkillLayout`] and worktrees are not
+/// seeded). No headless form is declared: an unattended launch must not be
+/// guessed.
+struct Hermes;
+
+impl Harness for Hermes {
+    fn id(&self) -> &'static str {
+        "hermes"
+    }
+    fn display_name(&self) -> &'static str {
+        "Hermes"
+    }
+    fn interactive_command(&self) -> &'static str {
+        "hermes"
+    }
+    fn login_argv(&self) -> &'static [&'static str] {
+        &["hermes", "setup"]
+    }
+    fn home(&self) -> Option<HomeSpec> {
+        None
+    }
+    fn headless_template(&self) -> Option<&'static str> {
+        None
+    }
+    fn caps(&self) -> HarnessCaps {
+        HarnessCaps::NONE
+    }
+}
+
 // --- Antigravity (usage only) -----------------------------------------------
 
 struct Antigravity;
@@ -833,7 +872,10 @@ mod tests {
     #[test]
     fn registry_is_closed_and_ids_unique() {
         let ids: Vec<&str> = HARNESSES.iter().map(|h| h.id()).collect();
-        assert_eq!(ids, vec!["codex", "claude", "aider", "antigravity", "pi"]);
+        assert_eq!(
+            ids,
+            vec!["codex", "claude", "aider", "antigravity", "pi", "hermes"]
+        );
         let set: HashSet<&str> = ids.iter().copied().collect();
         assert_eq!(set.len(), ids.len(), "duplicate harness id");
         assert!(harness("codex").is_some());
@@ -864,7 +906,7 @@ mod tests {
                 project_root: ".pi/skills"
             })
         );
-        for id in ["aider", "antigravity"] {
+        for id in ["aider", "antigravity", "hermes"] {
             assert_eq!(harness(id).unwrap().skill_layout(), None, "{id}");
         }
     }

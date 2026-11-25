@@ -594,6 +594,13 @@ pub struct FrameModel {
     /// Read it through [`FrameModel::procs_enabled`], never directly.
     /// Config-derived, set in `build_model` beside `disk_warn_threshold_gb`.
     pub procs_disabled: bool,
+    /// `[panel] layout_hints` inverted (default `false` = hint block shown), so
+    /// the derived `Default` matches the config default. Set in `build_model`.
+    pub layout_hints_off: bool,
+    /// `[panel] context_hints` inverted (default `false` = the focused zone's
+    /// keys fill the panel's blank rows; see `panel::context_hints`). Set in
+    /// `build_model`.
+    pub context_hints_off: bool,
     /// Active worktree's total size (bytes), for the bottom `disk` widget next
     /// to LOC. From the off-loop scan cache; `None` until first scanned.
     pub active_worktree_disk: Option<u64>,
@@ -630,6 +637,9 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
+    /// True while the bottom drawer owns the keyboard (the panel's context-keys
+    /// block titles itself for it). Mirrored from the focus state each frame.
+    pub drawer_focused: bool,
     /// Index of the selected item in the masthead's navigable cluster (when the
     /// masthead owns focus). Clamped to the visible item count each frame.
     pub masthead_sel: usize,
@@ -978,7 +988,22 @@ impl LoadStep {
 /// Action ids whose chords the chrome prints inline, resolved into
 /// [`FrameModel::chord_hints`] each frame. Add an id here when a draw site
 /// needs to name a key, rather than writing the chord as a literal.
-pub const INLINE_CHORD_IDS: &[&str] = &["help", "palette", "toggle-key-lock", "jump-lead"];
+pub const INLINE_CHORD_IDS: &[&str] = &[
+    "help",
+    "palette",
+    "toggle-key-lock",
+    "jump-lead",
+    // The panel's "Layout keys" hint block (`panel::layout_hints::ROWS`).
+    "split-right",
+    "swap-pane-left",
+    "resize-left",
+    "zoom",
+    "move-tab-left",
+    "move-tab-right",
+    "break-pane-to-tab",
+    "move-pane-to-prev-tab",
+    "move-pane-to-next-tab",
+];
 
 impl FrameModel {
     /// The live chord for an action id, for chrome that names a key inline.
@@ -1687,7 +1712,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
         "fleet" => model
             .fleet
             .as_deref()
-            .and_then(fleet_widget)
+            .and_then(|snap| fleet_widget(snap, model.bars.fleet_always_show))
             .map(|(text, warn)| {
                 let fg = if warn {
                     level_color(Level::Warn)
@@ -1703,16 +1728,27 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
 /// The `fleet` widget's text and whether it warrants the amber tone (an orphan
 /// VM, a recorded VM the provider no longer lists, or a provider burn at a
 /// `[placement.fleet_budget]` limit). `None` hides it.
-pub(crate) fn fleet_widget(snap: &crate::fleet_read::FleetSnapshot) -> Option<(String, bool)> {
+pub(crate) fn fleet_widget(
+    snap: &crate::fleet_read::FleetSnapshot,
+    always_show: bool,
+) -> Option<(String, bool)> {
     let (view, cost) = (&snap.view, &snap.cost);
+    // One combined burn: provider VMs plus metered (pay-per-token) AI spend
+    // over the trailing hour. The zero-hide rule applies to the total.
+    let burn = cost.total_hourly + snap.ai.burn_hourly.max(0.0);
     let warn = view.orphans > 0 || !view.missing.is_empty() || !cost.budget.is_empty();
-    if view.rows.is_empty() && cost.total_hourly <= 0.0 && !warn {
+    if view.rows.is_empty() && burn <= 0.0 && !warn {
         return None;
     }
-    let mut text = if cost.total_hourly > 0.0 && cost.total_hourly < 0.01 {
+    // A zero burn with nothing to flag (no unpriced VM, no warning) is hidden
+    // unless `[bars] fleet_always_show` keeps the meter on the bar.
+    if !always_show && burn <= 0.0 && cost.unpriced == 0 && !warn {
+        return None;
+    }
+    let mut text = if burn > 0.0 && burn < 0.01 {
         "<$0.01/h".to_string()
     } else {
-        format!("${:.2}/h", cost.total_hourly.max(0.0))
+        format!("${:.2}/h", burn.max(0.0))
     };
     if cost.unpriced > 0 {
         write!(text, " +{}", cost.unpriced).expect("writing to String cannot fail");
@@ -2324,20 +2360,55 @@ pub fn draw_panel(
     // the real bindings (and any remaps) instead of a static table. Painting
     // only over rows `build_panel` didn't produce means it never overlaps panel
     // content and needs no change to `panel_hits`.
-    if model.panel_focused {
-        let pairs: Vec<(String, String)> = model.keyhints.iter().take(6).cloned().collect();
-        let hint_h = pairs.len() + 1; // rule/title + one row per tip
-        let avail = body.rows.saturating_sub(frame.rows.len());
-        // Require a one-row gap between the last panel row and the footer.
+    // "Layout keys" block: the rearranging chords, bottom-aligned just above the
+    // Lead footer, only when a one-row gap above it is free. It takes priority
+    // over the NAVIGATE footer, which then stacks above it.
+    let free = body.rows.saturating_sub(frame.rows.len());
+    let layout_pairs = crate::panel::layout_hints::rows(model, rect.cols, free.saturating_sub(1));
+    let layout_h = if layout_pairs.is_empty() {
+        0
+    } else {
+        layout_pairs.len() + 1
+    };
+    if layout_h > 0 {
+        draw_panel_hints(
+            surface,
+            Rect {
+                x: rect.x,
+                y: body.y + body.rows - layout_h,
+                cols: rect.cols,
+                rows: layout_h,
+            },
+            crate::panel::layout_hints::TITLE,
+            &layout_pairs,
+        );
+    }
+    // Context keys: the focused zone's live keys (`model.keyhints`, the same
+    // pairs the statusbar shows) fill the rows left above the Layout block —
+    // NAVIGATE while the panel has focus, PANE / DRAWER / BAR KEYS otherwise
+    // (`[panel] context_hints`). Chords the Layout block already shows are
+    // skipped.
+    if let Some(title) = crate::panel::context_hints::title(model) {
+        let avail = body.rows.saturating_sub(frame.rows.len() + layout_h);
+        // `avail - 1` keeps a one-row gap between the last panel row and the
+        // block, so `hint_h` (title + one row per tip) is always `< avail`.
+        let pairs = crate::panel::context_hints::rows(
+            model,
+            rect.cols,
+            avail.saturating_sub(1),
+            &layout_pairs,
+        );
+        let hint_h = pairs.len() + 1;
         if !pairs.is_empty() && avail > hint_h {
             draw_panel_hints(
                 surface,
                 Rect {
                     x: rect.x,
-                    y: body.y + body.rows - hint_h,
+                    y: body.y + body.rows - layout_h - hint_h,
                     cols: rect.cols,
                     rows: hint_h,
                 },
+                title,
                 &pairs,
             );
         }
@@ -2384,7 +2455,7 @@ pub(crate) fn panel_body_rect(model: &FrameModel, rect: Rect) -> Rect {
 /// column of dim chord / label pairs. Mirrors the sidebar's `draw_sidebar_hints`
 /// so the two focus footers read identically; the pairs are the live
 /// `model.keyhints`, so the content is dynamic (see [`draw_panel`]).
-fn draw_panel_hints(surface: &mut Surface, rect: Rect, pairs: &[(String, String)]) {
+fn draw_panel_hints(surface: &mut Surface, rect: Rect, title: &str, pairs: &[(String, String)]) {
     if rect.rows < 2 || rect.cols == 0 {
         return;
     }
@@ -2402,7 +2473,7 @@ fn draw_panel_hints(surface: &mut Surface, rect: Rect, pairs: &[(String, String)
         surface,
         rect.x + 1,
         rect.y,
-        " NAVIGATE ",
+        title,
         col(S::Dim),
         col(S::Panel),
         rect.cols.saturating_sub(1),

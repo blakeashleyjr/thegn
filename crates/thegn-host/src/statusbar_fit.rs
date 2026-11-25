@@ -230,6 +230,47 @@ mod tests {
         assert!(cluster_width(&out) <= 40);
     }
 
+    /// The documented shed order (docs/help/bars.md): widgets first, quiet
+    /// badges next, alarms last, keepers never.
+    #[test]
+    fn shed_order_matches_the_documented_ladder() {
+        let order = vec![
+            widget("loc", "L"),
+            widget("tests", "T"),
+            widget("pr", "P"),
+            widget("disk", "D"),
+            badge(BarBadge::Media, " m "),
+            badge(BarBadge::Network, " n "),
+            badge(BarBadge::Usage, " u "),
+            badge(BarBadge::Notifications, " 1 "),
+            badge(BarBadge::Ci, " ci "),
+            badge(BarBadge::Attention, " ! "),
+            badge(BarBadge::Lock, " L "),
+        ];
+        let mut prev_len = usize::MAX;
+        for avail in (1..=cluster_width(&order)).rev().step_by(2) {
+            let out = fit(order.clone(), avail);
+            assert!(out.len() <= prev_len);
+            prev_len = out.len();
+            // Whatever survives is a priority-suffix of the ladder: nothing
+            // survives while something of lower priority was kept out.
+            let kept: Vec<u8> = out.iter().map(|(id, _)| priority(id)).collect();
+            let min_kept = kept.iter().copied().filter(|&p| p != KEEP).min();
+            if let Some(m) = min_kept {
+                for (id, _) in &order {
+                    if priority(id) > m {
+                        assert!(out.iter().any(|(o, _)| o == id), "{id:?} shed before {m}");
+                    }
+                }
+            }
+            assert!(
+                out.iter()
+                    .any(|(id, _)| *id == BarItemId::Badge(BarBadge::Lock)),
+                "lock must survive at {avail}"
+            );
+        }
+    }
+
     #[test]
     fn keepers_alone_may_still_overflow_but_are_never_dropped() {
         let items = vec![

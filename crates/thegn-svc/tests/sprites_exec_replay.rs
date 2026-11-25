@@ -651,3 +651,129 @@ async fn reattach_does_not_retry_a_cold_endpoint() {
             .starts_with("/v1/sprites/tgtest1/exec/1847")
     );
 }
+
+fn non_tty_spec() -> ExecSpec {
+    ExecSpec {
+        argv: vec!["sh".into()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    }
+}
+
+/// THE-2710: a non-tty stream that drops without an exit is reattached to its
+/// announced session, resuming after the stdout + stderr bytes already seen,
+/// and the stderr tail spans both attachments.
+#[tokio::test]
+async fn non_tty_streaming_reattach_resumes_after_the_delivered_offset() {
+    let mock = start_mock(vec![
+        script(vec![
+            Out::Text(
+                r#"{"type":"session_info","session_id":"1847","command":"sh","created":1767609000,"cols":0,"rows":0,"is_owner":true,"tty":false}"#,
+            ),
+            Out::Bin([vec![1], b"part1\n".to_vec()].concat()),
+            Out::Bin([vec![2], b"w\n".to_vec()].concat()),
+            Out::Close,
+        ]),
+        script(vec![
+            Out::Bin([vec![1], b"part2\n".to_vec()].concat()),
+            Out::Bin([vec![2], b"x\n".to_vec()].concat()),
+            Out::Bin(vec![3, 0]),
+            Out::Close,
+        ]),
+    ]);
+    let provider = provider(&mock);
+
+    let thegn_svc::provider::StreamingExec {
+        session, stderr, ..
+    } = provider
+        .open_exec_streaming("tgtest1", &non_tty_spec())
+        .await
+        .unwrap();
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        session_id,
+    } = session;
+    let mut received = Vec::new();
+    while let Some(frame) = frames.recv().await {
+        received.push(frame);
+    }
+    assert_eq!(
+        received,
+        vec![ExecFrame::Stdout(b"part1\n".to_vec())],
+        "the first stream ends without an exit status"
+    );
+    drop(control);
+    let sid = session_id.borrow().clone().expect("session announced");
+    assert_eq!(sid, "1847");
+    let offset = b"part1\n".len() as u64 + stderr.total();
+    assert_eq!(offset, 8);
+
+    let thegn_svc::provider::StreamingExec {
+        session,
+        stderr: resumed_stderr,
+        verdict,
+    } = provider
+        .attach_exec_streaming("tgtest1", &sid, offset, &stderr)
+        .await
+        .unwrap();
+    let thegn_svc::provider::ExecSession {
+        mut frames,
+        control,
+        ..
+    } = session;
+    drop(control);
+    let mut received = Vec::new();
+    while let Some(frame) = frames.recv().await {
+        received.push(frame);
+    }
+    assert_eq!(
+        received,
+        vec![ExecFrame::Stdout(b"part2\n".to_vec()), ExecFrame::Exit(0)]
+    );
+    assert_eq!(verdict.await.unwrap(), None);
+    assert_eq!(resumed_stderr.total(), 4, "stderr spans both attachments");
+    assert_eq!(resumed_stderr.render(), "w\nx\n");
+
+    let recorded = requests(&mock);
+    assert_eq!(recorded.len(), 2, "a reattach never re-runs the command");
+    assert!(recorded[0].target.starts_with("/v1/sprites/tgtest1/exec?"));
+    assert_eq!(
+        recorded[1].target,
+        "/v1/sprites/tgtest1/exec/1847?output_offset=8"
+    );
+    assert_eq!(recorded[1].authorization, "Bearer tok");
+}
+
+/// THE-2052: a detached launch starts the command once, asks the server to keep
+/// the session after disconnect, returns the announced session id and closes
+/// only its own end.
+#[tokio::test]
+async fn detached_launch_returns_the_session_id_and_asks_to_outlive_the_client() {
+    let mock = start_mock(vec![script(vec![
+        Out::Text(
+            r#"{"type":"session_info","session_id":"2051","command":"sh","created":1767609000,"cols":0,"rows":0,"is_owner":true,"tty":false}"#,
+        ),
+        Out::Close,
+    ])]);
+    let provider = provider(&mock);
+    let sid = provider
+        .open_exec_detached("tgtest1", &non_tty_spec(), Duration::from_secs(7200))
+        .await
+        .unwrap();
+    assert_eq!(sid, "2051");
+    let recorded = requests(&mock);
+    assert_eq!(recorded.len(), 1, "a detached launch runs the command once");
+    assert!(recorded[0].target.starts_with("/v1/sprites/tgtest1/exec?"));
+    assert!(
+        recorded[0]
+            .target
+            .contains("max_run_after_disconnect=7200s"),
+        "{}",
+        recorded[0].target
+    );
+    assert_eq!(recorded[0].authorization, "Bearer tok");
+}

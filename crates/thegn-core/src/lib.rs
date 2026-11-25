@@ -127,6 +127,7 @@ pub use db_dispatch_capability::{
 };
 mod db_gate_attest;
 pub use db_gate_attest::{GateAttestationRefusal, StoredGateAttestation};
+pub mod db_conn_gate;
 mod db_glyph;
 mod db_hibernate;
 pub mod db_inbox;
@@ -143,6 +144,7 @@ mod db_pool;
 pub mod db_pr_agent_outcome;
 pub mod db_producer_lease;
 mod db_projects;
+pub mod db_remote_health;
 mod db_review_tasks;
 mod db_semantic;
 mod db_session_migration;
@@ -336,6 +338,7 @@ pub mod proxy;
 pub mod pull_progress;
 pub mod rebase_todo;
 pub mod recipe_header;
+pub mod remote_health;
 #[cfg(test)]
 mod spawn_ratchet_tests;
 // The canonical secret-redaction seam: one sensitive-key predicate + JSON

@@ -80,13 +80,15 @@ pub enum Action {
     /// Re-read config and reconcile the daemon's mcp-proxy upstreams
     /// (start/stop/restart/refilter). Requires a running daemon.
     Reload,
-    /// Write the single secret-free proxy entry into agent CLIs' MCP settings
-    /// (marker-tagged, idempotent, reversible). `[[agents]]` is the source of
-    /// truth for which agents by default.
+    /// Write thegn's two secret-free entries into agent CLIs' MCP settings:
+    /// `thegn` (the `mcp proxy` hub) and `thegn-serve` (thegn's own docs and
+    /// live-state server). Marker-tagged, idempotent, reversible, and never
+    /// touching an entry thegn did not write. Codex's TOML config is edited in
+    /// place, comments kept.
     Wire {
         /// A specific agent kind (claude|codex|cursor|windsurf|vscode|zed|amp|
         /// gemini). Omit to wire every configured `[[agents]]` with a known
-        /// adapter (or pass `--all`).
+        /// adapter plus every such agent installed for you (or pass `--all`).
         #[arg(long)]
         agent: Option<String>,
         /// Wire every supported agent adapter, not just configured ones.
@@ -809,7 +811,7 @@ async fn fetch_state(
             let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
             serde_json::to_value(reply).map_err(|e| e.to_string())
         }
-        "git.status" | "merge.list" => {
+        "git.status" | "merge.list" | "env.status" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let worktree = str_arg(args, "worktree")
                 .map(std::path::PathBuf::from)
@@ -1453,6 +1455,7 @@ mod tests {
         // THE-2020: the provider fleet inventory read (no daemon required at
         // CLI scope, but the MCP tool routes through the daemon's HTTP route).
         "fleet.list",
+        "env.status",
         "sessions.list",
         "worktrees.list",
         "worktrees.sandbox_profile",
@@ -1531,7 +1534,7 @@ mod tests {
             sorted(READ_CAPS.to_vec()),
             "--scopes read"
         );
-        assert_eq!(READ_CAPS.len(), 29);
+        assert_eq!(READ_CAPS.len(), 30);
     }
 
     #[test]

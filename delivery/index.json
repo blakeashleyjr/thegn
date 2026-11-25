@@ -749,6 +749,15 @@
       "summary": "Admit only bounded complete clipboard sets with generation-fenced pending ownership."
     },
     {
+      "change": "agent-integrations-out-of-box",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-11-25",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2714 (Public launch: Monday 2026-11-30) owns this change, but that project is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "Coding agents get thegn's everyday skill and both MCP entries (proxy and serve, Codex TOML included) from one wire command; lifecycle hooks (host and remote sandboxes), Hermes (YAML adapter, registry harness), remote-environment wiring and a one-time offer to existing users are in."
+    },
+    {
       "change": "atomic-fold-outcomes",
       "archive_path": "openspec/changes/archive/2026-10-19-atomic-fold-outcomes/",
       "lifecycle": "archived",
@@ -958,6 +967,18 @@
         }
       ],
       "summary": "Classify active Ethernet, Wi-Fi, and generic network fallback semantics truthfully."
+    },
+    {
+      "change": "dynamic-key-discovery",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2704",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Panel blank rows teach the focused zone's live keys (slice 1 shipped); finer contexts, fading learned chords and a which-key overlay remain."
     },
     {
       "change": "expand-media-surfaces",
@@ -1227,6 +1248,18 @@
       "summary": "THE-2695 tightens the default standard sandbox: local panes mask well-known credential locations, private ~/.ssh entries and sibling repositories over the read-only $HOME (bwrap/OCI masks, systemd InaccessiblePaths), carve only agent runtime state writable, and explain the boundary in the first-run and new-worktree panels; remote build, tests and live bwrap check remain unchecked."
     },
     {
+      "change": "hide-zero-fleet-meter",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2705",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The top-right fleet $/h meter hides while its burn is zero; [bars] fleet_always_show keeps it; render tests at several widths."
+    },
+    {
       "change": "isolate-maintenance-regression-fixtures",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1280,6 +1313,18 @@
       ],
       "summary": "Truthful backend caveats shipped; task 5.1 superseded by reserved smol, wsl and appcontainer (fix-truth-in-reporting); replacements owned by WS07-P2-04 and WS06.",
       "archive_path": "openspec/changes/archive/2026-11-23-mark-unverified-backends/"
+    },
+    {
+      "change": "meter-ai-spend-in-fleet-burn",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2707",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The fleet $/h meter adds metered AI spend from the model proxy to VM burn; the popup splits VM vs AI per model."
     },
     {
       "change": "monitor-framework",
@@ -1424,6 +1469,14 @@
       "archive_path": "openspec/changes/archive/2026-09-30-preserve-winning-host-environment/"
     },
     {
+      "change": "provision-overlap-repo-and-nix",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issue THE-2708.",
+      "summary": "Provider provisioning runs the repository seed and the Nix and direnv installs at the same time."
+    },
+    {
       "change": "recover-sprites-across-instances",
       "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
@@ -1485,6 +1538,18 @@
         }
       ],
       "summary": "Provider-backed fleet list exposed read-scoped through GET /v1/fleet and the MCP fleet_list tool, reusing the CLI report on a blocking worker with sanitized strings; gRPC and a shared control cache stay follow-up work."
+    },
+    {
+      "change": "remote-sandbox-visibility",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2712",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Live health, restart/OOM classification and events for every remote sandbox."
     },
     {
       "change": "repair-kitty-stream-parser",
@@ -1801,6 +1866,14 @@
         }
       ],
       "summary": "Sidebar groups fold to 7 entries with protected rows, batch rows, no repeated title line, a continuous guide and state-toned names; live verification open."
+    },
+    {
+      "change": "sprite-exec-stream-reattach",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Sprites exec sockets ping every 15 s and drop a silent peer; non-tty sprite-exec reattaches with output_offset after a drop (THE-2710)."
     },
     {
       "change": "stabilize-process-monitor-refresh",

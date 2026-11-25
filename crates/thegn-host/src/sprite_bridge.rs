@@ -7,6 +7,9 @@
 //!   shell out through it (the role `vps-ssh` plays for VPS envs). Runs the
 //!   command over the native exec API and relays stdout as it arrives, so a
 //!   caller like `git -C /workspace status` reads the output exactly as if local.
+//!   A stream that drops without an exit status reattaches to the announced
+//!   session and resumes after the output already delivered (THE-2710), so a
+//!   long `--hold` run outlives a network blip instead of ending mid-build.
 //! - **TTY** (stdin and stdout are ttys): a long-running agent/session launched as
 //!   `thegn sprite-exec <id> -- agent…` (the create handle's exec prefix). Opens
 //!   a PTY exec, puts the local tty in raw mode, pumps keystrokes and resizes
@@ -33,7 +36,9 @@ use termwiz::terminal::{Terminal, new_terminal};
 use thegn_core::config::Config;
 use thegn_core::config_env_tables::wss_native_provider_kind;
 use thegn_core::sprite_hold::{HOLD_ENV, ceiling_secs, hold_name, wrap_argv};
-use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider, StreamingExec};
+use thegn_svc::provider::{
+    ExecControl, ExecFrame, ExecSession, ExecSessionState, ExecSpec, Provider, StreamingExec,
+};
 
 /// Exit code when the remote exec stream was lost and could not be reattached
 /// (`EX_TEMPFAIL`): the remote process did not survive. `session list` keys
@@ -132,6 +137,23 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
         }
         None => argv,
     };
+    let (provider, env_name) = select_provider(cfg, id)?;
+    if tty_mode(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        let code = run_tty(&provider, &env_name, id, argv)?;
+        std::process::exit(code);
+    }
+    // Current-thread: one network call does not need a worker per core.
+    // See `agent::provider_runtime`.
+    let rt = crate::agent::provider_runtime()?;
+    let code = rt.block_on(run_streaming(&provider, &env_name, id, argv))?;
+    std::process::exit(code);
+}
+
+/// The sprites provider that owns sprite `id`, with its env name.
+fn select_provider(cfg: &Config, id: &str) -> Result<(Provider, String)> {
     let record_account = thegn_svc::vps::registry::read(id)
         .filter(|record| record.provider == "sprites")
         .map(|record| record.account);
@@ -152,23 +174,111 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String], hold: Option<Duration>) -> Re
     }
     let selected = pick_sprites_env_named(id, &candidates, record_account.as_deref())
         .map_err(|error| anyhow!(error))?;
+    let env_name = candidates[selected].0.clone();
     let provider = providers
         .into_iter()
         .nth(selected)
         .flatten()
         .ok_or_else(|| anyhow!("sprite-exec: selected Sprites env has no resolvable API token"))?;
-    if tty_mode(
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    ) {
-        let code = run_tty(&provider, id, argv)?;
-        std::process::exit(code);
+    Ok((provider, env_name))
+}
+
+/// The default and largest `--max` for `--detach`: the keep-awake ceiling.
+pub(crate) fn detach_max_secs(max: Option<Duration>) -> u64 {
+    ceiling_secs(max.map(|max| max.as_secs().max(1)), 0)
+}
+
+/// The argv a detached launch sends: `cmd` inside the keep-awake heartbeat,
+/// bounded by `ceiling` seconds. A detached command always runs held, because
+/// the client that would otherwise keep the sprite awake is gone.
+pub(crate) fn detach_argv(cmd: &[String], task: &str, ceiling: u64) -> Result<Vec<String>> {
+    if cmd.is_empty() {
+        return Err(anyhow!("sprite-exec --detach needs a command after `--`"));
     }
-    // Current-thread: one network call does not need a worker per core.
-    // See `agent::provider_runtime`.
+    Ok(wrap_argv(cmd, task, ceiling))
+}
+
+/// `thegn sprite-exec <id> --detach [--max DUR] -- cmd…`: start `cmd` as a
+/// server-side exec session that outlives this process (THE-2052) and print
+/// its session id on stdout. The sprite stays awake while it runs, for at most
+/// `--max` (default 4 h, capped at 24 h), through the in-sprite heartbeat.
+pub fn run_detach(cfg: &Config, id: &str, cmd: &[String], max: Option<Duration>) -> Result<()> {
+    let ceiling = detach_max_secs(max);
+    let argv = detach_argv(cmd, &hold_task()?, ceiling)?;
+    let (provider, _env) = select_provider(cfg, id)?;
     let rt = crate::agent::provider_runtime()?;
-    let code = rt.block_on(run_streaming(&provider, id, argv))?;
+    let spec = ExecSpec {
+        argv,
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    let session = rt
+        .block_on(provider.open_exec_detached(id, &spec, Duration::from_secs(ceiling)))?
+        .ok_or_else(|| anyhow!("sprite-exec --detach: only Sprites sessions are detachable"))?;
+    write_stdout_line(&session);
+    Ok(())
+}
+
+/// `thegn sprite-exec <id> --attach <session>`: stream a detached session's
+/// output from its start, reattaching across dropped streams, and exit with its
+/// code. Never runs the command again.
+pub fn run_attach(cfg: &Config, id: &str, session: &str) -> Result<()> {
+    let (provider, env_name) = select_provider(cfg, id)?;
+    let rt = crate::agent::provider_runtime()?;
+    let code = rt.block_on(async {
+        let current = provider.attach_exec_fresh(id, session, 0).await?;
+        stream_attached(
+            &provider,
+            &env_name,
+            id,
+            current,
+            Some(session.to_owned()),
+            false,
+        )
+        .await
+    })?;
     std::process::exit(code);
+}
+
+/// `thegn sprite-exec <id> --status <session>`: print whether a detached
+/// session is still running. Exits 0 while running or finished with 0, the
+/// session's own code when finished with one, and 75 when it is gone.
+pub fn run_status(cfg: &Config, id: &str, session: &str) -> Result<()> {
+    let (provider, _env) = select_provider(cfg, id)?;
+    let rt = crate::agent::provider_runtime()?;
+    let state = rt
+        .block_on(provider.exec_session_state(id, session))?
+        .ok_or_else(|| anyhow!("sprite-exec --status: only Sprites sessions have a status"))?;
+    let (line, code) = status_line(session, state);
+    write_stdout_line(&line);
+    std::process::exit(code);
+}
+
+/// The one status line and the exit code for a session state.
+pub(crate) fn status_line(session: &str, state: ExecSessionState) -> (String, i32) {
+    match state {
+        ExecSessionState::Running => (format!("session {session} running"), 0),
+        ExecSessionState::Finished {
+            exit_code: Some(code),
+        } => (format!("session {session} finished exit {code}"), code),
+        ExecSessionState::Finished { exit_code: None } => {
+            (format!("session {session} finished exit unknown"), 0)
+        }
+        ExecSessionState::Absent => (
+            format!("session {session} not found (finished and reaped, or the sprite lost it)"),
+            EXIT_REMOTE_LOST,
+        ),
+    }
+}
+
+fn write_stdout_line(line: &str) {
+    let mut out = std::io::stdout();
+    if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+        tracing::debug!(target: "thegn::provider", "sprite-exec: stdout gone");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +396,12 @@ pub(crate) fn lost_line(id: &str, cause: &str) -> String {
     format!(
         "thegn: sprite {id} exec stream lost ({cause}); the sprite may have suspended — the remote process did not survive"
     )
+}
+
+/// The line printed when a probe explained the lost stream: the specific
+/// warning replaces the bare "stream ended" cause.
+pub(crate) fn explained_lost_line(warning: &str) -> String {
+    format!("thegn: {warning}; the remote process did not survive")
 }
 
 /// A usable PTY size: termwiz can report 0×0 for a not-yet-sized pty.
@@ -506,6 +622,26 @@ pub(crate) fn coalesce_input(
 // decision above is pure and unit-tested; this only moves bytes.
 // ---------------------------------------------------------------------------
 
+/// The bare message of an exec stream that closed without an exit frame.
+const STREAM_ENDED: &str = "exec stream ended without an exit status";
+
+/// The PTY driver's own wording for the same condition (a prefix: it may be
+/// followed by a reattach reason).
+const STREAM_ENDED_PREFIX: &str = "stream ended without an exit status";
+
+/// The classified restart warning for a stream that ended without an exit
+/// status, when one fresh probe shows the sandbox rebooted (THE-2712).
+async fn explain_stream_end(provider: &Provider, env: &str, id: &str) -> Option<String> {
+    crate::remote_health_sampler::explain_lost_stream(
+        provider,
+        "sprites",
+        env,
+        id,
+        thegn_core::util::now_ms(),
+    )
+    .await
+}
+
 /// How one exec stream ended.
 enum StreamEnd {
     /// The remote process exited with this code.
@@ -542,7 +678,13 @@ impl Drop for TtyGuard {
 
 /// Stream a non-tty exec: stdout as it arrives (no cap), remote stderr to
 /// stderr at the end, a non-terminal stdin forwarded then half-closed.
-async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
+///
+/// When the stream drops without an exit status (THE-2710: a quiet `--hold`
+/// poll loop lost its socket mid-build), the bridge reattaches to the announced
+/// exec session with the same backoff as the TTY path, resuming the output after
+/// the bytes already delivered. Progress notices go to stderr only; stdout stays
+/// the remote's exact byte stream. A reattach never re-runs the command.
+async fn run_streaming(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Result<i32> {
     let spec = ExecSpec {
         argv,
         tty: false,
@@ -551,19 +693,25 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
         env: Vec::new(),
         cwd: None,
     };
-    let StreamingExec {
-        session,
-        stderr,
-        verdict,
-    } = provider.open_exec_streaming(id, &spec).await?;
-    let ExecSession {
-        mut frames,
-        control,
-        ..
-    } = session;
+    let current = provider.open_exec_streaming(id, &spec).await?;
+    stream_attached(provider, env, id, current, None, true).await
+}
 
-    if !std::io::stdin().is_terminal() {
-        let input_control = control.clone();
+/// Stream an already-open (or freshly attached) non-tty session to stdout with
+/// the reattach loop. `session_id` seeds the handle for a session attached by
+/// id; `forward_stdin` is false for a detached session, whose stdin is closed.
+async fn stream_attached(
+    provider: &Provider,
+    env: &str,
+    id: &str,
+    mut current: StreamingExec,
+    session_id: Option<String>,
+    forward_stdin: bool,
+) -> Result<i32> {
+    let mut stdin_rx = if !forward_stdin || std::io::stdin().is_terminal() {
+        None
+    } else {
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         thegn_core::thread_name::spawn_named("thegn-sprite-in", move || {
             let mut input = std::io::stdin().lock();
             let mut chunk = [0u8; 32 * 1024];
@@ -580,28 +728,81 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
                         break;
                     }
                     Ok(len) => {
-                        if input_control
-                            .blocking_send(ExecControl::Stdin(chunk[..len].to_vec()))
-                            .is_err()
-                        {
+                        if stdin_tx.blocking_send(chunk[..len].to_vec()).is_err() {
                             break;
                         }
                     }
                 }
             }
         });
-    }
-    drop(control);
-
-    let frame_result = {
-        let stdout = std::io::stdout();
-        let mut stdout = stdout.lock();
-        stream_frames(&mut frames, &mut stdout).await
+        Some(stdin_rx)
     };
-    let verdict_result = tokio::time::timeout(Duration::from_secs(3), verdict).await;
-    let result = match verdict_result {
-        Ok(Ok(Some(fault))) => Err(anyhow::Error::new(fault)),
-        _ => frame_result.map_err(anyhow::Error::msg),
+    let mut pending_stdin: Option<Vec<u8>> = None;
+    let mut delivered: u64 = 0;
+    let mut session_id = session_id;
+    let mut attempt = 0usize;
+
+    let (result, stderr) = 'session: loop {
+        let started = Instant::now();
+        let StreamingExec {
+            session,
+            stderr,
+            verdict,
+        } = current;
+        let ExecSession {
+            mut frames,
+            control,
+            session_id: announced,
+        } = session;
+        let frame_result = {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let mut io = StreamIo {
+                control: Some(control),
+                stdin: &mut stdin_rx,
+                pending: &mut pending_stdin,
+                delivered: &mut delivered,
+            };
+            stream_session(&mut frames, &mut io, &mut stdout).await
+        };
+        let announced = announced.borrow().clone();
+        if announced.is_some() {
+            session_id = announced;
+        }
+        let fault = match tokio::time::timeout(Duration::from_secs(3), verdict).await {
+            Ok(Ok(Some(fault))) => Some(fault),
+            _ => None,
+        };
+        match (frame_result, fault) {
+            (_, Some(fault)) => break 'session (Err(anyhow::Error::new(fault)), stderr),
+            (Err(error), None) if error == STREAM_ENDED => {}
+            (other, None) => break 'session (other.map_err(anyhow::Error::msg), stderr),
+        }
+
+        attempt = attempts_after_stream(attempt, started.elapsed());
+        let mut cause = STREAM_ENDED.to_string();
+        current = loop {
+            if !should_reattach(false, session_id.as_deref(), attempt) {
+                if session_id.is_none() {
+                    cause = format!("{cause}; no exec session id to reattach to");
+                }
+                let message = explain_stream_end(provider, env, id).await.unwrap_or(cause);
+                break 'session (Err(anyhow!(message)), stderr);
+            }
+            let delay = reconnect_delays()[attempt];
+            stderr_line(&reattach_line(id, attempt + 1, delay));
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            let sid = session_id.as_deref().unwrap_or_default();
+            let offset = delivered.saturating_add(stderr.total());
+            match provider
+                .attach_exec_streaming(id, sid, offset, &stderr)
+                .await
+            {
+                Ok(next) => break next,
+                Err(error) => cause = format!("{STREAM_ENDED}; reattach failed: {error:#}"),
+            }
+        };
     };
     let rendered = stderr.render();
     let total = stderr.total();
@@ -623,41 +824,118 @@ async fn run_streaming(provider: &Provider, id: &str, argv: Vec<String>) -> Resu
     result
 }
 
+/// The stderr notice before reattach attempt `attempt` (1-based).
+pub(crate) fn reattach_line(id: &str, attempt: usize, delay: Duration) -> String {
+    let id: String = id.chars().filter(|ch| !ch.is_control()).take(64).collect();
+    format!(
+        "thegn: sprite {id} exec stream dropped; reattaching in {}s (attempt {attempt}/{REATTACH_ATTEMPTS})",
+        delay.as_secs()
+    )
+}
+
+/// The stdin side of one streaming attachment, carried across reattaches:
+/// `stdin` is the local reader's queue (`None` once it hit EOF or when stdin
+/// is a terminal), `pending` a chunk a dying session could not take, and
+/// `delivered` the stdout payload bytes received so far (the resume offset).
+struct StreamIo<'a> {
+    control: Option<tokio::sync::mpsc::Sender<ExecControl>>,
+    stdin: &'a mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    pending: &'a mut Option<Vec<u8>>,
+    delivered: &'a mut u64,
+}
+
+#[cfg(test)]
 async fn stream_frames(
     frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
     out: &mut dyn std::io::Write,
 ) -> std::result::Result<i32, String> {
-    while let Some(frame) = frames.recv().await {
-        match frame {
-            ExecFrame::Stdout(bytes) => {
-                if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
-                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
-                        Ok(141)
-                    } else {
-                        Err(error.to_string())
-                    };
+    let mut stdin = None;
+    let mut pending = None;
+    let mut delivered = 0;
+    let mut io = StreamIo {
+        control: None,
+        stdin: &mut stdin,
+        pending: &mut pending,
+        delivered: &mut delivered,
+    };
+    stream_session(frames, &mut io, out).await
+}
+
+/// Pump one streaming attachment: stdout frames to `out` (flushed per frame),
+/// queued local stdin to the session until it ends. The session's stdin is
+/// half-closed (its control sender dropped) once local stdin is done, at once
+/// when there is none.
+async fn stream_session(
+    frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
+    io: &mut StreamIo<'_>,
+    out: &mut dyn std::io::Write,
+) -> std::result::Result<i32, String> {
+    if let Some(bytes) = io.pending.take()
+        && let Some(control) = &io.control
+        && let Err(error) = control.send(ExecControl::Stdin(bytes)).await
+        && let ExecControl::Stdin(bytes) = error.0
+    {
+        *io.pending = Some(bytes);
+    }
+    if io.stdin.is_none() && io.pending.is_none() {
+        io.control = None;
+    }
+    loop {
+        let forwarding = io.control.is_some() && io.pending.is_none();
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Some(ExecFrame::Stdout(bytes)) => {
+                    *io.delivered = io.delivered.saturating_add(bytes.len() as u64);
+                    if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
+                        return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            Ok(141)
+                        } else {
+                            Err(error.to_string())
+                        };
+                    }
                 }
-            }
-            ExecFrame::Exit(code) => {
-                if let Err(error) = out.flush() {
-                    return if error.kind() == std::io::ErrorKind::BrokenPipe {
-                        Ok(141)
-                    } else {
-                        Err(error.to_string())
-                    };
+                Some(ExecFrame::Exit(code)) => {
+                    if let Err(error) = out.flush() {
+                        return if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            Ok(141)
+                        } else {
+                            Err(error.to_string())
+                        };
+                    }
+                    return Ok(code);
                 }
-                return Ok(code);
-            }
+                None => return Err(STREAM_ENDED.to_string()),
+            },
+            chunk = async {
+                match io.stdin.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if forwarding => match chunk {
+                Some(bytes) => {
+                    if let Some(control) = &io.control
+                        && let Err(error) = control.send(ExecControl::Stdin(bytes)).await
+                        && let ExecControl::Stdin(bytes) = error.0
+                    {
+                        // The session is ending; resend on the next attachment.
+                        *io.pending = Some(bytes);
+                    }
+                }
+                None => {
+                    // Local EOF: half-close the remote stdin.
+                    *io.stdin = None;
+                    io.control = None;
+                }
+            },
         }
     }
-    Err("exec stream ended without an exit status".to_string())
 }
 
 /// Stream `argv` in sprite `id` over a PTY exec with the local tty in raw mode.
 /// Returns the code to exit with (the remote's, or [`EXIT_REMOTE_LOST`]); the
 /// tty is restored before this returns on every path. Subprocess/network seam
 /// (`cov_ignore`).
-fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
+fn run_tty(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Result<i32> {
     // Mouse + bracketed paste stay the REMOTE app's call: its own output sets
     // those modes on the outer terminal, so termwiz must not force them on.
     let hints = ProbeHints::new_from_env()
@@ -667,7 +945,7 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     let mut term = new_terminal(caps).context("open terminal")?;
     let size = term.get_screen_size().context("screen size")?;
     let (cols, rows) = pty_size(size.cols, size.rows);
-    let env = tty_env(&|key| std::env::var(key).ok());
+    let tty_vars = tty_env(&|key| std::env::var(key).ok());
 
     let rt = crate::agent::provider_runtime()?;
     let spec = ExecSpec {
@@ -675,7 +953,7 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
         tty: true,
         cols,
         rows,
-        env,
+        env: tty_vars,
         cwd: None,
     };
     // Open BEFORE raw mode so an open failure never leaves the tty altered.
@@ -709,8 +987,17 @@ fn run_tty(provider: &Provider, id: &str, argv: Vec<String>) -> Result<i32> {
     match outcome {
         Ok(code) => Ok(code),
         Err(cause) => {
+            let warning = if cause.starts_with(STREAM_ENDED_PREFIX) {
+                rt.block_on(explain_stream_end(provider, env, id))
+            } else {
+                None
+            };
+            let line = match warning {
+                Some(warning) => explained_lost_line(&warning),
+                None => lost_line(id, &cause),
+            };
             let mut out = std::io::stdout();
-            let _ = writeln!(out, "{}", lost_line(id, &cause)); // best-effort: stdout write: the pane may already be gone
+            let _ = writeln!(out, "{line}"); // best-effort: stdout write: the pane may already be gone
             let _ = out.flush(); // best-effort: flush: display-only
             Ok(EXIT_REMOTE_LOST)
         }
@@ -747,7 +1034,7 @@ async fn drive(
             StreamEnd::Dropped => {}
         }
         attempt = attempts_after_stream(attempt, started.elapsed());
-        let mut cause = "stream ended without an exit status".to_string();
+        let mut cause = STREAM_ENDED_PREFIX.to_string();
         session = loop {
             if !should_reattach(false, session_id.as_deref(), attempt) {
                 if session_id.is_none() {
@@ -922,16 +1209,55 @@ fn tty_loop<T: Terminal>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXIT_REMOTE_LOST, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes, StreamEnd,
-        WAKE_NOTICE_AFTER, attempts_after_stream, coalesce_input, encode_input, hold_ceiling,
-        hold_task_from, lost_line, pick_sprites_env, pty_size, pump, reconnect_delays,
-        should_reattach, stream_frames, tty_env, tty_mode, with_slow_notice,
+        EXIT_REMOTE_LOST, ExecControl, ExecFrame, FromTty, REATTACH_BUDGET_RESET, RemoteModes,
+        STREAM_ENDED, StreamEnd, StreamIo, WAKE_NOTICE_AFTER, attempts_after_stream,
+        coalesce_input, encode_input, explained_lost_line, hold_ceiling, hold_task_from, lost_line,
+        pick_sprites_env, pty_size, pump, reattach_line, reconnect_delays, should_reattach,
+        stream_frames, stream_session, tty_env, tty_mode, with_slow_notice,
     };
     use std::cell::Cell;
     use std::time::Duration;
     use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use thegn_core::sprite_hold::{HOLD_ENV, HOLD_MAX_CEILING_SECS, HOLD_SCRIPT, wrap_argv};
     use thegn_svc::provider::ExecSession;
+
+    #[test]
+    fn detach_max_defaults_to_four_hours_and_caps_at_a_day() {
+        assert_eq!(super::detach_max_secs(None), 4 * 3600);
+        assert_eq!(super::detach_max_secs(Some(Duration::from_secs(90))), 90);
+        assert_eq!(
+            super::detach_max_secs(Some(Duration::from_secs(99 * 3600))),
+            HOLD_MAX_CEILING_SECS
+        );
+    }
+
+    #[test]
+    fn detach_argv_runs_the_command_inside_the_heartbeat() {
+        let cmd = vec!["make".to_owned(), "-j8".to_owned()];
+        let argv = super::detach_argv(&cmd, "thegn-hold-0123456789abcdef", 600).unwrap();
+        assert_eq!(argv, wrap_argv(&cmd, "thegn-hold-0123456789abcdef", 600));
+        assert!(super::detach_argv(&[], "thegn-hold-0123456789abcdef", 600).is_err());
+    }
+
+    #[test]
+    fn status_line_reports_running_finished_and_gone() {
+        use thegn_svc::provider::ExecSessionState as S;
+        assert_eq!(
+            super::status_line("7", S::Running),
+            ("session 7 running".to_owned(), 0)
+        );
+        assert_eq!(
+            super::status_line("7", S::Finished { exit_code: Some(3) }),
+            ("session 7 finished exit 3".to_owned(), 3)
+        );
+        assert_eq!(
+            super::status_line("7", S::Finished { exit_code: None }).0,
+            "session 7 finished exit unknown"
+        );
+        let (line, code) = super::status_line("7", S::Absent);
+        assert!(line.contains("not found"), "{line}");
+        assert_eq!(code, EXIT_REMOTE_LOST);
+    }
 
     #[test]
     fn reconnect_delays_back_off_1_2_4_8_15() {
@@ -958,6 +1284,16 @@ mod tests {
         assert_eq!(attempts_after_stream(3, REATTACH_BUDGET_RESET), 0);
         assert_eq!(attempts_after_stream(3, Duration::from_secs(5)), 3);
         assert_eq!(attempts_after_stream(0, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn explained_lost_line_carries_the_specific_warning() {
+        let line = explained_lost_line("sprite restarted: it slept while idle");
+        assert_eq!(
+            line,
+            "thegn: sprite restarted: it slept while idle; the remote process did not survive"
+        );
+        assert!(!line.contains("stream ended"));
     }
 
     #[test]
@@ -1156,6 +1492,113 @@ mod tests {
             stream_frames(&mut frames, &mut output).await,
             Err("exec stream ended without an exit status".to_string())
         );
+    }
+
+    #[test]
+    fn reattach_line_names_the_sprite_attempt_and_delay() {
+        assert_eq!(
+            reattach_line("dev-1", 2, Duration::from_secs(2)),
+            "thegn: sprite dev-1 exec stream dropped; reattaching in 2s (attempt 2/5)"
+        );
+        assert!(!reattach_line("a\nb", 1, Duration::from_secs(1)).contains('\n'));
+        assert_eq!(STREAM_ENDED, "exec stream ended without an exit status");
+    }
+
+    #[tokio::test]
+    async fn stream_session_forwards_stdin_counts_stdout_and_half_closes_on_eof() {
+        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let (control, mut control_rx) = tokio::sync::mpsc::channel(8);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let mut stdin = Some(stdin_rx);
+        let mut pending = None;
+        let mut delivered = 0;
+        stdin_tx.send(b"in".to_vec()).await.unwrap();
+        drop(stdin_tx);
+
+        let remote = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // The control channel closing is the half-close the driver turns
+            // into a stdin EOF frame; only then does the remote answer.
+            while let Some(message) = control_rx.recv().await {
+                seen.push(message);
+            }
+            frames_tx
+                .send(ExecFrame::Stdout(b"out".to_vec()))
+                .await
+                .unwrap();
+            frames_tx.send(ExecFrame::Exit(0)).await.unwrap();
+            seen
+        });
+        let mut output = Vec::new();
+        let code = {
+            let mut io = StreamIo {
+                control: Some(control),
+                stdin: &mut stdin,
+                pending: &mut pending,
+                delivered: &mut delivered,
+            };
+            stream_session(&mut frames, &mut io, &mut output).await
+        };
+        assert_eq!(code, Ok(0));
+        assert_eq!(output, b"out");
+        assert_eq!(delivered, 3);
+        assert!(stdin.is_none(), "local EOF is remembered across reattaches");
+        assert_eq!(pending, None);
+        assert_eq!(
+            remote.await.unwrap(),
+            vec![ExecControl::Stdin(b"in".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_session_keeps_stdin_a_dying_session_refused_for_the_next() {
+        // First attachment: its driver is already gone, so the chunk bounces.
+        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let (control, control_rx) = tokio::sync::mpsc::channel(8);
+        drop(control_rx);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(8);
+        let mut stdin = Some(stdin_rx);
+        let mut pending = None;
+        let mut delivered = 0;
+        stdin_tx.send(b"keep".to_vec()).await.unwrap();
+        drop(frames_tx);
+        let mut output = Vec::new();
+        let first = {
+            let mut io = StreamIo {
+                control: Some(control),
+                stdin: &mut stdin,
+                pending: &mut pending,
+                delivered: &mut delivered,
+            };
+            stream_session(&mut frames, &mut io, &mut output).await
+        };
+        assert_eq!(first, Err(STREAM_ENDED.to_string()));
+
+        // Second attachment: the bounced chunk goes first, then local EOF.
+        drop(stdin_tx);
+        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let (control, mut control_rx) = tokio::sync::mpsc::channel(8);
+        let remote = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(message) = control_rx.recv().await {
+                seen.push(message);
+            }
+            frames_tx.send(ExecFrame::Exit(3)).await.unwrap();
+            seen
+        });
+        let second = {
+            let mut io = StreamIo {
+                control: Some(control),
+                stdin: &mut stdin,
+                pending: &mut pending,
+                delivered: &mut delivered,
+            };
+            stream_session(&mut frames, &mut io, &mut output).await
+        };
+        assert_eq!(second, Ok(3));
+        let seen = remote.await.unwrap();
+        assert_eq!(seen.first(), Some(&ExecControl::Stdin(b"keep".to_vec())));
+        assert_eq!(pending, None);
     }
 
     #[test]

@@ -293,6 +293,8 @@ pub struct WelcomeTour {
     agent_sel: Option<usize>,
     agent_keep: Vec<(String, String)>,
     agent_note: Option<String>,
+    /// The user pressed `w`: wire the detected agents for thegn at finish.
+    wire_accepted: bool,
     // Keys
     drills: Vec<Drill>,
     drill_at: usize,
@@ -379,6 +381,7 @@ impl WelcomeTour {
                 .map(|a| (a.name.clone(), a.command.clone()))
                 .collect(),
             agent_note: None,
+            wire_accepted: false,
             drills,
             drill_at: 0,
             misses: 0,
@@ -521,7 +524,10 @@ impl WelcomeTour {
                     .position(|b| *b == self.init_backend)
                     .unwrap_or(0);
             }
-            Chapter::Agents => self.agent_sel = self.agent_init_sel,
+            Chapter::Agents => {
+                self.agent_sel = self.agent_init_sel;
+                self.wire_accepted = false;
+            }
             _ => {}
         }
         match self.next() {
@@ -615,7 +621,29 @@ impl WelcomeTour {
                 },
             });
         }
+        let kinds = self.wire_offer();
+        if self.wire_accepted && !kinds.is_empty() {
+            out.push(Change {
+                key: "agent wiring",
+                old: "not wired".into(),
+                new: format!("{} (MCP + hooks)", kinds.join(", ")),
+                op: WriteOp::WireAgents { kinds },
+            });
+        }
         out
+    }
+
+    /// The installed, wireable agents thegn's entries are not fully written
+    /// for yet: what the Agents chapter offers to set up.
+    fn wire_offer(&self) -> Vec<String> {
+        match &self.agents {
+            Probe::Done(list) => list
+                .iter()
+                .filter(|a| a.path.is_some() && a.unwired)
+                .map(|a| a.id.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn preview(&self) -> TourOutcome {
@@ -684,6 +712,10 @@ impl WelcomeTour {
                     probes: vec![ProbeRequest::Sandbox(self.sandbox_chain())],
                     ..TourEffects::default()
                 })
+            }
+            (Chapter::Agents, KeyCode::Char('w' | 'W')) if !self.wire_offer().is_empty() => {
+                self.wire_accepted = !self.wire_accepted;
+                TourOutcome::Pending
             }
             (Chapter::Agents, _) if delta != 0 => {
                 if let Probe::Done(list) = &self.agents
@@ -932,6 +964,7 @@ impl WelcomeTour {
             ],
             Chapter::Agents => &[
                 ("up/down", "agent"),
+                ("w", "set up for thegn"),
                 ("enter", "next"),
                 ("tab", "skip"),
                 ("esc", "leave"),
@@ -1304,6 +1337,27 @@ impl WelcomeTour {
                         .to_string(),
                 ),
             ]));
+        }
+        let offer = self.wire_offer();
+        if !offer.is_empty() {
+            let (g, hue) = if self.wire_accepted {
+                (Glyph::Check, Hue::Green)
+            } else {
+                (Glyph::Chevron, Hue::Amber)
+            };
+            lines.push(blank());
+            lines.push(Line::segs(vec![
+                seg(Tok::Hue(hue), format!("{} ", glyph(g))),
+                seg(
+                    Tok::Slot(S::Text),
+                    format!("Press w: set up {} for thegn", offer.join(" + ")),
+                )
+                .bold(),
+            ]));
+            lines.push(faint(
+                "  Writes marked MCP entries + lifecycle hooks to their settings.",
+            ));
+            lines.push(faint("  Undo any time: thegn mcp wire --remove"));
         }
         if let Some(note) = &self.agent_note {
             lines.extend(marked(false, note, width));
@@ -1751,6 +1805,7 @@ mod tests {
                     name: id.to_string(),
                     command: id.to_string(),
                     path: installed.contains(id).then(|| format!("/usr/bin/{id}")),
+                    unwired: installed.contains(id) && *id != "pi",
                 })
                 .collect(),
         )
@@ -2075,5 +2130,29 @@ mod tests {
             describe(&Key::modified(KeyCode::Char('w'), Modifiers::ALT)),
             "Alt-w"
         );
+    }
+
+    #[test]
+    fn w_accepts_the_wiring_offer_and_it_lands_in_the_finish_writes() {
+        let mut t = tour();
+        t.apply_probe(agents(&["claude", "codex", "pi"]));
+        goto(&mut t, Chapter::Agents);
+        assert!(t.changes().is_empty(), "nothing is written until w");
+        press(&mut t, KeyCode::Char('w'));
+        let ops: Vec<_> = t.changes().into_iter().map(|c| c.op).collect();
+        assert!(ops.contains(&WriteOp::WireAgents {
+            kinds: vec!["claude".into(), "codex".into()]
+        }));
+        press(&mut t, KeyCode::Char('w'));
+        assert!(t.changes().is_empty(), "w toggles it back off");
+    }
+
+    #[test]
+    fn no_offer_when_nothing_detected_is_unwired() {
+        let mut t = tour();
+        t.apply_probe(agents(&[]));
+        goto(&mut t, Chapter::Agents);
+        press(&mut t, KeyCode::Char('w'));
+        assert!(t.changes().is_empty());
     }
 }

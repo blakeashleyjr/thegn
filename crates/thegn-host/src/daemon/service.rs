@@ -1951,6 +1951,25 @@ impl DaemonService {
 }
 
 impl ControlApi for DaemonService {
+    fn env_status<'a>(
+        &'a self,
+        worktree: &'a str,
+    ) -> BoxFuture<'a, ControlResult<serde_json::Value>> {
+        Box::pin(async move {
+            self.confine_worktree(worktree).await?;
+            let config = self.config.clone();
+            let wt = worktree.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::cmd::env_status::control_report(&config, &wt)
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("env status task failed: {error}"))
+            })?
+            .map_err(|error| ControlError::Unavailable(error.to_string()))
+        })
+    }
+
     fn fleet_list(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
         let config = self.config.clone();
         Box::pin(async move {
@@ -3100,6 +3119,13 @@ impl ControlApi for DaemonService {
                         }
                     };
                     let source = note.source.as_deref().unwrap_or("api");
+                    // `thegn agent hook` carries its worktree as
+                    // `agent-hook:<agent>@<path>`: the wire note has no field.
+                    let worktree = source
+                        .strip_prefix("agent-hook:")
+                        .and_then(|rest| rest.split_once('@'))
+                        .map(|(_, path)| path.to_string())
+                        .unwrap_or_default();
                     let message = if note.body.is_empty() {
                         note.title.clone()
                     } else {
@@ -3110,7 +3136,7 @@ impl ControlApi for DaemonService {
                         kind,
                         source,
                         &message,
-                        "",
+                        &worktree,
                         crate::automation_events::EventFacts {
                             origin: note.automation_origin.map(|origin| {
                                 thegn_core::automation::AutomationOrigin {

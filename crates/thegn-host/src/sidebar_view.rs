@@ -262,6 +262,35 @@ pub fn menu_step(entries: &[RowMenuEntry], from: usize, dir: i32) -> usize {
 /// The `WORKSPACES` header row's title, and the width it occupies.
 const HEADER_TITLE: &str = " WORKSPACES";
 
+/// The sidebar row's remote-health cluster: the level dot, then the warning
+/// text clipped to 18 cells when there is one.
+pub(crate) fn remote_health_segs(
+    level: thegn_core::remote_health::HealthLevel,
+    note: Option<&str>,
+    gl: &thegn_core::termcaps::GlyphSet,
+) -> Vec<crate::seg::Seg> {
+    use crate::seg::{Tok, seg, sp};
+    use thegn_core::pipeline_report::display_cell;
+    use thegn_core::remote_health::HealthLevel;
+    let (tone, glyph) = match level {
+        HealthLevel::Ok => (Tok::Hue(theme::Hue::Green), gl.dot_filled),
+        HealthLevel::Warn => (Tok::Hue(theme::Hue::Amber), gl.dot_filled),
+        HealthLevel::Unknown => (Tok::Slot(S::Faint), gl.dot_hollow),
+    };
+    let mut out = vec![seg(tone, glyph.to_string())];
+    if let Some(note) = note.filter(|n| level != HealthLevel::Ok && !n.is_empty()) {
+        out.push(sp(1));
+        out.push(seg(
+            tone,
+            display_cell(&thegn_core::pipeline_report::display_clip(
+                &display_cell(note),
+                18,
+            )),
+        ));
+    }
+    out
+}
+
 /// The header-row sort chip on its own; a test shorthand for
 /// `header_chips(..).sort`.
 #[cfg(test)]
@@ -2549,6 +2578,18 @@ fn compose_row_lines(
                 right.push(seg(Tok::Slot(S::Dim), gl.moon.to_string())); // ⏾ hibernated
             }
 
+            // Remote sandbox health: a dot (green ok / amber warn / faint
+            // unknown) plus the warning text clipped to a short chip. Only
+            // worktrees the sampler has a reading for carry it.
+            if let Some((level, note)) = row
+                .worktree_path
+                .as_deref()
+                .and_then(|path| thegn_core::remote_health::global().badge(path))
+            {
+                push_sp(&mut right);
+                right.extend(remote_health_segs(level, note.as_deref(), gl));
+            }
+
             let mut lines = vec![if right.is_empty() {
                 Line::Segs(left)
             } else {
@@ -2745,6 +2786,29 @@ fn draw_row_menu(
 mod tests {
     use super::*;
     use crate::sidebar::RowKind;
+
+    #[test]
+    fn remote_health_cluster_dot_and_clipped_warning() {
+        use thegn_core::remote_health::HealthLevel;
+        let gl = crate::caps::active_glyphs();
+        let text = |v: Vec<crate::seg::Seg>| v.iter().map(|s| s.text.clone()).collect::<String>();
+        let ok = remote_health_segs(HealthLevel::Ok, Some("ignored"), gl);
+        assert_eq!(ok.len(), 1, "an ok sandbox is a bare dot");
+        let unknown = remote_health_segs(HealthLevel::Unknown, None, gl);
+        assert_eq!(unknown.len(), 1);
+        assert_ne!(text(ok), text(unknown), "ok and unknown glyphs differ");
+        let warn = remote_health_segs(
+            HealthLevel::Warn,
+            Some("sprite restarted: likely out of memory (3.7 GB of 4.0 GB used)"),
+            gl,
+        );
+        let warn_text = text(warn);
+        assert!(warn_text.contains("sprite restarted"), "{warn_text}");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(warn_text.as_str()) <= 1 + 1 + 18,
+            "{warn_text}"
+        );
+    }
 
     fn entry(id: &str) -> RowMenuEntry {
         RowMenuEntry {

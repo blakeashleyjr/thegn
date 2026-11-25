@@ -1742,7 +1742,20 @@ shift 4
 rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
 command -v setsid >/dev/null 2>&1 || fail setsid
 [ -n "${PATH:-}" ] || fail path
-mkdir -p -- "${pidfile%/*}" "$home/tmp" "$cache/cargo" "$cache/target" || fail dirs
+mkdir -p -- "${pidfile%/*}" "$home/tmp" "$cache/cargo/bin" "$cache/target" || fail dirs
+# The job's CARGO_HOME is a per-project cache with no toolchain; rustup-style
+# shims (`/.sprite/bin/cargo`) exec `$CARGO_HOME/bin/cargo`, so link the real
+# cargo home's binaries in.
+real_cargo=${CARGO_HOME:-${HOME:-}/.cargo}
+if [ "$real_cargo" != "$cache/cargo" ] && [ -d "$real_cargo/bin" ]; then
+    for b in "$real_cargo"/bin/*; do
+        [ -e "$b" ] || continue
+        ln -sf -- "$b" "$cache/cargo/bin/${b##*/}" 2>/dev/null
+    done
+fi
+if [ "${1:-}" = cargo ] && [ ! -e "$cache/cargo/bin/cargo" ] && ! command -v cargo >/dev/null 2>&1; then
+    fail "no Rust toolchain on this sprite (cargo not found; install rustup there)"
+fi
 cd -- "$cwd" || fail cwd
 for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
     SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE; do
@@ -2559,6 +2572,15 @@ impl SpritesSelectedRunner {
                 Ok(())
             }
             Err(error) if format!("{error:#}").contains("404") => {
+                // A 404 is a missing file or a missing sprite; only the sprite
+                // lookup tells them apart. Say so plainly for the second.
+                if matches!(self.provider.inspect(sprite).await, Ok(None)) {
+                    bail!(
+                        "sprite {sprite} does not exist; run `thegn env up` or create it \
+                         (the runner alias is `{}`, the sprite is `{sprite}`)",
+                        self.alias
+                    );
+                }
                 let project = self.binding.project().as_bytes();
                 let first = self.provider.write(sprite, &marker, project).await;
                 match first {

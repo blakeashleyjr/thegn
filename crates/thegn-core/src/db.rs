@@ -242,7 +242,11 @@ mod db_open_memo;
 /// v117: pr_queue.admission_refusal + admission_refusal_head, the typed reason
 /// the last PR-agent dispatch for a head was refused (THE-1991). Purely
 /// additive; a pre-v117 row reads back as no refusal.
-pub const SCHEMA_VERSION: i64 = 117;
+///
+/// v118: remote_health (latest + previous sampler reading per remote sandbox)
+/// and remote_events (bounded journal), OpenSpec remote-sandbox-visibility
+/// (THE-2712). Purely additive new tables.
+pub const SCHEMA_VERSION: i64 = 118;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1053,6 +1057,9 @@ pub struct Db {
     conn: Connection,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
     pub(crate) schema_mismatch: Option<i64>,
+    /// Gate slot held for the connection's lifetime when opened via [`Db::open`]; declared
+    /// last so it is returned only after `conn` has closed.
+    _slot: Option<crate::db_conn_gate::ConnSlot>,
 }
 
 static BACKGROUND_WORKER_HOOK: OnceLock<fn()> = OnceLock::new();
@@ -1133,6 +1140,7 @@ fn spawn_semantic_sweep(path: PathBuf) -> std::io::Result<std::thread::JoinHandl
                 let sweep_db = Db {
                     conn,
                     schema_mismatch: None,
+                    _slot: None,
                 };
                 if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
                     tracing::warn!(%error, "semantic prune sweep failed");
@@ -1481,7 +1489,11 @@ impl Db {
         // this is one `Instant::now()` pair and a thread-id compare; in a
         // process that never marked a loop thread it is the compare alone.
         let started = std::time::Instant::now();
-        let out = Self::open_timed();
+        let slot = crate::db_conn_gate::acquire();
+        let out = Self::open_timed().map(|mut db| {
+            db._slot = slot;
+            db
+        });
         crate::db_open_stats::record_open(
             started.elapsed().as_micros() as u64,
             std::panic::Location::caller(),
@@ -1624,6 +1636,7 @@ impl Db {
             db: Db {
                 conn,
                 schema_mismatch: None,
+                _slot: None,
             },
             operation,
             _schema_lease: lease,
@@ -1650,6 +1663,7 @@ impl Db {
         Ok(Some(Db {
             conn,
             schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+            _slot: None,
         }))
     }
 
@@ -1679,6 +1693,7 @@ impl Db {
         Ok(Some(Db {
             conn,
             schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+            _slot: None,
         }))
     }
 
@@ -1838,6 +1853,7 @@ impl Db {
             return Ok(Db {
                 conn,
                 schema_mismatch: Some(ver),
+                _slot: None,
             });
         }
 
@@ -1927,6 +1943,7 @@ impl Db {
                     // insert probe runs on the migration path below.
                     crate::db_migrate::verify_v116_shape(&conn)?;
                     crate::db_migrate::verify_v117_schema(&conn)?;
+                    crate::db_migrate::verify_v118_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -1938,6 +1955,7 @@ impl Db {
             return Ok(Db {
                 conn,
                 schema_mismatch: None,
+                _slot: None,
             });
         }
         // Forward migration of an existing database: keep a verified, rotated copy
@@ -2653,6 +2671,7 @@ impl Db {
         crate::db_migrate::migrate_v114(&conn)?;
         crate::db_migrate::migrate_v116(&conn)?;
         crate::db_migrate::migrate_v117(&conn)?;
+        crate::db_migrate::migrate_v118(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2707,6 +2726,7 @@ impl Db {
             crate::db_migrate::verify_v114_schema(&conn)?;
             crate::db_migrate::verify_v116_schema(&conn)?;
             crate::db_migrate::verify_v117_schema(&conn)?;
+            crate::db_migrate::verify_v118_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
@@ -2769,6 +2789,7 @@ impl Db {
         let db = Db {
             conn,
             schema_mismatch,
+            _slot: None,
         };
         // Full inits (fresh DB / migration) prune inline; the common fast-path
         // open skips this and relies on the once-per-process prune in `open()`.
