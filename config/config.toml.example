@@ -5166,8 +5166,9 @@ enabled = true
 # on-disk OAuth token (Anthropic /api/oauth/usage; Antigravity quota summary),
 # run off the event loop. Set false and those two read "unavailable" and no
 # network call is ever made — which for a Claude-only setup means the feature has
-# nothing to show, hence the default.
-allow_network = true
+# nothing to show. Opt-in: thegn does not use an existing login until you enable
+# this. Default: false.
+allow_network = false
 # The always-on statusbar gauge (the worst window across all tracked accounts).
 # Unlike the other badges it is NOT silent when healthy: it is a gauge, not an
 # alarm, and one that only appears when you are nearly out is no use. Turn it off
