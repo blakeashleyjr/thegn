@@ -153,7 +153,8 @@ pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 /// per-attempt `HOME`, then the recipe argv. It enters the checkout and `exec`s
 /// the recipe under `env -i`, keeping only proxy and CA variables from the
 /// sandbox environment, with a per-attempt `HOME`, `CARGO_HOME` and
-/// `CARGO_TARGET_DIR`. Any failure to get that far prints
+/// `CARGO_TARGET_DIR`. When the recipe is `cargo` and the image has none, it
+/// first installs a minimal rustup toolchain into the per-attempt home. Any failure to get that far prints
 /// [`LAUNCH_FAILED_MARKER`] on stderr and exits 125.
 pub const LAUNCH_SCRIPT: &str = r#"fail() { echo "thegn-job-launch-failed: $1" >&2; exit 125; }
 cwd=$1
@@ -163,6 +164,19 @@ rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
 [ -n "${PATH:-}" ] || fail path
 mkdir -p -- "$home/tmp" "$home/cargo" "$home/target" || fail dirs
 cd -- "$cwd" || fail cwd
+if [ "$1" = cargo ] && ! command -v cargo >/dev/null 2>&1; then
+    # The default sandbox image has no Rust toolchain: install a minimal one
+    # into the per-attempt home before the recipe starts.
+    command -v curl >/dev/null 2>&1 || fail "no-cargo-and-no-curl: the sandbox image has no Rust toolchain and cannot fetch one; use a runtime image that provides cargo"
+    rustup_home="$home/rustup"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$home/tmp/rustup-init.sh" \
+        || fail "rustup-download: the sandbox image has no Rust toolchain and rustup could not be downloaded"
+    RUSTUP_HOME="$rustup_home" CARGO_HOME="$home/cargo" sh "$home/tmp/rustup-init.sh" -y \
+        --profile minimal --default-toolchain stable --no-modify-path >&2 \
+        || fail "rustup-install: installing a minimal Rust toolchain failed"
+    PATH="$home/cargo/bin:$PATH"
+    command -v cargo >/dev/null 2>&1 || fail "no-cargo: cargo is missing after the rustup install"
+fi
 for v in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
     SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE; do
     eval "val=\${$v:-}"
@@ -2035,6 +2049,13 @@ mod tests {
         assert!(!LAUNCH_SCRIPT.contains("VERCEL"));
         assert!(!LAUNCH_SCRIPT.contains(".claude"));
         assert!(LAUNCH_SCRIPT.contains(crate::sprites::job::SELECTED_JOB_ENV));
+    }
+
+    #[test]
+    fn the_launcher_provisions_a_minimal_toolchain_when_cargo_is_missing() {
+        assert!(LAUNCH_SCRIPT.contains("sh.rustup.rs"));
+        assert!(LAUNCH_SCRIPT.contains("--profile minimal"));
+        assert!(LAUNCH_SCRIPT.contains("no-cargo"));
     }
 
     #[test]

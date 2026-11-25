@@ -311,6 +311,13 @@ test Jobs (runner alias `vercel-<project>`). Only the closed `cargo build` and
 `cargo test` recipes run, for the deadline the route forwards. The agent, its
 model login and the Vercel token stay on your machine.
 
+The default Vercel Sandbox image has no Rust toolchain. When `cargo` is not on
+the sandbox `PATH`, the launcher installs a minimal rustup toolchain (stable)
+into the attempt's own home before the recipe starts, so the first run pays the
+download. If the image cannot fetch one (no `curl`, or no network), the attempt
+stops with a `thegn-job-launch-failed` message on stderr naming the missing
+toolchain and reports as indeterminate rather than exit 127.
+
 Each attempt gets its own fresh sandbox, so a fresh sandbox is enough to
 finish. The steps, in order:
 
