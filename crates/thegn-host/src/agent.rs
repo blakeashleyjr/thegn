@@ -3123,8 +3123,23 @@ fn provision_provider_env_inner(
             detail: None,
         }]);
         tracing::debug!(target: "thegn::startup", %id, "provider ensure_exists (create/list)");
+        let create_started = std::time::Instant::now();
         match block_on_provider(|| async { provider.ensure_exists(&id).await }) {
-            Ok(created) => created,
+            Ok(created) => {
+                tracing::info!(
+                    target: "thegn::startup",
+                    %id,
+                    created,
+                    elapsed_ms = create_started.elapsed().as_millis() as u64,
+                    "phase: sandbox create/list"
+                );
+                progress(&[ProvisionStepView {
+                    label: "Preparing sandbox".to_string(),
+                    state: ProvisionState::Done,
+                    detail: None,
+                }]);
+                created
+            }
             // `{e:#}` (alternate) flattens the whole anyhow cause chain into the
             // message — without it, Display keeps only the outermost context and the
             // real cause (e.g. machine0's `vm_create` `isError` text) is dropped
@@ -3147,8 +3162,16 @@ fn provision_provider_env_inner(
             detail: None,
         }];
         progress(&boot);
-        if let Err(e) = block_on_provider(|| async { provider.wait_ready(&id, READY_BUDGET).await })
-        {
+        let boot_started = std::time::Instant::now();
+        let ready = block_on_provider(|| async { provider.wait_ready(&id, READY_BUDGET).await });
+        tracing::info!(
+            target: "thegn::startup",
+            %id,
+            ok = ready.is_ok(),
+            elapsed_ms = boot_started.elapsed().as_millis() as u64,
+            "phase: wait for sandbox boot"
+        );
+        if let Err(e) = ready {
             boot[0].state = ProvisionState::Failed;
             boot[0].detail = Some(format!("{e:#}"));
             progress(&boot);
@@ -3213,7 +3236,14 @@ fn provision_provider_env_inner(
     // a bare `/workspace` at the root fs is not writable by a non-root login and
     // fails the "Prepare workspace" `mkdir`. Caches the home so the pane, chrome
     // reads, and marker checks all resolve the SAME path (`provider_workdir`).
+    let home_probe_started = std::time::Instant::now();
     let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
+    tracing::info!(
+        target: "thegn::startup",
+        %id,
+        elapsed_ms = home_probe_started.elapsed().as_millis() as u64,
+        "phase: probe sandbox home"
+    );
     let marker = EnvPlan::marker_path(&workdir);
 
     let read_marker = || {
