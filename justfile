@@ -444,6 +444,15 @@ perf-flood *args: release _perf-guard
 perf-t3 *args: release _perf-guard
     bash test/perf/t3-workspace-switch.sh {{args}}
 
+# thegn vs tmux vs zellij on this machine (THE-2661): startup, `cat` of 100 MiB
+# and `yes | head -n 5e7`, idle CPU + RSS with 1 and 8 panes — same PTY wrapper
+# and pane shell for every tool (test/perf/compare/). Prints one table plus a
+# manifest under target/perf-compare/. Fails if a tool is missing or its version
+# differs from test/perf/compare/pins.json. Takes ~10 minutes (60 s settle x
+# 2 pane counts x 3 tools); results go in docs/performance-results.md.
+perf-compare *args: release _perf-guard
+    python3 -I test/perf/compare/compare.py {{args}}
+
 # Criterion micro-benchmarks across the workspace (hot git path, core models).
 # `cargo bench` uses the release-grade bench profile. For a debug-vs-release
 # A/B, append `--profile dev`. Pass extra criterion args after `--`.
