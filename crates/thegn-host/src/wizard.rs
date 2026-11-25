@@ -735,6 +735,16 @@ impl NewWorktreeWizard {
                     }
                     WizardOutcome::Pending
                 }
+                // The wizard opens on this list, so a user who just starts
+                // typing a branch name would otherwise have every key dropped
+                // and silently get the generated name. Route name characters
+                // to the Name field (j/k stay list navigation here).
+                KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                    self.focus = Field::Name;
+                    self.tail.push(*c);
+                    self.name_edited = true;
+                    WizardOutcome::Pending
+                }
                 _ => WizardOutcome::Pending,
             },
         }
@@ -2312,6 +2322,19 @@ mod tests {
             key(&mut w, KeyCode::Enter),
             WizardOutcome::Submit(_)
         ));
+    }
+
+    #[test]
+    fn typing_on_program_list_reaches_the_branch_name() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w =
+            NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &test_cfg());
+        assert_eq!(w.focus, Field::Program);
+        key(&mut w, KeyCode::Char('f'));
+        key(&mut w, KeyCode::Char('x'));
+        assert_eq!(w.focus, Field::Name);
+        assert!(w.candidate().ends_with("fx"));
+        assert!(w.name_edited);
     }
 
     #[test]
