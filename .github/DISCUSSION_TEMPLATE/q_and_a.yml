@@ -1,0 +1,38 @@
+name: Q&A
+description: Ask how to do something with thegn, or why it behaves the way it does.
+title: "[Q&A] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the question. Check the help pages
+        (https://github.com/blakeashleyjr/thegn/tree/main/docs/help) and
+        KNOWN_ISSUES.md before posting — many answers are already written
+        down. Security-sensitive reports never go here; see SECURITY.md.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What do you want to do, or what did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: thegn version
+      description: Output of `thegn --version`, or "not installed yet".
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux (x86_64)
+        - Linux (other)
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Windows (native)
+        - Other
+    validations:
+      required: false
