@@ -692,8 +692,9 @@ What thegn stores, logs and sends is described in the in-app [privacy help
 page](docs/help/privacy.md) (press `F1`). In short: no vendor telemetry was
 found; crash reports and logs stay on your machine and are never uploaded
 automatically; GitHub and other forge, update and provider calls happen only
-when you use or enable those features. A first-run network trace has not been
-recorded yet.
+when you use or enable those features. A first-run network trace of main
+`1c5b3de0ab` shows only local Unix-socket connects; see the privacy page for
+what the trace covers.
 
 ## Security
 
