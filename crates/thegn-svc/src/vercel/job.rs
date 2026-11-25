@@ -795,6 +795,12 @@ impl AttemptOptions {
             .saturating_add(SANDBOX_SLACK);
         u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
     }
+
+    /// The longest deadline whose sandbox fits a lifetime `ceiling`; zero when
+    /// the transfer budget and slack alone do not fit it.
+    fn longest_deadline_within(&self, ceiling: Duration) -> Duration {
+        ceiling.saturating_sub(self.transfer_budget.saturating_add(SANDBOX_SLACK))
+    }
 }
 
 /// One attempt's outcome, including the accounting a report needs.
@@ -1085,8 +1091,19 @@ impl VercelSelectedRunner {
         let timeout_ms = self.options.sandbox_timeout_ms(deadline);
         let ceiling = self.sandbox_ceiling();
         if Duration::from_millis(timeout_ms) > ceiling {
+            let fitting = self.options.longest_deadline_within(ceiling);
+            let remedy = if fitting.is_zero() {
+                "the transfer budget and slack alone exceed it: raise max_lifetime_secs".to_owned()
+            } else {
+                format!(
+                    "lower --deadline to {}s or less, or raise max_lifetime_secs",
+                    fitting.as_secs()
+                )
+            };
             return Err(RunnerRefusal::InvalidSpec(format!(
-                "the attempt needs a {}s sandbox (transfer budget {}s + deadline {}s + {}s                  slack) but the lifetime ceiling is {}s (the smaller of max_lifetime_secs and                  the plan's session maximum); lower the deadline or raise the ceiling",
+                "the attempt needs a {}s sandbox (transfer budget {}s + deadline {}s + {}s \
+                 slack) but the lifetime ceiling is {}s (the smaller of max_lifetime_secs and \
+                 the plan's session maximum); {remedy}",
                 timeout_ms / 1000,
                 self.options.transfer_budget.as_secs(),
                 deadline.as_secs(),
