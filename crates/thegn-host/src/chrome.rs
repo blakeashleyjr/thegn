@@ -1737,12 +1737,15 @@ pub(crate) fn fleet_widget(
     // over the trailing hour. The zero-hide rule applies to the total.
     let burn = cost.total_hourly + snap.ai.burn_hourly.max(0.0);
     let warn = view.orphans > 0 || !view.missing.is_empty() || !cost.budget.is_empty();
-    if view.rows.is_empty() && burn <= 0.0 && !warn {
+    // Sprites billed today from the usage API keeps the meter on the bar even
+    // when nothing burns right now (it is real spend, not an estimate).
+    let billed = cost.sprites.is_some_and(|s| s.today_usd > 0.0);
+    if view.rows.is_empty() && burn <= 0.0 && !warn && !billed {
         return None;
     }
     // A zero burn with nothing to flag (no unpriced VM, no warning) is hidden
     // unless `[bars] fleet_always_show` keeps the meter on the bar.
-    if !always_show && burn <= 0.0 && cost.unpriced == 0 && !warn {
+    if !always_show && burn <= 0.0 && cost.unpriced == 0 && !warn && !billed {
         return None;
     }
     let mut text = if burn > 0.0 && burn < 0.01 {
@@ -1750,6 +1753,10 @@ pub(crate) fn fleet_widget(
     } else {
         format!("${:.2}/h", burn.max(0.0))
     };
+    // Sprites burn is estimated from recent usage at the published rates.
+    if cost.sprites.is_some_and(|s| s.burn_usd_per_hour > 0.0) {
+        text.push_str(" est.");
+    }
     if cost.unpriced > 0 {
         write!(text, " +{}", cost.unpriced).expect("writing to String cannot fail");
     }

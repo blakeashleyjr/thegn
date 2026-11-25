@@ -452,6 +452,105 @@ pub struct FleetCost {
     /// (empty until then, and when no budget is set or none is reached).
     #[serde(default)]
     pub budget: Vec<BudgetBreach>,
+    /// Sprites spend read from the usage API, filled by
+    /// [`apply_sprites_usage`]. `None` when no usage was read (or a
+    /// `[placement.price]` rate prices the sprites directly).
+    #[serde(default)]
+    pub sprites: Option<SpritesSpend>,
+}
+
+/// Sprites bill by usage, not by the hour: published CPU rate, USD per
+/// CPU-hour (`sprites.dev/pricing`, as of [`PRICE_TABLE_DATE`]).
+pub const SPRITES_CPU_USD_PER_HOUR: f64 = 0.07;
+/// Published memory rate, USD per reserved GB-hour.
+pub const SPRITES_GB_USD_PER_HOUR: f64 = 0.04375;
+
+/// One Sprites account's usage-API readings, in hours. Account-wide: it
+/// covers every sprite on the account, including those another host created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpritesAccountUsage {
+    pub today_cpu_hours: f64,
+    pub today_gb_hours: f64,
+    pub mtd_cpu_hours: f64,
+    pub mtd_gb_hours: f64,
+    /// Usage over a recent window, the basis of the `$/h` estimate.
+    pub recent_cpu_hours: f64,
+    pub recent_gb_hours: f64,
+    /// Length of that window in hours (`0` = not read; no burn estimate).
+    pub recent_window_hours: f64,
+}
+
+/// Sprites spend priced from usage. The burn is an estimate: recent usage
+/// at the published rates, spread over the window it was read for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpritesSpend {
+    pub today_usd: f64,
+    pub mtd_usd: f64,
+    /// Estimated burn, USD/h (always an estimate: label it `est.`).
+    pub burn_usd_per_hour: f64,
+    /// Sprites listed on the account that this host never recorded; their
+    /// usage is included above.
+    pub unrecorded: usize,
+}
+
+/// USD for `cpu_hours` and `gb_hours` at the published Sprites rates.
+/// Non-finite or negative input counts as zero.
+pub fn sprites_usd(cpu_hours: f64, gb_hours: f64) -> f64 {
+    let clean = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.0 };
+    clean(cpu_hours) * SPRITES_CPU_USD_PER_HOUR + clean(gb_hours) * SPRITES_GB_USD_PER_HOUR
+}
+
+/// Fold Sprites usage into `cost`: today and month-to-date from real usage,
+/// a `$/h` burn estimate from recent usage, and the sprites rows (which have
+/// no bundled rate) no longer count as unpriced. Pure. A no-op when no usage
+/// was read, or when a `[placement.price]` rate already prices a sprites row
+/// (the override wins; adding usage would double count).
+pub fn apply_sprites_usage(cost: &mut FleetCost, view: &FleetView, usage: &[SpritesAccountUsage]) {
+    if usage.is_empty() {
+        return;
+    }
+    if cost
+        .per_row
+        .iter()
+        .any(|row| row.provider == "sprites" && row.rate.is_some())
+    {
+        return;
+    }
+    let mut spend = SpritesSpend {
+        unrecorded: view
+            .rows
+            .iter()
+            .filter(|row| row.provider == "sprites" && row.unrecorded)
+            .count(),
+        ..SpritesSpend::default()
+    };
+    for account in usage {
+        spend.today_usd += sprites_usd(account.today_cpu_hours, account.today_gb_hours);
+        spend.mtd_usd += sprites_usd(account.mtd_cpu_hours, account.mtd_gb_hours);
+        if account.recent_window_hours.is_finite() && account.recent_window_hours > 0.0 {
+            spend.burn_usd_per_hour +=
+                sprites_usd(account.recent_cpu_hours, account.recent_gb_hours)
+                    / account.recent_window_hours;
+        }
+    }
+    let covered = cost
+        .per_row
+        .iter()
+        .filter(|row| row.provider == "sprites" && row.rate.is_none())
+        .count();
+    cost.unpriced = cost.unpriced.saturating_sub(covered);
+    cost.today += spend.today_usd;
+    cost.mtd += spend.mtd_usd;
+    cost.total_hourly += spend.burn_usd_per_hour;
+    cost.projected_24h += spend.burn_usd_per_hour * 24.0;
+    cost.projected_30d += spend.burn_usd_per_hour * 24.0 * 30.0;
+    if spend.burn_usd_per_hour > 0.0 {
+        *cost
+            .per_provider_hourly
+            .entry("sprites".to_string())
+            .or_default() += spend.burn_usd_per_hour;
+    }
+    cost.sprites = Some(spend);
 }
 
 /// Which `[placement.fleet_budget.<provider>]` limit a burn reached.
@@ -729,6 +828,88 @@ mod tests {
             rate_for(TABLE, &BTreeMap::new(), "nobody", None, None),
             None
         );
+    }
+
+    fn sprite_row(id: &str, unrecorded: bool) -> FleetRow {
+        FleetRow {
+            provider: "sprites".into(),
+            id: id.into(),
+            unrecorded,
+            ..FleetRow::default()
+        }
+    }
+
+    #[test]
+    fn sprites_usage_prices_spend_and_counts_unrecorded() {
+        let view = FleetView {
+            rows: vec![sprite_row("mine", false), sprite_row("theirs", true)],
+            unrecorded: 1,
+            ..FleetView::default()
+        };
+        let mut cost = fleet_cost(&view, BUNDLED_PRICES, &BTreeMap::new(), 0);
+        assert_eq!(cost.unpriced, 2);
+        let usage = SpritesAccountUsage {
+            today_cpu_hours: 2.0,
+            today_gb_hours: 4.0,
+            mtd_cpu_hours: 10.0,
+            mtd_gb_hours: 20.0,
+            recent_cpu_hours: 1.0,
+            recent_gb_hours: 2.0,
+            recent_window_hours: 2.0,
+        };
+        apply_sprites_usage(&mut cost, &view, &[usage]);
+        let today = 2.0 * 0.07 + 4.0 * 0.04375;
+        assert!(close(cost.today, today));
+        assert!(close(cost.mtd, 10.0 * 0.07 + 20.0 * 0.04375));
+        let burn = (0.07 + 2.0 * 0.04375) / 2.0;
+        assert!(close(cost.total_hourly, burn));
+        assert!(close(cost.per_provider_hourly["sprites"], burn));
+        assert!(close(cost.projected_24h, burn * 24.0));
+        assert_eq!(cost.unpriced, 0);
+        let spend = cost.sprites.unwrap();
+        assert_eq!(spend.unrecorded, 1);
+        assert!(close(spend.today_usd, today));
+    }
+
+    #[test]
+    fn sprites_usage_without_a_window_has_no_burn_and_garbage_is_zero() {
+        let view = FleetView::default();
+        let mut cost = fleet_cost(&view, BUNDLED_PRICES, &BTreeMap::new(), 0);
+        let usage = SpritesAccountUsage {
+            today_cpu_hours: f64::NAN,
+            today_gb_hours: -1.0,
+            mtd_cpu_hours: 1.0,
+            recent_cpu_hours: 5.0,
+            recent_window_hours: 0.0,
+            ..SpritesAccountUsage::default()
+        };
+        apply_sprites_usage(&mut cost, &view, &[usage]);
+        assert!(close(cost.today, 0.0));
+        assert!(close(cost.mtd, 0.07));
+        assert!(close(cost.total_hourly, 0.0));
+        assert!(!cost.per_provider_hourly.contains_key("sprites"));
+        let mut untouched = fleet_cost(&view, BUNDLED_PRICES, &BTreeMap::new(), 0);
+        apply_sprites_usage(&mut untouched, &view, &[]);
+        assert_eq!(untouched.sprites, None);
+    }
+
+    #[test]
+    fn sprites_config_price_wins_over_usage() {
+        let view = FleetView {
+            rows: vec![sprite_row("a", false)],
+            ..FleetView::default()
+        };
+        let price: BTreeMap<String, f64> = [("sprites".to_string(), 0.5)].into_iter().collect();
+        let mut cost = fleet_cost(&view, BUNDLED_PRICES, &price, 0);
+        let before = cost.clone();
+        let usage = SpritesAccountUsage {
+            today_cpu_hours: 1.0,
+            recent_cpu_hours: 1.0,
+            recent_window_hours: 1.0,
+            ..SpritesAccountUsage::default()
+        };
+        apply_sprites_usage(&mut cost, &view, &[usage]);
+        assert_eq!(cost, before);
     }
 
     #[test]

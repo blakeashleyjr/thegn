@@ -91,6 +91,15 @@ limit is reached, a `budget` section at the top lists each provider's burn
 against its limit (amber at `warn_hourly`, red at `max_hourly`, where new
 sandboxes are refused). Long worktree paths show their tail. Every amount is an estimate, not a bill.
 
+Sprites bill by usage, so they have no table price. The widget reads the
+account's Sprites usage instead: today and month to date come from real usage,
+and the burn is recent usage at the published CPU and memory rates, shown with
+an `est.` suffix (`$0.12/h est.`). The read is account-wide, so sprites that
+another host or session created on the same account count too (they show as
+unrecorded in `thegn fleet list`). Spend billed today keeps the widget on the
+bar even while nothing burns. A `[placement.price]` entry for `sprites` takes
+precedence over usage pricing.
+
 The meter is one combined burn: provider VMs plus **metered AI spend**, the
 pay-per-token cost the model proxy recorded over the trailing hour (see
 [AI account usage](ai-usage.md)). Subscription plans are not counted; they stay

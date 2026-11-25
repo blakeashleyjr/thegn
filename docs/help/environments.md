@@ -343,7 +343,9 @@ N`, or `not found`; exit 75 when the session is gone). A detached command has
   unknown type are accepted.
 - **Instance cap.** `max_instances` applies through the ledger; `0` (the
   default for sprites) means no cap.
-- **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
+- **Cost.** `thegn fleet cost` also prices Sprites from the account usage
+  API (today, month to date, and an `est.` burn from recent usage at the
+  published rates, including sprites this host did not record). It shows a Sprites block with CPU hours and
   reserved GB-hours per recorded sprite, read from the Sprites usage API only
   when you run that verb. It is priced only when `[placement.price]` has a
   `sprites` entry; otherwise it is labelled "usage from the Sprites API;

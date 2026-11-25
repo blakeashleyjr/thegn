@@ -711,7 +711,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     // Budgets compare a provider's WHOLE burn: a one-env read cannot judge
     // them, so `--env` reports none rather than an undercount.
     let cost = if only_env.is_none() {
-        crate::fleet_read::priced(cfg, &view, now_ms)
+        let mut cost = crate::fleet_read::priced(cfg, &view, now_ms);
+        if !list {
+            crate::fleet_read::apply_sprites(cfg, &view, &mut cost, now_ms);
+        }
+        cost
     } else {
         fleet_cost::fleet_cost(
             &view,
@@ -975,6 +979,22 @@ fn render_cost(view: &FleetView, cost: &FleetCost) -> String {
             usd(breach.hourly, 2),
             breach.level.label(),
             usd(breach.limit, 2),
+        ));
+    }
+    if let Some(spend) = &cost.sprites {
+        out.push(format!(
+            "sprites (from usage): today {} · MTD {} · burn ~{}/h est.{}",
+            usd(spend.today_usd, 2),
+            usd(spend.mtd_usd, 2),
+            usd(spend.burn_usd_per_hour, 2),
+            if spend.unrecorded > 0 {
+                format!(
+                    " · includes {} unrecorded on this account",
+                    spend.unrecorded
+                )
+            } else {
+                String::new()
+            },
         ));
     }
     partial_section(view, &mut out);
