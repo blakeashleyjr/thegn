@@ -60,8 +60,13 @@
 # (docs/performance-benchmark-protocol.md) — while pty_bytes_per_s is high.
 # A breach is "file a perf bug and soften the claim", not a harness failure.
 #
+# Tab switches (Alt+Right = nav-right, next tab) are fired in a second burst
+# after the worktree burst. Both feed the same switch_* histograms (the rollup
+# records tab and worktree switches together), so the rollup cannot separate them.
+#
 # Usage: flood.sh [--bin PATH] [--mode seq|cat-file|many-panes] [--panes N]
-#                 [--worktrees N] [--floods N] [--switches N] [--json]
+#                 [--worktrees N] [--floods N] [--switches N] [--tab-switches N]
+#                 [--json]
 # TG_PERF_MODE/TG_PERF_SETTLE_MS/TG_PERF_MARKERS/TG_PERF_SPLIT_MS/
 # TG_PERF_CAT_BYTES tune defaults. TG_PERF_SANDBOX=1 opts into measuring
 # sandboxed panes.
@@ -83,8 +88,9 @@ WORKTREES="${TG_PERF_WORKTREES:-8}"
 MODE="${TG_PERF_MODE:-seq}"
 PANES=16
 PANES_GIVEN=0
-FLOODS=3    # how many panes/shells run a flood
-SWITCHES=30 # Alt+Down burst size, fired mid-flood
+FLOODS=3        # how many panes/shells run a flood
+SWITCHES=30     # Alt+Down burst size, fired mid-flood
+TAB_SWITCHES=30 # Alt+Right burst size, fired after the worktree burst
 JSON_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -112,6 +118,10 @@ while [ $# -gt 0 ]; do
     ;;
   --switches)
     SWITCHES="$2"
+    shift 2
+    ;;
+  --tab-switches)
+    TAB_SWITCHES="$2"
     shift 2
     ;;
   --json)
@@ -227,7 +237,7 @@ else
   BUILD_MS=0
   FLOOD_PHASE_MS=$((FLOODS * 800))
 fi
-RUN_MS=$((SETTLE_MS + ESC_MS + BUILD_MS + FLOOD_PHASE_MS + MARKER_MS + SWITCHES * BURST_GAP_MS + 4000))
+RUN_MS=$((SETTLE_MS + ESC_MS + BUILD_MS + FLOOD_PHASE_MS + MARKER_MS + (SWITCHES + TAB_SWITCHES) * BURST_GAP_MS + 4000))
 DEADLINE_S=$(((RUN_MS / 1000) + 15))
 # Precomputed second-valued sleeps: the key loops below fire up to ~64 of them,
 # and a fresh awk per sleep would put harness noise inside the measurement.
@@ -357,6 +367,12 @@ for _ in $(seq 1 "$SWITCHES"); do
   sleep "$BURST_GAP_S"
 done
 
+# Mid-flood tab burst: Alt+Right = nav-right (next tab), same gap as above.
+for _ in $(seq 1 "$TAB_SWITCHES"); do
+  keys '\x1b[1;3C'
+  sleep "$(awk "BEGIN{print $BURST_GAP_MS/1000}")"
+done
+
 exec 3>&- # close the key channel; thegn exits on its bench window
 wait "$LAUNCHER" 2>/dev/null || true
 
@@ -459,13 +475,13 @@ if [ "$MODE" = many-panes ]; then
   DESC="$DESC panes=$PANES"
 fi
 
-RESULT="{\"scenario\":\"flood\",\"mode\":\"$MODE\",\"build\":\"$BUILD\",\"panes\":$PANES_JSON,\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"cat_bytes\":$BIG_BYTES,\"quiet_markers\":$MARKERS,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"switch_p99_all_us\":${SWITCH_P99_ALL:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p99_us\":${INPUT_P99:-0},\"input_p99_all_us\":${INPUT_P99_ALL:-0},\"input_samples_total\":${INPUT_SAMPLES_TOTAL:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"pty_bytes_total\":${PTY_BYTES_TOTAL:-0},\"quiet_ok\":$QUIET_OK,\"echo_ok\":$ECHO_OK,\"budget_ok\":$BUDGET_OK,\"input_budget_us\":$INPUT_BUDGET_US,\"switch_budget_us\":$SWITCH_BUDGET_US,\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"flood\",\"mode\":\"$MODE\",\"build\":\"$BUILD\",\"panes\":$PANES_JSON,\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"tab_switches\":$TAB_SWITCHES,\"cat_bytes\":$BIG_BYTES,\"quiet_markers\":$MARKERS,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"switch_p99_all_us\":${SWITCH_P99_ALL:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p99_us\":${INPUT_P99:-0},\"input_p99_all_us\":${INPUT_P99_ALL:-0},\"input_samples_total\":${INPUT_SAMPLES_TOTAL:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"pty_bytes_total\":${PTY_BYTES_TOTAL:-0},\"quiet_ok\":$QUIET_OK,\"echo_ok\":$ECHO_OK,\"budget_ok\":$BUDGET_OK,\"input_budget_us\":$INPUT_BUDGET_US,\"switch_budget_us\":$SWITCH_BUDGET_US,\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 if [ "$JSON_ONLY" = 1 ]; then
   printf '%s\n' "$RESULT"
 else
-  echo "scenario=flood $DESC build=$BUILD worktrees=$WORKTREES floods=$FLOODS switches=$SWITCHES (sha=$GIT_SHA host=$HOST_TAG)"
-  echo "  switch→frame  p50=${SWITCH_P50:-–}us  p99=${SWITCH_P99:-–}us (worst)  p99=${SWITCH_P99_ALL:-–}us (all rollups)"
+  echo "scenario=flood $DESC build=$BUILD worktrees=$WORKTREES floods=$FLOODS switches=$SWITCHES tab_switches=$TAB_SWITCHES (sha=$GIT_SHA host=$HOST_TAG)"
+  echo "  switch→frame (worktree+tab)  p50=${SWITCH_P50:-–}us  p99=${SWITCH_P99:-–}us (worst)  p99=${SWITCH_P99_ALL:-–}us (all rollups)"
   echo "  input→frame   p50=${INPUT_P50:-–}us  p99=${INPUT_P99:-–}us (worst)  p99=${INPUT_P99_ALL:-–}us (all rollups)  samples=${INPUT_SAMPLES_TOTAL:-0}"
   echo "  drain p99=${DRAIN_P99:-–}us  flush p99=${FLUSH_P99:-–}us  render p99=${RENDER_P99:-–}us"
   echo "  pty_bytes_per_s=${PTY_BPS:-0} (worst)  accounted=${PTY_BYTES_TOTAL:-0}B total  cat_bytes/flooder=$BIG_BYTES  rollups=$ROLLUPS"
