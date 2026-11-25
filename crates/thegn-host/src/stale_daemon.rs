@@ -88,9 +88,13 @@ pub(crate) fn report(stale: &StaleDaemon) -> Outcome {
         }
         Offer::Ask => {
             eprint!("Stop it now? This ends that instance's panes. [y/N] ");
-            let _ = std::io::stderr().flush(); // best-effort: prompt text only
+            if std::io::stderr().flush().is_err() {
+                // The prompt is best-effort text; an unflushed stderr still reads the answer.
+            }
             let mut line = String::new();
-            let _ = std::io::stdin().lock().read_line(&mut line); // best-effort: EOF or error declines
+            if std::io::stdin().lock().read_line(&mut line).is_err() {
+                line.clear(); // EOF or a read error declines
+            }
             if !is_yes(&line) {
                 eprintln!("Not stopped. To do it later, run:  {STOP_DAEMON_COMMAND}");
                 return Outcome::NotStopped;

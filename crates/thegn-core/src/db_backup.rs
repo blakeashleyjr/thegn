@@ -79,10 +79,16 @@ pub fn backup_before_migration(
     conn.execute("VACUUM INTO ?1", [dest_text])
         .with_context(|| format!("write backup {}", dest.display()))?;
     if let Err(error) = verify(&dest, from_version) {
-        let _ = std::fs::remove_file(&dest); // best-effort: a failed copy must not count toward retention
+        if let Err(error) = std::fs::remove_file(&dest) {
+            // A failed copy must not count toward retention; removal is best-effort.
+            tracing::debug!(%error, path = %dest.display(), "could not remove a failed database backup");
+        }
         return Err(error);
     }
-    let _ = crate::fsperm::restrict_to_owner(&dest); // best-effort: hardening: a failed chmod must never block migration
+    if let Err(error) = crate::fsperm::restrict_to_owner(&dest) {
+        // Hardening only: a failed chmod must never block the migration.
+        tracing::debug!(%error, "could not restrict the database backup to its owner");
+    }
     rotate(dir, KEEP)?;
     Ok(dest)
 }
