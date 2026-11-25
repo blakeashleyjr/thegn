@@ -634,7 +634,7 @@ pub fn provider_table_warnings(cfg: &crate::config::Config) -> Vec<String> {
                 && !p.model_credentials_is_explicit()
             {
                 warnings.push(format!(
-                    "env.{env_name}.provider.model_credentials: credentials are forwarded by default on this env; set model_credentials = \"none\" in [env.{env_name}.provider] to turn them off"
+                    "env.{env_name}.provider.model_credentials: credentials are not forwarded until you approve them on this project's first launch; set model_credentials = \"upload\" in [env.{env_name}.provider] to forward them, or \"none\" to never send them"
                 ));
             }
             let size = p.size.trim();

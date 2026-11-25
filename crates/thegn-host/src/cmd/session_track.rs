@@ -150,6 +150,18 @@ fn refuse_active_issue(db: &Db, issue_id: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// Fail closed before any session exists when canonicalizing the tracked
+/// identity duplicates an issue that already has an active dispatch row
+/// (THE-2681). [`insert_and_start`] re-runs the same gate after the open, so a
+/// row admitted in the gap between this check and the session open is still
+/// caught and the opened session torn down; the point of the early gate is
+/// that the common case — a plain duplicate — is refused without launching
+/// (and then killing) a worker.
+pub(crate) fn refuse_duplicate_track(db: &Db, issue_id: &str, worktree_path: &str) -> Result<()> {
+    let (issue_id, _) = crate::cmd::dispatch::dispatch_identity(issue_id, worktree_path)?;
+    refuse_active_issue(db, &issue_id, Db::ROSTER_ACTIVE_LIMIT)
+}
+
 fn insert_and_start_with_status(
     db: &Db,
     issue_id: &str,
@@ -585,6 +597,38 @@ mod tests {
             .expect_err("truncated active roster must refuse");
         assert!(format!("{error:#}").contains("more than 1 active dispatch rows"));
         super::refuse_active_issue(&db, "linear:CAP-3", 2).expect("complete roster, no dup");
+    }
+
+    #[test]
+    fn refuse_duplicate_track_refuses_an_active_issue_before_the_open() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        insert_and_start(&db, "linear:THE-1976", path, "coder", "session-1")
+            .expect("first tracked row");
+        let error = super::refuse_duplicate_track(&db, "LINEAR:THE-1976", path)
+            .expect_err("a duplicate tracked open must be refused before launch");
+        assert!(format!("{error:#}").contains("already has an active dispatch row"));
+    }
+
+    #[test]
+    fn refuse_duplicate_track_admits_an_issue_whose_row_is_terminal() {
+        let state = crate::testenv::IsolatedState::new();
+        let (_repo_dir, worktree) = git_repo();
+        let db = db(&state);
+        let path = worktree.to_str().expect("utf8 worktree");
+        let row = insert_and_start(&db, "linear:THE-1976", path, "coder", "session-1")
+            .expect("first tracked row");
+        db.set_dispatch_status_checked(
+            row,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Done,
+            Some("supervisor accepted the artifact"),
+        )
+        .expect("close the row");
+        super::refuse_duplicate_track(&db, "LINEAR:THE-1976", path)
+            .expect("a terminal row no longer blocks a tracked open");
     }
 
     #[test]

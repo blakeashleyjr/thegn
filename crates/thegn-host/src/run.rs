@@ -5593,6 +5593,9 @@ fn dispatch_menu_choice(
         MenuChoice::SandboxRetry
         | MenuChoice::SandboxRunOnHost
         | MenuChoice::SandboxStartRuntime(_) => {}
+        MenuChoice::ModelCredentialsForward(_)
+        | MenuChoice::ModelCredentialsNotNow(_)
+        | MenuChoice::ModelCredentialsNever(_) => {}
     }
     GitAfter::None
 }
@@ -21046,6 +21049,21 @@ async fn event_loop<T: Terminal>(
                             {
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
+                            // Esc/q on the credential question means "not now":
+                            // withhold this launch and retry without remembering.
+                            if m.tag == menu::MenuKindTag::ModelCredentialsConsent
+                                && let Some(target) = m.items().iter().find_map(|item| match &item
+                                    .choice
+                                {
+                                    menu::MenuChoice::ModelCredentialsForward(t) => Some(t.clone()),
+                                    _ => None,
+                                })
+                            {
+                                crate::model_credential_prompt::not_now(&target);
+                                materialize_failed.remove(&(target.group.clone(), target.tab));
+                                prewarm_failed.remove(&(target.group.clone(), target.tab));
+                                model.status = "Retrying environment bring-up…".into();
+                            }
                             active_menu = None;
                             if let Some(v) = pr_view.as_mut() {
                                 v.pending_handoff = None;
@@ -21241,6 +21259,37 @@ async fn event_loop<T: Terminal>(
                                     dirty = true;
                                     continue;
                                 }
+                            }
+                            // One-time model-credential answer: remember (or
+                            // withhold once), then re-run the blocked launch.
+                            let credential_target = match &choice {
+                                menu::MenuChoice::ModelCredentialsForward(t)
+                                | menu::MenuChoice::ModelCredentialsNotNow(t)
+                                | menu::MenuChoice::ModelCredentialsNever(t) => Some(t),
+                                _ => None,
+                            };
+                            if let Some(target) = credential_target {
+                                match &choice {
+                                    menu::MenuChoice::ModelCredentialsForward(_) => {
+                                        crate::model_credential_prompt::remember_forward(target);
+                                    }
+                                    menu::MenuChoice::ModelCredentialsNever(_) => {
+                                        crate::model_credential_prompt::remember_never(target);
+                                    }
+                                    menu::MenuChoice::ModelCredentialsNotNow(_) => {
+                                        crate::model_credential_prompt::not_now(target);
+                                    }
+                                    _ => {}
+                                }
+                                materialize_failed.remove(&(target.group.clone(), target.tab));
+                                prewarm_failed.remove(&(target.group.clone(), target.tab));
+                                crate::agent::clear_native_exec_cooldown(
+                                    keymap.config(),
+                                    &target.worktree,
+                                );
+                                model.status = "Retrying environment bring-up…".into();
+                                dirty = true;
+                                continue;
                             }
                             // Dismissing the sandbox-halt modal (`[n]`) suppresses
                             // it for this key: the row keeps its red error dot and

@@ -192,6 +192,12 @@ pub const CATALOG: &[HostCapability] = &[
         "List daemon sessions (worktree hints, geometry, lease state)",
     ),
     cap(
+        "fleet.list",
+        Verb::FleetList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Read provider fleet inventory and estimated costs",
+    ),
+    cap(
         "sessions.migrate",
         Verb::MigrateSession,
         SurfaceSet::of(&[Surface::Cli]),

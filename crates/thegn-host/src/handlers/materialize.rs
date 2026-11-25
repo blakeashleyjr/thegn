@@ -336,12 +336,19 @@ pub(crate) fn maybe_materialize(
                         .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
                         .map_err(spec_err)
                     }
-                    Err(e) => Err(match crate::handlers::provision::sandbox_halt_in(&e) {
-                        Some(h) => SpecError::Halt(Box::new(h.clone())),
-                        // `{e:#}` keeps the full cause chain (see `ensure sandbox`
-                        // in agent.rs) so the provider's real failure is shown.
-                        None => SpecError::Other(format!("environment setup failed: {e:#}")),
-                    }),
+                    Err(e) => {
+                        if let Some(h) = crate::handlers::provision::sandbox_halt_in(&e) {
+                            Err(SpecError::Halt(Box::new(h.clone())))
+                        } else if let Some(prompt) =
+                            crate::handlers::provision::model_credential_consent_in(&e)
+                        {
+                            Err(SpecError::Consent(Box::new(prompt.clone())))
+                        } else {
+                            // `{e:#}` keeps the full cause chain (see `ensure sandbox`
+                            // in agent.rs) so the provider's real failure is shown.
+                            Err(SpecError::Other(format!("environment setup failed: {e:#}")))
+                        }
+                    }
                 }
             };
             // Attach-on-open (THE-85): list the worktree's LIVE daemon agent

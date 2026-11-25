@@ -138,12 +138,18 @@ unverified backends SHALL report `unmanaged`. A provider placement SHALL report 
 kind lowers the lists to a provider policy API and reads them back, and `unmanaged` otherwise. The
 enforcement matrix MUST describe hostname rules as advisory and MUST NOT describe them as enforced DNS
 filtering. Where hostname rules are configured and nothing enforces them, thegn SHALL warn at launch, at
-provision and in `thegn doctor`, and MUST NOT describe the rules as enforced egress.
+provision, in `thegn config validate` and in `thegn doctor`, and MUST NOT describe the rules as enforced egress.
 
 #### Scenario: Lists on a local OCI backend are unmanaged
 
 - **WHEN** a local podman or docker worktree has `network_allow` or `network_block` lists and `network = "nat"`
 - **THEN** its egress is reported `unmanaged` and the matrix net cell reads `netns; rules advisory`
+
+#### Scenario: Validate warns that lists are advisory
+
+- **WHEN** the main or profile config sets `[sandbox] network_allow` or `network_block` with `network = "nat"` or `"host"`, and no `*` block entry
+- **THEN** `thegn config validate` prints a warning naming the lists as advisory on local backends, and exits successfully when there are no other problems
+- **AND** a config with `network = "none"`, no lists, or a `*` block entry prints no such warning
 
 #### Scenario: Network none is offline
 

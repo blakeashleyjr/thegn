@@ -449,7 +449,9 @@ Vercel environments; the Fly and machine0 parts need the dev channel
   with `created_at` set to now, so lifetime counts from adoption. It refuses a
   record owned by another controller, account or provider, refuses when
   `max_instances` is reached, and says "already recorded" if the sprite is
-  already yours. It never touches the sprite itself.
+  already yours. It never touches the sprite itself. Stable and dev instances
+  keep separate ledgers, so a sprite one made is refused by the other; the
+  refusal names this command, so run it from the instance that needs the sprite.
 - **Daily loop.** `thegn agent run --wait --pull` runs the agent, pulls the
   commits back and, on a Fly or machine0 env that bills while started,
   stops the machine and prints `stopped <name> (it bills while started)`.
@@ -525,11 +527,13 @@ the agent step.
   files into the sandbox. `none` withholds the fixed list of model credential
   variables from provisioning, the pane environment and repo exec, and skips the
   agent login upload and resync; provisioning prints one line naming what was
-  withheld and how to grant it. An env that does not set `model_credentials`
-  behaves as before (credentials are forwarded), and `thegn doctor` and config
-  validation say so. Set `model_credentials = "none"` to withhold explicitly.
-  Names you add to `env_passthrough` yourself are not affected. Not yet
-  verified live.
+  withheld and how to grant it. Leaving `model_credentials` unset asks once per
+  project and provider on the first interactive launch: forward and remember,
+  not now (this launch only), or never. The answer is stored per project, so
+  later launches do not ask. A headless launch with no stored answer withholds
+  and prints the hint instead of blocking. `thegn doctor` and config validation
+  report an unset Sprites value as waiting for that answer. Names you add to
+  `env_passthrough` yourself are not affected. Not yet verified live.
 - **Sprites destroy needs proof.** After the provider accepts the DELETE,
   thegn polls the sprite every 2 seconds for up to 30 seconds until it gets a
   definite 404. Only then does it revoke custody and forget the record.

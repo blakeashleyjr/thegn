@@ -43,6 +43,9 @@ pub const CONTROLLER_KEY: &str = "tg-ctl";
 
 pub(crate) const MAX_INVENTORY_PAGES: u32 = 50;
 pub(crate) const MAX_INVENTORY_ROWS: usize = 10_000;
+/// A single control response is capped by the shared HTTP client; cap the
+/// decoded inventory aggregate as well so a long paginated pass stays bounded.
+pub(crate) const MAX_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
 const DESTROY_ATTEMPTS: u32 = 3;
 
@@ -58,9 +61,13 @@ pub struct InventoryPage<T> {
 pub enum PartialReason {
     PageCap,
     RowCap,
+    ByteCap,
     Budget,
     TotalMismatch,
+    TotalChanged,
+    EmptyPage,
     DuplicateId,
+    DuplicateName,
 }
 
 impl PartialReason {
@@ -69,12 +76,18 @@ impl PartialReason {
         match self {
             PartialReason::PageCap => "inventory exceeds the page cap; refusing a partial list",
             PartialReason::RowCap => "inventory exceeds the row cap; refusing a partial list",
+            PartialReason::ByteCap => "inventory exceeds the byte cap; refusing a partial list",
             PartialReason::Budget => {
                 "inventory listing exceeded the 120 second budget; refusing a partial list"
             }
             PartialReason::TotalMismatch => "inventory total does not match collected rows",
+            PartialReason::TotalChanged => "inventory total changed between pages",
+            PartialReason::EmptyPage => "inventory contains an empty page before its end",
             PartialReason::DuplicateId => {
                 "inventory contains a duplicate id; refusing a partial list"
+            }
+            PartialReason::DuplicateName => {
+                "inventory contains a duplicate canonical name; refusing a partial list"
             }
         }
     }
@@ -85,9 +98,13 @@ impl fmt::Display for PartialReason {
         f.write_str(match self {
             PartialReason::PageCap => "page cap",
             PartialReason::RowCap => "row cap",
+            PartialReason::ByteCap => "byte cap",
             PartialReason::Budget => "budget",
             PartialReason::TotalMismatch => "total mismatch",
+            PartialReason::TotalChanged => "total changed",
+            PartialReason::EmptyPage => "empty middle page",
             PartialReason::DuplicateId => "duplicate id",
+            PartialReason::DuplicateName => "duplicate canonical name",
         })
     }
 }
@@ -170,6 +187,8 @@ where
     let outcome = tokio::time::timeout(budget, async {
         let mut ids = HashSet::new();
         let mut page_number = 1_u32;
+        let mut announced_total = None;
+        let mut encoded_bytes = 0_usize;
         loop {
             if page_number > MAX_INVENTORY_PAGES {
                 return Err(InventoryStop::Partial(PartialReason::PageCap));
@@ -177,8 +196,24 @@ where
             let body = fetch(page_number)
                 .await
                 .map_err(|e| InventoryStop::Unknown(format!("{e:#}")))?;
+            let page_bytes = serde_json::to_vec(&body)
+                .map_err(|error| InventoryStop::Unknown(format!("encode inventory page: {error}")))?
+                .len();
+            if page_bytes > MAX_INVENTORY_BYTES.saturating_sub(encoded_bytes) {
+                return Err(InventoryStop::Partial(PartialReason::ByteCap));
+            }
+            encoded_bytes += page_bytes;
             let page =
                 parse(&body, page_number).map_err(|e| InventoryStop::Unknown(format!("{e:#}")))?;
+            if let Some(total) = page.total {
+                if announced_total.is_some_and(|previous| previous != total) {
+                    return Err(InventoryStop::Partial(PartialReason::TotalChanged));
+                }
+                announced_total = Some(total);
+            }
+            if page.has_next && page.items.is_empty() {
+                return Err(InventoryStop::Partial(PartialReason::EmptyPage));
+            }
             if all.len().saturating_add(page.items.len()) > MAX_INVENTORY_ROWS {
                 return Err(InventoryStop::Partial(PartialReason::RowCap));
             }
@@ -189,7 +224,7 @@ where
                 all.push(item);
             }
             if !page.has_next {
-                if let Some(total) = page.total
+                if let Some(total) = announced_total
                     && u64::try_from(all.len()).ok() != Some(total)
                 {
                     return Err(InventoryStop::Partial(PartialReason::TotalMismatch));
@@ -215,6 +250,27 @@ fn matching_ssh_key(keys: Vec<(i64, String)>, pubkey: &str) -> Option<i64> {
     keys.into_iter()
         .find(|(_, key)| same_pubkey(key, pubkey))
         .map(|(id, _)| id)
+}
+
+/// A provider name is the key used by lifecycle and ledger operations. Keep
+/// the inventory non-authoritative if two immutable provider IDs claim the
+/// same canonical name.
+fn reject_duplicate_names(inventory: Inventory<VpsInstance>) -> Inventory<VpsInstance> {
+    let Inventory::Complete(rows) = inventory else {
+        return inventory;
+    };
+    let mut names = HashSet::with_capacity(rows.len());
+    if rows
+        .iter()
+        .any(|server| !names.insert(server.name.trim().to_ascii_lowercase()))
+    {
+        Inventory::Partial {
+            rows,
+            reason: PartialReason::DuplicateName,
+        }
+    } else {
+        Inventory::Complete(rows)
+    }
 }
 
 /// Which VPS vendor an env targets. One enum arm per implemented adapter; each
@@ -846,7 +902,7 @@ impl VpsProvider {
         };
         let base = base.as_str();
         let shaper = self.shaper();
-        collect_inventory(
+        let inventory = collect_inventory(
             move |page| {
                 Box::pin(async move {
                     let url = shaper.list_page_url(base, page);
@@ -860,7 +916,8 @@ impl VpsProvider {
             |body, page| shaper.parse_server_page(body, page),
             |server: &VpsInstance| server.id.clone(),
         )
-        .await
+        .await;
+        reject_duplicate_names(inventory)
     }
 
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
@@ -1847,9 +1904,19 @@ mod tests {
         )
         .await
         .unwrap();
+        let report = vps_inventory_report(Inventory::Complete(rows)).unwrap();
+        let crate::provider::InventoryReport::Complete(rows) = report else {
+            panic!("expected a complete report, got {report:?}");
+        };
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            vec!["1", "2", "3"]
+            vec!["server-1", "server-2", "server-3"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("1"), Some("2"), Some("3")]
         );
     }
 
@@ -1883,6 +1950,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_collector_rejects_changing_totals_and_empty_middle_pages() {
+        let changing = vec![
+            hetzner_page(&[1], 1, true, 2),
+            hetzner_page(&[2], 2, false, 3),
+        ];
+        let changing = &changing;
+        assert!(matches!(
+            collect_inventory(
+                |page| Box::pin(async move { Ok(changing[(page - 1) as usize].clone()) }),
+                hetzner::parse_server_page,
+                |row: &VpsInstance| row.id.clone(),
+            )
+            .await,
+            Inventory::Partial {
+                reason: PartialReason::TotalChanged,
+                ..
+            }
+        ));
+
+        let empty_middle = vec![
+            hetzner_page(&[1], 1, true, 2),
+            hetzner_page(&[], 2, true, 2),
+            hetzner_page(&[2], 3, false, 2),
+        ];
+        let empty_middle = &empty_middle;
+        assert!(matches!(
+            collect_inventory(
+                |page| Box::pin(async move { Ok(empty_middle[(page - 1) as usize].clone()) }),
+                hetzner::parse_server_page,
+                |row: &VpsInstance| row.id.clone(),
+            )
+            .await,
+            Inventory::Partial {
+                reason: PartialReason::EmptyPage,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_canonical_vps_names_are_not_authoritative() {
+        let rows = vec![
+            VpsInstance {
+                id: "1".into(),
+                name: "Prod".into(),
+                ..VpsInstance::default()
+            },
+            VpsInstance {
+                id: "2".into(),
+                name: "prod ".into(),
+                ..VpsInstance::default()
+            },
+        ];
+        assert!(matches!(
+            reject_duplicate_names(Inventory::Complete(rows)),
+            Inventory::Partial {
+                reason: PartialReason::DuplicateName,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn inventory_collector_rejects_page_cap_and_fetch_error_without_partial_rows() {
         let capped = collect_pages(
             |page| Box::pin(async move { Ok(hetzner_page(&[], page, true, 0)) }),
@@ -1907,6 +2037,31 @@ mod tests {
         )
         .await;
         assert!(failed.is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_collector_enforces_cumulative_encoded_byte_cap() {
+        let padding = "x".repeat(2 * 1024 * 1024);
+        let inventory = collect_inventory(
+            |page| {
+                let padding = padding.clone();
+                Box::pin(async move {
+                    let mut body = hetzner_page(&[page as i64], page, true, 10);
+                    body["padding"] = serde_json::Value::String(padding);
+                    Ok(body)
+                })
+            },
+            hetzner::parse_server_page,
+            |row: &VpsInstance| row.id.clone(),
+        )
+        .await;
+        assert!(matches!(
+            inventory,
+            Inventory::Partial {
+                reason: PartialReason::ByteCap,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1950,7 +2105,7 @@ mod tests {
         }
 
         let capped = collect_inventory(
-            |page| Box::pin(async move { Ok(hetzner_page(&[], page, true, 0)) }),
+            |page| Box::pin(async move { Ok(hetzner_page(&[i64::from(page)], page, true, 0)) }),
             hetzner::parse_server_page,
             |row: &VpsInstance| row.id.clone(),
         )

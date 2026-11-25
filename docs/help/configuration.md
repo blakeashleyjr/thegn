@@ -53,9 +53,10 @@ Workspace keybinds and the workspace editor setting are not applied from a
 bound block.
 
 `[env.<n>.provider] model_credentials` applies to Vercel and Sprites
-(`none` or `upload`; `proxy` and `inject` are refused). On Sprites, leaving it
-unset forwards credentials as before; set `none` to withhold them. See
-[[environments]] and [[vercel-sandbox]].
+(`none` or `upload`; `proxy` and `inject` are refused). On Vercel it defaults
+to `none`. On Sprites, leaving it unset asks once per project whether to
+forward; set `none` to withhold without asking or `upload` to forward without
+asking. See [[environments]] and [[vercel-sandbox]].
 
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The
@@ -201,6 +202,14 @@ build or test recipe. It must name an `[env.<name>]` whose provider is
 `sprites` or `vercel`; `thegn config validate` refuses any other name. It is
 empty by default, and `thegn job run --runner <env>` overrides it for one run.
 The choice is explicit: there is no placement fallback to another runner.
+
+A project can bind its own runner in your own config:
+`[project.<slug>.jobs] runner = "<env name>"` (the legacy `[workspace.<slug>.jobs]`
+spelling works too). It wins over `[jobs] runner` for that project only, so two
+projects can use different runners; the global key stays the fallback. A
+repo-root `.thegn.*` file cannot set it. `thegn job route` shows the effective
+runner and why. If the project's block is ambiguous nothing applies, not even
+the global key.
 
 The runner uses that env's own provider settings and token reference. A
 Sprites env needs `id` set to the one Sprite bound to the project (not a

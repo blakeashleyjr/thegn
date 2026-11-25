@@ -1,0 +1,25 @@
+name: Show and tell
+description: Share a setup, theme, workflow, or something you built with or for thegn.
+title: "[Show and tell] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing. Screenshots can be pasted straight into the
+        fields below. Include the config keys or commands someone else
+        would need to reproduce your setup.
+  - type: textarea
+    id: show
+    attributes:
+      label: What are you showing?
+      description: A setup, a theme, a workflow, or a project you run inside thegn.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Config or steps
+      description: The config keys, commands or steps others need to reproduce it. Screenshots can be pasted here too.
+      render: text
+    validations:
+      required: false

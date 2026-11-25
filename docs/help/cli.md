@@ -25,7 +25,7 @@ programs grouping repos):
 | Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                                                   |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                                               |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                                                     |
-| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `job run` · `debug` · `mcp` · `plugin`                                                      |
+| Environments  | `env` · `zone` · `host` · `placement` · `fleet` · `job run` · `job route` · `debug` · `mcp` · `plugin`                                        |
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `usage [--json] [--tokens]` · `db` · `setup` · `completions`                                         |
@@ -355,9 +355,10 @@ sandbox, credentials, model flag and env overlay an interactive pane gets.
 `--widen-permissions` permits a wider set and is only valid on plain opens.
 
 `session open --track <issue>` is the ad-hoc worker form: it requires
-`--worktree`, opens the plain session, then writes a dispatch roster row visible
-to `dispatch list`, `dispatch wait` and `dispatch verify`. For a lane without
-an issue, use `session open --brief-file F [--vars key=value]`; repeatable
+`--worktree`, refuses a duplicate issue before the session opens, then records
+a dispatch roster row visible to `dispatch list`, `dispatch wait` and
+`dispatch verify`. For a lane without an issue, use
+`session open --brief-file F [--vars key=value]`; repeatable
 `--vars` bindings render `{key}` placeholders in the file. These options cannot
 be combined with `--prompt`, `--issue` or `--resume-work`, and `--vars` requires
 `--brief-file`.
@@ -605,6 +606,10 @@ the snapshot's digest, and the runner verifies the files it received against
 that digest before running anything. There is no free-form command and no
 fallback to another runner. The recipe runs with a scrubbed environment and
 `THEGN_SELECTED_JOB=1`; `thegn job run` refuses to start inside such a job.
+`thegn job route [--json]` prints where this project's recipes run and why
+(the project's `[project.<slug>.jobs] runner`, the global `[jobs] runner`, or
+local when neither is set) without dispatching anything. `--json` prints one
+document with `project`, `destination`, `env`, `source`, `reason` and `status`.
 Provider tokens stay on this machine and never reach the recipe. `--deadline`
 (default 1800, at most 86400) is clamped to the runner's own limit.
 

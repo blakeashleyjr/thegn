@@ -108,6 +108,7 @@ pub fn rule(verb: Verb) -> Rule {
         // Observe-only reads. The Lead already has a read-only view of the
         // host; none of these starts a process or writes outside thegn's DB.
         Verb::ListSessions
+        | Verb::FleetList
         | Verb::ListWorktrees
         | Verb::WorktreeSandboxProfile
         | Verb::Snapshot
@@ -553,6 +554,7 @@ mod tests {
     /// each new verb needs a deliberate Lead decision.
     const TABLE: &[(Verb, Kind)] = &[
         (Verb::ListSessions, Allow),
+        (Verb::FleetList, Allow),
         (Verb::MigrateSession, Refuse),
         (Verb::ListWorktrees, Allow),
         (Verb::OpenSession, AllowIf),

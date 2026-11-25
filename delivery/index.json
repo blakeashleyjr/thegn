@@ -1421,6 +1421,18 @@
       "summary": "Sprites adopt, opt-in lifetime reaper, land-local-then-release, pull single-flight, credential custody and conformance slice 2; live verification open."
     },
     {
+      "change": "remote-fleet-control-list",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2020",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Provider-backed fleet list exposed read-scoped through GET /v1/fleet and the MCP fleet_list tool, reusing the CLI report on a blocking worker with sanitized strings; gRPC and a shared control cache stay follow-up work."
+    },
+    {
       "change": "repair-kitty-stream-parser",
       "archive_path": "openspec/changes/archive/2026-10-21-repair-kitty-stream-parser/",
       "lifecycle": "archived",

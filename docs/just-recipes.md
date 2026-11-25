@@ -214,23 +214,25 @@ Anything that compiles runs on the Mac (see the guard note below).
 
 All A/B or machine-dependent; none are in CI. They refuse a stale or debug binary via `_perf-guard`.
 
-| Recipe              | Params  | Purpose                                                         | Heavy | Status |
-| ------------------- | ------- | --------------------------------------------------------------- | ----- | ------ |
-| `bench`             |         | Startup benchmarks with hyperfine (builds release).             | Mac   | OK     |
-| `bench-idle`        |         | Idle CPU benchmark over a worktree fixture.                     | Mac   | OK     |
-| `bench-idle-record` |         | Record the idle reading as this machine's baseline.             | Mac   | OK     |
-| `bench-steady`      |         | Steady-workload CPU benchmark.                                  | Mac   | OK     |
-| `bench-soak`        | `*args` | 40-worktree resource soak (children, fds, threads, read rate).  | Mac   | OK     |
-| `bench-soak-daemon` | `*args` | Soak with the pane daemon running.                              | Mac   | OK     |
-| `bench-micro`       | `*args` | Criterion micro-benchmarks across the workspace.                | Mac   | OK     |
-| `bench-micro-svc`   | `*args` | Git hot-path benches (`thegn-svc --bench git_hot`).             | Mac   | OK     |
-| `perf`              |         | Umbrella: `bench`, `bench-idle`, `bench-micro`.                 | Mac   | OK     |
-| `perf-flood`        | `*args` | Switch/input latency under an output flood.                     | Mac   | OK     |
-| `perf-t3`           | `*args` | Workspace-switch latency.                                       | Mac   | OK     |
-| `perf-selftest`     |         | Perf harness internals check; part of `lint`.                   | light | OK     |
-| `_perf-guard`       |         | Private: refuse stale or debug binaries.                        | light | OK     |
-| `profile`           | `*args` | Launch under the sampling profiler.                             | Mac   | OK     |
-| `net-trace`         | `*args` | strace the first frame and list every connect() target (Linux). | Mac   | OK     |
+| Recipe              | Params  | Purpose                                                               | Heavy | Status |
+| ------------------- | ------- | --------------------------------------------------------------------- | ----- | ------ |
+| `bench`             |         | Startup benchmarks with hyperfine (builds release).                   | Mac   | OK     |
+| `bench-idle`        |         | Idle CPU benchmark over a worktree fixture.                           | Mac   | OK     |
+| `bench-idle-record` |         | Record the idle reading as this machine's baseline.                   | Mac   | OK     |
+| `bench-steady`      |         | Steady-workload CPU benchmark.                                        | Mac   | OK     |
+| `bench-soak`        | `*args` | 40-worktree resource soak (children, fds, threads, read rate, RSS).   | Mac   | OK     |
+| `bench-soak-daemon` | `*args` | Soak with the pane daemon running.                                    | Mac   | OK     |
+| `bench-micro`       | `*args` | Criterion micro-benchmarks across the workspace.                      | Mac   | OK     |
+| `bench-micro-svc`   | `*args` | Git hot-path benches (`thegn-svc --bench git_hot`).                   | Mac   | OK     |
+| `perf`              |         | Umbrella: `bench`, `bench-idle`, `bench-micro`.                       | Mac   | OK     |
+| `perf-flood`        | `*args` | Switch/input latency under an output flood.                           | Mac   | OK     |
+| `perf-compare`      | `*args` | thegn vs tmux vs zellij: startup, cat/yes, idle CPU + RSS.            | Mac   | OK     |
+| `perf-echo`         | `*args` | Quiet-session key → first output p50/p95/p99 (submission, not paint). | Mac   | OK     |
+| `perf-t3`           | `*args` | Workspace-switch latency.                                             | Mac   | OK     |
+| `perf-selftest`     |         | Perf harness internals checks; part of `lint`.                        | light | OK     |
+| `_perf-guard`       |         | Private: refuse stale or debug binaries.                              | light | OK     |
+| `profile`           | `*args` | Launch under the sampling profiler.                                   | Mac   | OK     |
+| `net-trace`         | `*args` | strace the first frame and list every connect() target (Linux).       | Mac   | OK     |
 
 ## Release and packaging
 

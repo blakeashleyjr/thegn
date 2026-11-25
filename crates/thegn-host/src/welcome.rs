@@ -801,6 +801,10 @@ impl WelcomeTour {
         let width = screen.cols.saturating_sub(4).min(MAX_WIDTH);
         let x = screen.x + (screen.cols - width) / 2;
         seg::draw_line(surface, x, screen.y, width, &self.header(width), bg);
+        // The gap row under the header carries the skip control on every
+        // chapter, so the way out is named on the screen itself and never only
+        // in the footer's list of chords.
+        seg::draw_line(surface, x, screen.y + 1, width, &Self::skip_line(width), bg);
         let footer_y = screen.y + screen.rows - 1;
         seg::draw_line(surface, x, footer_y, width, &self.footer(), bg);
         let mut y = screen.y + 2;
@@ -885,6 +889,23 @@ impl WelcomeTour {
         segs.push(sp(width.saturating_sub(used)));
         segs.extend(dots);
         Line::segs(segs)
+    }
+
+    /// The persistent skip control, right-aligned under the header. It paints
+    /// on every chapter (including the drill) and names the same chord the key
+    /// handler honours, so "how do I get out" never has a wrong answer.
+    fn skip_line(width: usize) -> Line {
+        let mut segs = vec![
+            seg(Tok::Slot(S::Faint), "[ ".to_string()),
+            seg(Tok::Slot(S::Accent), "esc".to_string()).bold(),
+            seg(Tok::Slot(S::Faint), format!(" {} ", glyph(Glyph::Middot))),
+            seg(Tok::Slot(S::Text), "skip tour".to_string()),
+            seg(Tok::Slot(S::Faint), " ]".to_string()),
+        ];
+        let used = segs_width(&segs);
+        let mut line = vec![sp(width.saturating_sub(used))];
+        line.append(&mut segs);
+        Line::segs(line)
     }
 
     fn footer(&self) -> Line {
@@ -1772,6 +1793,48 @@ mod tests {
         press(&mut t, KeyCode::DownArrow);
         assert!(!t.changes().is_empty());
         assert!(writes(press(&mut t, KeyCode::Escape)).is_empty());
+    }
+
+    #[test]
+    fn esc_leaves_from_every_chapter() {
+        // The skip control on every chapter names `esc`; the key handler must
+        // honour it there too (the drill included).
+        for c in CHAPTERS {
+            let mut t = tour();
+            t.chapter = *c;
+            assert_eq!(
+                press(&mut t, KeyCode::Escape),
+                TourOutcome::Close {
+                    completed: false,
+                    writes: vec![],
+                    open_setup: false
+                },
+                "{c:?} must close on the skip chord"
+            );
+        }
+    }
+
+    #[test]
+    fn every_chapter_paints_the_skip_control() {
+        let mut t = tour();
+        for c in CHAPTERS {
+            t.chapter = *c;
+            let mut s = Surface::new(80, 24);
+            t.render(
+                &mut s,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            let screen = s.screen_chars_to_string();
+            assert!(
+                screen.contains("skip tour"),
+                "{c:?} has no visible skip control:\n{screen}"
+            );
+        }
     }
 
     #[test]

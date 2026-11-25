@@ -280,6 +280,41 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
         return false;
     }
     let env_name = environment.name;
+    // A warm spare is provisioned before the user's model-credential answer
+    // exists, so claiming one for an unset Sprites env would bypass the
+    // one-time question (and could hand over the wrong credential state).
+    // Only a remembered "forward" may claim; every other answer provisions
+    // through the focused path, which prompts or withholds.
+    if let Some(env_cfg) = cfg.env.get(&env_name) {
+        let kind = thegn_core::config::EnvProviderKind::of(&env_cfg.provider.provider);
+        if kind == thegn_core::config::EnvProviderKind::Sprites
+            && !env_cfg.provider.model_credentials_is_explicit()
+        {
+            let consent = db.as_ref().and_then(|db| {
+                thegn_core::model_credential_consent::load(
+                    db,
+                    &repo_root.to_string_lossy(),
+                    &env_cfg.provider.provider,
+                )
+                .ok()
+                .flatten()
+            });
+            if consent != Some(thegn_core::model_credential_consent::Consent::Forward) {
+                tracing::debug!(
+                    target: "thegn::lifecycle",
+                    worktree = %worktree,
+                    env = %env_name,
+                    "warm claim skipped: model credentials need a per-project answer first"
+                );
+                return false;
+            }
+            crate::agent::memo_model_credential_consent(
+                &env_cfg.provider.provider,
+                worktree,
+                thegn_core::model_credential_consent::Consent::Forward,
+            );
+        }
+    }
     // Never claim for an env that can't hand a spare over (no configured
     // provider) — the bind would "succeed" while skipping branch settle, parity,
     // and the worktree's real provisioning.

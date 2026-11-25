@@ -38,6 +38,57 @@ pub fn choices(cfg: &Config) -> Vec<String> {
     labels
 }
 
+/// The program basename of an `[[agents]]` command (`/opt/bin/claude --x` → `claude`).
+fn agent_program(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Drop picker entries for KNOWN coding agents that `detected` (see
+/// [`detect_host_agents`]) does not list, so a fresh machine does not offer an
+/// agent it cannot run. Custom agents, tools and `shell` are always kept.
+pub(crate) fn filter_undetected_agents(
+    cfg: &Config,
+    choices: Vec<String>,
+    detected: &[String],
+) -> Vec<String> {
+    let known = thegn_core::envplan::known_agents();
+    choices
+        .into_iter()
+        .filter(|name| {
+            let Some(entry) = cfg.agents.iter().find(|a| &a.name == name) else {
+                return true;
+            };
+            if entry.name == SHELL || entry.command.trim() == "__shell__" {
+                return true;
+            }
+            let program = agent_program(&entry.command);
+            !known.contains(&program) || detected.iter().any(|d| d == program)
+        })
+        .collect()
+}
+
+/// True when `choices` offers no coding agent at all (only tools and the shell).
+pub(crate) fn has_no_agent(cfg: &Config, choices: &[String]) -> bool {
+    !choices.iter().any(|c| {
+        c != SHELL
+            && cfg
+                .agents
+                .iter()
+                .any(|a| &a.name == c && a.command.trim() != "__shell__")
+    })
+}
+
+/// The empty-state hint shown under the picker when no coding agent was found.
+pub(crate) const NO_AGENT_HINT: &str = "No coding agent found on PATH. Install claude \
+(https://claude.com/product/claude-code) or codex (https://github.com/openai/codex), \
+then run it once to log in.";
+
 /// Resolve a picker label to the command string to run inside the worktree.
 /// `shell` (and any unknown label) resolves to the interactive login shell.
 /// Always uses the host (non-OCI) form; callers that know the sandbox context
@@ -661,6 +712,15 @@ pub fn prepare_sandbox_env_with_selection(
         match auto_provision_sandbox(cfg, &env_name, worktree) {
             Ok(guard) => provisioned = guard,
             Err(e) => {
+                // A one-time credential question is not a provider failure: keep
+                // the typed error so the drain raises the consent menu instead
+                // of a sandbox-halt modal.
+                if let Some(prompt) = e
+                    .chain()
+                    .find_map(|src| src.downcast_ref::<ModelCredentialConsentRequired>())
+                {
+                    return Err(anyhow::Error::new(prompt.clone()));
+                }
                 // Provider won't provision (bad token, quota, API down): surface the
                 // real cause (`{e:#}`); only an explicit local host choice may degrade.
                 if !degrade_allowed {
@@ -2042,6 +2102,212 @@ impl PaneNativeExec {
     }
 }
 
+/// The answer a project gave to the model-credential question, kept in process
+/// so a menu choice is visible to the retry before the on-disk write drains.
+/// The DB remains the durable store (see
+/// [`thegn_core::model_credential_consent`]).
+pub(crate) type ModelConsent = thegn_core::model_credential_consent::Consent;
+type ConsentMemo = std::sync::Mutex<std::collections::HashMap<String, ModelConsent>>;
+
+fn consent_memo() -> &'static ConsentMemo {
+    static MEMO: std::sync::OnceLock<ConsentMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn consent_key(provider: &str, scope: &str) -> String {
+    format!("{}\u{1f}{scope}", provider.trim().to_ascii_lowercase())
+}
+
+/// Memoize an answer for a worktree and/or its repo root. Public so the menu
+/// handler and the warm-pool claim can close the write-then-retry race.
+pub(crate) fn memo_model_credential_consent(provider: &str, scope: &str, consent: ModelConsent) {
+    if let Ok(mut memo) = consent_memo().lock() {
+        memo.insert(consent_key(provider, scope), consent);
+    }
+}
+
+fn memo_model_credential_consent_get(provider: &str, scope: &str) -> Option<ModelConsent> {
+    consent_memo()
+        .lock()
+        .ok()?
+        .get(&consent_key(provider, scope))
+        .copied()
+}
+
+fn not_now_memo() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static NOT_NOW: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOT_NOW.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Withhold credentials for the next launch only. Stored separately from the
+/// durable answer so it is consumed once and then the question returns.
+pub(crate) fn withhold_model_credentials_once(provider: &str, worktree: &str) {
+    if let Ok(mut memo) = not_now_memo().lock() {
+        memo.insert(consent_key(provider, worktree));
+    }
+}
+
+fn take_model_credentials_not_now(provider: &str, worktree: &str) -> bool {
+    not_now_memo()
+        .lock()
+        .map(|mut memo| memo.remove(&consent_key(provider, worktree)))
+        .unwrap_or(false)
+}
+
+/// Resolve an unset Sprites `model_credentials`: the one-shot "not now" wins
+/// for this launch, then the in-process memo, then the durable per-project
+/// answer. A failed read is logged and treated as no answer (fail closed).
+fn resolve_sprites_model_credentials(
+    worktree: &str,
+    project: &str,
+    provider: &str,
+) -> Option<ModelConsent> {
+    let provider = provider.trim().to_ascii_lowercase();
+    if take_model_credentials_not_now(&provider, worktree) {
+        return Some(ModelConsent::Never);
+    }
+    if let Some(consent) = memo_model_credential_consent_get(&provider, worktree) {
+        return Some(consent);
+    }
+    if let Some(consent) = memo_model_credential_consent_get(&provider, project) {
+        memo_model_credential_consent(&provider, worktree, consent);
+        return Some(consent);
+    }
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provider",
+                %error,
+                "model credential consent read failed; withholding"
+            );
+            return None;
+        }
+    };
+    match thegn_core::model_credential_consent::load(&db, project, &provider) {
+        Ok(Some(consent)) => {
+            memo_model_credential_consent(&provider, project, consent);
+            memo_model_credential_consent(&provider, worktree, consent);
+            Some(consent)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provider",
+                %error,
+                "model credential consent read failed; withholding"
+            );
+            None
+        }
+    }
+}
+
+/// What an unset Sprites key should do for this launch. Callers only pass
+/// Sprites envs; `consent` is `None` when nothing is remembered.
+fn sprites_credential_launch(
+    pc: &thegn_core::config::EnvProviderConfig,
+    consent: Option<ModelConsent>,
+    interactive: bool,
+) -> thegn_core::model_credential_consent::Launch {
+    thegn_core::model_credential_consent::decide(
+        pc.model_credentials,
+        pc.model_credentials_is_explicit(),
+        consent,
+        interactive,
+    )
+}
+
+/// Map a resolved answer onto the provisioning mode. Only a remembered
+/// `Forward` uploads; `Never` and "no answer yet" withhold.
+fn sprites_credential_mode(consent: Option<ModelConsent>) -> thegn_core::config::ModelCredentials {
+    match consent {
+        Some(ModelConsent::Forward) => thegn_core::config::ModelCredentials::Upload,
+        _ => thegn_core::config::ModelCredentials::None,
+    }
+}
+
+/// The agents whose login files the provisioner would upload. Mirrors the
+/// provisioning selection: the env overlay, then the global `[sandbox.home]`
+/// list, then the `[[agents]]` picker, then host detection. The prompt must
+/// name them; an empty list still reads as "agent login".
+fn model_credential_agents(cfg: &Config, env: &thegn_core::config::EnvConfig) -> Vec<String> {
+    let overlay = env
+        .sandbox
+        .home
+        .as_ref()
+        .and_then(|home| home.agents.clone());
+    let mut agents = overlay.unwrap_or_else(|| cfg.sandbox.home.agents.clone());
+    if agents.is_empty() {
+        let picker = provisioned_agent_kinds(cfg);
+        agents = if picker.is_empty() {
+            detect_host_agents()
+        } else {
+            picker
+        };
+    }
+    agents
+        .into_iter()
+        .map(|agent| agent.trim().to_string())
+        .filter(|agent| !agent.is_empty())
+        .collect()
+}
+
+/// The fixed model-credential env keys the provisioner would forward. Values
+/// are never read here, so nothing secret can reach the prompt.
+fn model_credential_keys(cfg: &Config, repo_root: &Path) -> Vec<String> {
+    let mut keys: Vec<String> = cfg
+        .repo_sandbox(repo_root)
+        .passthrough_env_remote()
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            thegn_core::provider_credentials::MODEL_CREDENTIAL_ENV.contains(&key.as_str())
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The menu body wording. Safe fields only: agent names, fixed key names and
+/// the sandbox name.
+pub fn model_credential_question(prompt: &ModelCredentialConsentRequired) -> String {
+    let logins = match prompt.agents.as_slice() {
+        [] => "agent login".to_string(),
+        [one] => format!("{one} login"),
+        many => format!("{} logins", many.join(", ")),
+    };
+    let keys = if prompt.keys.is_empty() {
+        "model API keys".to_string()
+    } else {
+        prompt.keys.join(", ")
+    };
+    format!("Forward your {logins} and {keys} to {}?", prompt.sandbox)
+}
+
+/// A launch refused until the user answers the one-time model-credential
+/// question. Carried as a typed error so the drain can raise the menu on the
+/// focused tab and a background prewarm can defer without prompting.
+#[derive(Debug, Clone)]
+pub struct ModelCredentialConsentRequired {
+    pub env_name: String,
+    pub project: String,
+    pub provider: String,
+    pub worktree: String,
+    pub sandbox: String,
+    pub agents: Vec<String>,
+    pub keys: Vec<String>,
+}
+
+impl std::fmt::Display for ModelCredentialConsentRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("forwarding model credentials needs your approval")
+    }
+}
+
+impl std::error::Error for ModelCredentialConsentRequired {}
+
 /// Like [`native_shell_exec`] but runs the AGENT `choice`'s command in the sandbox
 /// over the native exec API — so the "Agent"/claude/codex/… picker entries run
 /// INSIDE the sprite (where the code is), instead of via the provider CLI prefix
@@ -2097,10 +2363,12 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
     };
     let pc = &env_cfg.provider;
     let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
+    // The pane path runs on the event loop, so it reads the in-process memo only.
+    // Provisioning (which always precedes the first pane launch) populates it.
     let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
         && !pc.model_credentials_is_explicit()
     {
-        thegn_core::config::ModelCredentials::Upload
+        sprites_credential_mode(memo_model_credential_consent_get(&pc.provider, worktree))
     } else {
         pc.model_credentials
     };
@@ -3000,6 +3268,7 @@ fn provision_provider_env_inner(
     progress: &mut impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<ProvisionOutcome> {
     use thegn_core::envplan::{self, EnvPlan, PlanOpts, StepKind};
+    use thegn_core::model_credential_consent::Launch;
     use thegn_core::provision_journal::{self as journal, Phase};
 
     let Some(env) = cfg.env.get(env_name) else {
@@ -3007,14 +3276,15 @@ fn provision_provider_env_inner(
     };
     let pc = &env.provider;
     let kind = thegn_core::config::EnvProviderKind::of(&pc.provider);
-    let credential_mode = if kind == thegn_core::config::EnvProviderKind::Sprites
-        && !pc.model_credentials_is_explicit()
-    {
-        thegn_core::config::ModelCredentials::Upload
-    } else {
-        pc.model_credentials
-    };
-    let grant = thegn_core::provider_credentials::model_grant(kind, credential_mode);
+    // Host-local repository membership is needed both by provisioning and by
+    // the post-checkpoint return-credential policy.
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
     // Credential-free kinds (Vercel): the repo goes in only as a host bundle and
     // no host credential is uploaded. Refuse BEFORE anything billable exists
     // when the bundle seed is impossible — never fall back to an origin clone.
@@ -3057,6 +3327,70 @@ fn provision_provider_env_inner(
     if !provider.caps().files {
         return Ok(ProvisionOutcome::not_provisioned()); // can't provision without the fs API
     }
+    // An omitted Sprites `model_credentials` asks once per project+provider. The
+    // question is raised from the drain, not here: a background/deferred or
+    // warm-pool provision declines instead of prompting, and the focused launch
+    // asks. Explicit `"upload"`/`"none"` never reach this block.
+    let mut consent_settled = false;
+    let consent = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        let project = repo_root.to_string_lossy().into_owned();
+        let remembered = resolve_sprites_model_credentials(worktree, &project, &pc.provider);
+        match sprites_credential_launch(pc, remembered, thegn_core::msg::tui_active()) {
+            Launch::Ask => {
+                let agents = model_credential_agents(cfg, env);
+                let keys = model_credential_keys(cfg, &repo_root);
+                if agents.is_empty() && keys.is_empty() {
+                    // Nothing to forward: skip a pointless question.
+                    consent_settled = true;
+                    None
+                } else if name_override.is_some() {
+                    return Ok(ProvisionOutcome::not_provisioned());
+                } else if matches!(&mode, ProvisionMode::Deferred(_)) {
+                    // The foreground phase already asked (or consumed a
+                    // one-shot "not now"). Withhold and finish the deferred
+                    // steps rather than abandoning them.
+                    None
+                } else {
+                    return Err(ModelCredentialConsentRequired {
+                        env_name: env_name.to_string(),
+                        project,
+                        provider: pc.provider.trim().to_ascii_lowercase(),
+                        worktree: worktree.to_string(),
+                        sandbox: name_override.unwrap_or(id.as_str()).to_string(),
+                        agents,
+                        keys,
+                    }
+                    .into());
+                }
+            }
+            Launch::Forward => {
+                consent_settled = true;
+                memo_model_credential_consent(&pc.provider, worktree, ModelConsent::Forward);
+                Some(ModelConsent::Forward)
+            }
+            Launch::Withhold => {
+                // A spare provisioned without the answer would be useless (the
+                // claim path only takes spares whose creds match the answer).
+                consent_settled = remembered.is_some();
+                if name_override.is_some() {
+                    return Ok(ProvisionOutcome::not_provisioned());
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let credential_mode = if kind == thegn_core::config::EnvProviderKind::Sprites
+        && !pc.model_credentials_is_explicit()
+    {
+        sprites_credential_mode(consent)
+    } else {
+        pc.model_credentials
+    };
+    let grant = thegn_core::provider_credentials::model_grant(kind, credential_mode);
     let loc = GitLoc::for_worktree_op(Path::new(worktree), "provider provisioning")
         .map_err(anyhow::Error::msg)?;
     // Prompt-first fast path: a pane opened during the deferred phase never waits on sandbox_lock (D-pf-c).
@@ -3158,15 +3492,6 @@ fn provision_provider_env_inner(
         progress(&boot);
     }
 
-    // Host-local repository membership is needed both by provisioning and by
-    // the post-checkpoint return-credential policy.
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
     let selection = selection_with_profile(worktree, &repo_root, Some(env_name.to_string()))
         .ok_or_else(|| anyhow::anyhow!("the worktree's sandbox profile could not be read"))?;
     let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), &selection);
@@ -3334,7 +3659,10 @@ fn provision_provider_env_inner(
     if !grant.login_files {
         withheld.push("agent logins".to_string());
     }
+    // Only an unanswered unset key gets the hint; a remembered "never" is not
+    // nagged on every headless launch.
     if !deferred_only
+        && !consent_settled
         && kind == thegn_core::config::EnvProviderKind::Sprites
         && let Some(message) = sprites_withheld_notice(env_name, &withheld)
     {
@@ -4948,7 +5276,12 @@ fn provision_provider_repo(
     let mode = if kind == thegn_core::config::EnvProviderKind::Sprites
         && !pc.model_credentials_is_explicit()
     {
-        thegn_core::config::ModelCredentials::Upload
+        let project = repo_root.to_string_lossy().into_owned();
+        sprites_credential_mode(resolve_sprites_model_credentials(
+            worktree,
+            &project,
+            &pc.provider,
+        ))
     } else {
         pc.model_credentials
     };

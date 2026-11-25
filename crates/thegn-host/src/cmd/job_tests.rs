@@ -187,3 +187,60 @@ fn remote_output_cannot_inject_terminal_controls() {
     assert!(!text.contains('\u{1b}'), "{text:?}");
     assert!(text.contains("^[[2Jowned"), "{text:?}");
 }
+
+#[test]
+fn job_route_parses_with_and_without_json() {
+    for (args, want) in [
+        (&["job", "route"][..], false),
+        (&["job", "route", "--json"][..], true),
+    ] {
+        match parse(args).unwrap().command {
+            Some(crate::Command::Job {
+                action: Action::Route { json },
+            }) => assert_eq!(json, want),
+            _ => panic!("not a job route: {args:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_route_report_reads_project_then_global_then_local() {
+    use thegn_core::config::{EnvConfig, EnvProviderConfig, WorkspaceConfig};
+    let root = std::path::Path::new("/nonexistent/route-demo");
+    let mut cfg = Config::default();
+    let local = route_report(&cfg, root, "route-demo");
+    assert_eq!(
+        (local.destination.as_str(), local.source),
+        ("local", "unset")
+    );
+    cfg.env.insert(
+        "sp".into(),
+        EnvConfig {
+            provider: EnvProviderConfig {
+                provider: "sprites".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    cfg.jobs.runner = "sp".into();
+    let global = route_report(&cfg, root, "route-demo");
+    assert_eq!(
+        (global.destination.as_str(), global.source),
+        ("sprites", "global")
+    );
+    assert_eq!(global.status, "ready");
+    cfg.workspace.insert(
+        thegn_core::config::workspace_slug(root),
+        WorkspaceConfig {
+            jobs: thegn_core::config::JobsOverlay {
+                runner: Some("missing".into()),
+            },
+            ..Default::default()
+        },
+    );
+    let bound = route_report(&cfg, root, "route-demo");
+    assert_eq!(bound.source, "project");
+    assert!(bound.status.starts_with("invalid"), "{bound:?}");
+    assert!(render_route(&bound).contains("reason: project binding"));
+}

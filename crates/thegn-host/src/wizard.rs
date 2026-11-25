@@ -240,6 +240,8 @@ pub struct NewWorktreeWizard {
     profile_default: thegn_core::config::SandboxProfile,
     agent_rows: Vec<(String, String)>,
     agent_sel: usize,
+    /// Empty-state hint under the program list when no coding agent was found.
+    agent_hint: Option<&'static str>,
     /// A speculative worker can fail before the user has submitted. Keep its
     /// explanation visible until dismissed, without accepting more commands.
     failure: Option<String>,
@@ -337,7 +339,14 @@ impl NewWorktreeWizard {
             .collect();
         let profile_sel =
             usize::from(profile_default == thegn_core::config::SandboxProfile::Sealed);
-        let agent_rows = crate::palette::build_agent_palette(cfg)
+        let agent_choices = crate::agent::filter_undetected_agents(
+            cfg,
+            crate::agent::choices(cfg),
+            &crate::agent::detect_host_agents(),
+        );
+        let agent_hint =
+            crate::agent::has_no_agent(cfg, &agent_choices).then_some(crate::agent::NO_AGENT_HINT);
+        let agent_rows = crate::palette::build_agent_palette_for(cfg, agent_choices)
             .into_iter()
             .map(|i| (i.key, i.label))
             .collect();
@@ -360,6 +369,7 @@ impl NewWorktreeWizard {
             profile_default,
             agent_rows,
             agent_sel: 0,
+            agent_hint,
             failure: None,
         }
     }
@@ -765,11 +775,19 @@ impl NewWorktreeWizard {
             .iter()
             .flat_map(|text| seg::wrap(&[seg(Tok::Slot(S::Dim), *text)], 52, 0))
             .collect::<Vec<_>>();
-        let fixed_rows = 5 + usize::from(show_collision) + self.agent_rows.len();
+        let hint_lines = self
+            .agent_hint
+            .map(|h| seg::wrap(&[seg(Tok::Slot(S::Dim), h)], 50, 0))
+            .unwrap_or_default();
+        let fixed_rows = 5 + usize::from(show_collision) + self.agent_rows.len() + hint_lines.len();
         let explanation_budget = screen.rows.saturating_sub(fixed_rows + 4);
         explanation_lines.truncate(explanation_budget);
         let explain_rows = explanation_lines.len();
-        let body_rows = 5 + explain_rows + usize::from(show_collision) + self.agent_rows.len();
+        let body_rows = 5
+            + explain_rows
+            + usize::from(show_collision)
+            + self.agent_rows.len()
+            + hint_lines.len();
         let spec = LayerSpec {
             title: format!("new worktree — {}", self.repo_slug),
             badge: Some(" Alt+w ".into()),
@@ -949,6 +967,10 @@ impl NewWorktreeWizard {
                 &Line::segs(vec![marker, l]),
                 pad,
             );
+            y += 1;
+        }
+        for line in hint_lines {
+            seg::draw_line(surface, inner.x, y, inner.cols, &Line::segs(line), panel);
             y += 1;
         }
 

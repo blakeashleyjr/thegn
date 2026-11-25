@@ -1694,6 +1694,29 @@ fn choices_lists_agents_then_tools_then_shell() {
 }
 
 #[test]
+fn picker_keeps_only_detected_known_agents_and_custom_entries() {
+    let cfg = cfg_with(
+        &[
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("mine", "my-agent --x"),
+        ],
+        &[("lazygit", "lazygit")],
+    );
+    let kept = filter_undetected_agents(&cfg, choices(&cfg), &["claude".to_string()]);
+    assert_eq!(kept, vec!["claude", "mine", "lazygit", "shell"]);
+    assert!(!has_no_agent(&cfg, &kept));
+}
+
+#[test]
+fn picker_with_no_detected_agent_reports_the_empty_state() {
+    let cfg = cfg_with(&[("claude", "claude"), ("shell", "__shell__")], &[]);
+    let kept = filter_undetected_agents(&cfg, choices(&cfg), &[]);
+    assert_eq!(kept, vec!["shell"]);
+    assert!(has_no_agent(&cfg, &kept));
+}
+
+#[test]
 fn choices_does_not_duplicate_an_explicit_shell() {
     let cfg = cfg_with(&[], &[("shell", "bash")]);
     assert_eq!(choices(&cfg), vec!["shell"]);
@@ -4190,4 +4213,97 @@ fn compose_spec_refuses_provider_spec_without_transport() {
     )
     .expect_err("a remote env must never fall back to a host shell here");
     assert!(error.downcast_ref::<SandboxHalt>().is_some());
+}
+
+#[test]
+fn unset_sprites_asks_once_and_withholds_headless() {
+    use thegn_core::config::{EnvProviderConfig, ModelCredentials};
+    use thegn_core::model_credential_consent::Launch;
+
+    let mut pc = EnvProviderConfig {
+        provider: "sprites".into(),
+        ..Default::default()
+    };
+    assert_eq!(sprites_credential_launch(&pc, None, true), Launch::Ask);
+    assert_eq!(
+        sprites_credential_launch(&pc, None, false),
+        Launch::Withhold
+    );
+    assert_eq!(
+        sprites_credential_launch(
+            &pc,
+            Some(thegn_core::model_credential_consent::Consent::Never),
+            true
+        ),
+        Launch::Withhold
+    );
+    assert_eq!(
+        sprites_credential_launch(
+            &pc,
+            Some(thegn_core::model_credential_consent::Consent::Forward),
+            true
+        ),
+        Launch::Forward
+    );
+    assert_eq!(
+        sprites_credential_mode(Some(thegn_core::model_credential_consent::Consent::Forward)),
+        ModelCredentials::Upload
+    );
+    assert_eq!(sprites_credential_mode(None), ModelCredentials::None);
+    assert_eq!(
+        sprites_credential_mode(Some(thegn_core::model_credential_consent::Consent::Never)),
+        ModelCredentials::None
+    );
+
+    pc.model_credentials = ModelCredentials::Upload;
+    pc.mark_model_credentials_explicit();
+    assert_eq!(sprites_credential_launch(&pc, None, true), Launch::Forward);
+}
+
+#[test]
+fn model_credential_not_now_is_consumed_once() {
+    let provider = "sprites-test-not-now";
+    let worktree = "/tmp/thegn-not-now-wt";
+    assert!(!take_model_credentials_not_now(provider, worktree));
+    withhold_model_credentials_once(provider, worktree);
+    assert!(take_model_credentials_not_now(provider, worktree));
+    assert!(!take_model_credentials_not_now(provider, worktree));
+}
+
+#[test]
+fn model_credential_memo_is_scoped_by_provider_and_worktree() {
+    let provider = "sprites-test-memo";
+    memo_model_credential_consent(
+        provider,
+        "/tmp/thegn-memo-a",
+        thegn_core::model_credential_consent::Consent::Forward,
+    );
+    assert_eq!(
+        memo_model_credential_consent_get(provider, "/tmp/thegn-memo-a"),
+        Some(thegn_core::model_credential_consent::Consent::Forward)
+    );
+    assert_eq!(
+        memo_model_credential_consent_get(provider, "/tmp/thegn-memo-b"),
+        None
+    );
+}
+
+#[test]
+fn unset_sprites_headless_withholds_and_names_the_config_key() {
+    use thegn_core::config::EnvProviderKind;
+    use thegn_core::config::ModelCredentials;
+
+    let grant = thegn_core::provider_credentials::model_grant(
+        EnvProviderKind::Sprites,
+        ModelCredentials::None,
+    );
+    assert!(!grant.env_keys && !grant.login_files);
+    let notice = sprites_withheld_notice(
+        "remote",
+        &["ANTHROPIC_API_KEY".into(), "agent logins".into()],
+    )
+    .expect("withheld names produce a hint");
+    assert!(notice.contains("model_credentials"));
+    assert!(notice.contains("ANTHROPIC_API_KEY"));
+    assert!(notice.contains("agent logins"));
 }

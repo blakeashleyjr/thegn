@@ -292,8 +292,8 @@ pub struct EnvProviderConfig {
     /// `proxy`/`inject` are refused. Only the user's own config table may set it.
     #[serde(default)]
     pub model_credentials: ModelCredentials,
-    /// Whether the user supplied `model_credentials`; omitted Sprites settings
-    /// retain the historical forwarding behavior without adding a config key.
+    /// Whether the user supplied `model_credentials`; an omitted Sprites setting
+    /// asks once per project+provider instead of silently forwarding.
     #[serde(skip)]
     #[schemars(skip)]
     pub model_credentials_explicit: bool,

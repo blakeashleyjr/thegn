@@ -239,7 +239,7 @@ fn sprites_ours(names: Option<&BTreeSet<String>>, row: &fleet_cost::FleetRow) ->
 }
 
 /// Shape one env's read. `Err` carries the reason (build or read failure).
-fn env_inventory(
+pub(crate) fn env_inventory(
     env: &str,
     provider: &str,
     read: std::result::Result<InventoryReport, String>,

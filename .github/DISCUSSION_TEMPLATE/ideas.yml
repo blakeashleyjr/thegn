@@ -1,0 +1,31 @@
+name: Idea
+description: Propose an improvement for thegn, to shape before it becomes a tracked issue.
+title: "[Idea] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Ideas that stick are converted into tracked
+        issues by a maintainer, so keep the discussion focused on the
+        problem and the shape of a solution.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that thegn makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What would you like to see? A keybind, a panel, a config key, a behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use now, or other approaches you weighed.
+    validations:
+      required: false

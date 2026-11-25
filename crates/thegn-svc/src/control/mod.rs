@@ -1125,6 +1125,16 @@ pub struct CalendarEventsReply {
 pub trait ControlApi: Send + Sync + 'static {
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>>;
 
+    /// Read-only provider fleet report (`fleet.list`). The payload is the
+    /// existing CLI JSON report so the control surface cannot drift models.
+    fn fleet_list(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "fleet listing is not available",
+            ))
+        })
+    }
+
     /// Worktrees registered with thegn (`worktrees.list`). Defaulted like the
     /// calendar verbs so transport-only impls and test fakes need no wiring.
     fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<WorktreeInfo>>> {

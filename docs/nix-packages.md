@@ -14,6 +14,25 @@ one currently built by each attribute.
 | `.#thegn-dev`      | Alias of the dev-channel host package.                                                | On x86_64-linux, `THEGN_BRIDGE_BINARY`; elsewhere none.    |
 | `.#thegn-musl`     | Static musl bridge binary for provider microVMs.                                      | the bridge itself                                          |
 
+## Run without installing
+
+`nix run github:blakeashleyjr/thegn` builds the stable host and starts it
+straight from the flake, with nothing added to a Nix profile. The bare
+reference resolves `apps.default`, which names the same `bin/thegn` wrapper
+`.#default` installs, so the pinned yazi and the runtime tools are on `PATH`
+exactly as they are for an installed package.
+
+```sh
+nix run github:blakeashleyjr/thegn        # stable host, one command
+nix run github:blakeashleyjr/thegn#dev    # dev channel, as thegn-dev
+nix run github:blakeashleyjr/thegn/v<tag> # pin a published release tag
+```
+
+The first run compiles the workspace and its dependencies — and on x86_64
+Linux also the musl bridge that `.#default` carries — so it is a long build, not
+a download. Later runs reuse the store paths, so the only files that change are
+the ones thegn itself keeps in its state directory.
+
 ## Bridge discovery
 
 Release archives, Homebrew and the deb/rpm/AUR packages ship the same bridge as
@@ -36,6 +55,10 @@ On x86_64-linux, `.#default` and `.#dev` each pull in the musl cross-compile of
 the workspace, about double the cost of a plain stable build. `.#thegn-nobridge`
 avoids that compile and is what CI builds routinely. These are qualitative
 build-cost descriptions; no timing or closure-size measurements are claimed.
+
+The same applies to `nix run github:blakeashleyjr/thegn`: the default app is
+`.#default`, so the first bare run pays for the native build plus the musl
+cross-build.
 
 ## Module defaults and stable users
 

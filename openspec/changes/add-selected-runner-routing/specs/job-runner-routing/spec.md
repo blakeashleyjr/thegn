@@ -99,3 +99,27 @@ stock interactive command interception are outside this contract.
 - **WHEN** the runner returns more than 16 KiB of output
 - **THEN** only the tail is retained and the result reports
   `truncated.logTail`
+
+### Requirement: Per-project runner binding and route inspector
+
+The selected runner SHALL be resolvable per project. A trusted
+`[project.<slug>.jobs] runner` (legacy `[workspace.<slug>.jobs]`) SHALL win over
+the global `[jobs] runner` for that project only, and the global key SHALL
+remain the fallback. A repo-root `.thegn.*` overlay MUST NOT set it, and an
+ambiguous or refused project block MUST fail closed (no runner, not the global
+one). An explicit `--runner` SHALL win over both. `thegn job route [--json]`
+SHALL print the effective destination and the reason (project binding, global
+default, or local) without resolving a token or dispatching anything.
+
+#### Scenario: Two projects bind different runners
+
+- **WHEN** project A binds `[project.a.jobs] runner = "sp"` and project B has
+  no binding while `[jobs] runner = "vx"`
+- **THEN** `job route` reports `sp` with source `project` for A and `vx` with
+  source `global` for B
+
+#### Scenario: Nothing selects a runner
+
+- **WHEN** neither a project binding nor `[jobs] runner` is set
+- **THEN** `job route` reports destination `local` and `job run` still
+  requires `--runner`

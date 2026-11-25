@@ -272,6 +272,7 @@ pub mod merge_queue_view;
 pub mod merge_sweep;
 pub mod metrics;
 pub mod migrate_brand;
+pub mod model_credential_consent;
 pub mod models;
 pub mod msg;
 pub mod notification;

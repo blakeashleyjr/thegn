@@ -23,9 +23,17 @@ See [[sandboxing]] and [[getting-started]].
   and put `thegn` on your `PATH`. The commands are under
   [Release archive](#release-archive) below. Use the musl archive on older
   distributions.
-- **Nix:** `nix profile install github:blakeashleyjr/thegn`.
+- **Nix:** `nix profile install github:blakeashleyjr/thegn`, or
+  `nix run github:blakeashleyjr/thegn` to try it with nothing installed.
 - **Source checkout:** `./install.sh` (needs Rust). It is not in the release
   archive.
+
+`nix run github:blakeashleyjr/thegn` builds the stable host from the flake and
+starts it without writing to a Nix profile, so it is the quickest check that
+thegn runs on your machine. It runs the same wrapped binary an installed
+package gives you, and the first run compiles the workspace instead of
+downloading it. Add `#dev` for the dev channel, or a `v<version>` tag after the
+repository to pin a published release.
 
 The macOS release tarball also works, but it is not signed or notarized. A copy
 downloaded in a browser is quarantined by Gatekeeper; run
@@ -117,6 +125,11 @@ thegn entry. To upgrade a Home Manager install, bump the release tag in both the
 (see the README's Install section) and rebuild your Home Manager configuration. `nix profile rollback` returns a
 profile to its previous generation; this is Nix's profile history, not a
 thegn rollback command.
+
+`nix run github:blakeashleyjr/thegn` has no installed state to upgrade: each
+run builds the ref you name, so running it again after the branch moves builds
+the new commit. Pin `github:blakeashleyjr/thegn/v<version>` for a fixed
+release.
 
 ### Source checkout
 

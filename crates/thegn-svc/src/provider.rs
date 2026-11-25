@@ -1460,6 +1460,9 @@ impl RemoteProvider for SpritesProvider {
                     crate::vps::PartialReason::RowCap => {
                         anyhow!("sprites list exceeded the row limit; refusing a partial list")
                     }
+                    crate::vps::PartialReason::ByteCap => {
+                        anyhow!("sprites list exceeded the byte limit; refusing a partial list")
+                    }
                     crate::vps::PartialReason::DuplicateId => anyhow!(
                         "sprites list returned duplicate sprite name {} (the continuation token may have been ignored)",
                         duplicate.unwrap_or_default()
@@ -1469,6 +1472,14 @@ impl RemoteProvider for SpritesProvider {
                         "sprites list exceeded the {} second budget; refusing a partial list",
                         crate::vps::INVENTORY_BUDGET.as_secs()
                     ),
+                    crate::vps::PartialReason::TotalChanged
+                    | crate::vps::PartialReason::EmptyPage
+                    | crate::vps::PartialReason::DuplicateName => {
+                        anyhow!(
+                            "sprites list returned a partial inventory: {}",
+                            reason.message()
+                        )
+                    }
                 }),
                 crate::vps::Inventory::Unknown(reason) => Err(anyhow!(reason)),
             }

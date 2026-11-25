@@ -958,7 +958,7 @@ fn sprites_min_ram_note_and_clean_env() {
     );
     assert!(
         labelled(&w, "env.s.provider.model_credentials:")[0]
-            .contains("credentials are forwarded by default")
+            .contains("not forwarded until you approve")
     );
 }
 

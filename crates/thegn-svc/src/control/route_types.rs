@@ -8,6 +8,7 @@
 /// request cell names the query type.
 pub static ROUTE_TYPES: &[(&str, &str, &str)] = &[
     ("me", "—", "{pairing_id, label, scopes}"),
+    ("fleet.list", "—", "{generated_ms, view, cost, agents}"),
     ("sessions.list", "—", "{sessions:[SessionInfo]}"),
     ("sessions.open", "OpenSpec", "SessionInfo"),
     ("sessions.fork", "ForkSpec", "SessionInfo"),

@@ -405,7 +405,7 @@ bench-steady: release _perf-guard
 
 # Resource-soak gate: the same harness over a 40-worktree fixture for a minute,
 # asserting the axes CPU sampling cannot see — unreaped children, descriptors,
-# threads and the read-syscall RATE. The incident that motivated this ran a
+# threads, resident memory and the read-syscall RATE. The incident that motivated this ran a
 # process to 4,408 zombie children and 26,063 reads/sec while its cores-used
 # looked ordinary, so `bench-idle` passing says nothing about accumulation.
 # Machine-dependent, so out of `just ci` like the rest of perf — but unlike the
@@ -419,7 +419,8 @@ bench-soak *args: release _perf-guard
 # daemon: every other one passes THEGN_NO_DAEMON=1, which is exactly why the
 # daemon's own per-pane child leak (THE-704) went unnoticed for three days while
 # `bench-idle` and `bench-soak` stayed green. The daemon is the longest-lived
-# process thegn runs, so it is where a per-event leak compounds.
+# process thegn runs, so it is where a per-event leak compounds. Its RSS is
+# reported as `rss_daemon_kb` alongside the host's `rss_host_kb`.
 bench-soak-daemon *args: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario soak-daemon {{args}}
 
@@ -444,6 +445,21 @@ perf-flood *args: release _perf-guard
 perf-t3 *args: release _perf-guard
     bash test/perf/t3-workspace-switch.sh {{args}}
 
+# thegn vs tmux vs zellij on this machine (THE-2661): startup, `cat` of 100 MiB
+# and `yes | head -n 5e7`, idle CPU + RSS with 1 and 8 panes — same PTY wrapper
+# and pane shell for every tool (test/perf/compare/). Prints one table plus a
+# manifest under target/perf-compare/. Fails if a tool is missing or its version
+# differs from test/perf/compare/pins.json. Takes ~10 minutes (60 s settle x
+# 2 pane counts x 3 tools); results go in docs/performance-results.md.
+perf-compare *args: release _perf-guard
+    python3 -I test/perf/compare/compare.py {{args}}
+
+# Quiet-session keystroke echo: types N keys at fixed spacing into `cat` and
+# reports p50/p95/p99 of key → first PTY output (submission, not paint).
+# Advisory, machine-dependent. --tool thegn|tmux.
+perf-echo *args: release _perf-guard
+    bash test/perf/echo.sh {{args}}
+
 # Criterion micro-benchmarks across the workspace (hot git path, core models).
 # `cargo bench` uses the release-grade bench profile. For a debug-vs-release
 # A/B, append `--profile dev`. Pass extra criterion args after `--`.
@@ -463,6 +479,7 @@ perf: bench bench-idle bench-micro
 # Cheap hermetic regression checks for perf harness internals.
 perf-selftest:
     bash test/perf/pause-process-scan.sh
+    bash test/perf/rss-sample.sh
 
 # Build thegn with the in-process sampling profiler (release + profiling
 # feature). SIGUSR2 toggles a flamegraph capture written to

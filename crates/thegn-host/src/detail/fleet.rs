@@ -265,7 +265,12 @@ fn build_sections(snap: &FleetSnapshot, now_ms: i64) -> SectionsDetail {
         )),
     ));
 
-    if view.rows.is_empty() {
+    if view.rows.is_empty() && !view.partial.is_empty() {
+        secs.push(heading(
+            "No provider sandboxes confirmed; inventory is incomplete.",
+            None,
+        ));
+    } else if view.rows.is_empty() {
         secs.push(heading("No provider sandboxes listed.", None));
     } else {
         let mut rows = Vec::new();
@@ -423,6 +428,7 @@ mod tests {
     use thegn_core::placement::fleet_cost::{
         self, FleetRow, FleetView, PartialEnv, PriceRow, RecordedSandbox,
     };
+    use thegn_svc::provider::{InventoryReport, SandboxInfo};
 
     const TABLE: &[PriceRow] = &[PriceRow {
         provider: "fly",
@@ -678,6 +684,127 @@ mod tests {
         assert!(lines.iter().any(|l| l == "No provider sandboxes listed.: "));
         assert!(lines.iter().any(|l| l == "burn=$0.0000/h"));
         assert!(!lines.iter().any(|l| l.starts_with("orphan:")));
+    }
+
+    #[test]
+    fn provider_inventory_display_keeps_page_rows_identity_and_offline_state() {
+        let complete = crate::fleet_read::env_inventory(
+            "vps",
+            "hetzner",
+            Ok(InventoryReport::Complete(vec![
+                SandboxInfo {
+                    id: "tg-first".into(),
+                    name: Some("101".into()),
+                    state: Some("running".into()),
+                    ..SandboxInfo::default()
+                },
+                SandboxInfo {
+                    id: "tg-selected".into(),
+                    name: Some("202".into()),
+                    state: Some("off".into()),
+                    ..SandboxInfo::default()
+                },
+            ])),
+        );
+        let offline = crate::fleet_read::env_inventory(
+            "do",
+            "digitalocean",
+            Err("temporary provider timeout".into()),
+        );
+        let view = fleet_cost::join(
+            vec![complete, offline],
+            vec![
+                RecordedSandbox {
+                    worktree: "/wt/first".into(),
+                    provider: "hetzner".into(),
+                    env: "vps".into(),
+                    id: "tg-first".into(),
+                },
+                RecordedSandbox {
+                    worktree: "/wt/selected".into(),
+                    provider: "hetzner".into(),
+                    env: "vps".into(),
+                    id: "tg-selected".into(),
+                },
+                RecordedSandbox {
+                    worktree: "/wt/unreadable".into(),
+                    provider: "digitalocean".into(),
+                    env: "do".into(),
+                    id: "tg-not-provably-missing".into(),
+                },
+            ],
+        );
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(view.orphans, 0);
+        assert!(
+            view.missing.is_empty(),
+            "offline inventory cannot prove absence"
+        );
+        assert_eq!(view.partial.len(), 1);
+        assert_eq!(view.partial[0].env, "do");
+
+        let detail = build_sections(&snap(view), NOW);
+        let lines = texts(&detail.sections);
+        assert!(
+            lines.iter().any(|line| line.starts_with(
+                "provider VMs: 2 listed · 0 orphan · 0 missing · 0 down · 0 unrecorded"
+            )),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("|tg-first|")));
+        assert!(lines.iter().any(|line| line.contains("|tg-selected|")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "do=unavailable: temporary provider timeout")
+        );
+        let cursor = detail.cursor.expect("two provider rows remain selectable");
+        assert_eq!(cursor.rows[1].id, "hetzner/tg-selected");
+        assert!(matches!(
+            cursor.rows[1].keys.as_slice(),
+            [
+                ('s', DetailAction::FleetDown { worktree, label, stop: true }),
+                ('d', DetailAction::FleetDown { worktree: destroy_worktree, label: destroy_label, stop: false })
+            ] if worktree == "/wt/selected"
+                && destroy_worktree == "/wt/selected"
+                && label == "hetzner/tg-selected"
+                && destroy_label == "hetzner/tg-selected"
+        ));
+
+        let offline_only = crate::fleet_read::env_inventory(
+            "vps",
+            "hetzner",
+            Err("temporary provider timeout".into()),
+        );
+        let empty_detail = build_sections(
+            &snap(fleet_cost::join(
+                vec![offline_only],
+                vec![RecordedSandbox {
+                    worktree: "/wt/unreadable".into(),
+                    provider: "hetzner".into(),
+                    env: "vps".into(),
+                    id: "tg-known".into(),
+                }],
+            )),
+            NOW,
+        );
+        let lines = texts(&empty_detail.sections);
+        assert!(
+            lines.iter().any(|line| {
+                line == "No provider sandboxes confirmed; inventory is incomplete.: "
+            })
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "No provider sandboxes listed.: ")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "vps=unavailable: temporary provider timeout")
+        );
+        assert!(empty_detail.cursor.is_none());
     }
 
     #[test]

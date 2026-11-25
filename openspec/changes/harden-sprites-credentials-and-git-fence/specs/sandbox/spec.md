@@ -6,7 +6,9 @@
 
 thegn SHALL accept `model_credentials` of `none` or `upload` for Sprites and refuse
 `proxy` and `inject`. Under `none` it MUST NOT send the fixed model credential variables
-or agent login files into the sandbox. An env that leaves the key unset keeps its prior behaviour.
+or agent login files into the sandbox. An env that leaves the key unset SHALL ask once per
+project and provider on the first interactive launch, and forward only after approval. With
+no UI and no remembered answer it MUST withhold, never block, and print the same one-line hint.
 
 #### Scenario: Sprites none withholds
 
@@ -17,6 +19,18 @@ or agent login files into the sandbox. An env that leaves the key unset keeps it
 
 - **WHEN** a sprites env sets `model_credentials = "upload"`
 - **THEN** credentials and logins are forwarded as before
+
+#### Scenario: Unset asks once per project
+
+- **WHEN** a sprites env leaves `model_credentials` unset and no answer is remembered and a UI is active
+- **THEN** the launch pauses and one menu names the agents and fixed model credential variables, without reading their values
+- **AND** "forward and remember" forwards them and stores the answer, "not now" withholds for this launch only, and "never" withholds and stores that answer
+- **AND** a later launch on the same project and provider reuses the stored answer without asking
+
+#### Scenario: Unset headless withholds
+
+- **WHEN** a sprites env leaves `model_credentials` unset and no answer is remembered and no UI is active
+- **THEN** provisioning withholds the credentials, skips the login step and resync, and prints one line naming what was withheld and the `model_credentials` key
 
 ### Requirement: Sprites destroy is done only on proof
 
