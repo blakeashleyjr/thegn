@@ -622,7 +622,8 @@ source digest, the duration and an estimated cost from the runner's ledger, and
 the last 16 KiB of output (marked when earlier output was dropped). Exit codes:
 the recipe's own code, `130` cancelled, `124` deadline, `128 + n` killed by
 signal `n`, and `1` when no outcome was proven or the run was refused; an
-unproven run may have executed, so check the ledger before retrying. The
+unproven run may have executed, so check the ledger before retrying, while
+`job not started: ...` means nothing was dispatched and a retry is safe. The
 daemon settles attempts a crash left behind for the configured `[jobs] runner`
 when it starts. Not yet forwarded: custom argv, working directory and per-step
 deadlines.

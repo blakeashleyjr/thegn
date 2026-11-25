@@ -567,3 +567,41 @@ fn a_cancel_during_the_runner_call_reaches_its_hook_and_reads_back_as_cancelled(
     late.on_cancel(move || flag.store(true, Ordering::SeqCst));
     assert!(fired.load(Ordering::SeqCst));
 }
+
+#[test]
+fn a_runner_that_proves_nothing_was_dispatched_is_a_refusal_not_unproven() {
+    struct NeverSentRunner;
+    impl SelectedRunner for NeverSentRunner {
+        fn submit(
+            &self,
+            _runner_alias: &str,
+            _recipe: Recipe,
+            _source: &Digest,
+            _deadline: Duration,
+            _cancel: &SelectedCancel,
+        ) -> Result<SelectedJobResult, RunnerRefusal> {
+            Err(RunnerRefusal::NotStarted("unresolved env".into()))
+        }
+    }
+    struct NeverSentDirectory;
+    impl RunnerDirectory for NeverSentDirectory {
+        fn resolve(&self, _: &str) -> Option<&dyn SelectedRunner> {
+            Some(&NeverSentRunner)
+        }
+    }
+
+    let spec = JobSpec::parse_yaml(SELECTED_BUILD).unwrap();
+    let failure = submit_selected(
+        &spec,
+        &Digest::of(b""),
+        &NeverSentDirectory,
+        &SelectedCancel::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure,
+        SelectedFailure::Refused(RunnerRefusal::NotStarted("unresolved env".into()))
+    );
+    let readback = selected_job_readback("job-never-sent", Err(failure));
+    assert!(matches!(readback.status, JobStatus::Rejected { .. }));
+}

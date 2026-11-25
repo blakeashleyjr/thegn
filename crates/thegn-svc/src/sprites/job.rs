@@ -3335,7 +3335,7 @@ impl SpritesSelectedRunner {
     fn unavailable(&self, error: impl std::fmt::Display) -> RunnerRefusal {
         // `{:#}` keeps the cause chain: a refusal is the operator's only clue
         // about which call the sprite rejected and why.
-        RunnerRefusal::RunnerUnavailable(format!("{}: {error:#}", self.alias))
+        RunnerRefusal::NotStarted(format!("{}: {error:#}", self.alias))
     }
 }
 
@@ -3382,7 +3382,7 @@ impl SelectedRunner for SpritesSelectedRunner {
             // A cancel that closed the attempt before dispatch is recorded as
             // rejected (nothing was sent, so no command ran); the route reads it
             // back as a user cancel rather than an unavailable runner.
-            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+            Err(RunnerRefusal::NotStarted(_)) if token.is_cancelled() => {
                 return Ok(cancelled(self));
             }
             Err(refusal) => return Err(refusal),

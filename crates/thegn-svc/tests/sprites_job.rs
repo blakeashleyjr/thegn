@@ -992,7 +992,7 @@ async fn a_rejected_handshake_is_provably_never_run_and_commits_no_spend() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("sprites-tgtest1"), "{why}");
@@ -1155,7 +1155,7 @@ async fn the_spend_envelope_stops_the_attempt_that_would_exceed_it() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("spend envelope exhausted"), "{why}");
@@ -1315,7 +1315,7 @@ async fn a_second_project_cannot_bind_a_sprite_the_first_one_holds() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("already bound to project"), "{why}");
@@ -1336,7 +1336,7 @@ async fn a_second_project_cannot_bind_a_sprite_the_first_one_holds() {
         .await
         .unwrap_err();
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("already bound to another project"), "{why}");
@@ -1488,7 +1488,7 @@ async fn a_transfer_over_its_own_budget_is_rejected_and_cleaned_up() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("transfer exceeded"), "{why}");
@@ -1513,7 +1513,7 @@ async fn a_denied_transfer_is_refused_before_a_command_can_run() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("403"), "{why}");
@@ -1543,7 +1543,7 @@ async fn a_checkout_holding_a_stray_file_is_never_run() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("does not hold exactly"), "{why}");
@@ -2054,7 +2054,7 @@ async fn a_token_cancelled_before_dispatch_never_sends_a_command() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert!(mock.execs.lock().unwrap().is_empty());
     assert_eq!(
         store.read(1).unwrap().unwrap().state,

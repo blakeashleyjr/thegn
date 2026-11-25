@@ -1761,7 +1761,7 @@ impl VercelSelectedRunner {
 
     fn unavailable(&self, error: impl std::fmt::Display) -> RunnerRefusal {
         // `{:#}` keeps the cause chain: a refusal is the operator's only clue.
-        RunnerRefusal::RunnerUnavailable(format!("{}: {error:#}", self.alias))
+        RunnerRefusal::NotStarted(format!("{}: {error:#}", self.alias))
     }
 
     /// [`persist`](Self::persist) guarded by [`AttemptStore::mark_if_unchanged`].
@@ -2039,7 +2039,7 @@ impl SelectedRunner for VercelSelectedRunner {
             Ok(receipt) => receipt,
             // A cancel that closed the attempt before dispatch is recorded as
             // rejected; the route reads it back as a user cancel.
-            Err(RunnerRefusal::RunnerUnavailable(_)) if token.is_cancelled() => {
+            Err(RunnerRefusal::NotStarted(_)) if token.is_cancelled() => {
                 return Ok(cancelled(self));
             }
             Err(refusal) => return Err(refusal),

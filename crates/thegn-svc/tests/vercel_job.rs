@@ -861,7 +861,7 @@ async fn a_token_cancelled_before_dispatch_never_starts_the_command() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert_eq!(mock.count("POST", "/cmd"), 0, "no command was started");
     assert_eq!(
         store.read(1).unwrap().unwrap().state,
@@ -923,7 +923,7 @@ async fn a_team_or_project_mismatch_is_refused_before_any_create() {
         .unwrap_err();
 
     let why = match refusal {
-        RunnerRefusal::RunnerUnavailable(why) => why,
+        RunnerRefusal::NotStarted(why) => why,
         other => panic!("expected an unavailable runner, got {other:?}"),
     };
     assert!(why.contains("refusing to claim"), "{why}");
@@ -1175,7 +1175,7 @@ async fn an_ambiguous_create_is_left_pending_and_never_dispatches() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     assert_eq!(mock.count("POST", "/cmd"), 0, "nothing was dispatched");
     let record = store.read(1).unwrap().unwrap();
     assert_eq!(record.state, AttemptState::Rejected);
@@ -1258,7 +1258,7 @@ async fn a_rejected_attempt_after_the_create_records_an_estimated_spend() {
         .await
         .unwrap_err();
 
-    assert!(matches!(refusal, RunnerRefusal::RunnerUnavailable(_)));
+    assert!(matches!(refusal, RunnerRefusal::NotStarted(_)));
     let record = store.read(1).unwrap().unwrap();
     assert_eq!(record.state, AttemptState::Rejected);
     assert_eq!(record.cleanup, Cleanup::Done);

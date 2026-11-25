@@ -47,8 +47,15 @@ pub enum SelectedCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerRefusal {
     InvalidSpec(String),
-    SourceMismatch { expected: Digest, observed: Digest },
+    SourceMismatch {
+        expected: Digest,
+        observed: Digest,
+    },
     RunnerUnavailable(String),
+    /// The runner proves nothing was dispatched (no recipe exec was sent): an
+    /// unresolved binding, a snapshot or claim failure, a provider rejection.
+    /// The route reads it back as [`SelectedFailure::Refused`], never unproven.
+    NotStarted(String),
     WrongRunner,
     WrongSource,
     WrongRecipe,
@@ -63,6 +70,7 @@ impl std::fmt::Display for RunnerRefusal {
                 f.write_str("captured source digest does not match the pinned identity")
             }
             Self::RunnerUnavailable(name) => write!(f, "selected runner {name:?} is unavailable"),
+            Self::NotStarted(reason) => write!(f, "{reason}"),
             Self::WrongRunner => f.write_str("runner result came from a different runner"),
             Self::WrongSource => f.write_str("runner result names a different source digest"),
             Self::WrongRecipe => f.write_str("runner result names a different recipe"),
@@ -158,7 +166,8 @@ impl SelectedCancel {
 
 /// A runner that accepts only a fully typed, source-pinned request. `submit`
 /// may already have started work when it returns `Err`, so every error it
-/// returns is read back as unproven, never as a refusal. A cancel before or
+/// returns is read back as unproven, except [`RunnerRefusal::NotStarted`],
+/// which asserts nothing was dispatched. A cancel before or
 /// during dispatch must come back as `Ok` with [`SelectedCompletion::Cancelled`].
 pub trait SelectedRunner: Send + Sync {
     fn submit(
@@ -227,7 +236,11 @@ pub fn submit_selected(
     // pre-submission refusal. A lost or mismatched receipt stays indeterminate.
     let result = runner
         .submit(runner_alias, recipe, expected, deadline, cancel)
-        .map_err(SelectedFailure::Unproven)?;
+        .map_err(|refusal| match refusal {
+            // The runner proved nothing was sent, so this is a plain refusal.
+            RunnerRefusal::NotStarted(_) => SelectedFailure::Refused(refusal),
+            other => SelectedFailure::Unproven(other),
+        })?;
     if result.runner != runner_alias {
         return Err(SelectedFailure::Unproven(RunnerRefusal::WrongRunner));
     }
