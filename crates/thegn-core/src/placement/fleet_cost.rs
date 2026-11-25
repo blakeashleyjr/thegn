@@ -460,10 +460,11 @@ pub struct FleetCost {
 }
 
 /// Sprites bill by usage, not by the hour: published CPU rate, USD per
-/// CPU-hour (`sprites.dev/pricing`, as of [`PRICE_TABLE_DATE`]).
-pub const SPRITES_CPU_USD_PER_HOUR: f64 = 0.07;
-/// Published memory rate, USD per reserved GB-hour.
-pub const SPRITES_GB_USD_PER_HOUR: f64 = 0.04375;
+/// CPU-hour (fly.io/pricing, Sprites section, checked 2026-11-25). Storage
+/// (hot $0.000683/GB-h while awake, cold $0.000027/GB-h) is not yet counted.
+pub const SPRITES_CPU_USD_PER_HOUR: f64 = 0.0385;
+/// Published memory rate, USD per GB-hour of actual memory use.
+pub const SPRITES_GB_USD_PER_HOUR: f64 = 0.021875;
 
 /// One Sprites account's usage-API readings, in hours. Account-wide: it
 /// covers every sprite on the account, including those another host created.
@@ -858,10 +859,10 @@ mod tests {
             recent_window_hours: 2.0,
         };
         apply_sprites_usage(&mut cost, &view, &[usage]);
-        let today = 2.0 * 0.07 + 4.0 * 0.04375;
+        let today = 2.0 * 0.0385 + 4.0 * 0.021875;
         assert!(close(cost.today, today));
-        assert!(close(cost.mtd, 10.0 * 0.07 + 20.0 * 0.04375));
-        let burn = (0.07 + 2.0 * 0.04375) / 2.0;
+        assert!(close(cost.mtd, 10.0 * 0.0385 + 20.0 * 0.021875));
+        let burn = (0.0385 + 2.0 * 0.021875) / 2.0;
         assert!(close(cost.total_hourly, burn));
         assert!(close(cost.per_provider_hourly["sprites"], burn));
         assert!(close(cost.projected_24h, burn * 24.0));
@@ -885,7 +886,7 @@ mod tests {
         };
         apply_sprites_usage(&mut cost, &view, &[usage]);
         assert!(close(cost.today, 0.0));
-        assert!(close(cost.mtd, 0.07));
+        assert!(close(cost.mtd, 0.0385));
         assert!(close(cost.total_hourly, 0.0));
         assert!(!cost.per_provider_hourly.contains_key("sprites"));
         let mut untouched = fleet_cost(&view, BUNDLED_PRICES, &BTreeMap::new(), 0);
