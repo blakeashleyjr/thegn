@@ -7,6 +7,49 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.133] — 2026-11-25
+
+Model credentials are no longer sent to a remote sandbox without asking. If
+`model_credentials` is unset, the first agent launch on a Sprite asks once per
+project and provider; set `upload` or `none` to skip the question.
+
+### Changed
+
+- Forwarding your model login and API keys to a Sprite now asks once per
+  project and provider: forward and remember, not now, or never for this
+  project. Answers are kept in thegn's database, never in a repository file.
+  Runs with no screen to answer on (`thegn job run`, pipelines) do not forward
+  and print a one-line hint naming the setting.
+- The Alt+W agent picker lists only agents installed on this machine, with an
+  install hint for the rest.
+- The welcome tour shows a visible "Skip tour (Esc)" control on every screen.
+
+### Added
+
+- `[project.<name>.jobs] runner` binds a job runner to one project, and
+  `thegn job route` prints where this worktree's jobs will run and why.
+- The provider fleet report is available over the control socket and MCP.
+- `nix run github:blakeashleyjr/thegn` starts thegn (the flake declares
+  `apps.default`).
+- Performance harnesses: `just perf-compare` (tmux and zellij comparison),
+  `just perf-echo` (quiet-session keystroke echo), cat-file and many-pane modes
+  for `just perf-flood`, and host and daemon RSS in the soak report.
+- Tests replay database snapshots from shipped releases through the migrator,
+  and a SIGKILL test checks that a session survives its client being killed.
+- Discussion templates and a launch-day operations plan under `docs/launch/`.
+
+### Fixed
+
+- `thegn config validate` warns that network allow and block lists are
+  advisory on local sandbox backends.
+- Provider inventories that are unstable or too large are refused instead of
+  half-read, and an empty offline read is labelled incomplete.
+- A lost Vercel job reconcile race is reported as superseded, not failed.
+- Refusing to destroy a sprite another thegn instance created now names
+  `thegn env adopt`.
+- `thegn agent run --track --wait` closes its dispatch row when the agent
+  exits, so the next tracked run on that issue is not refused.
+
 ## [0.1.0-alpha.132] — 2026-11-24
 
 Restart thegn after upgrading. If an older daemon still holds the database,
