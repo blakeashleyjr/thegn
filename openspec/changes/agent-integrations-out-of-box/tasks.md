@@ -30,10 +30,13 @@
       `settings.json`) and Codex (`notify`), written by the same marked
       writer as `thegn mcp wire` and reporting through the hidden
       `thegn agent hook` verb over the control socket (finished turn and
-      needs-you; working stays CPU-derived).
-- [ ] 4.2 Hermes registry harness and YAML MCP adapter.
-- [ ] 4.3 Remote envs: rewrite the carried MCP command to the in-sandbox thegn.
+      needs-you; working stays CPU-derived). Remote sandboxes get the same
+      hooks, with the in-sandbox resolver as the hook command.
+- [x] 4.2 Hermes registry harness and YAML MCP adapter (`~/.hermes/config.yaml`,
+      `HERMES_HOME`; comment-marked, text-edited so user text is untouched).
+- [x] 4.3 Remote envs: after the agent install and login sync, wire MCP with an
+      in-sandbox resolver command and seed the `thegn` skill, idempotently.
 - [x] 4.4 Offer the wiring from the welcome tour's agent step as an explicit
       one-key accept (`w`), written at finish.
-- [ ] 4.5 Show the same offer once to an existing user whose detected agents
+- [x] 4.5 Show the same offer once to an existing user whose detected agents
       are not wired (outside the first-run tour).

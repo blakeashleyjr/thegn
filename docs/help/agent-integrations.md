@@ -43,7 +43,18 @@ a `Notification` hook in `~/.claude/settings.json`, Codex a `notify` line in
 finished or the agent needs you, and prints nothing. A hook or `notify` you
 wrote yourself is never replaced; Codex runs only one notifier, so thegn skips
 it and says so. The welcome tour offers all of this with one key (`w`) on its
-agents step and writes nothing until you press it.
+agents step and writes nothing until you press it. If you finished the tour before agents were
+wired, thegn asks once at a later start; either answer is remembered and the
+answer is never asked again.
+Remote Sprites and Vercel environments get the same MCP entries and hooks, run
+through a resolver that finds `thegn` inside the environment.
+
+Hermes keeps its servers in `~/.hermes/config.yaml` (or `$HERMES_HOME`) under
+`mcp_servers:`. thegn edits that file as text, so your comments, key order and
+quoting stay byte for byte; each thegn entry has a `# x-thegn-managed` comment
+above it. A `mcp_servers` written as an inline `{}` mapping or a list is left
+alone, and `wire` tells you why. These paths follow Hermes's documented layout
+and have not been checked against every release.
 
 Codex keeps its servers in `~/.codex/config.toml` (or `$CODEX_HOME`), which
 thegn edits in place: your comments and tables stay as they were, and thegn's
@@ -51,15 +62,15 @@ tables carry a `# x-thegn-managed` comment.
 
 ## Per agent
 
-| Agent                   | Launch and pipelines | Skills seeded     | `thegn mcp wire`       | Remote install |
-| ----------------------- | -------------------- | ----------------- | ---------------------- | -------------- |
-| Claude Code             | yes                  | `.claude/skills/` | `~/.claude.json`       | yes            |
-| Codex                   | yes                  | `.agents/skills/` | `~/.codex/config.toml` | yes            |
-| pi                      | yes                  | `.pi/skills/`     | pi has no MCP client   | yes            |
-| Hermes                  | interactive only     | no                | not yet                | yes            |
-| Gemini CLI, Cursor, Amp | interactive only     | no                | yes                    | no             |
-| Windsurf, VS Code, Zed  | not a terminal agent | no                | yes                    | no             |
-| Aider                   | yes                  | no                | no                     | no             |
+| Agent                   | Launch and pipelines | Skills seeded     | `thegn mcp wire`        | Remote install |
+| ----------------------- | -------------------- | ----------------- | ----------------------- | -------------- |
+| Claude Code             | yes                  | `.claude/skills/` | `~/.claude.json`        | yes            |
+| Codex                   | yes                  | `.agents/skills/` | `~/.codex/config.toml`  | yes            |
+| pi                      | yes                  | `.pi/skills/`     | pi has no MCP client    | yes            |
+| Hermes                  | interactive only     | remote only       | `~/.hermes/config.yaml` | yes            |
+| Gemini CLI, Cursor, Amp | interactive only     | no                | yes                     | no             |
+| Windsurf, VS Code, Zed  | not a terminal agent | no                | yes                     | no             |
+| Aider                   | yes                  | no                | no                      | no             |
 
 Every agent, named or not, gets the same activity tracking in the [[sidebar]]
 (working, waiting, finished), the automatic build route for a project with
@@ -81,6 +92,11 @@ helper agent (`thegn agent run`), and what the sandbox will refuse. See
 
 A Sprites or Vercel environment installs Claude Code, Codex, pi and Hermes and
 carries their logins and settings from this machine, so an agent there starts
-signed in. The wired MCP entries travel with the settings but name this
-machine's `thegn` path; inside a remote environment they work only where that
-path exists. See [[environments]].
+signed in. Once the agents are installed and synced, thegn wires the same two
+MCP entries inside the environment and seeds the `thegn` skill into each
+agent's own skill folder (`[skills] enabled = true`). The entries do not use
+this machine's `thegn` path: they run `thegn` from the environment's `PATH`,
+or the `thegn` that the connection pushes there, and report plainly when
+neither exists. Re-provisioning or restoring a snapshot changes nothing that is
+already in place, and an entry or skill you wrote yourself is never replaced.
+See [[environments]].

@@ -4202,7 +4202,7 @@ fn provision_provider_env_inner(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
-                if !grant.login_files {
+                let synced = if !grant.login_files {
                     Ok(())
                 } else {
                     let account_failures = crate::agent_configs::upload_agent_accounts(
@@ -4219,7 +4219,16 @@ fn provision_provider_env_inner(
                         &pc.login_homes,
                     );
                     crate::agent_configs::agent_configs_step_result(configs, &account_failures)
-                }
+                };
+                // Same agents, in the sandbox: wire MCP + seed the skill.
+                crate::agent_integrate::integrate_sandbox_agents(
+                    &provider,
+                    &id,
+                    &sprite_home,
+                    agents,
+                    cfg.skills.enabled,
+                );
+                synced
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::LocalParity {

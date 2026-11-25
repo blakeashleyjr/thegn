@@ -361,11 +361,20 @@ pub fn claude_hook_command(command: &str, event: &str) -> String {
     )
 }
 
-fn hook_group(command: &str, event: &str) -> Value {
+/// The marked shell command for one Claude hook event inside a sandbox: the
+/// in-sandbox resolver ([`SANDBOX_RESOLVER`]) instead of the host's path.
+pub fn sandbox_claude_hook_command(event: &str) -> String {
+    format!(
+        "{SANDBOX_COMMAND} -c {} thegn agent hook claude {event} # {HOOK_MARKER}",
+        shell_word(SANDBOX_RESOLVER)
+    )
+}
+
+fn hook_group(command: &str) -> Value {
     json!({
         "hooks": [{
             "type": "command",
-            "command": claude_hook_command(command, event),
+            "command": command,
         }]
     })
 }
@@ -391,6 +400,27 @@ fn hook_group_is_ours(group: &Value) -> bool {
 pub fn apply_claude_hooks(
     settings: &mut Value,
     command: &str,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    apply_claude_hooks_with(
+        settings,
+        &|event| claude_hook_command(command, event),
+        remove,
+    )
+}
+
+/// [`apply_claude_hooks`] for a sandbox: hooks run the in-sandbox resolver.
+pub fn apply_sandbox_claude_hooks(
+    settings: &mut Value,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    apply_claude_hooks_with(settings, &sandbox_claude_hook_command, remove)
+}
+
+/// Shared body: `make(verb_event)` renders the marked hook command.
+fn apply_claude_hooks_with(
+    settings: &mut Value,
+    make: &dyn Fn(&str) -> String,
     remove: bool,
 ) -> Result<WireOutcome, String> {
     if settings.is_null() {
@@ -429,7 +459,7 @@ pub fn apply_claude_hooks(
                 any_removed = true;
             }
         } else {
-            let want = hook_group(command, verb_event);
+            let want = hook_group(&make(verb_event));
             match ours {
                 Some(i) if groups[i] == want => {}
                 Some(i) => {
@@ -482,7 +512,18 @@ fn toml_notify_is_ours(item: &toml_edit::Item) -> bool {
         return false;
     };
     let words: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-    words.len() == arr.len() && words.len() == 5 && words[1..] == ["agent", "hook", "codex", "stop"]
+    words.len() == arr.len()
+        && words.len() >= 5
+        && words[words.len() - 4..] == ["agent", "hook", "codex", "stop"]
+}
+
+/// The Codex `notify` argv for a sandbox: the in-sandbox resolver then the verb.
+pub fn sandbox_codex_notify_argv() -> Vec<String> {
+    std::iter::once(SANDBOX_COMMAND)
+        .chain(SANDBOX_PREFIX.iter().copied())
+        .chain(["agent", "hook", "codex", "stop"])
+        .map(String::from)
+        .collect()
 }
 
 /// Add (or `remove`) thegn's top-level `notify = [...]` in a Codex
@@ -491,6 +532,22 @@ fn toml_notify_is_ours(item: &toml_edit::Item) -> bool {
 pub fn apply_codex_notify(
     doc: &mut toml_edit::DocumentMut,
     command: &str,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    apply_codex_notify_argv(doc, codex_notify_argv(command), remove)
+}
+
+/// [`apply_codex_notify`] for a sandbox: `notify` runs the in-sandbox resolver.
+pub fn apply_sandbox_codex_notify(
+    doc: &mut toml_edit::DocumentMut,
+    remove: bool,
+) -> Result<WireOutcome, String> {
+    apply_codex_notify_argv(doc, sandbox_codex_notify_argv(), remove)
+}
+
+fn apply_codex_notify_argv(
+    doc: &mut toml_edit::DocumentMut,
+    want: Vec<String>,
     remove: bool,
 ) -> Result<WireOutcome, String> {
     let root = doc.as_table_mut();
@@ -509,13 +566,12 @@ pub fn apply_codex_notify(
     if existing.is_some() && !ours {
         return Err("`notify` is already set by you — refusing to overwrite it".to_string());
     }
-    let want = codex_notify_argv(command);
     if ours
-        && existing
-            .and_then(|i| i.as_array())
-            .and_then(|a| a.iter().next())
-            .and_then(|v| v.as_str())
-            == Some(command)
+        && existing.and_then(|i| i.as_array()).is_some_and(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .eq(want.iter().map(String::as_str))
+        })
     {
         return Ok(WireOutcome::Unchanged);
     }
@@ -530,6 +586,303 @@ pub fn apply_codex_notify(
         WireOutcome::Added
     })
 }
+
+// ── YAML agent settings (Hermes `config.yaml`) ──────────────────────────────
+
+/// The marker comment thegn writes directly above its own entry in a YAML
+/// settings file. A comment because YAML carries no spare key an agent is
+/// guaranteed to ignore, and every YAML reader skips comments.
+pub const YAML_MARKER: &str = "# x-thegn-managed: written by `thegn mcp wire`; \
+                               undo with `thegn mcp wire --remove`";
+
+fn yaml_indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+fn yaml_blank_or_comment(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// A block-mapping line `key: rest` → `(key, rest)`; quoted keys are unquoted.
+fn yaml_key_of(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    if let Some(q) = t.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        let close = t[1..].find(q)? + 1;
+        let rest = t[close + 1..].trim_start().strip_prefix(':')?;
+        return Some((t[1..close].to_string(), rest.to_string()));
+    }
+    let mut chars = t.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == ':' && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) {
+            return Some((t[..i].trim_end().to_string(), t[i + 1..].to_string()));
+        }
+    }
+    None
+}
+
+fn yaml_scalar(s: &str) -> String {
+    // A JSON string is a valid YAML double-quoted scalar.
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// The marked block for one entry at `pad` spaces of indent: argv only.
+fn yaml_entry_lines(pad: usize, key: &str, command: &str, args: &[&str]) -> Vec<String> {
+    let sp = " ".repeat(pad);
+    let flow: Vec<String> = args.iter().map(|a| yaml_scalar(a)).collect();
+    vec![
+        format!("{sp}{YAML_MARKER}"),
+        format!("{sp}{key}:"),
+        format!("{sp}  command: {}", yaml_scalar(command)),
+        format!("{sp}  args: [{}]", flow.join(", ")),
+    ]
+}
+
+/// `[hdr+1, end)`: the section body after the header at `hdr`, trimmed back to
+/// its last content line; plus whether any content line exists.
+fn yaml_body_end(lines: &[String], hdr: usize) -> usize {
+    let mut end = hdr + 1;
+    let mut last = hdr + 1;
+    while end < lines.len() && (yaml_indent(&lines[end]) > 0 || yaml_blank_or_comment(&lines[end]))
+    {
+        if !yaml_blank_or_comment(&lines[end]) {
+            last = end + 1;
+        }
+        end += 1;
+    }
+    last
+}
+
+/// [`apply_named`] for a YAML settings text whose server entries live under a
+/// top-level block mapping `container` (Hermes: `mcp_servers`). A text editor,
+/// not a YAML serializer, so every user comment, key order and quoting survives
+/// byte for byte; the same guarantees hold: argv only, marked by
+/// [`YAML_MARKER`], idempotent, and an entry of that name thegn did not mark is
+/// never overwritten or removed. Shapes it cannot edit safely (CRLF text, a
+/// flow or duplicate `container`, a sequence body, tab indentation) are
+/// refused. Returns the new text and the outcome.
+pub fn apply_yaml(
+    text: &str,
+    container: &str,
+    key: &str,
+    command: &str,
+    args: &[&str],
+    remove: bool,
+) -> Result<(String, WireOutcome), String> {
+    if text.contains('\r') {
+        return Err("settings use CRLF line endings — refusing to rewrite; edit by hand".into());
+    }
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut header: Option<(usize, String)> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with(' ') || l.starts_with('\t') || yaml_blank_or_comment(l) {
+            continue;
+        }
+        if let Some((k, rest)) = yaml_key_of(l)
+            && k == container
+        {
+            if header.is_some() {
+                return Err(format!("`{container}` appears twice — refusing to edit"));
+            }
+            header = Some((i, rest));
+        }
+    }
+    let finish = |lines: Vec<String>| {
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        }
+    };
+    let Some((hdr, rest)) = header else {
+        if remove {
+            return Ok((text.to_string(), WireOutcome::NothingToRemove));
+        }
+        if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("{container}:"));
+        lines.extend(yaml_entry_lines(2, key, command, args));
+        return Ok((finish(lines), WireOutcome::Added));
+    };
+    let inline = rest.split(" #").next().unwrap_or("").trim();
+    if !inline.is_empty() && !inline.starts_with('#') {
+        return Err(format!(
+            "`{container}` is not a block mapping — refusing to rewrite it; edit it by hand"
+        ));
+    }
+    let end = yaml_body_end(&lines, hdr);
+    let content: Vec<usize> = (hdr + 1..end)
+        .filter(|i| !yaml_blank_or_comment(&lines[*i]))
+        .collect();
+    if content.iter().any(|i| lines[*i].starts_with('\t')) {
+        return Err("tab indentation — refusing to edit".into());
+    }
+    if content
+        .iter()
+        .any(|i| lines[*i].trim_start().starts_with("- "))
+    {
+        return Err(format!("`{container}` is a sequence — refusing to edit"));
+    }
+    let child = content.first().map_or(2, |i| yaml_indent(&lines[*i]));
+
+    let mut found: Option<usize> = None;
+    for &i in &content {
+        if yaml_indent(&lines[i]) == child && yaml_key_of(&lines[i]).is_some_and(|(k, _)| k == key)
+        {
+            found = Some(i);
+            break;
+        }
+    }
+    let marker_above = |i: usize| {
+        i > hdr + 1
+            && yaml_indent(&lines[i - 1]) == child
+            && lines[i - 1].trim_start().starts_with('#')
+            && lines[i - 1].contains(TOML_MARKER_TAG)
+    };
+    let new_block = yaml_entry_lines(child, key, command, args);
+
+    let Some(i) = found else {
+        if remove {
+            return Ok((text.to_string(), WireOutcome::NothingToRemove));
+        }
+        lines.splice(end..end, new_block);
+        return Ok((finish(lines), WireOutcome::Added));
+    };
+    if !marker_above(i) {
+        let verb = if remove { "remove" } else { "overwrite" };
+        return Err(format!(
+            "a `{container}.{key}` entry exists but was not created by thegn \
+             (no `{TOML_MARKER_TAG}` comment) — refusing to {verb} it"
+        ));
+    }
+    let start = i - 1;
+    let mut stop = i + 1;
+    let mut last = i + 1;
+    while stop < end && (yaml_blank_or_comment(&lines[stop]) || yaml_indent(&lines[stop]) > child) {
+        if !yaml_blank_or_comment(&lines[stop]) {
+            last = stop + 1;
+        }
+        stop += 1;
+    }
+    if remove {
+        lines.drain(start..last);
+        if yaml_body_end(&lines, hdr) == hdr + 1 {
+            // Nothing else lives under the container: drop the header too (and
+            // the one blank line wiring put above it).
+            lines.remove(hdr);
+            if hdr > 0 && lines[hdr - 1].trim().is_empty() {
+                lines.remove(hdr - 1);
+            }
+        }
+        return Ok((finish(lines), WireOutcome::Removed));
+    }
+    if lines[start..last] == new_block[..] {
+        return Ok((text.to_string(), WireOutcome::Unchanged));
+    }
+    lines.splice(start..last, new_block);
+    Ok((finish(lines), WireOutcome::Updated))
+}
+
+// ── Format dispatch shared by the host command and remote environments ──────
+
+/// How an agent stores its MCP servers on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireFormat {
+    /// A JSON settings file; the container is the JSON path to the server map.
+    Json,
+    /// A TOML settings file; the first container segment is the top-level
+    /// server table (Codex: `[mcp_servers.<name>]`).
+    Toml,
+    /// A YAML settings file; the first container segment is the top-level
+    /// block mapping (Hermes: `mcp_servers:`).
+    Yaml,
+}
+
+/// Apply every [`WIRED_ENTRIES`] row to one settings text. `prefix` is put
+/// before each entry's own args (empty on the host; the in-sandbox resolver for
+/// a remote environment, see [`SANDBOX_COMMAND`]). Returns the new text and the
+/// per-key outcomes; a foreign entry or unparseable text fails the whole text
+/// before anything is returned.
+pub fn apply_all(
+    format: WireFormat,
+    body: &str,
+    container: &[&str],
+    command: &str,
+    prefix: &[&str],
+    remove: bool,
+) -> Result<(String, Vec<(&'static str, WireOutcome)>), String> {
+    let mut outcomes = Vec::new();
+    let full = |args: &[&str]| -> Vec<String> {
+        prefix
+            .iter()
+            .chain(args.iter())
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let rendered = match format {
+        WireFormat::Json => {
+            let mut settings: Value = if body.trim().is_empty() {
+                Value::Object(Map::new())
+            } else {
+                serde_json::from_str(body).map_err(|e| format!("not valid JSON: {e}"))?
+            };
+            for (key, args) in WIRED_ENTRIES {
+                let argv = full(args);
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let entry = wired_entry(command, &refs);
+                outcomes.push((
+                    *key,
+                    apply_named(&mut settings, container, key, entry, remove)?,
+                ));
+            }
+            serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?
+        }
+        WireFormat::Toml => {
+            let mut doc: toml_edit::DocumentMut =
+                body.parse().map_err(|e| format!("not valid TOML: {e}"))?;
+            let top = container.first().copied().unwrap_or("mcp_servers");
+            for (key, args) in WIRED_ENTRIES {
+                let argv = full(args);
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                outcomes.push((
+                    *key,
+                    apply_toml(&mut doc, top, key, command, &refs, remove)?,
+                ));
+            }
+            doc.to_string()
+        }
+        WireFormat::Yaml => {
+            let top = container.first().copied().unwrap_or("mcp_servers");
+            let mut text = body.to_string();
+            for (key, args) in WIRED_ENTRIES {
+                let argv = full(args);
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let (next, outcome) = apply_yaml(&text, top, key, command, &refs, remove)?;
+                text = next;
+                outcomes.push((*key, outcome));
+            }
+            text
+        }
+    };
+    Ok((rendered, outcomes))
+}
+
+/// The command a wired entry runs inside a sandbox / remote environment. The
+/// host's own `thegn` path means nothing there, and the resident bridge path is
+/// content-addressed (it changes with the pushed bytes and arrives after
+/// provisioning), so the entry is a tiny argv-only resolver: `thegn` on `PATH`,
+/// else the resident bridge's `thegn`, else a clear error. Still secret-free.
+pub const SANDBOX_COMMAND: &str = "/bin/sh";
+
+/// The resolver script behind [`SANDBOX_COMMAND`] (`sh -c <script> thegn <args>`).
+pub const SANDBOX_RESOLVER: &str = "t=$(command -v thegn 2>/dev/null); \
+     [ -n \"$t\" ] || t=$(ls -d /var/tmp/thegn-bridge/*/thegn 2>/dev/null | head -n 1); \
+     [ -n \"$t\" ] || { echo 'thegn: no thegn binary in this environment' >&2; exit 127; }; \
+     exec \"$t\" \"$@\"";
+
+/// Args placed before each entry's own args for a sandbox entry.
+pub const SANDBOX_PREFIX: &[&str] = &["-c", SANDBOX_RESOLVER, "thegn"];
 
 // ── The Lead's private MCP config (THE-2188) ────────────────────────────────
 
@@ -1111,5 +1464,233 @@ mod tests {
             apply_codex_notify(&mut none, "t", true),
             Ok(WireOutcome::NothingToRemove)
         );
+    }
+
+    // --- sandbox hooks ------------------------------------------------------
+
+    #[test]
+    fn sandbox_claude_hooks_replace_host_path_and_are_idempotent() {
+        let mut s = json!({"theme": "dark"});
+        assert_eq!(
+            apply_claude_hooks(&mut s, "/home/u/thegn", false),
+            Ok(WireOutcome::Added)
+        );
+        assert_eq!(
+            apply_sandbox_claude_hooks(&mut s, false),
+            Ok(WireOutcome::Updated)
+        );
+        assert!(!s.to_string().contains("/home/u"), "{s}");
+        assert!(s.to_string().contains(HOOK_MARKER));
+        assert_eq!(
+            apply_sandbox_claude_hooks(&mut s, false),
+            Ok(WireOutcome::Unchanged)
+        );
+        assert_eq!(
+            apply_sandbox_claude_hooks(&mut s, true),
+            Ok(WireOutcome::Removed)
+        );
+        assert_eq!(s, json!({"theme": "dark"}));
+    }
+
+    #[test]
+    fn sandbox_codex_notify_replaces_host_path_and_refuses_user_notify() {
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        apply_codex_notify(&mut doc, "/home/u/thegn", false).unwrap();
+        assert_eq!(
+            apply_sandbox_codex_notify(&mut doc, false),
+            Ok(WireOutcome::Updated)
+        );
+        assert!(!doc.to_string().contains("/home/u"), "{doc}");
+        assert_eq!(
+            apply_sandbox_codex_notify(&mut doc, false),
+            Ok(WireOutcome::Unchanged)
+        );
+        let mut mine: toml_edit::DocumentMut = "notify = [\"mine\"]\n".parse().unwrap();
+        assert!(apply_sandbox_codex_notify(&mut mine, false).is_err());
+        assert_eq!(mine.to_string(), "notify = [\"mine\"]\n");
+    }
+
+    // --- YAML (Hermes) ------------------------------------------------------
+
+    fn yaml_wire(text: &str) -> String {
+        let (out, outcomes) = apply_all(
+            WireFormat::Yaml,
+            text,
+            &["mcp_servers"],
+            "/bin/thegn",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(
+            outcomes.iter().all(|(_, o)| *o == WireOutcome::Added),
+            "{outcomes:?}"
+        );
+        out
+    }
+
+    #[test]
+    fn yaml_wire_creates_the_section_and_removes_it_again() {
+        let user = "model: hermes-3\n# my note\nagent:\n  verbose: true\n";
+        let wired = yaml_wire(user);
+        assert!(wired.starts_with(user), "{wired}");
+        assert!(wired.contains("\nmcp_servers:\n"), "{wired}");
+        assert!(
+            wired.contains("  thegn-serve:\n    command: \"/bin/thegn\"\n"),
+            "{wired}"
+        );
+        assert!(wired.contains("args: [\"mcp\", \"proxy\"]"), "{wired}");
+        assert!(!wired.contains("env"), "{wired}");
+        let (back, outcomes) =
+            apply_all(WireFormat::Yaml, &wired, &["mcp_servers"], "x", &[], true).unwrap();
+        assert!(
+            outcomes.iter().all(|(_, o)| *o == WireOutcome::Removed),
+            "{outcomes:?}"
+        );
+        assert_eq!(back, user);
+    }
+
+    #[test]
+    fn yaml_wire_is_idempotent_and_updates_a_changed_command() {
+        let wired = yaml_wire("");
+        let (again, outcomes) = apply_all(
+            WireFormat::Yaml,
+            &wired,
+            &["mcp_servers"],
+            "/bin/thegn",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(
+            outcomes.iter().all(|(_, o)| *o == WireOutcome::Unchanged),
+            "{outcomes:?}"
+        );
+        assert_eq!(again, wired);
+        let (moved, outcomes) = apply_all(
+            WireFormat::Yaml,
+            &wired,
+            &["mcp_servers"],
+            "/opt/thegn",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(
+            outcomes.iter().all(|(_, o)| *o == WireOutcome::Updated),
+            "{outcomes:?}"
+        );
+        assert!(
+            moved.contains("/opt/thegn") && !moved.contains("/bin/thegn"),
+            "{moved}"
+        );
+        assert_eq!(moved.matches("x-thegn-managed").count(), 2, "{moved}");
+    }
+
+    #[test]
+    fn yaml_wire_keeps_user_servers_and_trailing_keys() {
+        let user =
+            "mcp_servers:\n  git:\n    command: \"git-mcp\"\n    args: []\n# tail\nother: 1\n";
+        let wired = yaml_wire(user);
+        assert!(
+            wired.contains("  git:\n    command: \"git-mcp\"\n    args: []\n"),
+            "{wired}"
+        );
+        assert!(wired.ends_with("# tail\nother: 1\n"), "{wired}");
+        let thegn = wired.find("  thegn:").unwrap();
+        assert!(thegn < wired.find("# tail").unwrap(), "{wired}");
+        let (back, _) =
+            apply_all(WireFormat::Yaml, &wired, &["mcp_servers"], "x", &[], true).unwrap();
+        assert_eq!(back, user);
+    }
+
+    #[test]
+    fn yaml_refuses_foreign_entries_and_unsafe_shapes_without_changes() {
+        let foreign = "mcp_servers:\n  thegn:\n    command: mine\n";
+        let err = apply_yaml(foreign, "mcp_servers", "thegn", "t", &[], false).unwrap_err();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        let err = apply_yaml(foreign, "mcp_servers", "thegn", "t", &[], true).unwrap_err();
+        assert!(err.contains("refusing to remove"), "{err}");
+        for bad in [
+            "mcp_servers: {}\n",
+            "mcp_servers:\n  - a\n",
+            "a: 1\r\nb: 2\r\n",
+        ] {
+            assert!(
+                apply_yaml(bad, "mcp_servers", "thegn", "t", &[], false).is_err(),
+                "{bad}"
+            );
+        }
+        let (text, out) = apply_yaml("a: 1\n", "mcp_servers", "thegn", "t", &[], true).unwrap();
+        assert_eq!(
+            (text.as_str(), out),
+            ("a: 1\n", WireOutcome::NothingToRemove)
+        );
+    }
+
+    #[test]
+    fn sandbox_prefix_yields_a_resolver_entry_in_every_format() {
+        for (format, container) in [
+            (WireFormat::Json, &["mcpServers"][..]),
+            (WireFormat::Toml, &["mcp_servers"][..]),
+            (WireFormat::Yaml, &["mcp_servers"][..]),
+        ] {
+            let (text, outcomes) = apply_all(
+                format,
+                "",
+                container,
+                SANDBOX_COMMAND,
+                SANDBOX_PREFIX,
+                false,
+            )
+            .unwrap();
+            assert!(outcomes.iter().all(|(_, o)| *o == WireOutcome::Added));
+            assert!(text.contains("/bin/sh"), "{text}");
+            assert!(text.contains("/var/tmp/thegn-bridge"), "{text}");
+            assert!(
+                !text.contains("/home/"),
+                "no host path in a sandbox entry: {text}"
+            );
+            let (again, outcomes) = apply_all(
+                format,
+                &text,
+                container,
+                SANDBOX_COMMAND,
+                SANDBOX_PREFIX,
+                false,
+            )
+            .unwrap();
+            assert!(
+                outcomes.iter().all(|(_, o)| *o == WireOutcome::Unchanged),
+                "{format:?}"
+            );
+            assert_eq!(again, text);
+        }
+    }
+
+    #[test]
+    fn host_entry_is_rewritten_to_the_sandbox_resolver() {
+        // A host-wired settings file carried into a sandbox keeps the host path
+        // until the sandbox pass rewrites the thegn-marked entries in place.
+        let (host, _) = apply_all(
+            WireFormat::Json,
+            "{}",
+            &["mcpServers"],
+            "/home/u/thegn",
+            &[],
+            false,
+        )
+        .unwrap();
+        let (sandbox, outcomes) = apply_all(
+            WireFormat::Json,
+            &host,
+            &["mcpServers"],
+            SANDBOX_COMMAND,
+            SANDBOX_PREFIX,
+            false,
+        )
+        .unwrap();
+        assert!(outcomes.iter().all(|(_, o)| *o == WireOutcome::Updated));
+        assert!(!sandbox.contains("/home/u"), "{sandbox}");
     }
 }

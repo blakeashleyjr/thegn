@@ -11,6 +11,7 @@ mod actions;
 mod agent;
 mod agent_configs;
 mod agent_home;
+mod agent_integrate;
 mod agent_output;
 mod agent_run;
 mod agent_ssh;

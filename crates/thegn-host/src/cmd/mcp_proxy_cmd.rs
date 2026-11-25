@@ -155,15 +155,7 @@ pub fn reload(cfg: &Config) -> Result<()> {
 
 // ── wire ──────────────────────────────────────────────────────────────────
 
-/// How an agent stores its MCP servers on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
-    /// A JSON settings file; `container` is the JSON path to the server map.
-    Json,
-    /// A TOML settings file; `container[0]` is the top-level server table
-    /// (Codex: `[mcp_servers.<name>]`).
-    Toml,
-}
+use wire::WireFormat as Format;
 
 /// A per-vendor MCP-settings adapter: where the file lives (under `$HOME`),
 /// its format, the path to the object holding server entries, and the home
@@ -200,6 +192,14 @@ const ADAPTERS: &[Adapter] = &[
         container: &["mcp_servers"],
         detect: ".codex",
         home_env: Some("CODEX_HOME"),
+    },
+    Adapter {
+        kind: "hermes",
+        rel_path: ".hermes/config.yaml",
+        format: Format::Yaml,
+        container: &["mcp_servers"],
+        detect: ".hermes",
+        home_env: Some("HERMES_HOME"),
     },
     Adapter {
         kind: "cursor",
@@ -417,32 +417,18 @@ fn is_wired(
     command: &str,
 ) -> bool {
     let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
-    let mcp_ok = {
-        let path = settings_path(a, home, env);
-        match a.format {
-            Format::Json => {
-                let body = read(&path);
-                let mut v: Value =
-                    serde_json::from_str(&body).unwrap_or_else(|_| Value::Object(Map::new()));
-                wire::WIRED_ENTRIES.iter().all(|(key, args)| {
-                    wire::apply_named(
-                        &mut v,
-                        a.container,
-                        key,
-                        wire::wired_entry(command, args),
-                        false,
-                    ) == Ok(WireOutcome::Unchanged)
-                })
-            }
-            Format::Toml => {
-                let mut doc: toml_edit::DocumentMut = read(&path).parse().unwrap_or_default();
-                let container = a.container.first().copied().unwrap_or("mcp_servers");
-                wire::WIRED_ENTRIES.iter().all(|(key, args)| {
-                    wire::apply_toml(&mut doc, container, key, command, args, false)
-                        == Ok(WireOutcome::Unchanged)
-                })
-            }
-        }
+    // A file thegn cannot wire (unparseable, foreign entry) counts as done: an
+    // offer to wire it could only fail.
+    let mcp_ok = match wire::apply_all(
+        a.format,
+        &read(&settings_path(a, home, env)),
+        a.container,
+        command,
+        &[],
+        false,
+    ) {
+        Ok((_, outcomes)) => outcomes.iter().all(|(_, o)| *o == WireOutcome::Unchanged),
+        Err(_) => true,
     };
     let hooks_ok = hooks_path(a, home, env).is_none_or(|p| {
         let body = read(&p);
@@ -570,36 +556,8 @@ fn wire_file(
     }
     let body = body.unwrap_or_default();
 
-    let mut outcomes = Vec::new();
-    let rendered = match a.format {
-        Format::Json => {
-            let mut settings: Value = if body.trim().is_empty() {
-                Value::Object(Map::new())
-            } else {
-                serde_json::from_str(&body)
-                    .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?
-            };
-            for (key, args) in wire::WIRED_ENTRIES {
-                let entry = wire::wired_entry(command, args);
-                let outcome = wire::apply_named(&mut settings, a.container, key, entry, remove)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                outcomes.push((*key, outcome));
-            }
-            serde_json::to_string_pretty(&settings)?
-        }
-        Format::Toml => {
-            let mut doc: toml_edit::DocumentMut = body
-                .parse()
-                .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?;
-            let container = a.container.first().copied().unwrap_or("mcp_servers");
-            for (key, args) in wire::WIRED_ENTRIES {
-                let outcome = wire::apply_toml(&mut doc, container, key, command, args, remove)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                outcomes.push((*key, outcome));
-            }
-            doc.to_string()
-        }
-    };
+    let (rendered, outcomes) = wire::apply_all(a.format, &body, a.container, command, &[], remove)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
     let changed = outcomes
         .iter()
@@ -728,13 +686,19 @@ mod wire_tests {
     }
 
     #[test]
-    fn every_adapter_kind_is_unique_and_codex_is_toml() {
+    fn every_adapter_kind_is_unique_and_codex_is_toml_hermes_yaml() {
         let kinds: std::collections::HashSet<&str> = ADAPTERS.iter().map(|a| a.kind).collect();
         assert_eq!(kinds.len(), ADAPTERS.len());
         let codex = adapter("codex").unwrap();
         assert_eq!(codex.format, Format::Toml);
         assert_eq!(codex.container, &["mcp_servers"]);
-        for a in ADAPTERS.iter().filter(|a| a.kind != "codex") {
+        let hermes = adapter("hermes").unwrap();
+        assert_eq!(hermes.format, Format::Yaml);
+        assert_eq!(hermes.container, &["mcp_servers"]);
+        for a in ADAPTERS
+            .iter()
+            .filter(|a| a.kind != "codex" && a.kind != "hermes")
+        {
             assert_eq!(a.format, Format::Json, "{}", a.kind);
         }
     }
@@ -950,5 +914,78 @@ mod wire_tests {
         assert!(is_wired(claude, tmp.path(), &no_env, "/bin/thegn"));
         wire_target(claude, tmp.path(), &no_env, "/bin/thegn", true);
         assert!(!is_wired(claude, tmp.path(), &no_env, "/bin/thegn"));
+    }
+
+    #[test]
+    fn hermes_home_relocates_and_is_detected() {
+        let home = std::path::Path::new("/home/u");
+        let hermes = adapter("hermes").unwrap();
+        assert_eq!(
+            settings_path(hermes, home, &no_env),
+            PathBuf::from("/home/u/.hermes/config.yaml")
+        );
+        let relocated = |k: &str| (k == "HERMES_HOME").then(|| "/srv/hermes".to_string());
+        assert_eq!(
+            settings_path(hermes, home, &relocated),
+            PathBuf::from("/srv/hermes/config.yaml")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!detected(hermes, tmp.path(), &no_env));
+        std::fs::create_dir_all(tmp.path().join(".hermes")).unwrap();
+        assert!(detected(hermes, tmp.path(), &no_env));
+        let kinds: Vec<&str> = default_targets(&Config::default(), tmp.path(), &no_env)
+            .iter()
+            .map(|a| a.kind)
+            .collect();
+        assert_eq!(kinds, vec!["hermes"]);
+    }
+
+    #[test]
+    fn hermes_yaml_wire_is_idempotent_reversible_and_keeps_user_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".hermes/config.yaml");
+        let hermes = adapter("hermes").unwrap();
+
+        let none = wire_file(hermes, &path, "/bin/thegn", true).unwrap();
+        assert!(none.iter().all(|(_, o)| *o == WireOutcome::NothingToRemove));
+        assert!(!path.exists(), "remove must not create the file");
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let user = "# my hermes\nmodel: nous-hermes\nmcp_servers:\n  git:\n    command: git-mcp\n";
+        std::fs::write(&path, user).unwrap();
+        let added = wire_file(hermes, &path, "/bin/thegn", false).unwrap();
+        assert_eq!(
+            added,
+            vec![
+                ("thegn", WireOutcome::Added),
+                ("thegn-serve", WireOutcome::Added)
+            ]
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# my hermes\nmodel: nous-hermes\n"),
+            "{text}"
+        );
+        assert!(text.contains("  git:\n    command: git-mcp\n"), "{text}");
+        assert!(text.contains("command: \"/bin/thegn\""), "{text}");
+
+        let again = wire_file(hermes, &path, "/bin/thegn", false).unwrap();
+        assert!(again.iter().all(|(_, o)| *o == WireOutcome::Unchanged));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        let removed = wire_file(hermes, &path, "/bin/thegn", true).unwrap();
+        assert!(removed.iter().all(|(_, o)| *o == WireOutcome::Removed));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
+    }
+
+    #[test]
+    fn hermes_foreign_entry_is_refused_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        let user = "mcp_servers:\n  thegn-serve:\n    command: mine\n";
+        std::fs::write(&path, user).unwrap();
+        let hermes = adapter("hermes").unwrap();
+        assert!(wire_file(hermes, &path, "/bin/thegn", false).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
     }
 }
