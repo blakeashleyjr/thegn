@@ -412,12 +412,30 @@ fn headless_pool_gate(
         return false;
     }
     match crate::lifecycle::effective_pool_target(db, cfg, &repo, &environment.name) {
-        Ok(target) => target > 0,
+        Ok(target) if target > 0 => true,
+        // Pool off: a spare left from an earlier bake (checkpointed, keyed on
+        // the flake lock) still skips the cold create for a repeat `env up`.
+        Ok(_) => match db.pool_spares_for(&repo, &environment.name) {
+            Ok(spares) => has_fresh_ready_spare(&spares, &flake_lock_hash(&repo_root)),
+            Err(error) => {
+                tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "headless warm claim skipped: spare ledger unreadable");
+                false
+            }
+        },
         Err(error) => {
             tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "headless warm claim skipped: pool target unreadable");
             false
         }
     }
+}
+
+/// Whether `spares` holds a `ready` spare baked against exactly `lock` (the
+/// repo's current flake-lock hash). A spare with no recorded hash or a
+/// different one is stale: claiming it would hand over an outdated devShell.
+fn has_fresh_ready_spare(spares: &[thegn_core::db::PoolSpare], lock: &str) -> bool {
+    spares
+        .iter()
+        .any(|s| s.state == "ready" && s.lock_hash.as_deref() == Some(lock))
 }
 
 /// The provisioning-gate halt for an attach: `Some` when `worktree` resolves to a
@@ -1611,6 +1629,38 @@ mod tests {
             assert_eq!(db.pool_target(repo, "sprites").unwrap(), None);
             assert!(db.pool_spares_for(repo, "sprites").unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn fresh_ready_spare_requires_ready_state_and_matching_lock() {
+        let spare = |state: &str, lock: Option<&str>| thegn_core::db::PoolSpare {
+            sandbox_name: "s".into(),
+            repo_path: "/r".into(),
+            env_name: "sprites".into(),
+            state: state.into(),
+            checkpoint_id: None,
+            lock_hash: lock.map(str::to_string),
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!has_fresh_ready_spare(&[], "abc"));
+        assert!(has_fresh_ready_spare(&[spare("ready", Some("abc"))], "abc"));
+        assert!(!has_fresh_ready_spare(
+            &[spare("ready", Some("old"))],
+            "abc"
+        ));
+        assert!(!has_fresh_ready_spare(&[spare("ready", None)], "abc"));
+        assert!(!has_fresh_ready_spare(
+            &[spare("claimed", Some("abc"))],
+            "abc"
+        ));
+        assert!(has_fresh_ready_spare(
+            &[
+                spare("quarantined", Some("abc")),
+                spare("ready", Some("abc"))
+            ],
+            "abc"
+        ));
     }
 
     #[test]
