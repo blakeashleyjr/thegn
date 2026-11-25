@@ -799,6 +799,8 @@ pub enum WireFormat {
     Yaml,
 }
 
+/// The rewritten config body and each entry's outcome.
+type WiredBody = (String, Vec<(&'static str, WireOutcome)>);
 /// Apply every [`WIRED_ENTRIES`] row to one settings text. `prefix` is put
 /// before each entry's own args (empty on the host; the in-sandbox resolver for
 /// a remote environment, see [`SANDBOX_COMMAND`]). Returns the new text and the
@@ -811,7 +813,7 @@ pub fn apply_all(
     command: &str,
     prefix: &[&str],
     remove: bool,
-) -> Result<(String, Vec<(&'static str, WireOutcome)>), String> {
+) -> Result<WiredBody, String> {
     let mut outcomes = Vec::new();
     let full = |args: &[&str]| -> Vec<String> {
         prefix

@@ -390,6 +390,38 @@ pub const CATALOG: &[Slot] = &[
     slot("job shim", "argv", SourceKind::Reserved(Reserved::Freeform)),
     // A directory path: the engine's filename completion serves it.
     slot("job shim-install", "dir", SourceKind::Structural),
+    // Agent lifecycle hook: values come from the agent's own hook runner.
+    slot(
+        "agent hook",
+        "agent",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "agent hook",
+        "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "agent hook",
+        "payload",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // Detached sprite sessions: server-issued ids and a duration.
+    slot(
+        "sprite-exec",
+        "attach",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "sprite-exec",
+        "status",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "sprite-exec",
+        "max",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),

@@ -286,7 +286,8 @@ pub fn run(cfg: &Config, args: StatusArgs) -> Result<()> {
             }
             outln!("");
         } else {
-            let _ = watch_events(&mut prev, &report);
+            // JSON mode: advance `prev` only; the events are carried in the report.
+            drop(watch_events(&mut prev, &report));
         }
         std::thread::sleep(interval);
     }

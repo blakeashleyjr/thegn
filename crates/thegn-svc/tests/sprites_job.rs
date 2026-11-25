@@ -2745,7 +2745,7 @@ async fn a_missing_sprite_is_named_plainly_not_as_a_404_chain() {
     assert!(text.contains("does not exist"), "{text}");
     assert!(text.contains("tgtest1"), "{text}");
     assert!(text.contains("thegn env up"), "{text}");
-    assert!(!text.contains("sprites-tgtest1"), "{text}");
+    assert!(!text.contains("404"), "{text}");
 }
 
 /// The launcher keeps the stock toolchain resolvable: `$CARGO_HOME/bin` holds

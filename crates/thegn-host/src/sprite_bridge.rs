@@ -945,7 +945,7 @@ fn run_tty(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Resul
     let mut term = new_terminal(caps).context("open terminal")?;
     let size = term.get_screen_size().context("screen size")?;
     let (cols, rows) = pty_size(size.cols, size.rows);
-    let env = tty_env(&|key| std::env::var(key).ok());
+    let tty_vars = tty_env(&|key| std::env::var(key).ok());
 
     let rt = crate::agent::provider_runtime()?;
     let spec = ExecSpec {
@@ -953,7 +953,7 @@ fn run_tty(provider: &Provider, env: &str, id: &str, argv: Vec<String>) -> Resul
         tty: true,
         cols,
         rows,
-        env,
+        env: tty_vars,
         cwd: None,
     };
     // Open BEFORE raw mode so an open failure never leaves the tty altered.

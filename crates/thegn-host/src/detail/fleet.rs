@@ -308,7 +308,8 @@ fn health_cells(reading: &HealthReading, now_ms: i64) -> Vec<Cell> {
     let mem = sample.and_then(|s| s.memory_percent());
     let hot = mem.is_some_and(|p| p >= remote_health::MEM_PRESSURE_PERCENT);
     let left = reading.lifetime_left_at(now_ms);
-    let short = left.is_some_and(|l| l < remote_health::LIFETIME_WARN_SECS);
+    let short =
+        left.is_some_and(|l| i64::try_from(l).is_ok_and(|l| l < remote_health::LIFETIME_WARN_SECS));
     vec![
         text(
             mem.map_or_else(|| "-".to_string(), |p| format!("{p}%")),

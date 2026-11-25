@@ -248,7 +248,10 @@ fn hook(cfg: &Config, agent: &str, event: &str, payload: &[String]) {
     let mut raw = payload.last().cloned().unwrap_or_default();
     if raw.is_empty() && agent == "claude" && !std::io::stdin().is_terminal() {
         let mut buf = String::new();
-        let _ = std::io::stdin().take(64 * 1024).read_to_string(&mut buf);
+        if let Err(error) = std::io::stdin().take(64 * 1024).read_to_string(&mut buf) {
+            // A hook must never fail the agent: an unreadable payload is just empty.
+            tracing::debug!(target: "thegn::agent", %error, "agent hook: payload read failed");
+        }
         raw = buf;
     }
     let (cwd, message) = hook_payload_fields(&raw);
@@ -280,7 +283,10 @@ fn hook(cfg: &Config, agent: &str, event: &str, payload: &[String]) {
     else {
         return;
     };
-    let _ = rt.block_on(hook_push(cfg, &note));
+    if let Err(error) = rt.block_on(hook_push(cfg, &note)) {
+        // Best-effort: a hook with no reachable daemon must not fail the agent.
+        tracing::debug!(target: "thegn::agent", error = %format!("{error:#}"), "agent hook: push failed");
+    }
 }
 
 async fn hook_push(cfg: &Config, note: &thegn_svc::control::PushedNote) -> Result<()> {

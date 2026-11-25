@@ -267,7 +267,7 @@ const HEADER_TITLE: &str = " WORKSPACES";
 pub(crate) fn remote_health_segs(
     level: thegn_core::remote_health::HealthLevel,
     note: Option<&str>,
-    gl: &crate::caps::GlyphSet,
+    gl: &thegn_core::termcaps::GlyphSet,
 ) -> Vec<crate::seg::Seg> {
     use crate::seg::{Tok, seg, sp};
     use thegn_core::pipeline_report::display_cell;

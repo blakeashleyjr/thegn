@@ -320,7 +320,7 @@ fn default_targets(
 /// (`thegn-serve`).
 pub fn wire(cfg: &Config, agent: Option<&str>, all: bool, remove: bool) -> Result<()> {
     let home = thegn_core::util::home();
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| -> Option<String> { std::env::var(k).ok() };
     let targets: Vec<&Adapter> = if let Some(kind) = agent {
         match adapter(kind) {
             Some(a) => vec![a],
@@ -398,7 +398,7 @@ pub fn hook_capable(kind: &str) -> bool {
 /// tour offers exactly these; an empty answer means there is nothing to offer.
 pub fn unwired_detected_agents(cfg: &Config) -> Vec<String> {
     let home = thegn_core::util::home();
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| -> Option<String> { std::env::var(k).ok() };
     let command = proxy_command();
     default_targets(cfg, &home, &env)
         .into_iter()
@@ -451,7 +451,7 @@ fn is_wired(
 /// tour's one-key accept does. Returns one report line per write.
 pub fn wire_kinds(kinds: &[String]) -> Result<Vec<String>> {
     let home = thegn_core::util::home();
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| -> Option<String> { std::env::var(k).ok() };
     let command = proxy_command();
     let mut lines = Vec::new();
     for kind in kinds {

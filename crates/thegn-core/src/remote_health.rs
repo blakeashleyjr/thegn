@@ -147,9 +147,9 @@ pub fn parse_probe(output: &str) -> Result<HealthSample, String> {
                 // `Filesystem 1024-blocks Used Available Capacity Mounted`
                 let cols: Vec<&str> = rest.split_whitespace().collect();
                 if cols.len() >= 4 {
-                    s.disk_total_kib = cols[1].parse().ok();
-                    s.disk_used_kib = cols[2].parse().ok();
-                    s.disk_avail_kib = cols[3].parse().ok();
+                    s.disk_total_kib = parse_kib(cols[1]);
+                    s.disk_used_kib = parse_kib(cols[2]);
+                    s.disk_avail_kib = parse_kib(cols[3]);
                 }
             }
             "oom" => {
@@ -599,6 +599,11 @@ pub fn global() -> &'static HealthCache {
     CACHE.get_or_init(HealthCache::default)
 }
 
+/// A `df -k` size column; `None` for a non-numeric cell.
+fn parse_kib(cell: &str) -> Option<u64> {
+    cell.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,7 +851,7 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
         );
     }
 
-    fn sample(load: f64, mem_pct: u64) -> HealthSample {
+    fn sample_lm(load: f64, mem_pct: u64) -> HealthSample {
         HealthSample {
             load: Some([load, 0.0, 0.0]),
             cpus: Some(4),
@@ -863,7 +868,7 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
         let c = HealthCache::default();
         assert!(c.reading("w").is_none());
         for i in 0..(HISTORY_LEN + 5) {
-            c.record("w", sample(1.0, 10), i as i64, None, Some(7200));
+            c.record("w", sample_lm(1.0, 10), i as i64, None, Some(7200));
         }
         let r = c.reading("w").unwrap();
         assert_eq!(r.history.len(), HISTORY_LEN);
@@ -874,7 +879,7 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
         assert!((r.disk_series()[0] - 0.50).abs() < 1e-6);
         c.record(
             "w",
-            sample(1.0, 95),
+            sample_lm(1.0, 95),
             9,
             Some("sprite restarted".into()),
             Some(7200),
@@ -886,11 +891,11 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
     #[test]
     fn short_lifetime_warns_and_counts_down() {
         let c = HealthCache::default();
-        c.record("w", sample(0.1, 10), 1_000, None, Some(3_700));
+        c.record("w", sample_lm(0.1, 10), 1_000, None, Some(3_700));
         let r = c.reading("w").unwrap();
         assert_eq!(r.level(), HealthLevel::Ok);
         assert_eq!(r.lifetime_left_at(1_000 + 200_000), Some(3_500));
-        c.record("w", sample(0.1, 10), 1_000, None, Some(600));
+        c.record("w", sample_lm(0.1, 10), 1_000, None, Some(600));
         assert_eq!(c.badge("w").unwrap().0, HealthLevel::Warn);
         assert_eq!(
             c.reading("w").unwrap().lifetime_left_at(10_000_000),
@@ -901,7 +906,7 @@ oom [  812.1] Out of memory: Killed process 4242 (rustc) total-vm:5000000kB, ano
     #[test]
     fn probe_error_is_unknown_and_keeps_history() {
         let c = HealthCache::default();
-        c.record("w", sample(0.1, 10), 1, None, None);
+        c.record("w", sample_lm(0.1, 10), 1, None, None);
         c.record_error("w", "exec refused".into(), 2);
         let r = c.reading("w").unwrap();
         assert_eq!(r.level(), HealthLevel::Unknown);
