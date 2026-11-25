@@ -188,7 +188,29 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
         for warning in crate::agent_run::headless_settings_warnings(&cfg) {
             add_warning(health, path, warning);
         }
+        if let Some(warning) = sandbox_rules_advisory_warning(&cfg) {
+            add_warning(health, path, warning);
+        }
     }
+}
+
+/// `[sandbox] network_allow`/`network_block` are advisory on every local
+/// backend: only Sprites and Vercel lower them to a provider policy API. Say
+/// so at validate time, as launch and doctor do. A `*` block entry already
+/// makes the launch offline, which is enforced, so it is not reported here.
+fn sandbox_rules_advisory_warning(cfg: &thegn_core::config::Config) -> Option<String> {
+    let sb = &cfg.sandbox;
+    let effective = thegn_core::sandbox::lower_universal_deny(sb.network, &sb.network_block);
+    if !thegn_core::sandbox::hostname_rules_active(effective, &sb.network_allow, &sb.network_block)
+    {
+        return None;
+    }
+    Some(
+        "[sandbox] network_allow/network_block are advisory on local backends: no backend \
+         enforces hostname rules (direct IPs and other resolvers are unaffected); set \
+         `network = \"none\"` to deny egress, or remove the lists"
+            .to_string(),
+    )
 }
 
 fn collect_repo(health: &mut ConfigHealth, discovery: &RepoOverlayDiscovery) {
@@ -327,6 +349,49 @@ mod tests {
                 .findings()
                 .all(|finding| { !finding.message.contains("[merge_queue]") })
         );
+    }
+
+    #[test]
+    fn sandbox_hostname_lists_warn_as_advisory_at_validate_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sandbox]\nnetwork = \"nat\"\nnetwork_allow = [\"github.com\"]\n",
+        )
+        .unwrap();
+
+        let health = collect(&path, Some(dir.path()));
+
+        assert_eq!(health.problems(), 0);
+        assert!(health.findings().any(|finding| {
+            finding.warning
+                && finding.path == path
+                && finding
+                    .message
+                    .contains("network_allow/network_block are advisory")
+        }));
+    }
+
+    // Positive control: an offline or list-free sandbox has nothing advisory.
+    #[test]
+    fn sandbox_hostname_lists_silent_when_enforced_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for body in [
+            "[sandbox]\nnetwork = \"none\"\nnetwork_allow = [\"github.com\"]\n",
+            "[sandbox]\nnetwork = \"nat\"\nnetwork_block = [\"*\"]\n",
+            "[sandbox]\nnetwork = \"nat\"\n",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let health = collect(&path, Some(dir.path()));
+            assert!(
+                health
+                    .findings()
+                    .all(|finding| !finding.message.contains("are advisory")),
+                "{body}"
+            );
+        }
     }
 
     #[test]
