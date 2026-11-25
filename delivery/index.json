@@ -1400,14 +1400,6 @@
       "archive_path": "openspec/changes/archive/2026-09-30-preserve-winning-host-environment/"
     },
     {
-      "change": "redact-tailnet-identity-in-doctor",
-      "lifecycle": "active",
-      "disposition": "alpha-delivery",
-      "owners": [],
-      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
-      "summary": "Doctor redacts the tailnet name and control URL by default (shared redaction placeholder, reveal note names the flag), with `thegn doctor --full` (alias `--unredacted`) printing them verbatim; `doctor bundle` archives the redacted view."
-    },
-    {
       "change": "recover-sprites-across-instances",
       "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
@@ -1415,6 +1407,14 @@
       "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
       "summary": "A sprite created by another thegn instance on the same account is adopted on reattach from its creation marker, without a manual env adopt.",
       "delivered_at": "2026-11-25"
+    },
+    {
+      "change": "redact-tailnet-identity-in-doctor",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Doctor redacts the tailnet name and control URL by default (shared redaction placeholder, reveal note names the flag), with `thegn doctor --full` (alias `--unredacted`) printing them verbatim; `doctor bundle` archives the redacted view."
     },
     {
       "change": "reduce-process-monitor-idle-work",
