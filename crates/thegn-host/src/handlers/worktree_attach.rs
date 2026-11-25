@@ -29,8 +29,8 @@
 //! silently dropped.
 //!
 //! Everything side-effecting lives in the workers and the drain; this
-//! module's decision logic ([`live_for_worktree`], [`plan`]) is pure and
-//! unit-tested.
+//! module's decision logic ([`live_for_worktree`], [`recorded_daemon_sessions`],
+//! [`plan`]) is pure and unit-tested.
 
 use crate::compositor::Rect;
 use crate::panes::Panes;
@@ -99,6 +99,33 @@ pub(crate) fn live_for_worktree(
             program: s.program.clone(),
         })
         .collect()
+}
+
+/// Daemon session ids the session model holds a persisted record for — a
+/// `pane_sessions` entry with `provider = "daemon"` whose key is a leaf
+/// still in its tab's tree. Materialize reattaches each such session onto its
+/// recorded leaf (the warm-reattach contract), so it is NOT headless and must
+/// stay out of the attach pool: the probe lists every live session of the
+/// worktree, and a tab's own persisted session used to sail through the
+/// drain-side `shown` dedup (no pane shows it YET), land in the surplus, and
+/// come back as a second pane beside the leaf that reattached it — THE-2683's
+/// restored single-pane tab with an extra pane and a different split. Stale
+/// records (keyed by a leaf no longer in the tree, e.g. after a pane close)
+/// do not filter: the session is headless from the compositor's view and
+/// stays adoptable. Pure.
+pub(crate) fn recorded_daemon_sessions(session: &Session) -> Vec<String> {
+    let mut out = Vec::new();
+    for g in &session.worktrees {
+        for tab in &g.tabs {
+            let ids = tab.center.pane_ids();
+            for (id, ps) in &tab.pane_sessions {
+                if ps.provider == "daemon" && ids.contains(id) {
+                    out.push(ps.session.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Zip the newest targets onto the missing leaves, in order; the rest are
@@ -272,6 +299,80 @@ mod tests {
             )),
             vec!["hidden"],
             "the AlreadyShown rule"
+        );
+    }
+
+    #[test]
+    fn recorded_daemon_sessions_name_live_leaves_only() {
+        use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
+
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        let daemon_session = |session: &str| ProviderSession {
+            provider: "daemon".into(),
+            id: "local".into(),
+            session: session.into(),
+        };
+        {
+            let tab = &mut session.worktrees[0].tabs[0];
+            tab.center = crate::center::CenterTree::Leaf(7);
+            tab.focused_pane = 7;
+            tab.pane_sessions.insert(7, daemon_session("warm"));
+            // Keyed by a leaf that is no longer in the tree: a stale record
+            // must not filter — its session is headless from the
+            // compositor's view and stays adoptable.
+            tab.pane_sessions.insert(9, daemon_session("stale"));
+        }
+        let gi = session.worktrees[0].add_tab();
+        session.worktrees[0].tabs[gi].center = crate::center::CenterTree::Leaf(8);
+        // A remote provider record on a live leaf is not a daemon session.
+        session.worktrees[0].tabs[gi].pane_sessions.insert(
+            8,
+            ProviderSession {
+                provider: "sprites".into(),
+                id: "sandbox-1".into(),
+                session: "remote".into(),
+            },
+        );
+        assert_eq!(
+            recorded_daemon_sessions(&session),
+            vec!["warm"],
+            "only daemon records whose key is a live leaf are claimed"
+        );
+    }
+
+    #[test]
+    fn recorded_daemon_sessions_span_every_group_and_tab() {
+        use crate::session::{GroupKind, ProviderSession, Session, WorktreeGroup};
+
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, ""),
+                WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat"),
+            ],
+            active: 0,
+        };
+        for (gi, leaf, sid) in [(0usize, 11u32, "home"), (1, 12, "neighbor-tab")] {
+            let tab = &mut session.worktrees[gi].tabs[0];
+            tab.center = crate::center::CenterTree::Leaf(leaf);
+            tab.pane_sessions.insert(
+                leaf,
+                ProviderSession {
+                    provider: "daemon".into(),
+                    id: "local".into(),
+                    session: sid.into(),
+                },
+            );
+        }
+        assert_eq!(
+            recorded_daemon_sessions(&session),
+            vec!["home", "neighbor-tab"],
+            "a neighboring group's recorded session reattaches when its tab \
+             materializes, so it must leave the attach pool too"
         );
     }
 

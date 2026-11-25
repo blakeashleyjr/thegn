@@ -1036,6 +1036,18 @@
       "summary": "THE-2490 owns the Darwin process-group drain repair; coordinator native tests and exact B192 fixture proof remain unchecked."
     },
     {
+      "change": "fix-relaunch-duplicate-panes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2683",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "THE-2683 restores each recorded daemon session exactly once on relaunch: the drain drops attach targets a live-leaf daemon record names in both the materialize and prewarm-skip paths, so a quit-relaunch tab keeps its pane shape while headless targets still land; coordinator build and live repro remain unchecked."
+    },
+    {
       "change": "fix-static-cli-startup",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
