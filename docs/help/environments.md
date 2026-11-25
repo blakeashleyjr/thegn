@@ -445,6 +445,19 @@ environments.
   probe could not run; the reason is printed). Warnings name the cause, for
   example `sprite out of memory: kernel killed rustc 3.7 GB`, and a lifetime
   under an hour. With `--json` the same report is the `health` object.
+  `--probe` also works for a Vercel, VPS, Fly or machine0 env: pass the
+  sandbox id from `fleet list` as the name and the provider's own listing is
+  used instead of the Sprites API.
+- **Status for this worktree.** `thegn env status [--watch] [--interval SECS]
+[--json]` reports the current worktree's remote sandbox on any exec-capable
+  provider: provider state, size and region, time left before
+  `max_lifetime_secs`, estimated cost (hourly burn and accrued), and the same
+  health probe. A sandbox the provider reports cold, stopped or suspended is
+  not probed (a probe would wake and bill it); its health shows `unknown` with
+  that reason. `--watch` refreshes every 5 s (`--interval`, at least 1) and
+  prints a line when a restart or an out-of-memory kill is detected between
+  two probes. The same report is served read-only as `GET /v1/env/status` and
+  the MCP tool `env_status` (read scope; both take an optional `worktree`).
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.

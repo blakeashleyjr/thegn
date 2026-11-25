@@ -60,3 +60,23 @@ sandbox's lifetime has less than an hour left.
 
 - **WHEN** a sample's memory is at 95% of its limit
 - **THEN** its level is `warn`
+
+### Requirement: The current worktree's sandbox health is readable on every surface
+
+`thegn env status` SHALL report the current worktree's remote sandbox on any
+exec-capable provider: provider state, lifetime left, estimated cost and the
+health probe. The same report SHALL be served read-only over the control API
+(`env.status`) and MCP (`env_status`). thegn SHALL NOT probe a sandbox the
+provider reports cold or stopped.
+
+#### Scenario: Asleep sandbox
+
+- **WHEN** the provider lists the sandbox as `stopped`
+- **THEN** the report has level `unknown` with a "not probed" reason and no
+  exec is opened
+
+#### Scenario: Watching for restarts
+
+- **WHEN** `env status --watch` sees a boot id different from the previous
+  probe's
+- **THEN** it prints the restart warning once

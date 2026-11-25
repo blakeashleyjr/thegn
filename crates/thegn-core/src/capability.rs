@@ -198,6 +198,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Read provider fleet inventory and estimated costs",
     ),
     cap(
+        "env.status",
+        Verb::EnvStatus,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Read a worktree's remote sandbox health (state, lifetime, cost, probe)",
+    ),
+    cap(
         "sessions.migrate",
         Verb::MigrateSession,
         SurfaceSet::of(&[Surface::Cli]),

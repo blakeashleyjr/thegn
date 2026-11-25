@@ -571,7 +571,10 @@ worktree records but the provider no longer lists appears under "Recorded, not
 listed". An env whose token does not resolve, or whose listing fails or times
 out (20 s), is shown as unavailable instead of failing the command.
 `thegn fleet inspect <sprite> --env <S> [--policy] [--probe] [--json]` reads one sprite;
-`--probe` adds its live health (see [Environments](environments.md)). `thegn fleet cost [--json]` prints the hourly burn per provider, today's and
+`--probe` adds its live health (see [Environments](environments.md)); it also
+works for a non-Sprites env, naming the sandbox by its `fleet list` id.
+`thegn env status [--watch] [--json]` is the same health for the current
+worktree's sandbox. `thegn fleet cost [--json]` prints the hourly burn per provider, today's and
 the month's spend so far, and 24 h / 30 d projections. Costs are estimates:
 `[placement.price]` rates win over the bundled price table, a size with no
 known price shows `?` and is counted as unpriced, and accrued cost assumes the

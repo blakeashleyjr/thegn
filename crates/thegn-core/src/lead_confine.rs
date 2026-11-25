@@ -100,6 +100,8 @@ const NO_HOST_WRITE: &str = "writes into a worktree from outside the sandbox";
 const NO_RESUME: &str = "only the operator resumes automations (admin scope); the Lead may pause them, never restart them";
 const NO_REDEEM: &str = "only the owner's phone answers approvals";
 const NO_HALT: &str = "only the operator halts automations";
+const NO_REMOTE_PROBE: &str =
+    "a health probe runs a command inside a remote sandbox; ask the operator (`thegn env status`)";
 
 /// The confinement table: one explicit row per verb. No wildcard arm, so a new
 /// [`Verb`] fails to compile until someone decides its row.
@@ -207,6 +209,7 @@ pub fn rule(verb: Verb) -> Rule {
             Rule::Refuse(NO_HOST_WRITE)
         }
         Verb::LaunchPreset | Verb::ToolsRun => Rule::Refuse(EXEC_ONLY),
+        Verb::EnvStatus => Rule::Refuse(NO_REMOTE_PROBE),
         Verb::IssuePairing
         | Verb::WorktreeSandboxProfileSet
         | Verb::ListPairings
@@ -555,6 +558,7 @@ mod tests {
     const TABLE: &[(Verb, Kind)] = &[
         (Verb::ListSessions, Allow),
         (Verb::FleetList, Allow),
+        (Verb::EnvStatus, Refuse),
         (Verb::MigrateSession, Refuse),
         (Verb::ListWorktrees, Allow),
         (Verb::OpenSession, AllowIf),

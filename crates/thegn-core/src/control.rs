@@ -317,6 +317,9 @@ pub enum Verb {
     ListSessions,
     /// Read the provider-backed fleet inventory and estimate.
     FleetList,
+    /// Read one worktree's remote sandbox health (provider state, lifetime,
+    /// cost, one read-only probe exec). Read scope; never wakes a sleeping sandbox.
+    EnvStatus,
     /// Move one persisted worktree presentation between profile stores. This
     /// is deliberately a CLI-only admin operation, not a daemon route.
     MigrateSession,
@@ -555,6 +558,7 @@ impl Verb {
     pub const ALL: &'static [Verb] = &[
         Verb::ListSessions,
         Verb::FleetList,
+        Verb::EnvStatus,
         Verb::MigrateSession,
         Verb::ListWorktrees,
         Verb::OpenSession,
@@ -680,6 +684,7 @@ pub fn required_scope(verb: Verb) -> Scope {
     match verb {
         Verb::ListSessions
         | Verb::FleetList
+        | Verb::EnvStatus
         | Verb::ListWorktrees
         | Verb::WorktreeSandboxProfile
         | Verb::Snapshot
@@ -1184,6 +1189,7 @@ mod tests {
         let read = [
             ListSessions,
             FleetList,
+            EnvStatus,
             ListWorktrees,
             Snapshot,
             Events,

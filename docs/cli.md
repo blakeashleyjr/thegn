@@ -514,6 +514,7 @@ until its scope is granted.
 | `leases_list`               | `read`        | relay lease state per session                                             |
 | `me`                        | `read`        | the caller's pairing id, label, granted scopes                            |
 | `fleet_list`                | `read`        | provider fleet inventory, agents joined by worktree, and estimated costs  |
+| `env_status`                | `read`        | a worktree's remote sandbox health: state, lifetime, cost, one probe      |
 | `sessions_wait`             | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex)    |
 | `sessions_snapshot`         | `read`        | a live session's current emulator screen (`session`)                      |
 | `semantic_map`              | `read`        | ranked, budgeted repo map of a worktree's indexed entities                |

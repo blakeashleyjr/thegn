@@ -312,6 +312,8 @@ pub const CATALOG: &[Slot] = &[
     slot("env set", "worktree_pos", SourceKind::Worktree),
     slot("env show", "worktree", SourceKind::Worktree),
     slot("env show", "worktree_pos", SourceKind::Worktree),
+    slot("env status", "worktree", SourceKind::Worktree),
+    slot("env status", "worktree_pos", SourceKind::Worktree),
     slot("env snapshot", "worktree", SourceKind::Worktree),
     slot("env snapshot", "worktree_pos", SourceKind::Worktree),
     slot("env snapshots", "worktree", SourceKind::Worktree),
@@ -362,6 +364,12 @@ pub const CATALOG: &[Slot] = &[
     slot(
         "fleet inspect",
         "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // `env status --interval` is a count of seconds: no enumerable source.
+    slot(
+        "env status",
+        "interval",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     // `job run --deadline` is a count of seconds: no enumerable source.

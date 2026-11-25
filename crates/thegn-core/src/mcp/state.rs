@@ -101,6 +101,20 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "env.status",
+        description: "Read a worktree's remote sandbox health: provider state, lifetime \
+                      left, estimated cost, and one read-only probe (CPU load, memory, \
+                      disk, uptime, restart/OOM warnings). A sandbox the provider reports \
+                      asleep is not probed. Defaults to the server's resolved worktree. \
+                      Read-scoped; requires a running daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: false,
+            description: "Absolute path of the worktree; defaults to the resolved worktree",
+        }],
+    },
+    StateToolSpec {
         cap: "sessions.list",
         description: "List the thegn pane daemon's live terminal sessions: id, program, \
                       worktree, geometry, attached clients, lease state. Live state — \
@@ -1339,6 +1353,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 /// (`mcp_tools_cover_catalog` arbitrates both directions).
 pub const MCP_STATE_CAPS: &[&str] = &[
     "fleet.list",
+    "env.status",
     "sessions.list",
     "worktrees.list",
     "worktrees.sandbox_profile",
@@ -2796,6 +2811,7 @@ mod tests {
         let read = [
             // THE-2020: provider fleet inventory read.
             "fleet.list",
+            "env.status",
             "sessions.list",
             "worktrees.list",
             "worktrees.sandbox_profile",
