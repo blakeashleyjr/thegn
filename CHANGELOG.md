@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.135] — 2026-11-25
+
+### Changed
+
+- `thegn env up` in a terminal now returns once a shell can open and finishes coding-agent install, logins and the snapshot in a detached background run; `--wait` (and any non-terminal run) still waits for everything.
+
 ## [0.1.0-alpha.134] — 2026-11-25
 
 Agent builds and tests can run on a Sprite or Vercel sandbox. With
