@@ -7,7 +7,24 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.132] — 2026-11-24
+
+Restart thegn after upgrading. If an older daemon still holds the database,
+thegn now says so and offers to restart it; the database is backed up before
+any schema migration.
+
 ### Fixed
+
+- Upgrading no longer fails with a bare "refusing database schema migration":
+  thegn explains that an older daemon is still running, offers a safe restart
+  from the terminal, and keeps the last three timestamped database backups.
+- A first run makes no TCP connections: the music-player (MPD) probe only runs
+  when you configure an MPD socket or set `MPD_HOST`. The idle database writer
+  closes its connection when unused.
+- Startup moves help-registry and merge-guard work off the first-frame path and
+  logs per-phase timings.
+- The first `env up` on Sprites installs agent CLIs in parallel and reports a
+  total time; the shell is usable after about 20 seconds.
 
 - Stable-channel messages for remotes and client/server: `thegn doctor` shows the
   remote row as partly stable (ssh/mosh remotes and client/server stable;
@@ -42,9 +59,11 @@ egress = "registries"` allows only package registries and git hosts,
 - Sprites and Vercel Sandbox environments are supported on the stable channel:
   their `[env.*]` tables survive the stable config clamp, worktrees can open on
   them, the panel shows the environments section, and `thegn job run` with a
-  Sprites or Vercel runner is no longer refused. Every other cloud provider,
-  the managed `[host.*]` pool, Kubernetes placement and `thegn fleet`,
-  `thegn host` and `thegn placement` stay dev-channel only.
+  Sprites or Vercel runner is no longer refused; `thegn fleet` lists, costs and
+  inspects Sprites and Vercel instances, and the New-environment wizard offers
+  only providers your channel supports. Every other cloud provider, the managed
+  `[host.*]` pool, Kubernetes placement, `thegn host` and `thegn placement` stay
+  dev-channel only.
 - SSH/mosh remote workspaces (`[sandbox.remote]`, `[env.*] placement = "ssh"`)
   and client/server mode (`thegn serve`, `attach`, `pair`, `session`, `events`)
   are supported on the stable channel. Kubernetes placement and the direct-iroh
