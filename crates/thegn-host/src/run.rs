@@ -1144,6 +1144,10 @@ pub async fn main(
                 tracing::warn!(target: "thegn::sandbox", "orphan GC skipped: worktrees query failed");
                 return;
             };
+            // The container sweep below shells out to podman/docker for seconds;
+            // the rows are all it needs, so release the connection first
+            // (THE-2630: a held handle at the idle-bench sample).
+            drop(db);
             if !gc_wanted_without_repo_overlay
                 && !crate::sandbox_gc_gate::repo_overlay_wants_startup_gc(
                     &startup_gc_cfg,
