@@ -2063,7 +2063,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertNotEqual(0, missing.returncode)
             self.assertIn("THIRD_PARTY_NOTICES.md is missing", missing.stdout + missing.stderr)
 
-    def test_release_workflow_leaves_the_archive_include_list_alone(self) -> None:
+    def test_release_workflow_archive_include_list_ships_the_bridge(self) -> None:
         steps = read_workflow("release.yml")["jobs"]["build"]["steps"]
         upload = next(
             step
@@ -2071,7 +2071,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             if step.get("uses", "").startswith("taiki-e/upload-rust-binary-action@")
         )
         self.assertEqual(
-            "LICENSE-MIT,LICENSE-APACHE,README.md",
+            "LICENSE-MIT,LICENSE-APACHE,README.md,bridge/thegn-musl",
             upload.get("with", {}).get("include"),
         )
 
