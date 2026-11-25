@@ -2558,14 +2558,49 @@ impl SpritesSelectedRunner {
                 );
                 Ok(())
             }
-            Err(error) if format!("{error:#}").contains("404") => self
-                .provider
-                .write(sprite, &marker, self.binding.project().as_bytes())
-                .await
-                .with_context(|| format!("sprites: cannot write the owner marker {marker}")),
+            Err(error) if format!("{error:#}").contains("404") => {
+                let project = self.binding.project().as_bytes();
+                let first = self.provider.write(sprite, &marker, project).await;
+                match first {
+                    Ok(()) => Ok(()),
+                    // The fs write API may not create parent directories, and a
+                    // sprite that was never prepared has no checkout root: make
+                    // it, then write the marker once more.
+                    Err(error) if format!("{error:#}").contains("404") => {
+                        self.make_marker_parent(&marker).await?;
+                        self.provider
+                            .write(sprite, &marker, project)
+                            .await
+                            .with_context(|| {
+                                format!("sprites: cannot write the owner marker {marker}")
+                            })
+                    }
+                    Err(error) => Err(error).with_context(|| {
+                        format!("sprites: cannot write the owner marker {marker}")
+                    }),
+                }
+            }
             Err(error) => Err(error)
                 .with_context(|| format!("sprites: cannot read the owner marker {marker}")),
         }
+    }
+
+    /// `mkdir -p` the directory that holds the owner marker, over exec.
+    async fn make_marker_parent(&self, marker: &str) -> Result<()> {
+        let parent = marker.rsplit_once('/').map_or("/", |(dir, _)| dir);
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let argv = ["mkdir", "-p", "--", parent].map(str::to_owned);
+        let (code, output) = self
+            .provider
+            .run_exec(self.binding.sprite(), &argv, None, &[])
+            .await
+            .with_context(|| format!("sprites: cannot create {parent}"))?;
+        ensure!(
+            code == 0,
+            "sprites: cannot create {parent} (exit {code}): {}",
+            output.trim()
+        );
+        Ok(())
     }
 
     /// Write the authorized bytes into the attempt checkout, read every file

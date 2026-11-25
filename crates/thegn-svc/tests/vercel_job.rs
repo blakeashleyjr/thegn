@@ -1337,6 +1337,44 @@ async fn the_sandbox_timeout_is_bounded_by_the_configured_lifetime_ceiling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refusal_names_the_deadline_that_fits_the_lifetime_ceiling() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    // The 900 s default transfer budget + 900 s deadline + 5 min slack = 2100 s > 1800 s.
+    let (mock, _fs) = start(script(vec![exit_line(0)]));
+    let (_dir, store) = store();
+    let runner = VercelSelectedRunner::with_options(
+        provider_with(&mock, 1800),
+        JobBinding::new("proj", TEAM, PROJECT).unwrap(),
+        store.clone(),
+        Box::new(Fixed(content())),
+        tokio::runtime::Handle::current(),
+        options(),
+    )
+    .unwrap();
+    let content = content();
+
+    let refusal = runner
+        .run(
+            Recipe::CargoBuild,
+            &content.digest().unwrap(),
+            &content,
+            Duration::from_secs(900),
+        )
+        .await
+        .unwrap_err();
+
+    let RunnerRefusal::InvalidSpec(message) = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(
+        message.contains("lower --deadline to 600s or less, or raise max_lifetime_secs"),
+        "{message}"
+    );
+    assert!(!message.contains("  "), "no run of spaces: {message}");
+    assert!(mock.requests().is_empty(), "refused before any request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_owner_lease_refuses_recovery_even_past_the_staleness_margin() {
     let _state = thegn_core::testenv::IsolatedState::new();
     let (mock, fs) = start(script(vec![exit_line(0)]));
