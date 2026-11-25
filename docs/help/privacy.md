@@ -77,6 +77,11 @@ thegn makes no network calls.
 - **Weather — `[weather] enabled = false`:** when enabled, the wttr.in provider
   receives the configured `location`, or no location value if it is empty and
   the provider infers a city from your request IP.
+- **Media — `[media] backend = "auto"`:** `auto` talks only to local sources
+  (the session D-Bus for MPRIS, a live mpv socket). It does not dial the
+  default MPD address (`127.0.0.1:6600`), so a first run opens no TCP
+  connection. MPD is contacted only when you set `backend = "mpd"`, set
+  `[media.mpd] socket`, or export `MPD_HOST`.
 - **Issue trackers — `[issues] providers = []` and `provider = "none"`:**
   Linear, Jira, Kaneo and GitHub contact their APIs when you configure a
   provider; calendar network access requires a configured `calendar.accounts`

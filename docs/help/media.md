@@ -63,6 +63,9 @@ local player, without leaving the compositor. Hidden unless
   state”. A read that does not answer within two seconds reports “Media
   operation timed out”. A control that was sent is not reported as timed out
   because a read after it was slow.
+- Under `backend = "auto"`, MPD is used only when you configured an endpoint
+  (`[media.mpd] socket` or `MPD_HOST`); the default `127.0.0.1:6600` is not
+  probed. Set `backend = "mpd"` to use it.
 - With MPD, a control whose command the server does not permit for this
   connection (for example, under a restricted password) is not sent. Shuffle,
   loop, volume and seek report “This player does not support that control”;
