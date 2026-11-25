@@ -430,12 +430,21 @@ environments.
   (`retry-pullbacks`, no default chord) runs the same code as
   `thegn env sync-retry`, off the loop, and posts one toast with the counts. It
   never destroys a sandbox.
-- **Inspect.** `thegn fleet inspect <sprite> --env <S> [--policy] [--json]`
+- **Inspect.** `thegn fleet inspect <sprite> --env <S> [--policy] [--probe] [--json]`
   reads one sprite from the org-level API: name, status, `created_at` and URL
   auth, with a warning when URL auth is public. It never runs or resumes the
   sprite. `--policy` also reads the memory policy and your configured
   `min_ram_gb`; that read is separate because it may wake a cold sprite. Its
   errors never print the request URL.
+- **Live health.** `--probe` runs one short read-only command inside the
+  sprite (this wakes a cold sprite) and adds its health: CPU load and cores,
+  memory used against the limit (the cgroup limit when one is set) with memory
+  pressure, disk use of `/`, uptime and boot id, and the time left before
+  `max_lifetime_secs`. The health is `ok`, `warn` (memory or disk at 90% or
+  more, or the kernel killed a process for memory this boot) or `unknown` (the
+  probe could not run; the reason is printed). Warnings name the cause, for
+  example `sprite out of memory: kernel killed rustc 3.7 GB`, and a lifetime
+  under an hour. With `--json` the same report is the `health` object.
 - **Provision field.** `thegn agent run --json` and a headless `session open`
   carry `provision`: `none` (not a provider env, or already provisioned),
   `claimed_spare` or `provisioned`.

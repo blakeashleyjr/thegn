@@ -765,6 +765,13 @@
       "changes": [
         "meter-ai-spend-in-fleet-burn"
       ]
+    },
+    {
+      "issue": "THE-2712",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "remote-sandbox-visibility"
+      ]
     }
   ]
 }
