@@ -2658,15 +2658,17 @@ template = "image:registry.example/dev:1"
         let explicit = "[env.s]\nplacement = \"provider\"\n[env.s.provider]\nprovider = \"sprites\"\nmodel_credentials = \"none\"\n";
         let implicit =
             "[env.s]\nplacement = \"provider\"\n[env.s.provider]\nprovider = \"sprites\"\n";
-        assert!(
-            !validate_diagnostics(explicit)
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("forwarded by default"))
-        );
+        assert!(!validate_diagnostics(explicit).iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("not forwarded until you approve")
+        }));
         assert_eq!(
             validate_diagnostics(implicit)
                 .iter()
-                .filter(|diagnostic| diagnostic.message.contains("forwarded by default"))
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("not forwarded until you approve"))
                 .count(),
             1
         );

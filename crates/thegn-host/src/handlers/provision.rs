@@ -299,6 +299,9 @@ impl ProvisionSource for tokio::sync::mpsc::UnboundedReceiver<ProvisionProgress>
 pub(crate) enum SpecError {
     /// Boxed: `SandboxHalt` is large and every spec closure returns this error.
     Halt(Box<crate::agent::SandboxHalt>),
+    /// An unset Sprites `model_credentials` needs a one-time answer. Boxed for
+    /// the same size reason as `Halt`.
+    Consent(Box<crate::agent::ModelCredentialConsentRequired>),
     Other(String),
     /// Benign automatic pre-warm skip (provider env not provisioned yet, or
     /// host execution was the only fresh spec). Clears `prewarm_inflight` on
@@ -308,12 +311,24 @@ pub(crate) enum SpecError {
 }
 
 /// Lower an `anyhow::Error` from `launch_spec` into a channel-safe [`SpecError`],
-/// keeping the typed halt when present.
+/// keeping the typed halt or credential prompt when present.
 pub(crate) fn spec_err(e: anyhow::Error) -> SpecError {
-    match sandbox_halt_in(&e) {
-        Some(h) => SpecError::Halt(Box::new(h.clone())),
-        None => SpecError::Other(e.to_string()),
+    if let Some(h) = sandbox_halt_in(&e) {
+        return SpecError::Halt(Box::new(h.clone()));
     }
+    if let Some(prompt) = model_credential_consent_in(&e) {
+        return SpecError::Consent(Box::new(prompt.clone()));
+    }
+    SpecError::Other(e.to_string())
+}
+
+/// Find a [`ModelCredentialConsentRequired`](crate::agent::ModelCredentialConsentRequired)
+/// anywhere in an error's source chain (robust to `.context()` wrapping).
+pub(crate) fn model_credential_consent_in(
+    e: &anyhow::Error,
+) -> Option<&crate::agent::ModelCredentialConsentRequired> {
+    e.chain()
+        .find_map(|src| src.downcast_ref::<crate::agent::ModelCredentialConsentRequired>())
 }
 
 /// Find a [`SandboxHalt`](crate::agent::SandboxHalt) anywhere in an error's
@@ -959,6 +974,18 @@ pub(crate) fn drain_specs(
                             *ctx.active_menu = Some(sandbox_halt_overlay(&halt));
                         }
                         halt.reason.clone()
+                    }
+                    SpecError::Consent(prompt) => {
+                        ctx.model.status =
+                            format!("{}: approve credential forwarding", prompt.env_name);
+                        if is_active && origin != SpecOrigin::Prewarm {
+                            *ctx.active_menu = Some(crate::model_credential_prompt::menu_for(
+                                prompt.as_ref(),
+                                &name,
+                                ti,
+                            ));
+                        }
+                        format!("model credentials for {} need approval", prompt.sandbox)
                     }
                     SpecError::Other(s) => {
                         ctx.model.status = format!("Pane launch blocked: {s}");

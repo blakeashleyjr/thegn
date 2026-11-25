@@ -293,10 +293,10 @@ pub(crate) fn json_with(
                 String::new()
             };
             let credential_free = kind.credential_free();
-            let mode = if kind == EnvProviderKind::Sprites
-                && !pc.model_credentials_is_explicit()
-            {
-                thegn_core::config::ModelCredentials::Upload
+            let implicit =
+                kind == EnvProviderKind::Sprites && !pc.model_credentials_is_explicit();
+            let mode = if implicit {
+                thegn_core::config::ModelCredentials::None
             } else {
                 pc.model_credentials
             };
@@ -325,17 +325,17 @@ pub(crate) fn json_with(
             };
             let login_upload = if credential_free {
                 mode.as_str().to_string()
+            } else if implicit {
+                "unset".to_string()
             } else if kind == EnvProviderKind::Sprites && !grant.login_files {
                 "none".to_string()
             } else {
                 let agents = login_agents(cfg, env);
                 if agents.is_empty() { "none".to_string() } else { clean(&agents.join(",")) }
             };
-            let credentials_warning = if kind == EnvProviderKind::Sprites
-                && !pc.model_credentials_is_explicit()
-            {
+            let credentials_warning = if implicit {
                 format!(
-                    "credentials are forwarded by default on this env; set model_credentials = \"none\" in [env.{name}.provider] to turn them off"
+                    "credentials are not forwarded until you approve them on this project's first launch; set model_credentials = \"upload\" in [env.{name}.provider] to forward them, or \"none\" to never send them"
                 )
             } else {
                 String::new()
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn vercel_forwards_nothing_and_no_value_reaches_the_json() {
+    fn vercel_forwards_nothing_and_unset_sprites_waits_for_consent() {
         let temp = tempfile::tempdir().unwrap();
         let mut vars: Vec<(String, String)> = thegn_core::testenv::state_env_all(temp.path())
             .into_iter()
@@ -774,17 +774,19 @@ mod tests {
         sprites.sandbox.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
         sprites.sandbox.home.agents = vec!["claude".into()];
         let out = json_with(&sprites, None, &[], 0, &[]);
-        assert!(
-            out[0]["forwarded_env"]
-                .to_string()
-                .contains("ANTHROPIC_API_KEY")
-        );
-        assert_eq!(out[0]["login_upload"], "claude");
+        assert_eq!(out[0]["forwarded_env"], serde_json::json!([]));
+        assert_eq!(out[0]["login_upload"], "unset");
         assert!(
             out[0]["credentials_warning"]
                 .as_str()
                 .unwrap()
-                .contains("model_credentials = \"none\"")
+                .contains("model_credentials = \"upload\"")
+        );
+        assert!(
+            out[0]["credentials_warning"]
+                .as_str()
+                .unwrap()
+                .contains("first launch")
         );
         assert!(!out.to_string().contains("sentinel"));
     }

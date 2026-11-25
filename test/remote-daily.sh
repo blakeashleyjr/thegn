@@ -125,7 +125,7 @@ Steps:
       committing one file
   5   (fly only) fleet list --env shows stopped
   6   if login_upload=claude, exec bridge stat -c %a ~/.claude/.credentials.json is 600;
-      otherwise no model login entered the sandbox (model_credentials default)
+      otherwise no model login entered the sandbox (unset withholds headless)
   7   local git log has the commits
   8   land --worktree <rd-x path> --release-sandbox
       (requires the land to report "released sandbox <name>")
@@ -938,7 +938,7 @@ case ",$LOGIN_UPLOAD," in
   step 6 "credentials file mode is 600" cred_mode
   ;;
 *)
-  step 6 "no model login entered the sandbox (model_credentials default)" no_model_login
+  step 6 "no model login entered the sandbox (unset withholds headless)" no_model_login
   ;;
 esac
 if [ "$with_model" = 1 ]; then want=3; else want=1; fi
