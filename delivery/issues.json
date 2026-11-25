@@ -772,6 +772,13 @@
       "changes": [
         "remote-sandbox-visibility"
       ]
+    },
+    {
+      "issue": "THE-2725",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "lead-in-app-setup"
+      ]
     }
   ]
 }

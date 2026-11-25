@@ -17,15 +17,48 @@ it never lands work itself.
 It needs the **dev channel** (`THEGN_CHANNEL=dev`). On stable, `[lead]` is
 ignored and nothing about the Lead appears.
 
-## Configure it
+## Set it up in the app
 
-Add a `[lead]` section naming the agent entry to run, for example
-`[lead] agent = "claude"`. Restart the daemon after adding it: the Lead needs
-the daemon and its own control listener. `[lead] account` is refused for now,
-and only claude is supported as the Lead's agent. Without `[lead]` there is no Lead section in the
-sidebar and the jump key only says the Lead is not configured.
+Press `Alt i` (or click the Lead footer, or run "lead" from the palette) while
+the Lead is not configured, or is configured but not yet logged in or not yet
+attached to the daemon: a setup flow opens, one confirm per step. Nothing is
+typed in a shell.
 
-## First run
+1. **Channel.** The Lead is a dev-channel feature. On a stable build the flow
+   says so and lets you prepare the config anyway; its last step tells you to
+   relaunch with `THEGN_CHANNEL=dev thegn`.
+2. **Agent.** Choose the Lead's agent from the detected agents. Only claude is
+   supported today; others are listed as not offered.
+3. **Prerequisites.** bubblewrap is required (the flow shows install hints and
+   a "check again" row). If `pasta` is missing you can install it or choose the
+   host network (`[lead] network = "host"`), where the Lead's sandbox shares
+   your network.
+4. **Config.** A preview shows the exact `[lead]` and `[daemon] enabled = true`
+   lines; confirming writes them to your config file, keeping the rest of it.
+5. **Daemon.** The daemon must restart to carry the Lead's control listener.
+   The flow confirms first: restarting ends the terminals the daemon hosts,
+   including Lead tabs.
+6. **Login.** Opens a tab running `thegn lead login` (see "Log in"), so it keeps
+   every isolation guarantee of that verb. Type `/login` there, exit, then press
+   `Alt i` again.
+7. **Ready.** A summary of the checks, a row that opens the full doctor report
+   in a tab, one row per MCP server in `[lead] mcp_profile` (each opens `thegn
+lead login --mcp <server>` in a tab), and **open the Lead**.
+
+Pressing `Alt i` again at any point resumes from what is on disk. The final
+screen also has a **disable** row that removes the `[lead]` section after a
+confirm; `[daemon] enabled` and the saved login are left alone.
+
+## Configure it by hand
+
+The flow writes ordinary config. To do it yourself, add a `[lead]` section
+naming the agent entry to run, for example `[lead] agent = "claude"`. Restart
+the daemon after adding it: the Lead needs the daemon and its own control
+listener. `[lead] account` is refused for now, and only claude is supported as
+the Lead's agent. Without `[lead]` there is no Lead section in the sidebar and
+`Alt i` opens the setup flow.
+
+## First run, by hand
 
 Every `thegn lead` step needs the dev channel, because on stable `[lead]` is
 clamped off. Not yet verified live.
