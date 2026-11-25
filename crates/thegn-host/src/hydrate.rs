@@ -4568,6 +4568,7 @@ pub(crate) fn spawn_panel_prefetch(
         if !cwd.is_dir() {
             return;
         }
+        let _db_slot = crate::sched::bg_db_slot();
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
         };
@@ -4742,6 +4743,7 @@ fn pr_refresh_blocking_fenced(
             return PrRefreshOutcome::Skipped;
         }
         let loc = thegn_core::remote::GitLoc::for_worktree(cwd);
+        let _db_slot = crate::sched::bg_db_slot();
         let Ok(db) = thegn_core::db::Db::open() else {
             return PrRefreshOutcome::Skipped;
         };
