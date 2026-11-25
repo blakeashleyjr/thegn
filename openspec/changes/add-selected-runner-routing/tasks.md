@@ -104,3 +104,6 @@
       superseded flag and the pass maps it to `Superseded`, matching Sprites; a
       fixture test forces another recovery's write between the scan and the
       re-read.
+- [x] 3.3 Per-project runner binding (`[project.<slug>.jobs] runner`, resolved by
+      `Config::repo_job_runner`) and the `thegn job route [--json]` inspector.
+      Interception of stock agent commands (shell adapter) remains out of scope.

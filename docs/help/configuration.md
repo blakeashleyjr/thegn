@@ -202,6 +202,14 @@ build or test recipe. It must name an `[env.<name>]` whose provider is
 empty by default, and `thegn job run --runner <env>` overrides it for one run.
 The choice is explicit: there is no placement fallback to another runner.
 
+A project can bind its own runner in your own config:
+`[project.<slug>.jobs] runner = "<env name>"` (the legacy `[workspace.<slug>.jobs]`
+spelling works too). It wins over `[jobs] runner` for that project only, so two
+projects can use different runners; the global key stays the fallback. A
+repo-root `.thegn.*` file cannot set it. `thegn job route` shows the effective
+runner and why. If the project's block is ambiguous nothing applies, not even
+the global key.
+
 The runner uses that env's own provider settings and token reference. A
 Sprites env needs `id` set to the one Sprite bound to the project (not a
 `{worktree}` template). A Vercel env needs `team_id` and `project_id`, and

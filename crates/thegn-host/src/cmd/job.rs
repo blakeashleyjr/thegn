@@ -32,6 +32,13 @@ pub enum Action {
     /// Run a build or test recipe on the project's selected Sprites or Vercel
     /// runner, then print its receipt and exit with the job's exit code.
     Run(RunArgs),
+    /// Show where this project's build/test recipes run and why, without
+    /// dispatching anything.
+    Route {
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The closed set of recipes `job run` can submit.
@@ -75,7 +82,103 @@ pub struct RunArgs {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::Run(args) => run_recipe(cfg, &args),
+        Action::Route { json } => route(cfg, json),
     }
+}
+
+/// The effective destination for one project, as the route inspector shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct RouteReport {
+    project: String,
+    /// `sprites`, `vercel` or `local`.
+    destination: String,
+    /// The `[env.<name>]` runner; empty when local.
+    env: String,
+    /// `project`, `global`, `unset` or `refused`.
+    source: &'static str,
+    reason: String,
+    /// `ready`, `local` or `invalid: <why>`. Never resolves a token.
+    status: String,
+}
+
+fn route_report(cfg: &Config, repo_root: &std::path::Path, project: &str) -> RouteReport {
+    use thegn_core::config::RunnerSource;
+    let choice = cfg.repo_job_runner(repo_root);
+    let source = match choice.source {
+        RunnerSource::Project => "project",
+        RunnerSource::Global => "global",
+        RunnerSource::Unset => "unset",
+        RunnerSource::Refused(_) => "refused",
+    };
+    let reason = choice.reason();
+    if choice.env.is_empty() {
+        return RouteReport {
+            project: project.to_owned(),
+            destination: "local".to_owned(),
+            env: String::new(),
+            source,
+            reason,
+            status: "local".to_owned(),
+        };
+    }
+    let provider = cfg
+        .env
+        .get(&choice.env)
+        .map(|env| env.provider.provider.trim().to_owned());
+    let (destination, status) = match provider.as_deref() {
+        None => (
+            "unavailable".to_owned(),
+            format!("invalid: no [env.{}] is configured", choice.env),
+        ),
+        Some(p) if matches!(p, "sprites" | "vercel") => (p.to_owned(), "ready".to_owned()),
+        Some(p) => (
+            p.to_owned(),
+            format!(
+                "invalid: [env.{}] must use provider sprites or vercel",
+                choice.env
+            ),
+        ),
+    };
+    RouteReport {
+        project: project.to_owned(),
+        destination,
+        env: choice.env,
+        source,
+        reason,
+        status,
+    }
+}
+
+fn render_route(report: &RouteReport) -> String {
+    let env = if report.env.is_empty() {
+        String::new()
+    } else {
+        format!(" (env {})", report.env)
+    };
+    format!(
+        "project: {}\nroute: {}{env}\nreason: {}\nstatus: {}",
+        report.project, report.destination, report.reason, report.status
+    )
+}
+
+/// `thegn job route`: print the effective destination and reason. Read-only:
+/// nothing is built, resolved against a secret store, or sent.
+fn route(cfg: &Config, json: bool) -> Result<()> {
+    let worktree = super::resolve_worktree(None);
+    let repo_root = thegn_core::repo::main_worktree(&worktree).ok_or_else(|| {
+        anyhow::Error::new(super::NotFound(format!(
+            "not a git repository: {}",
+            worktree.display()
+        )))
+    })?;
+    let project = selected_runner::project_key(&repo_root)
+        .unwrap_or_else(|| thegn_core::repo::repo_name_from_path(&repo_root));
+    let report = route_report(cfg, &repo_root, &project);
+    if json {
+        return super::emit_json(&report);
+    }
+    outln!("{}", render_route(&report));
+    Ok(())
 }
 
 /// Refuse to start a selected job from inside one: the launchers set the marker
@@ -94,7 +197,6 @@ fn refuse_recursion(inside: bool) -> Result<()> {
 
 fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
     refuse_recursion(selected_job::inside_selected_job())?;
-    let env_name = selected_runner::select_env(cfg, args.runner.as_deref())?;
     let worktree = super::resolve_worktree(None);
     let repo_root = thegn_core::repo::main_worktree(&worktree).ok_or_else(|| {
         anyhow::Error::new(super::NotFound(format!(
@@ -102,6 +204,13 @@ fn run_recipe(cfg: &Config, args: &RunArgs) -> Result<()> {
             worktree.display()
         )))
     })?;
+    // `--runner` wins, then this project's binding, then the global key.
+    let choice = cfg.repo_job_runner(&repo_root);
+    let requested = args
+        .runner
+        .clone()
+        .or_else(|| (!choice.env.is_empty()).then(|| choice.env.clone()));
+    let env_name = selected_runner::select_env(cfg, requested.as_deref())?;
     let project = selected_runner::project_key(&repo_root).ok_or_else(|| {
         anyhow!(
             "cannot derive a project name from {}; it needs an ASCII letter or digit",

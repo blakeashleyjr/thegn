@@ -4162,6 +4162,42 @@ fn workspace_slug_is_the_repo_directory_name_slugified() {
 }
 
 #[test]
+fn repo_job_runner_prefers_the_project_binding_over_the_global_key() {
+    let a = tmpdir("jobs-a");
+    let b = tmpdir("jobs-b");
+    let mut cfg = Config::default();
+    assert_eq!(cfg.repo_job_runner(&a).source, RunnerSource::Unset);
+    cfg.jobs.runner = "global-env".into();
+    let c = cfg.repo_job_runner(&a);
+    assert_eq!(
+        (c.env.as_str(), c.source),
+        ("global-env", RunnerSource::Global)
+    );
+    cfg.workspace.insert(
+        workspace_slug(&a),
+        WorkspaceConfig {
+            jobs: JobsOverlay {
+                runner: Some(" sprite-a ".into()),
+            },
+            ..WorkspaceConfig::default()
+        },
+    );
+    let c = cfg.repo_job_runner(&a);
+    assert_eq!(
+        (c.env.as_str(), c.source),
+        ("sprite-a", RunnerSource::Project)
+    );
+    // A second project on the same config keeps the global fallback.
+    let c = cfg.repo_job_runner(&b);
+    assert_eq!(
+        (c.env.as_str(), c.source),
+        ("global-env", RunnerSource::Global)
+    );
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
 fn repo_ci_uses_only_the_trusted_workspace_overlay() {
     let dir = tmpdir("ci-overlay");
     let mut cfg = Config::default();
