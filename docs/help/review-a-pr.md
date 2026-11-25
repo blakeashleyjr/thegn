@@ -9,6 +9,9 @@ actions: [pr-open, pr-create]
 
 # Review a PR
 
+Use this page to review a teammate's pull request in its own worktree, from
+the notification to the review comment.
+
 1. The status bar's CI/notification cluster (see [[bars]]) surfaces PRs that
    need you; `↵` on the item shows the detail popup.
 2. Check out the branch as its own worktree: `Alt-w` in the repo's

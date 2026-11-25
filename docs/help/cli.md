@@ -16,8 +16,8 @@ works everywhere.
 
 ## The grammar
 
-Noun-verb namespaces mirror the domain model (repo → project →
-worktree):
+Noun-verb namespaces mirror the domain model (repo → worktree, with
+programs grouping repos):
 
 | Group         | Commands                                                                                                                                      |
 | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -29,6 +29,36 @@ worktree):
 | Session       | `session list\|open\|snapshot\|attach\|wait` · `notify` · `logs` · `share` · `forward`                                                        |
 | Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                                                    |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `usage [--json] [--tokens]` · `db` · `setup` · `completions`                                         |
+
+### Subcommand reference
+
+`thegn <group> --help` lists every verb. These are the ones the sections
+below do not cover in detail:
+
+| Command                                                                      | What it does                                                                                      |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `pr status` · `pr diff [--json]` · `pr open`                                 | Show the PR, its checks and reviews; print its diff; open it in a browser                         |
+| `pr create` · `pr ready [--undo]` · `pr auto-merge [--disable]`              | Create the PR; mark it ready or back to draft; toggle auto-merge                                  |
+| `pr approve` · `pr review` · `pr reviews` · `pr comment` · `pr rerun-checks` | Review, comment on, and re-run failed checks for the PR                                           |
+| `ci detect`                                                                  | Show which CI systems the worktree uses and the active provider                                   |
+| `kaneo login` · `logout` · `status`                                          | Sign in to a Kaneo instance, forget the token, show what is resolved                              |
+| `kaneo projects` · `board` · `create` · `comment` · `label` · `move`         | Work with Kaneo projects and tasks                                                                |
+| `env test` · `env snapshots` · `env clear`                                   | Check a provider env's token; list its checkpoints; clear a worktree's env selection              |
+| `env forward <local:remote>` · `env image-bake`                              | Forward a port from a k8s env; bake a reusable VPS base image                                     |
+| `host status` · `probe` · `provision` · `drain` · `rm-cache`                 | Inspect, re-probe, provision, drain or forget a `[host.<name>]` machine                           |
+| `placement explain` · `events` · `budget`                                    | Why the last spawn landed where it did; recent decisions; spend scopes and caps                   |
+| `zone list` · `rename` · `rm [--force]`                                      | Manage zones                                                                                      |
+| `proxy start` · `status` · `stop`                                            | Control the model proxy daemon                                                                    |
+| `mcp list` · `status` · `reload` · `emit` · `preset`                         | Inspect declared MCP servers and the proxy hub; reload upstreams; print settings; curated presets |
+| `notify push` · `read` · `read-all` · `dismiss` · `dismiss-all`              | Manage tray notifications                                                                         |
+| `logs count`                                                                 | Count log lines, optionally filtered                                                              |
+| `secret audit` · `secret rm`                                                 | List configured secret refs with their last outcome (never values); remove a stored secret        |
+| `session leases` · `session split`                                           | Show relay leases; open a sibling pane in a session                                               |
+| `agent sessions`                                                             | List discovered coding-agent sessions                                                             |
+| `merge conflicts`                                                            | Classify queue conflicts and print a reconcile draft                                              |
+| `supervise validations`                                                      | Show the validation runs recorded for a lane                                                      |
+| `config schema`                                                              | Print the JSON schema for editor autocomplete                                                     |
+| `api coverage`                                                               | Show the capability coverage ledger                                                               |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
