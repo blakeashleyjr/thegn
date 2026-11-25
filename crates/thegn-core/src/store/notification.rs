@@ -102,6 +102,10 @@ pub trait NotificationStore {
         worktree_path: &str,
     ) -> Result<usize>;
 
+    /// Mark every unread row of `kind` in one worktree read, whatever its source
+    /// (a later success of the same kind clears the worktree's failure badge).
+    fn mark_kind_read_for_worktree(&self, kind: &str, worktree_path: &str) -> Result<usize>;
+
     /// Expire old unread failure rows without deleting inbox history.
     fn expire_failures(&self, cutoff: i64) -> Result<usize>;
 

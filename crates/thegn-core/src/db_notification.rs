@@ -251,6 +251,13 @@ impl NotificationStore for Db {
         )?)
     }
 
+    fn mark_kind_read_for_worktree(&self, kind: &str, worktree_path: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE kind=?1 AND worktree_path=?2 AND read=0",
+            params![kind, worktree_path],
+        )?)
+    }
+
     fn expire_failures(&self, cutoff: i64) -> Result<usize> {
         Ok(self.conn().execute(
             "UPDATE notifications SET read=1 WHERE read=0 AND kind IN ('process_failed','agent_failed','test_failed') AND created_at_ms < ?1",
