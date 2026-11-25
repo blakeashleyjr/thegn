@@ -620,6 +620,10 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
             ws.autopilot
                 .validate(&format!("workspace.{slug}.autopilot")),
         );
+        batch!(
+            ws.jobs
+                .validate(&format!("workspace.{slug}.jobs"), &cfg.env),
+        );
     }
     // `[[presets]]` semantic checks (empty preset, template `preset`
     // exclusivity) — strings to the schema, so only checkable post-parse.

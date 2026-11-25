@@ -2652,6 +2652,11 @@ pub struct WorkspaceConfig {
     /// This is the only repo-scoped layer allowed to enable the supervisor.
     #[serde(skip_serializing_if = "AutopilotOverlay::is_empty")]
     pub autopilot: AutopilotOverlay,
+    /// Trusted per-project build/test runner (`[workspace.<slug>.jobs]
+    /// runner`). Repo-authored `.thegn.*` files cannot set this field.
+    /// Resolved by [`Config::repo_job_runner`].
+    #[serde(skip_serializing_if = "JobsOverlay::is_empty")]
+    pub jobs: JobsOverlay,
     /// Per-repo `[git]` refinements (`[workspace.<slug>.git]`). The TRUSTED
     /// per-repo layer for signing / fetch / diff-view policy — a work repo that
     /// wants `structural_diff` or different `auto_fetch` behaviour than your
@@ -5323,7 +5328,7 @@ pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
 };
-pub use crate::config_jobs::JobsConfig;
+pub use crate::config_jobs::{JobsConfig, JobsOverlay, RunnerChoice, RunnerSource};
 pub use crate::config_model_proxy::{
     BudgetBreach, BudgetConfig, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
     RouteBackend, RouteEntry, RoutingStrategy,
@@ -7482,6 +7487,44 @@ impl Config {
             _ => {}
         }
         policy
+    }
+
+    /// The effective build/test runner for a repo: the trusted project
+    /// binding (`[workspace.<slug>.jobs] runner`) over the global `[jobs]
+    /// runner`. A repo-root overlay is never consulted, and an ambiguous
+    /// project block fails closed (no runner, not the global one).
+    pub fn repo_job_runner(&self, repo_root: &Path) -> RunnerChoice {
+        match self.workspace_overlay(repo_root) {
+            crate::workspace_overlay::WorkspaceOverlay::Selected { overlay, .. } => {
+                if let Some(name) = overlay.jobs.runner.as_deref().map(str::trim)
+                    && !name.is_empty()
+                {
+                    return RunnerChoice {
+                        env: name.to_owned(),
+                        source: RunnerSource::Project,
+                    };
+                }
+            }
+            crate::workspace_overlay::WorkspaceOverlay::Refused(why) => {
+                return RunnerChoice {
+                    env: String::new(),
+                    source: RunnerSource::Refused(why.to_string()),
+                };
+            }
+            crate::workspace_overlay::WorkspaceOverlay::Unconfigured => {}
+        }
+        let global = self.jobs.runner.trim();
+        if global.is_empty() {
+            RunnerChoice {
+                env: String::new(),
+                source: RunnerSource::Unset,
+            }
+        } else {
+            RunnerChoice {
+                env: global.to_owned(),
+                source: RunnerSource::Global,
+            }
+        }
     }
 
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),

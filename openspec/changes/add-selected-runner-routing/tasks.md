@@ -101,3 +101,6 @@
 - [ ] 4.11 Follow-up: Vercel `reconcile_pending_at` reports a compare-and-swap loss as
       `Cleaned`/`StillPending`, never `ReconcileOutcome::Superseded` (Sprites reports it);
       only the logged `settled` count is affected.
+- [x] 3.3 Per-project runner binding (`[project.<slug>.jobs] runner`, resolved by
+      `Config::repo_job_runner`) and the `thegn job route [--json]` inspector.
+      Interception of stock agent commands (shell adapter) remains out of scope.

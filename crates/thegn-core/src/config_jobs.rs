@@ -41,6 +41,71 @@ impl JobsConfig {
     }
 }
 
+/// Trusted per-project refinement of `[jobs]` (`[workspace.<slug>.jobs]`, also
+/// spelled `[project.<slug>.jobs]`). Repo-authored `.thegn.*` files have no
+/// corresponding field: which provider account runs a project's builds, and at
+/// whose expense, is an owner decision.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct JobsOverlay {
+    /// This project's runner `[env.<name>]` (provider `sprites` or `vercel`).
+    /// Wins over the global `[jobs] runner` for this project only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+}
+
+impl JobsOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.runner.is_none()
+    }
+
+    /// Semantic checks, same rule as the global key.
+    pub fn validate(&self, prefix: &str, envs: &BTreeMap<String, EnvConfig>) -> Vec<String> {
+        JobsConfig {
+            runner: self.runner.clone().unwrap_or_default(),
+        }
+        .validate(prefix, envs)
+    }
+}
+
+/// Where the effective runner for a project came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerSource {
+    /// The project's trusted `[workspace.<slug>.jobs] runner`.
+    Project,
+    /// The global `[jobs] runner`.
+    Global,
+    /// Nothing selects a runner: the project stays local.
+    Unset,
+    /// The project's overlay block is ambiguous, so nothing applies (fail
+    /// closed: the global runner is NOT used either).
+    Refused(String),
+}
+
+/// The effective runner for one project and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerChoice {
+    /// The selected `[env.<name>]`; empty when `source` is `Unset`/`Refused`.
+    pub env: String,
+    pub source: RunnerSource,
+}
+
+impl RunnerChoice {
+    /// One-line reason for the route inspector.
+    pub fn reason(&self) -> String {
+        match &self.source {
+            RunnerSource::Project => "project binding ([project.<slug>.jobs] runner)".into(),
+            RunnerSource::Global => "global default ([jobs] runner)".into(),
+            RunnerSource::Unset => {
+                "no runner selected for this project: builds and tests stay local".into()
+            }
+            RunnerSource::Refused(why) => {
+                format!("project overlay refused, nothing applies: {why}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +126,19 @@ mod tests {
         assert_eq!(Config::default().jobs.runner, "");
         let cfg: Config = toml::from_str("[jobs]\nrunner = \"ci-sprite\"\n").unwrap();
         assert_eq!(cfg.jobs.runner, "ci-sprite");
+    }
+
+    #[test]
+    fn the_overlay_is_validated_like_the_global_key() {
+        let mut envs = BTreeMap::new();
+        envs.insert("fl".to_string(), env("fly"));
+        assert!(JobsOverlay::default().validate("p.jobs", &envs).is_empty());
+        let bad = JobsOverlay {
+            runner: Some("fl".into()),
+        };
+        let errs = bad.validate("workspace.x.jobs", &envs);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("workspace.x.jobs.runner"), "{errs:?}");
     }
 
     #[test]
