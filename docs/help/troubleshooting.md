@@ -104,6 +104,17 @@ choose one per worktree.
 **Do this:** Inspect `thegn doctor` and the refusal remediation. On NixOS, the
 sandboxing page recommends pinning `backend = "bwrap"`. See [[sandboxing]].
 
+## On WSL2, a sandboxed launch is refused or the daemon will not reattach
+
+**Why:** Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+which stops `bwrap` from starting. thegn then refuses the sandboxed launch. A
+stale pane daemon from an older build can also stop panes reattaching. The
+systemd user manager is not required, but it is needed for the `systemd`
+backend and hard CPU caps.
+
+**Do this:** Follow [[wsl2]]: check `bwrap` and the AppArmor sysctl, run
+`thegn daemon stop`, and restart thegn. Then run `thegn doctor`.
+
 ## A worktree or repository operation is refused by the merge queue
 
 **Why:** A branch that moved after verification is refused.

@@ -37,7 +37,7 @@ sandbox-and-credentials note under [First run](#3-first-run).
 
 ## Quickstart (Linux x86_64)
 
-Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. See [Install](#install) for platform details.
+Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. On Windows, run the Linux build inside WSL2: see `docs/help/wsl2.md` for the Ubuntu 24.04 steps. See [Install](#install) for platform details.
 
 ### 1. Install
 

@@ -40,8 +40,9 @@ downloaded in a browser is quarantined by Gatekeeper; run
 `xattr -d com.apple.quarantine ./thegn` once before the first launch. Homebrew
 downloads are not quarantined.
 
-Windows has no published binary. Run `thegn doctor` after installing to check
-your setup.
+Windows has no published binary. On Windows, install the Linux archive inside
+WSL2 instead; [[wsl2]] has the steps. Run `thegn doctor` after installing to
+check your setup.
 
 ## Before you start
 
