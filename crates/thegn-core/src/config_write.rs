@@ -735,6 +735,86 @@ pub fn upsert_forge(
     })
 }
 
+/// Make `name` the default coding agent: the first `[[agents]]` entry (see
+/// `Config::default_agent_name`). Never drops or rewrites another entry:
+///
+/// - `[[agents]]` holds `name`: that table (with its comments and every field)
+///   moves to the front;
+/// - `[[agents]]` exists without it: `{ name, command }` is inserted first;
+/// - no `[[agents]]` yet: the array is written as `{ name, command }` followed
+///   by `keep` (the effective built-in list, so the fallback shell and the
+///   previous default survive — an `[[agents]]` array replaces the built-ins).
+///
+/// toml_edit renders tables by their document position (a stable sort), so a
+/// moved table is re-pinned by handing the original positions out in the new
+/// order; otherwise the file would keep the old order on disk.
+pub fn promote_agent(
+    config_path: &Path,
+    name: &str,
+    command: &str,
+    keep: &[(String, String)],
+) -> Result<()> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "agent name is empty");
+    anyhow::ensure!(!command.trim().is_empty(), "agent command is empty");
+    let (mut doc, expected) = read_doc(config_path)?;
+    let entry_of = |n: &str, c: &str| {
+        let mut t = Table::new();
+        t.insert("name", value(n));
+        t.insert("command", value(c));
+        t
+    };
+    let root = doc.as_table_mut();
+    match root
+        .get_mut("agents")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        Some(aot) => {
+            let idx = aot
+                .iter()
+                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
+            if idx == Some(0) {
+                return Ok(()); // already the default — nothing to write
+            }
+            let positions: Vec<Option<isize>> = aot.iter().map(Table::position).collect();
+            let mut tables: Vec<Table> = aot.iter().cloned().collect();
+            let chosen = match idx {
+                Some(i) => tables.remove(i),
+                None => entry_of(name, command),
+            };
+            tables.insert(0, chosen);
+            aot.clear();
+            for (i, mut t) in tables.into_iter().enumerate() {
+                // Reorder: slot i keeps position i. Insert: the new head shares
+                // the old head's position (stable sort keeps it first) and every
+                // old table shifts down one slot.
+                let pos = match idx {
+                    Some(_) => positions.get(i).copied().flatten(),
+                    None => positions.get(i.saturating_sub(1)).copied().flatten(),
+                };
+                t.set_position(pos);
+                aot.push(t);
+            }
+        }
+        None => {
+            anyhow::ensure!(
+                root.get("agents").is_none(),
+                "`agents` in {} is not an array of tables; edit it by hand",
+                config_path.display()
+            );
+            let mut aot = toml_edit::ArrayOfTables::new();
+            aot.push(entry_of(name, command));
+            for (n, c) in keep {
+                if n.trim() != name && !n.trim().is_empty() && !c.trim().is_empty() {
+                    aot.push(entry_of(n.trim(), c.trim()));
+                }
+            }
+            root.insert("agents", Item::ArrayOfTables(aot));
+        }
+    }
+    write_doc(config_path, &doc, expected.as_deref())
+}
+
 /// In a **repo** `.thegn.toml`, select an env with a top-level `env = "<name>"`
 /// (repos select, never define — this refuses to write any `[env.*]` table).
 pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
@@ -1332,5 +1412,70 @@ mod tests {
         // caused (typed field := quoted string ⇒ load_layered discards everything).
         toml::from_str::<crate::config::Config>(&text)
             .expect("config with a bool/int set must still parse");
+    }
+
+    fn agent_names(text: &str) -> Vec<String> {
+        let cfg: toml::Value = toml::from_str(text).unwrap();
+        cfg.get("agents")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|t| t["name"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn promote_agent_writes_the_builtins_behind_the_pick_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[theme]\npreset = \"nord\"\n").unwrap();
+        let keep = vec![
+            ("claude".to_string(), "claude".to_string()),
+            ("shell".to_string(), "__shell__".to_string()),
+        ];
+        promote_agent(&path, "codex", "codex", &keep).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\n[theme]"), "{text}");
+        assert_eq!(agent_names(&text), ["codex", "claude", "shell"]);
+        let cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.default_agent_name(), Some("codex"));
+    }
+
+    #[test]
+    fn promote_agent_moves_an_existing_entry_first_keeping_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[agents]]\nname = \"claude\"\ncommand = \"claude\"\n\n\
+             # my pi\n[[agents]]\nname = \"pi\"\ncommand = \"pi --fast\"\n\n\
+             [[agents]]\nname = \"shell\"\ncommand = \"__shell__\"\n",
+        )
+        .unwrap();
+        promote_agent(&path, "pi", "pi", &[]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(agent_names(&text), ["pi", "claude", "shell"], "{text}");
+        assert!(text.contains("command = \"pi --fast\""), "{text}");
+        assert!(text.contains("# my pi"), "{text}");
+        // Idempotent: promoting the head again is a no-op.
+        promote_agent(&path, "pi", "pi", &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn promote_agent_inserts_a_missing_entry_at_the_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[agents]]\nname = \"claude\"\ncommand = \"claude\"\n\n[theme]\npreset = \"nord\"\n",
+        )
+        .unwrap();
+        promote_agent(&path, "aider", "aider", &[]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(agent_names(&text), ["aider", "claude"], "{text}");
+        assert!(text.contains("preset = \"nord\""));
     }
 }
