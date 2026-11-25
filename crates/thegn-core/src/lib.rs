@@ -127,6 +127,7 @@ pub use db_dispatch_capability::{
 };
 mod db_gate_attest;
 pub use db_gate_attest::{GateAttestationRefusal, StoredGateAttestation};
+pub mod db_conn_gate;
 mod db_glyph;
 mod db_hibernate;
 pub mod db_inbox;

@@ -1053,6 +1053,9 @@ pub struct Db {
     conn: Connection,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
     pub(crate) schema_mismatch: Option<i64>,
+    /// Gate slot held for the connection's lifetime when opened via [`Db::open`]; declared
+    /// last so it is returned only after `conn` has closed.
+    _slot: Option<crate::db_conn_gate::ConnSlot>,
 }
 
 static BACKGROUND_WORKER_HOOK: OnceLock<fn()> = OnceLock::new();
@@ -1133,6 +1136,7 @@ fn spawn_semantic_sweep(path: PathBuf) -> std::io::Result<std::thread::JoinHandl
                 let sweep_db = Db {
                     conn,
                     schema_mismatch: None,
+                    _slot: None,
                 };
                 if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
                     tracing::warn!(%error, "semantic prune sweep failed");
@@ -1481,7 +1485,11 @@ impl Db {
         // this is one `Instant::now()` pair and a thread-id compare; in a
         // process that never marked a loop thread it is the compare alone.
         let started = std::time::Instant::now();
-        let out = Self::open_timed();
+        let slot = crate::db_conn_gate::acquire();
+        let out = Self::open_timed().map(|mut db| {
+            db._slot = slot;
+            db
+        });
         crate::db_open_stats::record_open(
             started.elapsed().as_micros() as u64,
             std::panic::Location::caller(),
@@ -1624,6 +1632,7 @@ impl Db {
             db: Db {
                 conn,
                 schema_mismatch: None,
+                _slot: None,
             },
             operation,
             _schema_lease: lease,
@@ -1650,6 +1659,7 @@ impl Db {
         Ok(Some(Db {
             conn,
             schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+            _slot: None,
         }))
     }
 
@@ -1679,6 +1689,7 @@ impl Db {
         Ok(Some(Db {
             conn,
             schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+            _slot: None,
         }))
     }
 
@@ -1838,6 +1849,7 @@ impl Db {
             return Ok(Db {
                 conn,
                 schema_mismatch: Some(ver),
+                _slot: None,
             });
         }
 
@@ -1938,6 +1950,7 @@ impl Db {
             return Ok(Db {
                 conn,
                 schema_mismatch: None,
+                _slot: None,
             });
         }
         // Forward migration of an existing database: keep a verified, rotated copy
@@ -2769,6 +2782,7 @@ impl Db {
         let db = Db {
             conn,
             schema_mismatch,
+            _slot: None,
         };
         // Full inits (fresh DB / migration) prune inline; the common fast-path
         // open skips this and relies on the once-per-process prune in `open()`.
