@@ -1346,7 +1346,7 @@ in {
     gitMergeGuard = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
-      description = "Install the pre-merge-commit hook that refuses a merge into the canonical checkout from inside a thegn sandbox. Unset (null) = the binary's default.";
+      description = "Offer the pre-merge-commit hook (installed only after a once-per-repo yes) that refuses a merge into the canonical checkout from inside a thegn sandbox. Unset (null) = the binary's default.";
     };
 
     gitAutoFetch = lib.mkOption {

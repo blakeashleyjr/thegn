@@ -880,7 +880,10 @@ submodules = "auto"    # initialize recursively only when .gitmodules exists;
 override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
                        # -c tag.gpgSign=false, so a gpg passphrase prompt can
                        # never hang a background operation
-merge_guard = true     # install a pre-merge-commit hook that refuses `git merge`
+merge_guard = true     # offer a pre-merge-commit hook (thegn asks once per repo before
+                       # touching its hooks; the answer is remembered in
+                       # <git-dir>/thegn-merge-guard; a non-interactive start never
+                       # installs it). The hook refuses `git merge`
                        # in the canonical checkout from inside a sandbox (where
                        # its FS view can be incoherent and corrupt the merge);
                        # points at `thegn integrate`. No-op outside a sandbox or

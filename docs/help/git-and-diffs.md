@@ -274,6 +274,17 @@ thegn's database is a cache. Deleting a worktree with `git worktree
 remove` behind thegn's back is safe — the tree reconciles on the next
 launch.
 
+## The merge-guard hook
+
+thegn can install a `pre-merge-commit` hook in the repo's shared hooks
+directory. It refuses a raw `git merge` of the main checkout from inside a
+sandbox and points at `thegn integrate`. thegn never installs it silently:
+on an interactive start in a repo it has not asked about, it asks once and
+remembers your answer in the git directory (`thegn-merge-guard`). A
+non-interactive start with no answer leaves your hooks untouched. To change
+your mind, edit that file (`yes` or `no`) or set `[git] merge_guard = false`.
+`thegn doctor` reports the hook's state.
+
 ## Landing work
 
 Diffs are where a branch starts; [[merge-queue]] is where it ends. The

@@ -420,6 +420,68 @@ pub fn audit(hooks_dir: &Path) -> std::io::Result<Audit> {
     ))
 }
 
+/// File (inside the repo's common git dir, beside `hooks/`) remembering the
+/// owner's answer to "install the merge guard here?". Never inside `hooks/`:
+/// that dir is shared with frameworks that own its contents.
+pub const CONSENT_FILE: &str = "thegn-merge-guard";
+
+/// The remembered per-repo answer: `Some(true)` accepted, `Some(false)`
+/// declined, `None` never asked (or unreadable / unrecognised).
+pub fn consent(common_dir: &Path) -> Option<bool> {
+    match std::fs::read_to_string(common_dir.join(CONSENT_FILE))
+        .ok()?
+        .trim()
+    {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Remember the owner's answer for this repo.
+pub fn record_consent(common_dir: &Path, accepted: bool) -> std::io::Result<()> {
+    std::fs::write(
+        common_dir.join(CONSENT_FILE),
+        if accepted { "yes\n" } else { "no\n" },
+    )
+}
+
+/// What startup should do about the guard hook for one repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Install or refresh the hook.
+    Install,
+    /// Leave the hooks dir untouched.
+    Skip,
+    /// Never asked and nothing of ours is there: ask the owner first.
+    Ask,
+}
+
+/// Pure startup decision. A hook of ours already on disk (any revision) keeps
+/// being refreshed — the owner accepted it earlier; a repo's hooks are never
+/// created or modified without a recorded "yes".
+pub fn decide(enabled: bool, ours_present: bool, consent: Option<bool>) -> Decision {
+    if !enabled {
+        return Decision::Skip;
+    }
+    match consent {
+        Some(true) => Decision::Install,
+        Some(false) => Decision::Skip,
+        None if ours_present => Decision::Install,
+        None => Decision::Ask,
+    }
+}
+
+/// Whether a hook of ours (any revision) is already installed in `hooks_dir`.
+pub fn ours_present(hooks_dir: &Path) -> bool {
+    audit(hooks_dir).is_ok_and(|a| {
+        [a.slot, a.legacy]
+            .into_iter()
+            .flatten()
+            .any(|k| matches!(k, HookKind::Current | HookKind::StaleOurs))
+    })
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -883,5 +945,37 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&missing);
         assert!(install(&missing).is_err());
+    }
+
+    #[test]
+    fn decide_never_installs_without_consent() {
+        assert_eq!(decide(true, false, None), Decision::Ask);
+        assert_eq!(decide(true, false, Some(true)), Decision::Install);
+        assert_eq!(decide(true, false, Some(false)), Decision::Skip);
+        assert_eq!(decide(true, true, None), Decision::Install);
+        assert_eq!(decide(true, true, Some(false)), Decision::Skip);
+        assert_eq!(decide(false, false, Some(true)), Decision::Skip);
+    }
+
+    #[test]
+    fn consent_round_trips_and_ignores_garbage() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(consent(d.path()), None);
+        record_consent(d.path(), true).unwrap();
+        assert_eq!(consent(d.path()), Some(true));
+        record_consent(d.path(), false).unwrap();
+        assert_eq!(consent(d.path()), Some(false));
+        std::fs::write(d.path().join(CONSENT_FILE), "maybe").unwrap();
+        assert_eq!(consent(d.path()), None);
+    }
+
+    #[test]
+    fn ours_present_detects_our_hook_only() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!ours_present(d.path()));
+        std::fs::write(d.path().join(HOOK_NAME), USER_HOOK).unwrap();
+        assert!(!ours_present(d.path()));
+        std::fs::write(d.path().join(HOOK_NAME), HOOK_SCRIPT).unwrap();
+        assert!(ours_present(d.path()));
     }
 }

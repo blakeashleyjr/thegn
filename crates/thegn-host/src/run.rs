@@ -510,6 +510,50 @@ fn since_process_ms() -> u64 {
         .map_or(0, |t| t.elapsed().as_millis() as u64)
 }
 
+/// Ask once per repo whether to install the merge-guard hook, and remember the
+/// answer in the repo's git dir. Silent when already answered, when a guard of
+/// ours is already installed, outside a git repo, or without an interactive
+/// terminal (the hook then stays uninstalled and nothing is modified).
+fn ask_merge_guard_consent() {
+    use std::io::{BufRead, IsTerminal, Write};
+    use thegn_core::merge_guard as mg;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let common = thegn_core::util::git_common_dir(&cwd);
+    if !common.is_dir() {
+        return;
+    }
+    let ask = mg::decide(
+        true,
+        mg::ours_present(&common.join("hooks")),
+        mg::consent(&common),
+    ) == mg::Decision::Ask;
+    if !ask || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    if write!(
+        out,
+        "thegn can install a `pre-merge-commit` hook in {}/hooks that refuses a raw \
+         `git merge` of the main checkout from inside a sandbox (it points at `thegn \
+         integrate`). Install it? [y/N] ",
+        common.display()
+    )
+    .is_err()
+        || out.flush().is_err()
+    {
+        return;
+    }
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return;
+    }
+    let yes = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if let Err(e) = mg::record_consent(&common, yes) {
+        tracing::debug!(target: "thegn::startup", error = %e, "merge-guard consent not saved");
+    }
+}
+
 pub async fn main(
     cli: crate::Cli,
     admitted: std::sync::Arc<thegn_core::config_admission::AdmittedConfig>,
@@ -618,6 +662,12 @@ pub async fn main(
     // points at the log file.
     if let Some(g) = &_stderr_guard {
         g.register_crash_notice();
+    }
+
+    // Ask before touching a repo's hooks (cooked terminal, before the compositor
+    // owns the screen). The answer is remembered per repo; see `merge_guard`.
+    if admitted.config().git.merge_guard {
+        ask_merge_guard_consent();
     }
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
@@ -884,7 +934,7 @@ pub async fn main(
         "config loaded"
     );
     // Install/refresh the in-sandbox merge guard into the shared hooks dir
-    // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
+    // (`core.hooksPath` → the canonical `.git/hooks`), once the owner has said yes; it refuses
     // a raw `git merge` run against the canonical checkout from inside a sandbox
     // (where its FS view can be incoherent) and points at `thegn integrate`.
     // Chains a foreign hook, and installs *beside* (not over) a pre-commit
@@ -894,7 +944,21 @@ pub async fn main(
     if cfg.git.merge_guard {
         let guard_cwd = cwd.clone();
         tokio::task::spawn_blocking(move || {
-            let hooks = thegn_core::util::git_common_dir(&guard_cwd).join("hooks");
+            let common = thegn_core::util::git_common_dir(&guard_cwd);
+            let hooks = common.join("hooks");
+            // Never create or modify a repo's hooks without a recorded "yes"
+            // (an already-installed guard of ours keeps being refreshed).
+            let decision = thegn_core::merge_guard::decide(
+                true,
+                thegn_core::merge_guard::ours_present(&hooks),
+                thegn_core::merge_guard::consent(&common),
+            );
+            if decision != thegn_core::merge_guard::Decision::Install {
+                tracing::debug!(
+                    target: "thegn::startup", ?decision, "merge-guard hook not installed"
+                );
+                return;
+            }
             match thegn_core::merge_guard::install(&hooks) {
                 // Log the whole plan: `placement`/`restore_shim` are what tell you a
                 // pre-commit framework is in play, which is otherwise invisible until
