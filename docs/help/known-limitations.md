@@ -14,9 +14,10 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 
 - **Linux x86_64 is supported.** Install from a GNU or musl release archive or
   the Nix flake; use the musl archive on systems with older glibc.
-- **macOS on Apple silicon is best-effort.** The archive is unsigned; clear
-  quarantine with `xattr -dr com.apple.quarantine ./thegn` after a browser
-  download, set Option as Meta/Alt in your terminal, and treat CPU caps as
+- **macOS on Apple silicon is supported**; Intel macOS has no release binary.
+  Install with `brew install blakeashleyjr/thegn/thegn` (not quarantined). The
+  release archive is unsigned; clear quarantine with
+  `xattr -dr com.apple.quarantine ./thegn` after a browser download. Set Option as Meta/Alt in your terminal, and treat CPU caps as
   unavailable; the `apple` sandbox backend has no automated runtime coverage.
   See [[terminal-compatibility]] and [[sandboxing]].
 - **The `apple` sandbox backend cannot run offline and has no host network.**

@@ -319,9 +319,9 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 ### Prebuilt binary (no Nix)
 
 Release archives are attached to [each published release][releases], starting
-with the first published alpha tag; until then use the flake or `./install.sh`.
-On Linux x86_64, install the GNU or musl archive for
-your system. For example, with GitHub CLI installed and authenticated
+for every alpha: Linux x86_64 (GNU and musl) and macOS aarch64 (Apple
+silicon). Intel macOS has no release binary. On Linux x86_64, install the GNU
+or musl archive for your system. For example, with GitHub CLI installed and authenticated
 (`gh auth login`), this downloads the GNU archive and its checksum for the
 newest published release:
 
@@ -356,7 +356,9 @@ does not quarantine its downloads, so this needs no extra step. The
 `aarch64-apple-darwin` release tarball works too, but it is not yet signed or
 notarized, so a copy downloaded through a browser is quarantined by
 Gatekeeper; run `xattr -d com.apple.quarantine ./thegn` once before it will
-launch. AUR publication is pending owner setup. Nix store paths and the locally generated `thegn.app` are
+launch. The formula lives in the
+[`homebrew-thegn`](https://github.com/blakeashleyjr/homebrew-thegn) tap and is
+updated each release. AUR publication is pending owner setup. Nix store paths and the locally generated `thegn.app` are
 not quarantined, so neither hits that. The reasoning is in
 [`RELEASING.md`](RELEASING.md), which also covers the release process and the
 crates.io / `cargo binstall` status.
@@ -400,7 +402,7 @@ entry stops installation and restores the previous installation.
 thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
 `~/Applications` that opens a terminal emulator running thegn — Spotlight,
 Raycast, Alfred and the Dock all index it. `./install.sh` writes it
-automatically; for Nix installs, or Homebrew if published, generate it from a
+automatically; for Nix installs or Homebrew, generate it from a
 checkout. Safe staging requires Python 3.9 or newer (`python3`); the generator
 checks for it before changing the app destination:
 

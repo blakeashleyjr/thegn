@@ -11,10 +11,10 @@ reproducible problems that are not listed here.
 - **Linux x86_64 is supported.** Install from the GitHub release tarball
   (GNU or musl) or the Nix flake. See [README install](README.md#install) and
   [release instructions](RELEASING.md).
-- **macOS on Apple silicon is best-effort.** An unsigned, unnotarized archive
-  is built, but the macOS test job is opt-in and has not completed a run; the
-  on-device checklist is unfinished. The `apple` sandbox backend has unit
-  tests but no automated runtime coverage, and macOS has no CPU caps.
+- **macOS on Apple silicon is supported** and tested on real hardware. Install
+  with `brew install blakeashleyjr/thegn/thegn` or the release archive (unsigned,
+  unnotarized). Intel macOS has no release binary. The `apple` sandbox backend
+  has unit tests but no automated runtime coverage, and macOS has no CPU caps.
   Set Option as Meta/Alt in your terminal; `thegn doctor` names the setting.
   See [terminal compatibility](docs/help/terminal-compatibility.md). For a
   browser-downloaded archive, clear quarantine before first launch with
@@ -29,8 +29,10 @@ reproducible problems that are not listed here.
   [Windows and WSL test handoff](docs/superpowers/guides/windows-wsl-test-handoff.md).
   The native port compiles for MSVC, but its first opt-in CI run failed in the
   named-pipe IPC tests and no `thegn.exe` is published.
-- **Homebrew and AUR publication are pending owner setup.** They are not
-  install channels yet; see [RELEASING.md](RELEASING.md#deferred-release-channels).
+- **Homebrew works** (`brew install blakeashleyjr/thegn/thegn`, from the
+  `homebrew-thegn` tap, updated each release). AUR publication is pending
+  owner setup and is not an install channel yet; see
+  [RELEASING.md](RELEASING.md#deferred-release-channels).
 - Standalone `.deb` and `.rpm` assets are attached to releases, but their clean
   system install, upgrade, and uninstall rehearsal is pending. They are not a
   supported install channel. See the
@@ -99,9 +101,10 @@ reproducible problems that are not listed here.
 
 - macOS release archives are unsigned and unnotarized. A browser download is
   quarantined; remove the attribute with the command above before first launch.
-- Homebrew and AUR formula/package outputs are generated, but publication is
-  pending repository, environment, and key setup. The Homebrew formula is
-  rendered from `packaging/homebrew/thegn.rb.tmpl` during release packaging.
+  Homebrew downloads are not quarantined.
+- The Homebrew formula is rendered from `packaging/homebrew/thegn.rb.tmpl`
+  during release packaging and copied to the tap after each release. AUR
+  publication is pending repository, environment, and key setup.
 - `.deb` and `.rpm` assets are unrehearsed, and crates.io / `cargo binstall`
   remain deferred. Details are in
   [RELEASING.md](RELEASING.md#install-paths-this-enables).

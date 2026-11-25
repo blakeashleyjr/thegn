@@ -192,8 +192,8 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    contain identical output.
 
    Publication remains visibly pending until this one-time checklist is done:
-   - Create a public repository named `homebrew-tap`, initially with a `main`
-     branch, and create the AUR package repository named `thegn-bin`.
+   - The `homebrew-thegn` tap repository exists. Create the AUR package
+     repository named `thegn-bin`.
    - Add separate write-enabled deploy keys scoped only to the tap and AUR
      package repositories. They are not artifact-signing keys and have no write
      access to this source repository.
@@ -201,7 +201,7 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
      `package-publication-aur`, each with a required reviewer. Store only
      `HOMEBREW_TAP_DEPLOY_KEY` in the Homebrew environment and only
      `AUR_DEPLOY_KEY` in the AUR environment.
-   - Set `HOMEBREW_TAP_REPOSITORY` to `<owner>/homebrew-tap` in the
+   - Set `HOMEBREW_TAP_REPOSITORY` to `<owner>/homebrew-thegn` in the
      `package-publication-homebrew` environment, but leave
      `PACKAGE_PUBLICATION_ENABLED` unset.
    - Rehearse both generated outputs locally: install from a disposable local
@@ -253,11 +253,11 @@ CHANGELOG entries rather than copying them.
 
 ## Platforms
 
-| Platform or package                           | Support                                                            |
-| --------------------------------------------- | ------------------------------------------------------------------ |
-| Linux x86_64 GNU and musl tarballs; Nix flake | Supported                                                          |
-| aarch64-apple-darwin tarball                  | Best-effort and unsigned; see the macOS first-launch command below |
-| Windows                                       | Deferred; no binary is provided                                    |
+| Platform or package                           | Support                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| Linux x86_64 GNU and musl tarballs; Nix flake | Supported                                                        |
+| aarch64-apple-darwin tarball; Homebrew tap    | Supported (tarball unsigned; see the macOS first-launch command) |
+| Windows                                       | Deferred; no binary is provided                                  |
 
 ## Install
 
@@ -307,7 +307,8 @@ workflow can render other outputs without making them supported channels:
 
 | Channel                           | Current decision                                                                                                                 |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Homebrew tap / AUR                | pending owner setup (tap repository, publication environments, AUR host key) and same-release clean-host rehearsal               |
+| Homebrew tap                      | live: `blakeashleyjr/homebrew-thegn`; the formula is copied from the release's `*-homebrew.rb` asset after each release          |
+| AUR                               | pending owner setup (publication environment, AUR host key) and same-release clean-host rehearsal                                |
 | standalone `.deb` / `.rpm` assets | standalone assets, unrehearsed, not a supported channel; clean-system install, upgrade, and uninstall rehearsal still required   |
 | Scoop / winget                    | deferred until THE-140's Windows artifact gate and THE-145's interactive parity evidence are green                               |
 | hosted apt/rpm repositories       | deferred through the public-alpha cycle; their operational ownership is not justified while standalone assets remain unrehearsed |
@@ -323,7 +324,7 @@ automatic consequence of producing another archive.
   `sha256sum -c --ignore-missing SHA256SUMS` when you downloaded only some of
   the files), verify the checksum and
   build-provenance attestation, then extract
-  `thegn` onto `PATH`. The aarch64-apple-darwin archive is best-effort; on macOS
+  `thegn` onto `PATH`. The aarch64-apple-darwin archive is supported; on macOS
   see the Gatekeeper note below. Runtime requires `git`; `gh` and `ssh` are used
   as needed for integrations, and `lazygit` is optional. Diff highlighting is
   built in.
@@ -335,14 +336,16 @@ automatic consequence of producing another archive.
   Rust/Cargo). It is not included in the release archive. On macOS it also
   generates the `thegn.app` launcher; `just macos-app` does the same for the
   other paths.
-- **Homebrew / AUR** — pending the owner's one-time setup (the tap repository,
-  publication environments, and AUR host key) and clean-host rehearsal. Step 7
-  publishes only after that setup is complete and the resulting repositories
-  are verified.
+- **Homebrew** — `brew install blakeashleyjr/thegn/thegn`, from the
+  `blakeashleyjr/homebrew-thegn` tap. After each release, copy the release's
+  `thegn-v<version>-homebrew.rb` asset to `Formula/thegn.rb` in the tap and
+  push.
+- **AUR** — pending the owner's one-time setup (publication environment and
+  AUR host key) and clean-host rehearsal.
 
 ## macOS code signing and notarization — the decision
 
-**thegn does not sign or notarize its releases, and its best-effort macOS
+**thegn does not sign or notarize its releases, and its macOS
 install paths are chosen so that they do not require it.** (Precisely: arm64
 binaries are _ad-hoc_ signed by the linker — `codesign -dv` reports
 `adhoc, linker-signed` —
@@ -355,10 +358,9 @@ recurring cost and a key-management burden for an alpha project.
 
 What that decision costs, precisely:
 
-- **Homebrew — unaffected once published.** Homebrew does not attach
+- **Homebrew — unaffected.** Homebrew does not attach
   `com.apple.quarantine` to formula downloads, so an unsigned binary installed
-  with `brew` opens normally. Advertise this path only after the public tap
-  rehearsal above is recorded.
+  with `brew` opens normally.
 - **Nix — unaffected.** Same reason: the store path is not quarantined.
 - **`./install.sh` / `just macos-app` — unaffected.** The `thegn.app` bundle is
   generated on the user's own machine, so it carries no quarantine attribute.
@@ -383,9 +385,9 @@ quarantine prompt that the support cost exceeds the certificate's.
 
 ## Deferred release channels
 
-- **Homebrew and AUR** are pending the owner's one-time publication setup and a
-  clean-host rehearsal: the Homebrew tap repository, publication environments,
-  and AUR host key must be in place first.
+- **AUR** is pending the owner's one-time publication setup and a clean-host
+  rehearsal: the publication environment and AUR host key must be in place
+  first.
 - **Standalone `.deb` and `.rpm` assets** are unrehearsed and are not a
   supported channel. Clean-system install, upgrade, and uninstall evidence is
   still required.

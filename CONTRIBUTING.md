@@ -6,7 +6,7 @@ invariants see [the development reference](DEVELOPMENT.md).
 
 ## Start here
 
-- Linux x86_64 is supported; macOS is best-effort; Windows is deferred (see the
+- Linux x86_64 is supported; macOS on Apple silicon is supported; Windows is deferred (see the
   contributor notes below).
 - Questions and bug reports go through [SUPPORT.md](SUPPORT.md) and the issue
   templates. Security reports go through [SECURITY.md](SECURITY.md), never a

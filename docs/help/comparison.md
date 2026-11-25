@@ -11,7 +11,7 @@ multiplexer. One session holds projects for repositories and tabs for their
 worktrees, with the sidebar, right panel, tab bar and status bar drawn in the
 process. A background daemon owns pane processes so they can survive detach.
 Pane processes can optionally run in a sandbox, and the stable shell includes
-merge and PR queues. Linux x86_64 is supported, macOS is best-effort, and
+merge and PR queues. Linux x86_64 is supported, macOS on Apple silicon is supported, and
 Windows is deferred. See [[getting-started]], [[daemon-and-sessions]], and
 [[sandboxing]].
 
