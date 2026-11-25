@@ -246,6 +246,11 @@ impl MenuOverlay {
         self
     }
 
+    /// The note row above the items, if any.
+    pub fn body(&self) -> Option<&str> {
+        self.body.as_deref()
+    }
+
     pub fn items(&self) -> &[MenuItem] {
         &self.items
     }

@@ -101,6 +101,17 @@ pub(crate) fn jump(
     }
 }
 
+/// Whether activating `target` is the sidebar's "Lead — set up" row: the Lead
+/// group's target while no `[lead]` is configured.
+pub(crate) fn is_setup_target(target: &RowTarget, cfg: &thegn_core::config::Config) -> bool {
+    !super::enabled(cfg)
+        && matches!(
+            target,
+            RowTarget::Workspace { repo_path, group: Some(g) }
+                if repo_path == "terminal" && is_lead_group(g)
+        )
+}
+
 /// Result of [`jump`] for the caller.
 pub(crate) enum JumpOutcome {
     /// Nothing more to do.
@@ -150,6 +161,27 @@ mod tests {
             active: 0,
         };
         assert_eq!(plan(&cfg, &session, &[]), JumpPlan::Disabled);
+    }
+
+    #[test]
+    fn setup_target_is_the_lead_group_only_while_unconfigured() {
+        let lead = RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some("lead".into()),
+        };
+        let other = RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some("local".into()),
+        };
+        let off = thegn_core::config::Config::default();
+        assert!(is_setup_target(&lead, &off));
+        assert!(!is_setup_target(&other, &off));
+        assert!(!is_setup_target(&RowTarget::Tab(0, 0), &off));
+        let on = thegn_core::config::Config {
+            lead: Some(thegn_core::config_lead::LeadConfig::default()),
+            ..Default::default()
+        };
+        assert!(!is_setup_target(&lead, &on));
     }
 
     #[test]

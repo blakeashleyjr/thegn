@@ -5125,7 +5125,7 @@ poll_interval_secs = 3
 
 # ── Experimental Lead meta agent ([lead]) ───────────────────────────────────
 # A hosted agent CLI in a global tab that drives thegn through a scoped MCP
-# surface. Absent = no Lead. Dev channel only; stable clamps it off.
+# surface. Absent = no Lead. Dev channel; stable keeps it only with preview = true.
 # [lead]
 # agent = "claude"                  # required: an [[agents]] entry name
 # account = "work"                  # NOT supported yet: refused at launch; the Lead logs in once (thegn lead login)
@@ -5136,6 +5136,7 @@ poll_interval_secs = 3
 # network = "isolated"             # "isolated" (own netns via pasta; no pasta = no Lead) or "host" (warns on every launch)
 # token_ttl_secs = 43200            # Lead token lifetime (300..604800); slides on use, capped at 7 days from minting
 # outward_allow = []                # outward caps ("issues.comment", "issues.update") allowed without a per-call owner approval
+# preview = false                   # written by the in-app setup flow: keeps [lead] active on the stable channel (preview)
 
 # ── Experimental voice mode ─────────────────────────────────────────────────
 # Alt v records/stops; Esc cancels. Final text is pasted without submission.

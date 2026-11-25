@@ -80,7 +80,9 @@ pub(crate) fn check_channel(clamped: bool) -> Check {
         Level::Fail,
         "release channel allows [lead]",
         "[lead] is configured but this release channel clamps it off",
-        Some("run with THEGN_CHANNEL=dev (daemon too: `thegn daemon stop`)"),
+        Some(
+            "press Alt i to set the Lead up (it runs as a preview on stable), or use THEGN_CHANNEL=dev",
+        ),
     )
 }
 
@@ -148,6 +150,9 @@ pub(crate) struct DaemonFacts {
     pub enabled: bool,
     pub answers: bool,
     pub channel: Option<String>,
+    /// `[lead] preview = true` (written by the in-app setup): a stable daemon
+    /// keeps `[lead]` too.
+    pub preview: bool,
 }
 
 pub(crate) fn check_daemon(f: &DaemonFacts) -> Check {
@@ -160,13 +165,16 @@ pub(crate) fn check_daemon(f: &DaemonFacts) -> Check {
         );
     }
     if f.answers
+        && !f.preview
         && let Some(c) = f.channel.as_deref().filter(|c| *c != "dev")
     {
         return check(
             "daemon",
             Level::Fail,
             format!("the daemon runs on the {c} channel, where [lead] is off"),
-            Some("`thegn daemon stop`, then reopen thegn with THEGN_CHANNEL=dev"),
+            Some(
+                "set the Lead up again from Alt i (it marks [lead] as a preview), or use THEGN_CHANNEL=dev",
+            ),
         );
     }
     pass_or(
@@ -175,7 +183,7 @@ pub(crate) fn check_daemon(f: &DaemonFacts) -> Check {
         Level::Fail,
         "daemon answers on its socket",
         "the daemon socket does not answer",
-        Some("open thegn (it starts the daemon); with [lead], use THEGN_CHANNEL=dev"),
+        Some("open thegn (it starts the daemon)"),
     )
 }
 
@@ -187,7 +195,7 @@ pub(crate) fn check_listener(addr: Result<std::net::SocketAddr, String>) -> Chec
             "listener",
             Level::Fail,
             format!("Lead listener address unusable: {e}"),
-            Some("`thegn daemon stop`, reopen with the dev channel"),
+            Some("restart the daemon from the Lead setup (Alt i), then reopen thegn"),
         ),
     }
 }
@@ -646,6 +654,7 @@ pub(crate) fn inspect(cfg: &Config) -> LeadReadiness {
             enabled: cfg.daemon.enabled,
             answers: probe.is_some(),
             channel: probe.flatten(),
+            preview: cfg.lead.as_ref().is_some_and(|l| l.preview),
         }));
         let state = thegn_core::util::xdg_state_home();
         let addr_path = state
@@ -954,7 +963,7 @@ mod tests {
         assert_eq!(lv(&check_channel(false)), Level::Ok);
         let c = check_channel(true);
         assert_eq!(c.level, Level::Fail);
-        assert!(c.fix.unwrap().contains("THEGN_CHANNEL=dev"));
+        assert!(c.fix.unwrap().contains("preview on stable"));
     }
 
     #[test]
@@ -992,6 +1001,7 @@ mod tests {
                 enabled: true,
                 answers: true,
                 channel: Some("dev".into()),
+                preview: false,
             })),
             Level::Ok
         );
@@ -1000,6 +1010,7 @@ mod tests {
                 enabled: true,
                 answers: true,
                 channel: Some("stable".into()),
+                preview: false,
             })),
             Level::Fail
         );
@@ -1008,6 +1019,7 @@ mod tests {
                 enabled: true,
                 answers: true,
                 channel: None,
+                preview: false,
             })),
             Level::Ok
         );
@@ -1016,6 +1028,7 @@ mod tests {
                 enabled: false,
                 answers: false,
                 channel: None,
+                preview: false,
             })),
             Level::Fail
         );
@@ -1024,9 +1037,22 @@ mod tests {
                 enabled: true,
                 answers: false,
                 channel: None,
+                preview: false,
             })),
             Level::Fail
         );
+    }
+
+    #[test]
+    fn a_stable_daemon_is_fine_for_a_preview_lead() {
+        let facts = |preview| DaemonFacts {
+            enabled: true,
+            answers: true,
+            channel: Some("stable".into()),
+            preview,
+        };
+        assert_eq!(lv(&check_daemon(&facts(true))), Level::Ok);
+        assert_eq!(lv(&check_daemon(&facts(false))), Level::Fail);
     }
 
     #[test]

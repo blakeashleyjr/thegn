@@ -40,9 +40,9 @@ pub(crate) const CONTROL_ADDR_FILE: &str = "control-addr.json";
 /// `lead:<group>/<tab>` caller id.
 pub(crate) const PAIRING_LABEL: &str = "lead";
 
-const NO_LISTENER: &str = "no Lead listener: the daemon is not running, was started before [lead] \
-                           was added, or runs on the stable channel; run `thegn daemon stop` and \
-                           reopen thegn with THEGN_CHANNEL=dev";
+const NO_LISTENER: &str = "no Lead listener: the daemon is not running, or was started before \
+                           [lead] was added; restart it from the Lead setup (Alt i) or run \
+                           `thegn daemon stop`, then reopen thegn";
 /// The refusal when the daemon is disabled. Fixed text: the docs and tests
 /// cite it.
 const DAEMON_DISABLED: &str = "[daemon] enabled = false: the Lead's tools need the daemon; enable \
@@ -561,9 +561,9 @@ mod tests {
         assert_eq!(err.to_string(), NO_LISTENER);
         for needle in [
             "no Lead listener:",
-            "runs on the stable channel",
+            "was started before",
             "`thegn daemon stop`",
-            "THEGN_CHANNEL=dev",
+            "Alt i",
         ] {
             assert!(NO_LISTENER.contains(needle), "{needle}");
         }

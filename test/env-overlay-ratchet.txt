@@ -225,6 +225,7 @@ lead.mcp_profile
 lead.network
 lead.notes_dir
 lead.outward_allow
+lead.preview
 lead.scopes
 lead.skill
 lead.token_ttl_secs

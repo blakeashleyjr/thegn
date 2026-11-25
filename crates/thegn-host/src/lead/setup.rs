@@ -10,6 +10,13 @@
 //! [`Host`] (the effects: config write, daemon stop, facts), so every
 //! transition is testable with a fake host.
 //!
+//! On the stable channel the Lead is a labelled preview: the flow writes
+//! `[lead] preview = true`, the marker the channel clamp honours, so nothing
+//! else changes for users who never run it. The two things that touch the
+//! outside world while the menu is open (the Lead checks, the live daemon
+//! session count) run as background [`Job`]s whose [`Async`] result comes back
+//! through the event loop, never on it.
+//!
 //! The login steps do not reimplement `thegn lead login`: they open the very
 //! same verb in a thegn pane, so its isolation guarantees (fresh temp dir, host
 //! network, only the credentials copied back, refusal for a Lead or pipeline
@@ -51,8 +58,11 @@ impl AgentOption {
 /// (config file read, a few `stat`s), so it is safe on the event loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
-    /// Whether this process runs the dev channel (the Lead is dev-only).
+    /// Whether this process runs the dev channel. On stable the Lead is a
+    /// preview and needs the `[lead] preview = true` marker.
     pub dev_channel: bool,
+    /// `[lead] preview = true` as written in the user config file.
+    pub file_preview: bool,
     /// Detected and configured agents.
     pub agents: Vec<AgentOption>,
     /// `[lead] agent` as written in the user config file.
@@ -117,7 +127,11 @@ impl Plan {
 
     /// The exact lines the config write adds, shown as a preview first.
     pub(crate) fn preview(&self, f: &Facts) -> Vec<String> {
-        let mut lines = vec!["[lead]".to_string(), format!("agent = \"{}\"", self.agent)];
+        let mut lines = vec![
+            "[lead]".to_string(),
+            format!("agent = \"{}\"", self.agent),
+            "preview = true".to_string(),
+        ];
         if self.host_network {
             lines.push("network = \"host\"".into());
         } else if f.file_host_network {
@@ -140,8 +154,6 @@ pub(crate) enum Step {
     NeedNetwork,
     /// Write `[lead]` and `[daemon] enabled` (with a preview).
     WriteConfig,
-    /// Config is ready but this is the stable channel.
-    RelaunchDev,
     /// Stop the daemon so it restarts with the Lead's listener.
     Restart,
     /// Log the agent in (a pane running `thegn lead login`).
@@ -163,12 +175,10 @@ pub(crate) fn next_step(f: &Facts, plan: &Plan) -> Step {
     }
     let written = f.file_agent.as_deref() == Some(plan.agent.as_str())
         && f.file_host_network == plan.host_network
-        && f.daemon_enabled;
+        && f.daemon_enabled
+        && (f.dev_channel || f.file_preview);
     if !written {
         return Step::WriteConfig;
-    }
-    if !f.dev_channel {
-        return Step::RelaunchDev;
     }
     if !f.listener_up && !plan.restarted {
         return Step::Restart;
@@ -196,8 +206,9 @@ pub(crate) trait Host {
     fn reset_config(&mut self) -> Result<(), String>;
     /// Stop the daemon (it restarts on the next attach).
     fn stop_daemon(&mut self) -> Result<(), String>;
-    /// argv for a thegn verb, run in a pane (`["lead","login"]`), with the
-    /// dev channel carried over. `None` when the executable is unknown.
+    /// argv for a thegn verb, run in a pane (`["lead","login"]`), with this
+    /// process's channel carried over (never forced). `None` when the
+    /// executable is unknown.
     fn pane_argv(&self, verb: &[&str]) -> Option<Vec<String>>;
 }
 
@@ -212,6 +223,26 @@ pub(crate) struct Applied {
     pub tab: Option<Vec<String>>,
     /// Open the Lead now.
     pub open_lead: bool,
+    /// Work to run off the event loop; its result reopens a menu.
+    pub job: Option<Job>,
+}
+
+/// Work the flow needs but must not do on the event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Job {
+    /// Run the doctor's Lead checks.
+    Doctor(Plan),
+    /// Count the daemon's live sessions before a restart.
+    Sessions(Plan),
+}
+
+/// A finished [`Job`], delivered through the event loop's refresh channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Async {
+    /// The Lead checks, as report lines.
+    Doctor { plan: Plan, lines: Vec<String> },
+    /// Live daemon sessions (`None`: the count failed).
+    Sessions { plan: Plan, live: Option<usize> },
 }
 
 impl Applied {
@@ -245,8 +276,8 @@ fn cancel() -> ChoiceRow {
 
 const TITLE: &str = "Set up the Lead";
 
-/// The first menu for Alt i: the dev-channel explanation on stable, else the
-/// step the facts call for.
+/// The first menu for Alt i: the preview note on stable, else the step the
+/// facts call for.
 pub(crate) fn begin(host: &dyn Host) -> MenuOverlay {
     let f = host.facts();
     let plan = Plan::from_facts(&f);
@@ -255,10 +286,9 @@ pub(crate) fn begin(host: &dyn Host) -> MenuOverlay {
     }
     choice_menu(
         TITLE,
-        "The Lead is a dev-channel feature: this build runs the stable channel, so [lead] is \
-         ignored until thegn is started with THEGN_CHANNEL=dev. You can still prepare the \
-         config now (agent, sandbox and daemon checks, the [lead] write); the last step tells \
-         you how to relaunch on dev.",
+        "The Lead is a preview on the stable channel. Setting it up writes `preview = true` \
+         under [lead], the marker that lets this build keep it; nothing changes for anyone \
+         who does not run this. Undo any time from the last step's reset row.",
         TAG,
         vec![row('c', "continue setup", arg("go", &plan, "")), cancel()],
     )
@@ -304,29 +334,15 @@ pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
             TAG,
             vec![row('y', "write config", arg("write", plan, "")), cancel()],
         ),
-        Step::RelaunchDev => choice_menu(
-            "Lead: relaunch on the dev channel",
-            "The Lead config is written. This stable build ignores it: quit thegn and start it \
-             again as `THEGN_CHANNEL=dev thegn`, then press Alt i to finish (daemon restart, \
-             login, checks).",
-            TAG,
-            vec![
-                row(
-                    'x',
-                    "reset: remove the [lead] config",
-                    arg("reset", plan, ""),
-                ),
-                cancel(),
-            ],
-        ),
         Step::Restart => choice_menu(
             "Restart the daemon?",
             "The Lead needs the daemon to restart so it carries the Lead's control listener. \
              This stops the daemon: terminals it hosts (including Lead tabs) end, and thegn \
-             starts a fresh daemon on the next attach. Windows you have open are not closed.",
+             starts a fresh daemon on the next attach. Windows you have open are not closed. \
+             The next screen says how many sessions would end.",
             TAG,
             vec![
-                row('y', "restart the daemon", arg("restart", plan, "")),
+                row('y', "restart the daemon", arg("restartask", plan, "")),
                 row('s', "skip: I will restart it later", arg("skip", plan, "")),
                 cancel(),
             ],
@@ -387,7 +403,12 @@ fn mark(ok: bool) -> &'static str {
 }
 
 fn review_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
-    let body = format!(
+    review_menu_with(f, plan, None)
+}
+
+/// The last step; `checks` is the Lead checks report once they have run.
+fn review_menu_with(f: &Facts, plan: &Plan, checks: Option<&[String]>) -> MenuOverlay {
+    let mut body = format!(
         "{} agent {}\n{} bubblewrap\n{} {}\n{} daemon enabled, Lead listener up\n{} agent login",
         mark(true),
         plan.agent,
@@ -401,11 +422,19 @@ fn review_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
         mark(f.daemon_enabled && f.listener_up),
         mark(f.logged_in),
     );
+    if let Some(lines) = checks {
+        body.push_str("\n\n");
+        body.push_str(&lines.join("\n"));
+    }
     let mut rows = vec![
         row('o', "open the Lead", arg("open", plan, "")),
         row(
             'd',
-            "run the full doctor checks in a tab",
+            if checks.is_some() {
+                "run the Lead checks again"
+            } else {
+                "run the Lead checks"
+            },
             arg("doctor", plan, ""),
         ),
     ];
@@ -423,6 +452,78 @@ fn review_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
     ));
     rows.push(cancel());
     choice_menu("The Lead is ready", body, TAG, rows)
+}
+
+/// The restart confirm's note: how many live daemon sessions the stop ends.
+pub(crate) fn restart_body(live: Option<usize>) -> String {
+    match live {
+        Some(0) => "The daemon has no live sessions, so nothing ends. It restarts on the next \
+                    attach."
+            .to_string(),
+        Some(n) => format!(
+            "{n} live daemon session{} would end (terminals, agent runs and Lead tabs the daemon \
+             hosts). Windows you have open are not closed, and the daemon restarts on the next \
+             attach.",
+            if n == 1 { "" } else { "s" }
+        ),
+        None => "The daemon's live sessions could not be counted; any it hosts would end. \
+                 Windows you have open are not closed."
+            .to_string(),
+    }
+}
+
+/// The menu for a finished background [`Job`].
+pub(crate) fn async_menu(host: &dyn Host, done: Async) -> MenuOverlay {
+    match done {
+        Async::Doctor { plan, lines } => review_menu_with(&host.facts(), &plan, Some(&lines)),
+        Async::Sessions { plan, live } => confirm_menu(
+            "Restart the daemon?",
+            restart_body(live),
+            TAG,
+            arg("restart", &plan, ""),
+            true,
+        ),
+    }
+}
+
+/// Run a [`Job`] off the event loop; its [`Async`] result arrives as
+/// `RefreshKind::LeadSetup`.
+pub(crate) fn spawn_job(
+    job: Job,
+    cfg: &thegn_core::config::Config,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    let (tx, waker, cfg) = (tx.clone(), waker.clone(), cfg.clone());
+    tokio::spawn(async move {
+        let done = match job {
+            Job::Doctor(plan) => {
+                let lines = tokio::task::spawn_blocking(move || {
+                    crate::cmd::doctor_lead::lines(&crate::cmd::doctor_lead::inspect(&cfg))
+                })
+                .await
+                .unwrap_or_else(|e| vec![format!("the Lead checks failed to run: {e}")]);
+                Async::Doctor { plan, lines }
+            }
+            Job::Sessions(plan) => {
+                let live = match crate::daemon::client::connect_daemon(&cfg.daemon).await {
+                    Some(c) => c
+                        .sessions()
+                        .await
+                        .ok()
+                        .map(|v| v.iter().filter(|s| s.exited_at_ms.is_none()).count()),
+                    None => Some(0),
+                };
+                Async::Sessions { plan, live }
+            }
+        };
+        if tx
+            .send(crate::hydrate::RefreshKind::LeadSetup(Box::new(done)))
+            .is_ok()
+        {
+            let _ = waker.wake(); // best-effort: waker pulse
+        }
+    });
 }
 
 fn menu_now(host: &dyn Host, plan: &Plan) -> Option<MenuOverlay> {
@@ -482,6 +583,11 @@ pub(crate) fn apply(host: &mut dyn Host, arg_str: &str) -> Applied {
                 Err(e) => Applied::status(format!("Lead config not written: {e}")),
             }
         }
+        "restartask" => Applied {
+            status: Some("checking the daemon's live sessions…".into()),
+            job: Some(Job::Sessions(plan)),
+            ..Applied::default()
+        },
         "restart" => match host.stop_daemon() {
             Ok(()) => {
                 let plan = Plan {
@@ -534,13 +640,10 @@ pub(crate) fn apply(host: &mut dyn Host, arg_str: &str) -> Applied {
                 None => Applied::status("Lead login: cannot find the thegn executable"),
             }
         }
-        "doctor" => match host.pane_argv(&["doctor"]) {
-            Some(argv) => Applied {
-                status: Some("Lead doctor checks opened in a tab".into()),
-                tab: Some(argv),
-                ..Applied::default()
-            },
-            None => Applied::status("Lead doctor: cannot find the thegn executable"),
+        "doctor" => Applied {
+            status: Some("running the Lead checks…".into()),
+            job: Some(Job::Doctor(plan)),
+            ..Applied::default()
         },
         "open" => Applied {
             open_lead: true,
@@ -570,10 +673,11 @@ pub(crate) struct RealHost<'a> {
     pub cfg: &'a thegn_core::config::Config,
 }
 
-/// `[lead] agent`, `[lead] network` and `[daemon] enabled` from config text.
-pub(crate) fn parse_file_facts(text: &str) -> (Option<String>, bool, bool) {
+/// `[lead] agent`, `[lead] network`, `[daemon] enabled` and `[lead] preview`
+/// from config text.
+pub(crate) fn parse_file_facts(text: &str) -> (Option<String>, bool, bool, bool) {
     let Ok(v) = text.parse::<toml::Table>() else {
-        return (None, false, false);
+        return (None, false, false, false);
     };
     let lead = v.get("lead").and_then(toml::Value::as_table);
     let agent = lead
@@ -591,7 +695,11 @@ pub(crate) fn parse_file_facts(text: &str) -> (Option<String>, bool, bool) {
         .and_then(|t| t.get("enabled"))
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
-    (agent, host, daemon)
+    let preview = lead
+        .and_then(|t| t.get("preview"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    (agent, host, daemon, preview)
 }
 
 /// Agent options: configured `[[agents]]` entries plus built-in harnesses whose
@@ -628,7 +736,7 @@ fn agent_options(cfg: &thegn_core::config::Config) -> Vec<AgentOption> {
 impl Host for RealHost<'_> {
     fn facts(&self) -> Facts {
         let text = std::fs::read_to_string(thegn_core::config::Config::path()).unwrap_or_default();
-        let (file_agent, file_host_network, daemon_enabled) = parse_file_facts(&text);
+        let (file_agent, file_host_network, daemon_enabled, file_preview) = parse_file_facts(&text);
         let state = thegn_core::util::xdg_state_home();
         let harness = file_agent
             .as_deref()
@@ -641,6 +749,7 @@ impl Host for RealHost<'_> {
             .map_or("lead", |l| l.mcp_profile.as_str());
         Facts {
             dev_channel: crate::channel_state::current() == thegn_core::channel::Channel::Dev,
+            file_preview,
             agents: agent_options(self.cfg),
             file_agent,
             file_host_network,
@@ -672,6 +781,8 @@ impl Host for RealHost<'_> {
         let path = thegn_core::config::Config::path();
         let run = || -> anyhow::Result<()> {
             set_key(&path, "lead.agent", &plan.agent)?;
+            // The marker the stable-channel clamp honours (preview).
+            set_key(&path, "lead.preview", "true")?;
             if plan.host_network {
                 set_key(&path, "lead.network", "host")?;
             } else if f.file_host_network {
@@ -691,7 +802,7 @@ impl Host for RealHost<'_> {
         let exe = thegn_core::util::self_exe_path().ok_or("cannot find the thegn executable")?;
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["daemon", "stop"])
-            .env("THEGN_CHANNEL", "dev")
+            .env("THEGN_CHANNEL", crate::channel_state::current().as_str())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -704,13 +815,23 @@ impl Host for RealHost<'_> {
 
     fn pane_argv(&self, verb: &[&str]) -> Option<Vec<String>> {
         let exe = thegn_core::util::self_exe_path()?;
-        // A pane starts from a scrubbed env: carry the channel over so the
-        // verb sees `[lead]` the way this process does.
-        let mut argv = vec!["env".to_string(), "THEGN_CHANNEL=dev".to_string()];
-        argv.push(exe.to_string_lossy().into_owned());
-        argv.extend(verb.iter().map(|s| (*s).to_string()));
-        Some(argv)
+        let dev = crate::channel_state::current() == thegn_core::channel::Channel::Dev;
+        Some(pane_argv_for(&exe.to_string_lossy(), dev, verb))
     }
+}
+
+/// A pane starts from a scrubbed env: carry a dev channel over so the verb
+/// sees `[lead]` the way this process does. Stable needs nothing (the setup's
+/// `preview = true` marker keeps `[lead]`), and nothing here forces dev.
+fn pane_argv_for(exe: &str, dev: bool, verb: &[&str]) -> Vec<String> {
+    let mut argv = Vec::new();
+    if dev {
+        argv.push("env".to_string());
+        argv.push("THEGN_CHANNEL=dev".to_string());
+    }
+    argv.push(exe.to_string());
+    argv.extend(verb.iter().map(|s| (*s).to_string()));
+    argv
 }
 
 #[cfg(test)]
@@ -765,6 +886,7 @@ mod tests {
     fn ready() -> Facts {
         Facts {
             dev_channel: true,
+            file_preview: true,
             agents: vec![claude()],
             file_agent: Some("claude".into()),
             file_host_network: false,
@@ -859,10 +981,107 @@ mod tests {
     }
 
     #[test]
-    fn stable_channel_stops_at_relaunch_after_the_write() {
+    fn stable_channel_needs_the_preview_marker_then_carries_on_without_a_relaunch() {
         let mut f = ready();
         f.dev_channel = false;
-        assert_eq!(next_step(&f, &plan(&f)), Step::RelaunchDev);
+        f.file_preview = false;
+        f.listener_up = false;
+        // A config without the marker would be clamped off on stable: rewrite it.
+        assert_eq!(next_step(&f, &plan(&f)), Step::WriteConfig);
+        f.file_preview = true;
+        // No "relaunch on dev" step: straight on to the daemon restart.
+        assert_eq!(next_step(&f, &plan(&f)), Step::Restart);
+        f.listener_up = true;
+        f.logged_in = true;
+        assert_eq!(next_step(&f, &plan(&f)), Step::Review);
+    }
+
+    #[test]
+    fn stable_begin_describes_the_preview_not_a_relaunch() {
+        let host = Fake {
+            facts: Facts {
+                agents: vec![claude()],
+                ..Facts::default()
+            },
+            ..Fake::default()
+        };
+        let m = begin(&host);
+        let body = m.body().unwrap_or_default().to_string();
+        assert!(body.contains("preview"), "{body}");
+        assert!(!body.contains("THEGN_CHANNEL"), "{body}");
+    }
+
+    #[test]
+    fn pane_argv_never_forces_the_dev_channel() {
+        assert_eq!(
+            pane_argv_for("/bin/thegn", false, &["lead", "login"]),
+            ["/bin/thegn", "lead", "login"]
+        );
+        assert_eq!(
+            pane_argv_for("/bin/thegn", true, &["lead", "login"]),
+            ["env", "THEGN_CHANNEL=dev", "/bin/thegn", "lead", "login"]
+        );
+    }
+
+    #[test]
+    fn restart_asks_for_a_session_count_then_confirms_with_it() {
+        let mut host = Fake {
+            facts: ready(),
+            ..Fake::default()
+        };
+        let p = plan(&host.facts);
+        let asked = apply(&mut host, &arg("restartask", &p, ""));
+        assert_eq!(host.stops, 0, "asking must not stop the daemon");
+        assert_eq!(asked.job, Some(Job::Sessions(p.clone())));
+        assert!(asked.menu.is_none());
+        let menu = async_menu(
+            &host,
+            Async::Sessions {
+                plan: p.clone(),
+                live: Some(3),
+            },
+        );
+        assert_eq!(menu.title, "Restart the daemon?");
+        assert!(
+            menu.body()
+                .unwrap_or_default()
+                .to_string()
+                .contains("3 live daemon sessions would end")
+        );
+        let confirm = first_arg(&menu);
+        assert!(confirm.starts_with("restart;"), "{confirm}");
+        apply(&mut host, &confirm);
+        assert_eq!(host.stops, 1);
+    }
+
+    #[test]
+    fn restart_body_counts_and_pluralises() {
+        assert!(restart_body(Some(0)).contains("nothing ends"));
+        assert!(restart_body(Some(1)).contains("1 live daemon session would end"));
+        assert!(restart_body(Some(2)).contains("2 live daemon sessions would end"));
+        assert!(restart_body(None).contains("could not be counted"));
+    }
+
+    #[test]
+    fn doctor_runs_as_a_job_and_the_result_lands_in_the_last_step() {
+        let mut host = Fake {
+            facts: ready(),
+            ..Fake::default()
+        };
+        let p = plan(&host.facts);
+        let out = apply(&mut host, &arg("doctor", &p, ""));
+        assert_eq!(out.job, Some(Job::Doctor(p.clone())));
+        assert!(out.tab.is_none(), "no separate tab");
+        let menu = async_menu(
+            &host,
+            Async::Doctor {
+                plan: p,
+                lines: vec!["Lead readiness".into(), "ok    daemon answers".into()],
+            },
+        );
+        assert_eq!(menu.title, "The Lead is ready");
+        let body = menu.body().unwrap_or_default().to_string();
+        assert!(body.contains("Lead readiness") && body.contains("daemon answers"));
     }
 
     #[test]
@@ -1081,8 +1300,6 @@ mod tests {
         // A server outside the Lead's profile never reaches a pane.
         let out = apply(&mut host, &arg("mcp", &p, "other"));
         assert!(out.tab.is_none());
-        let out = apply(&mut host, &arg("doctor", &p, ""));
-        assert_eq!(out.tab, Some(vec!["doctor".to_string()]));
     }
 
     #[test]
@@ -1126,15 +1343,15 @@ mod tests {
 
     #[test]
     fn file_facts_read_the_lead_and_daemon_keys() {
-        let (agent, host, daemon) = parse_file_facts(
-            "[lead]\nagent = \"claude\"\nnetwork = \"host\"\n[daemon]\nenabled = true\n",
+        let (agent, host, daemon, preview) = parse_file_facts(
+            "[lead]\nagent = \"claude\"\nnetwork = \"host\"\npreview = true\n[daemon]\nenabled = true\n",
         );
         assert_eq!(agent.as_deref(), Some("claude"));
-        assert!(host && daemon);
-        assert_eq!(parse_file_facts("not toml ["), (None, false, false));
+        assert!(host && daemon && preview);
+        assert_eq!(parse_file_facts("not toml ["), (None, false, false, false));
         assert_eq!(
             parse_file_facts("[lead]\nagent = \"\"\n"),
-            (None, false, false)
+            (None, false, false, false)
         );
     }
 
@@ -1147,7 +1364,13 @@ mod tests {
         };
         assert_eq!(
             p.preview(&f),
-            ["[lead]", "agent = \"claude\"", "[daemon]", "enabled = true"]
+            [
+                "[lead]",
+                "agent = \"claude\"",
+                "preview = true",
+                "[daemon]",
+                "enabled = true"
+            ]
         );
         let h = Plan {
             host_network: true,

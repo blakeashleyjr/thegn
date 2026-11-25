@@ -7539,6 +7539,7 @@ async fn event_loop<T: Terminal>(
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
     sb.view.lead_enabled = crate::lead::enabled(keymap.config());
+    sb.view.lead_setup_row = !sb.view.lead_enabled;
     sb.freeze_sort = keymap.config().ui.sidebar_freeze_sort;
     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
@@ -9009,6 +9010,14 @@ async fn event_loop<T: Terminal>(
                     if sb.reorder_selection(&mut model, &mut session, up) {
                         need_relayout = true;
                     }
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Activate(target)
+                    if crate::lead::group::is_setup_target(&target, keymap.config()) =>
+                {
+                    // The "Lead — set up" row: open the guided setup, never a Lead.
+                    jump_lead!();
                     dirty = true;
                     continue;
                 }
@@ -15463,6 +15472,16 @@ async fn event_loop<T: Terminal>(
                         );
                     }
                 }
+                // A Lead-setup background job finished: reopen the flow's menu.
+                RefreshKind::LeadSetup(done) => {
+                    active_menu = Some(crate::lead::setup::async_menu(
+                        &crate::lead::setup::RealHost {
+                            cfg: keymap.config(),
+                        },
+                        *done,
+                    ));
+                    dirty = true;
+                }
                 // The daemon's answer to the status modal's session probe.
                 RefreshKind::DaemonSessions(p) => {
                     // The live probe is the truth: a registry row whose
@@ -20574,6 +20593,12 @@ async fn event_loop<T: Terminal>(
                         refresh_tab_model(&mut model, &session, &mut sb);
                         need_relayout = true;
                     }
+                    if applied.open_lead_setup {
+                        active_menu =
+                            Some(crate::lead::setup::begin(&crate::lead::setup::RealHost {
+                                cfg: keymap.config(),
+                            }));
+                    }
                     dirty = true;
                     continue;
                 }
@@ -21330,6 +21355,14 @@ async fn event_loop<T: Terminal>(
                                 }
                                 if let Some(next) = applied.menu {
                                     active_menu = Some(next);
+                                }
+                                if let Some(job) = applied.job {
+                                    crate::lead::setup::spawn_job(
+                                        job,
+                                        keymap.config(),
+                                        &refresh_tx,
+                                        &waker,
+                                    );
                                 }
                                 if let Some(argv) = applied.tab
                                     && crate::actions::open_argv_tab(

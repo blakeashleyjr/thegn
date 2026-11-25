@@ -1,5 +1,6 @@
 //! The `[lead]` config section (THE-2171): whether the Lead is configured and
-//! how it launches. Absent = no Lead; experimental (stable clamps it to `None`).
+//! how it launches. Absent = no Lead; experimental (stable clamps it to `None`
+//! unless `preview = true`, which the in-app setup writes).
 
 use std::path::PathBuf;
 
@@ -57,6 +58,10 @@ pub struct LeadConfig {
     /// without a per-call owner approval. Default empty: every outward call
     /// asks first.
     pub outward_allow: Vec<String>,
+    /// Preview marker written by the in-app setup flow (never hand-edited).
+    /// On the stable channel `[lead]` is ignored unless this is `true`, so the
+    /// Lead runs there only after the user set it up explicitly.
+    pub preview: bool,
 }
 
 impl Default for LeadConfig {
@@ -71,6 +76,7 @@ impl Default for LeadConfig {
             network: LeadNetwork::default(),
             token_ttl_secs: DEFAULT_TOKEN_TTL_SECS,
             outward_allow: Vec::new(),
+            preview: false,
         }
     }
 }
@@ -189,6 +195,7 @@ mod tests {
         assert_eq!(d.network, LeadNetwork::Isolated);
         assert_eq!(d.token_ttl_secs, 43_200);
         assert!(d.outward_allow.is_empty());
+        assert!(!d.preview);
     }
 
     #[test]

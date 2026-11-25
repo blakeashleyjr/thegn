@@ -24,5 +24,38 @@ and offer a reset that removes `[lead]`. Only claude SHALL be offered as the Lea
 #### Scenario: Stable channel
 
 - **WHEN** the running channel is stable
-- **THEN** the setup explains the dev channel and, after the config write, tells the user to
-  relaunch with `THEGN_CHANNEL=dev`
+- **THEN** the setup describes the Lead as a preview, writes `[lead] preview = true` with the rest
+  of the config, and continues to the daemon restart with no relaunch step
+
+### Requirement: Stable keeps an explicitly set-up Lead
+
+On the stable channel the config clamp SHALL keep `[lead]` only when `[lead] preview = true`, and
+SHALL still remove a `[lead]` without it. Panes and the daemon stop the flow starts SHALL NOT force
+`THEGN_CHANNEL=dev`, and the doctor SHALL accept a stable daemon for a preview Lead.
+
+#### Scenario: Marker present
+
+- **WHEN** a stable build loads a config with `[lead] preview = true`
+- **THEN** `[lead]` stays configured and the doctor channel check passes
+
+#### Scenario: Marker absent
+
+- **WHEN** a stable build loads a config with `[lead]` and no `preview`
+- **THEN** `[lead]` is clamped off as before
+
+### Requirement: Entry points, inline checks and a counted restart
+
+The sidebar SHALL show a "Lead — set up" row, on both channels, while no `[lead]` is configured, and
+the welcome tour's agents chapter SHALL offer a key that leaves the tour and opens the same flow.
+The flow SHALL run the Lead checks in a background task and show the report in its last step, and
+its restart confirm SHALL state how many live daemon sessions would end.
+
+#### Scenario: Setup row
+
+- **WHEN** no `[lead]` is configured and the sidebar row is activated
+- **THEN** the setup flow opens and no Lead terminal is created
+
+#### Scenario: Counted restart
+
+- **WHEN** the user chooses to restart the daemon with 3 live sessions
+- **THEN** the confirm says 3 live daemon sessions would end before anything is stopped
