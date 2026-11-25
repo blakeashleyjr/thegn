@@ -100,6 +100,47 @@ def validate_topology(flake: str, docs: str) -> list[str]:
     return problems
 
 
+def validate_run_entrypoint(flake: str, package: str, docs: str) -> list[str]:
+    """The bare `nix run github:…/thegn` entrypoint must be a declared app."""
+    problems: list[str] = []
+    apps_block = block_after(flake, "apps =")
+    if apps_block is None:
+        problems.append(
+            "flake.nix has no apps output for the bare `nix run` entrypoint"
+        )
+    else:
+        default_app = block_after(apps_block, "default =")
+        if default_app is None:
+            problems.append("flake.nix apps.default is missing")
+        else:
+            if 'type = "app"' not in default_app:
+                problems.append('flake.nix apps.default must declare type = "app"')
+            if 'program = "${defaultPkg}/bin/thegn";' not in default_app:
+                problems.append(
+                    "flake.nix apps.default must run ${defaultPkg}/bin/thegn "
+                    "(the stable binary documented for the bare run)"
+                )
+    if not re.search(
+        r'binName\s*=\s*if\s+isDev\s+then\s+"thegn-dev"\s+else\s+"thegn"\s*;',
+        package,
+    ):
+        problems.append(
+            "nix/package.nix binName no longer names the stable binary thegn, "
+            "so apps.default points at a program that does not exist"
+        )
+    if "mainProgram = binName;" not in package:
+        problems.append(
+            "nix/package.nix lacks meta.mainProgram = binName, so the "
+            "packages.default fallback cannot run the bare reference"
+        )
+    if not re.search(r"nix run github:blakeashleyjr/thegn(?![#/\w-])", docs):
+        problems.append(
+            "docs/nix-packages.md does not document `nix run "
+            "github:blakeashleyjr/thegn` as the one-command try"
+        )
+    return problems
+
+
 def expected_nix_licenses(spdx: str) -> list[str] | None:
     try:
         return [SPDX_TO_NIX[item.strip()] for item in spdx.split(" OR ")]
@@ -396,7 +437,7 @@ def validate(root: Path = ROOT) -> list[str]:
         (root / ".github/workflows/release.yml").read_text(),
         (root / "packaging/release.json").read_text(),
         templates,
-    ) + validate_topology(flake, docs)
+    ) + validate_topology(flake, docs) + validate_run_entrypoint(flake, package, docs)
 
 
 def main(root: Path = ROOT) -> int:
@@ -407,8 +448,8 @@ def main(root: Path = ROOT) -> int:
             print(f"  {problem}")
         return 1
     print(
-        "OK: Nix package metadata, release templates, upload matrix, and archive files "
-        "follow Cargo and packaging metadata"
+        "OK: Nix package metadata, release templates, upload matrix, archive files, "
+        "and the bare-run app entrypoint follow Cargo and packaging metadata"
     )
     return 0
 
@@ -516,6 +557,29 @@ def topology_fixture() -> tuple[str, str]:
     return flake, docs
 
 
+def run_fixture() -> tuple[str, str, str]:
+    """A minimal flake/package/docs triple with a valid bare-run entrypoint."""
+    flake = '''
+      apps = {
+        default = {
+          type = "app";
+          program = "${defaultPkg}/bin/thegn";
+        };
+      };
+    '''
+    package = '''
+      binName =
+        if isDev
+        then "thegn-dev"
+        else "thegn";
+      meta = {
+        mainProgram = binName;
+      };
+    '''
+    docs = "```sh\nnix run github:blakeashleyjr/thegn\n```\n"
+    return flake, package, docs
+
+
 def release_fixture() -> tuple[str, str, str, dict[str, str]]:
     cargo = '[workspace.package]\nversion = "1.0.0"\nlicense = "MIT OR Apache-2.0"\n'
     release_yml = '''
@@ -605,6 +669,59 @@ def self_test() -> int:
     )
     for flake, docs, label, expected_problem in topology_cases:
         problems = validate_topology(flake, docs)
+        if expected_problem not in problems:
+            print(
+                f"SELF-TEST FAIL: {label} drift did not produce the expected problem: "
+                f"{expected_problem!r}; got {problems!r}"
+            )
+            return 1
+        print(f"SELF-TEST OK: rejected {label} drift")
+
+    run_good = run_fixture()
+    run_problems = validate_run_entrypoint(*run_good)
+    if run_problems:
+        print(f"SELF-TEST FAIL: good run entrypoint fixture rejected: {run_problems}")
+        return 1
+    print("SELF-TEST OK: accepted the bare-run app entrypoint fixture")
+    run_cases = (
+        (
+            run_good[0].replace("apps = {", "outputs = {", 1),
+            run_good[1],
+            run_good[2],
+            "missing default app",
+            "flake.nix has no apps output for the bare `nix run` entrypoint",
+        ),
+        (
+            run_good[0].replace(
+                'program = "${defaultPkg}/bin/thegn";',
+                'program = "${thegnDev}/bin/thegn-dev";',
+                1,
+            ),
+            run_good[1],
+            run_good[2],
+            "default app running the dev binary",
+            "flake.nix apps.default must run ${defaultPkg}/bin/thegn "
+            "(the stable binary documented for the bare run)",
+        ),
+        (
+            run_good[0],
+            run_good[1].replace('else "thegn";', 'else "tg";', 1),
+            run_good[2],
+            "renamed stable binary",
+            "nix/package.nix binName no longer names the stable binary thegn, "
+            "so apps.default points at a program that does not exist",
+        ),
+        (
+            run_good[0],
+            run_good[1],
+            "```sh\nnix run github:blakeashleyjr/thegn#batteries\n```\n",
+            "undocumented bare run",
+            "docs/nix-packages.md does not document `nix run "
+            "github:blakeashleyjr/thegn` as the one-command try",
+        ),
+    )
+    for flake, package, docs, label, expected_problem in run_cases:
+        problems = validate_run_entrypoint(flake, package, docs)
         if expected_problem not in problems:
             print(
                 f"SELF-TEST FAIL: {label} drift did not produce the expected problem: "

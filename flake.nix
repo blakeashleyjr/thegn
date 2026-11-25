@@ -688,6 +688,21 @@
           wine = pkgs.wineWow64Packages.minimal;
         };
 
+      # The bare, one-command try: `nix run github:blakeashleyjr/thegn` with no
+      # `#attr` resolves `apps.default` (falling back to `packages.default` +
+      # `meta.mainProgram`). Declaring the app makes that entrypoint an output of
+      # the flake instead of an inference from the package, and it names the
+      # stable binary explicitly — README and docs/help document this command as
+      # the zero-install try, and `test/nix_metadata_test.py` pins the path so a
+      # rename cannot silently document a program that does not exist.
+      apps = {
+        default = {
+          type = "app";
+          # The stable host: same wrapper `nix profile install` would put on PATH.
+          program = "${defaultPkg}/bin/thegn";
+        };
+      };
+
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
 

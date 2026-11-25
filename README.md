@@ -28,7 +28,17 @@ Linux x86_64 and macOS on Apple silicon are supported; Windows is deferred. See 
 
 ### 1. Install
 
-With Nix:
+To try it without installing anything, run it straight from the flake:
+
+```sh
+nix run github:blakeashleyjr/thegn
+```
+
+That builds the stable host and starts it. The bare reference resolves the
+flake's default app, so it is the same wrapper `nix profile install` gives you;
+the first run compiles the workspace, so it is a build, not a download. See
+[One-command try](#one-command-try-nix) for the pinned-ref and dev-channel
+variants. Otherwise install it with Nix:
 
 ```sh
 nix profile install github:blakeashleyjr/thegn
@@ -187,6 +197,23 @@ layer) and `Emacs` presets ship too; switch with `Ctrl-Alt-v` / `Ctrl-Alt-e`
 familiar IDE chords._
 
 ## Install
+
+### One-command try (Nix)
+
+`nix run github:blakeashleyjr/thegn` builds the stable host from the flake and
+starts it, with nothing added to a Nix profile. It resolves the flake's default
+app (`apps.default`), which names the same wrapped `thegn` binary
+`nix profile install` would put on your `PATH`: the wrapper supplies the pinned
+yazi and the CLI tools it shells out to (`git`, `fzf`, `gum`, `lazygit`,
+`delta`, `gh`, `gdu`), so a bare run needs nothing preinstalled beyond Nix
+itself. It needs Nix with flakes enabled, and the first run compiles the
+workspace — on x86_64 Linux that includes the musl bridge the default package
+carries — so expect a long build rather than a download.
+
+Pin a published release with `nix run github:blakeashleyjr/thegn/v<version>`,
+or run the experimental channel with
+`nix run github:blakeashleyjr/thegn#dev`. The flake's attribute map, including
+this app, is documented in [`docs/nix-packages.md`](docs/nix-packages.md).
 
 ### Nix / home-manager (recommended)
 
