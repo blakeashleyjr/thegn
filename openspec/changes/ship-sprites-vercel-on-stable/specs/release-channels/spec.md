@@ -6,8 +6,9 @@ In the `stable` channel the config clamp SHALL keep every `[env.<name>]` whose
 `provider` is `sprites` or `vercel` (case-insensitive), so worktrees can be
 placed on them and `[jobs] runner` can name them. It SHALL still remove every
 other provider env (any other or empty `provider` with `placement =
-"provider"`, or a non-empty `provider` naming another kind), every SSH or
-Kubernetes env, and every `[host.*]` entry. `thegn job` SHALL NOT be refused in
+"provider"`, or a non-empty `provider` naming another kind), every Kubernetes
+env, and every `[host.*]` entry (SSH envs are covered by
+`ship-ssh-clientserver-on-stable`). `thegn job` SHALL NOT be refused in
 the stable channel; `thegn host`, `thegn fleet` and `thegn placement` SHALL
 remain refused. The `providers` feature SHALL remain experimental and name the
 dev-only remainder in `thegn doctor`.

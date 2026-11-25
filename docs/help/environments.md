@@ -19,10 +19,12 @@ set `THEGN_BRIDGE_BINARY` to override, and run `thegn doctor` if it reports
 
 Sprites and [[vercel-sandbox]] environments are supported on the stable
 channel, including `thegn fleet list`, `cost` and `inspect` for them and the
-**New environment…** wizard. SSH, Kubernetes, every other cloud provider and
+**New environment…** wizard. SSH and mosh remotes are stable too (see
+Remote worktrees below). Kubernetes, every other cloud provider and
 `[host.*]` are dev channel only (see [[release-channels]]); on the stable
-channel `thegn fleet` shows Sprites and Vercel environments only, and the
-wizard offers only `local`, `sprites` and `vercel`. Where this page
+channel `thegn fleet` shows Sprites and Vercel environments only (an ssh env
+is not a provider env and is not listed), and the wizard offers only `local`,
+`ssh`, `sprites` and `vercel`. Where this page
 says "on the dev channel" about provider behaviour, the same behaviour applies
 to Sprites and Vercel environments on the stable channel.
 
@@ -814,8 +816,9 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
-> Remote worktrees and cloud providers other than Sprites and Vercel are
-> **dev-channel only** — see [[release-channels]].
+> Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
+> and cloud providers other than Sprites and Vercel are **dev-channel only** —
+> see [[release-channels]].
 
 Daytona is in maintenance: thegn drives its REST API; interactive panes need
 the ssh gateway (planned). `thegn doctor` marks a Daytona env experimental and

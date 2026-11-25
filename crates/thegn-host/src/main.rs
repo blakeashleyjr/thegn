@@ -1383,6 +1383,9 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     Some(match command {
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
+        // Plain `serve`, `attach`, `pair` and `session` (client/server over the
+        // TCP/unix control API) are stable. Only the separate direct-iroh
+        // listener and its pairing stay behind `Feature::Remote` below.
         // `thegn fleet list|cost|inspect` is stable for Sprites and Vercel envs
         // only: the verb is not gated here, `fleet_read::fleet_provider_allowed`
         // scopes what it reads to the stable providers.

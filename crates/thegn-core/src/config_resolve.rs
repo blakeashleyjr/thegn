@@ -1145,15 +1145,15 @@ impl Config {
             }
             let changed = match feat {
                 Feature::Remote => {
-                    let was = !self.sandbox.remote.host.is_empty();
-                    self.sandbox.remote.host.clear();
+                    // SSH/mosh remotes (`[sandbox.remote]`, `[env.*] placement =
+                    // "ssh"`) graduated to stable and are kept. Only the
+                    // Kubernetes placement is still experimental. An ssh env
+                    // that also names a dev-only provider is removed by the
+                    // `Providers` arm below.
                     let env_count = self.env.len();
-                    // Experimental remote placements: ssh and Kubernetes.
-                    self.env.retain(|_, env| {
-                        env.placement != crate::config::PlacementMode::Ssh
-                            && env.placement != crate::config::PlacementMode::K8s
-                    });
-                    was || self.env.len() != env_count
+                    self.env
+                        .retain(|_, env| env.placement != crate::config::PlacementMode::K8s);
+                    self.env.len() != env_count
                 }
                 Feature::Providers => {
                     let was = !self.host.is_empty();
@@ -3392,10 +3392,12 @@ mod tests {
         use crate::channel::{Channel, Feature};
         use crate::placement::Placement;
 
-        let source = "[sandbox]\ndefault_env = \"box\"\n[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n";
+        // A plain ssh env is stable now; one that also names a dev-only
+        // provider (fly) is still dropped by the `Providers` clamp.
+        let source = "[sandbox]\ndefault_env = \"box\"\n[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n[env.box.provider]\nprovider = \"fly\"\n";
         let mut stable: Config = toml::from_str(source).unwrap();
         let clamped = stable.clamp_to_channel(Channel::Stable);
-        assert!(clamped.contains(&Feature::Remote));
+        assert!(clamped.contains(&Feature::Providers));
         let loc = GitLoc::Local(std::path::PathBuf::from("/wt/x"));
         let (env, _) = resolve_environment(
             &stable,

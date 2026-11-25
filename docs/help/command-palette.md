@@ -42,8 +42,8 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
 - **Clone and open** — paste a git URL; it clones off-loop and opens as a
   project.
 - **New environment…** — the add-environment wizard (`[env.<name>]`). It
-  offers only what the channel allows: `local`, `sprites` and `vercel` on
-  stable; also ssh and the other cloud providers on the dev channel.
+  offers only what the channel allows: `local`, `ssh`, `sprites` and `vercel`
+  on stable; also the other cloud providers on the dev channel.
 - **Welcome tour…** — reopen the first-run [[onboarding]] tour (theme,
   sandbox tier, default agent, key drill). Press `a` on its first screen for
   the classic setup wizard (forge auth, issue trackers, hosts), which

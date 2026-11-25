@@ -92,10 +92,12 @@ reproducible problems that are not listed here.
   accepted by config, not implemented, never selected.
 - Provider placements without an enforceable isolation request are reported as
   `provider-managed (unverified)`; their isolation is not verified by thegn.
-- The `remote`, `providers`, `placement`, and `voice` subsystems are
-  dev-channel only (experimental); their hardening and behavior are not
-  public-alpha promises. Sprites and Vercel environments, and `thegn job run`
-  on them, are the exception and are supported on the stable channel. Observe
+- Kubernetes placement, direct Iroh, the `providers`, `placement`, and `voice`
+  subsystems are dev-channel only (experimental); their hardening and behavior
+  are not public-alpha promises. Sprites and Vercel environments (and `thegn
+job run` on them), SSH/mosh remote workspaces and `thegn serve`/`attach`/
+  `pair` client/server mode are the exception and are supported on the stable
+  channel. Observe
   dashboards and plugin app tabs are available on the stable channel; plugin
   processes are native and unsandboxed.
 

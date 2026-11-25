@@ -39,14 +39,13 @@ const KINDS: &[&str] = &[
 ];
 
 /// Whether the env wizard (and the host picker's "set up …" rows) may offer
-/// `kind` in `channel`. `local` is always available; `ssh` is the `remote`
-/// feature; a provider kind is stable only for Sprites and Vercel
+/// `kind` in `channel`. `local` and `ssh` (SSH/mosh remotes, stable) are always
+/// available; a provider kind is stable only for Sprites and Vercel
 /// (`EnvProviderKind::stable_channel`), the rest are dev-only.
 pub(crate) fn kind_allowed_in(kind: &str, channel: thegn_core::channel::Channel) -> bool {
-    use thegn_core::channel::{Channel, Feature};
+    use thegn_core::channel::Channel;
     match kind {
-        "local" => true,
-        "ssh" => Feature::Remote.allowed_in(channel),
+        "local" | "ssh" => true,
         other => {
             channel == Channel::Dev
                 || thegn_core::config::EnvProviderKind::of(other).stable_channel()
@@ -562,17 +561,11 @@ mod tests {
     #[test]
     fn stable_wizard_offers_only_stable_kinds() {
         let w = EnvWizard::new_in(&Config::default(), Channel::Stable);
-        assert_eq!(w.kinds, vec!["local", "sprites", "vercel"]);
+        assert_eq!(w.kinds, vec!["local", "ssh", "sprites", "vercel"]);
         // Defaults to the first allowed cloud kind.
         assert_eq!(w.kind(), "sprites");
-        for dev_only in [
-            "ssh",
-            "fly",
-            "digitalocean",
-            "hetzner",
-            "daytona",
-            "machine0",
-        ] {
+        assert!(kind_allowed_in("ssh", Channel::Stable));
+        for dev_only in ["fly", "digitalocean", "hetzner", "daytona", "machine0"] {
             assert!(!kind_allowed_in(dev_only, Channel::Stable), "{dev_only}");
             assert!(kind_allowed_in(dev_only, Channel::Dev), "{dev_only}");
         }
@@ -586,10 +579,10 @@ mod tests {
             seen.push(w.kind());
             w.cycle(1);
         }
-        assert_eq!(seen, vec!["sprites", "vercel", "local"]);
+        assert_eq!(seen, vec!["sprites", "vercel", "local", "ssh"]);
         assert_eq!(w.kind(), "sprites");
         w.cycle(-1);
-        assert_eq!(w.kind(), "local");
+        assert_eq!(w.kind(), "ssh");
         // A dev-only seed ("+ set up fly…") keeps the default selection.
         let seeded = EnvWizard::with_kind_in(&Config::default(), "fly", Channel::Stable);
         assert_eq!(seeded.kind(), "sprites");

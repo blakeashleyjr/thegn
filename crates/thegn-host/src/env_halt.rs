@@ -230,7 +230,7 @@ pub(crate) fn remote_features_clamped() -> bool {
 pub(crate) fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
     if channel_clamped {
         format!(
-            "env '{name}' is not available on the stable channel (ssh, Kubernetes and cloud-provider environments other than Sprites and Vercel are dev-only: set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
+            "env '{name}' is not available on the stable channel (Kubernetes and cloud-provider environments other than Sprites and Vercel are dev-only; ssh and mosh environments are stable: set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
         )
     } else {
         format!("env '{name}' is not defined ([env.{name}] missing); its selection was dropped")

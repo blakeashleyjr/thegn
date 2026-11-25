@@ -549,7 +549,6 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
     let mut parts = key.split('.');
     let root = parts.next()?;
     let feature = match (root, parts.next()) {
-        ("sandbox", Some("remote")) => Feature::Remote,
         ("host", _) => Feature::Providers,
         ("placement", _) => Feature::Placement,
         ("voice", _) => Feature::Voice,
@@ -559,7 +558,7 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
     clamped.contains(&feature).then(|| {
         format!(
             "configuration for [{}] was disabled by the stable channel; set THEGN_CHANNEL=dev to enable {}",
-            if feature == Feature::Remote { "sandbox.remote" } else { root },
+            root,
             feature.id()
         )
     })
@@ -804,7 +803,8 @@ mod tests {
         use thegn_core::channel::Feature;
         let clamped = [Feature::Remote, Feature::Providers];
         assert!(clamp_notice("host.gpu.command", &clamped).is_some());
-        assert!(clamp_notice("sandbox.remote.host", &clamped).is_some());
+        // SSH/mosh remotes are stable: `[sandbox.remote]` is never clamped.
+        assert_eq!(clamp_notice("sandbox.remote.host", &clamped), None);
         assert_eq!(clamp_notice("ui.language", &clamped), None);
         assert_eq!(clamp_notice("issues.provider", &clamped), None);
         assert!(clamp_notice("lead.agent", &[Feature::Lead]).is_some());

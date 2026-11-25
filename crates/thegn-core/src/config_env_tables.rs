@@ -577,7 +577,9 @@ impl EnvProviderKind {
 
     /// Graduated to the **stable** release channel: Sprites and Vercel Sandbox
     /// environments (interactive worktrees and `thegn job run` selected
-    /// runners). Every other provider — and the managed `[host.*]` pool —
+    /// runners). Plain SSH/mosh envs are not providers and are stable through
+    /// the `Remote` clamp instead. Every other provider — and the managed
+    /// `[host.*]` pool —
     /// stays behind the dev-only [`crate::channel::Feature::Providers`] gate,
     /// so `Config::clamp_to_channel` keeps exactly these kinds on stable.
     pub fn stable_channel(self) -> bool {

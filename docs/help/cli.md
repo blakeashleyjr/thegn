@@ -76,7 +76,9 @@ The dry run reads the live database, including changes still in its
 write-ahead log, without writing it; it refuses a non-empty log without its
 `-shm` index.
 
-Some of these are dev-channel only — see [[release-channels]].
+Some of these are dev-channel only (`host`, `placement`, `serve --iroh-direct`,
+`pair direct`) — see [[release-channels]]. `serve`, `attach`, `pair`,
+`session` and `events` are stable.
 
 `thegn api` is the capability catalog as a client: `api list` prints every
 capability (scope, surfaces), `api schema` the control wire contract, and

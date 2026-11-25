@@ -35,8 +35,13 @@ egress = "registries"` allows only package registries and git hosts,
   their `[env.*]` tables survive the stable config clamp, worktrees can open on
   them, the panel shows the environments section, and `thegn job run` with a
   Sprites or Vercel runner is no longer refused. Every other cloud provider,
-  the managed `[host.*]` pool, SSH/Kubernetes placement and `thegn fleet`,
+  the managed `[host.*]` pool, Kubernetes placement and `thegn fleet`,
   `thegn host` and `thegn placement` stay dev-channel only.
+- SSH/mosh remote workspaces (`[sandbox.remote]`, `[env.*] placement = "ssh"`)
+  and client/server mode (`thegn serve`, `attach`, `pair`, `session`, `events`)
+  are supported on the stable channel. Kubernetes placement and the direct-iroh
+  listener (`serve --iroh-direct`, `pair direct`) stay dev-channel only. The
+  New-environment wizard offers `ssh` on stable.
 
 ## [0.1.0-alpha.131] — 2026-11-24
 

@@ -1841,17 +1841,19 @@ mod dev_env_daemon_tests {
     #[test]
     fn env_dropped_by_channel_matches_the_stable_clamp() {
         let cfg: Config = toml::from_str(
-            "[env.box]\nplacement = \"ssh\"\n\n[env.m0]\nplacement = \"provider\"\n\n[env.here]\nplacement = \"local\"\n\n[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\n[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n",
+            "[env.box]\nplacement = \"ssh\"\n\n[env.pod]\nplacement = \"k8s\"\n\n[env.m0]\nplacement = \"provider\"\n\n[env.here]\nplacement = \"local\"\n\n[env.spr]\nplacement = \"provider\"\n[env.spr.provider]\nprovider = \"sprites\"\n\n[env.vsb]\nplacement = \"provider\"\n[env.vsb.provider]\nprovider = \"vercel\"\n",
         )
         .expect("config parses");
-        assert!(env_dropped_by_channel(&cfg, "box", Channel::Stable));
+        // Plain ssh/mosh envs are stable; Kubernetes is not.
+        assert!(!env_dropped_by_channel(&cfg, "box", Channel::Stable));
+        assert!(env_dropped_by_channel(&cfg, "pod", Channel::Stable));
         assert!(env_dropped_by_channel(&cfg, "m0", Channel::Stable));
         assert!(!env_dropped_by_channel(&cfg, "here", Channel::Stable));
         assert!(!env_dropped_by_channel(&cfg, "missing", Channel::Stable));
         // Sprites and Vercel graduated to stable: no dev-daemon refusal.
         assert!(!env_dropped_by_channel(&cfg, "spr", Channel::Stable));
         assert!(!env_dropped_by_channel(&cfg, "vsb", Channel::Stable));
-        for name in ["box", "m0", "here", "spr", "vsb"] {
+        for name in ["box", "pod", "m0", "here", "spr", "vsb"] {
             assert!(!env_dropped_by_channel(&cfg, name, Channel::Dev), "{name}");
         }
     }

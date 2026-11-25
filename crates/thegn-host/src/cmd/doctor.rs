@@ -1873,6 +1873,12 @@ fn feature_state_line(
         // (`EnvProviderKind::stable_channel`); say so, or the row reads as
         // "no cloud environments on stable".
         format!("{state}; Sprites and Vercel environments are stable and stay enabled")
+    } else if feature == thegn_core::channel::Feature::Remote && !feature.allowed_in(channel) {
+        // SSH/mosh remote workspaces and `[sandbox.remote]` graduated out of
+        // this gate; only Kubernetes placement and direct-iroh stay dev-only.
+        format!(
+            "{state}; SSH/mosh remote workspaces are stable and stay enabled (Kubernetes placement and direct iroh are dev-only)"
+        )
     } else {
         state.to_string()
     }
@@ -9155,7 +9161,7 @@ args = ["--verbose"]
         );
         assert_eq!(
             feature_state_line(Feature::Remote, Channel::Stable),
-            "disabled (dev-only)"
+            "disabled (dev-only); SSH/mosh remote workspaces are stable and stay enabled (Kubernetes placement and direct iroh are dev-only)"
         );
         assert_eq!(
             feature_state_line(Feature::Observe, Channel::Stable),

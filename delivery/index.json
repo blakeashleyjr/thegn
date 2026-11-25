@@ -1717,6 +1717,14 @@
       "summary": "Make Sprites and Vercel environments and selected-runner jobs available on the stable channel; other providers stay dev-only."
     },
     {
+      "change": "ship-ssh-clientserver-on-stable",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Public launch of 30 November 2026 (Linear project 'Public launch'); tracked by launch-project issues.",
+      "summary": "Make SSH/mosh remote workspaces and client/server mode available on the stable channel; Kubernetes placement and direct iroh stay dev-only."
+    },
+    {
       "change": "sidebar-short-worktree-list",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

@@ -10,5 +10,5 @@ silently drop (THE-2669, THE-2670, THE-2671).
 - `thegn fleet list|cost|inspect` run on stable and read Sprites and Vercel
   environments only; other providers stay dev-only.
 - The env wizard and the host picker's "set up …" rows offer only the kinds the
-  channel allows (stable: `local`, `sprites`, `vercel`).
+  channel allows (stable: `local`, `ssh`, `sprites`, `vercel`).
 - Help pages describe Sprites and Vercel as supported on stable.

@@ -6,7 +6,7 @@
 stable channel; `thegn fleet` SHALL read only Sprites and Vercel environments
 there. `thegn host` and `thegn placement` SHALL remain refused. The "New
 environment…" wizard SHALL offer only the kinds the current channel allows:
-`local`, `sprites` and `vercel` on stable.
+`local`, `ssh`, `sprites` and `vercel` on stable (SSH added by `ship-ssh-clientserver-on-stable`).
 
 #### Scenario: Fleet runs on stable
 
@@ -17,4 +17,4 @@ environment…" wizard SHALL offer only the kinds the current channel allows:
 #### Scenario: Wizard offers stable kinds only
 
 - **WHEN** the user opens "New environment…" in the stable channel
-- **THEN** the kind cycle contains only `local`, `sprites` and `vercel`
+- **THEN** the kind cycle contains only `local`, `ssh`, `sprites` and `vercel`

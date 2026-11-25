@@ -91,10 +91,14 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 
 ## Experimental subsystems
 
-- **Remote, providers, placement, and voice are dev-channel only.** Treat them
-  as experimental rather than product promises; see [[release-channels]].
-  Sprites and Vercel environments (and `thegn job run` on them) are the
-  exception: they are supported on the stable channel. Neither has a recorded
+- **Kubernetes placement, other providers, placement, and voice are
+  dev-channel only.** Treat them as experimental rather than product promises;
+  see [[release-channels]]. Sprites and Vercel environments (and `thegn job
+run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
+  `pair` client/server mode are the exception: they are supported on the stable
+  channel. Direct Iroh (`serve --iroh-direct`, `pair direct`) stays dev-only.
+  SSH remotes have no recorded paid or multi-host soak on this release, and
+  mosh needs `mosh-server` on the remote host. Neither has a recorded
   paid live run on this release yet; see [[environments]] and
   [[vercel-sandbox]].
 - **Observe and plugin app tabs are stable.** Use the stable channel for these
