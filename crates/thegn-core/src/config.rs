@@ -2306,12 +2306,14 @@ pub struct GitConfig {
     /// passphrase prompt can never hang a background op. Off by default: a
     /// working gpg-agent signs headlessly.
     pub override_gpg: bool,
-    /// Install a `pre-merge-commit` hook that refuses a `git merge` run against
+    /// Offer a `pre-merge-commit` hook that refuses a `git merge` run against
     /// the canonical (primary) checkout from *inside* a thegn sandbox, where
     /// the canonical worktree's filesystem view can be incoherent and silently
     /// corrupt the merge. On by default; points at `thegn integrate` (an
-    /// object-DB fold with no checkout). No-op outside a sandbox, in linked
-    /// worktrees, and when a foreign hook is already present. Per-merge escape
+    /// object-DB fold with no checkout). The hook is only installed after the
+    /// owner answers yes to a once-per-repo prompt (remembered in the git dir's
+    /// `thegn-merge-guard`); a non-interactive start never installs it. No-op
+    /// outside a sandbox, in linked worktrees, and when a foreign hook is already present. Per-merge escape
     /// hatch: `THEGN_MERGE_GUARD_OFF=1`.
     pub merge_guard: bool,
     /// Poll the remote in the background (`git fetch --prune`, never a merge) so
