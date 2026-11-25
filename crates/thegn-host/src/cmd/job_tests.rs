@@ -68,11 +68,18 @@ fn job_run_accepts_only_the_closed_recipe_set() {
 }
 
 #[test]
-fn job_is_a_dev_channel_provider_verb() {
+fn job_is_a_stable_channel_verb() {
+    // Selected runners are Sprites and Vercel only, both stable-channel.
     let cli = parse(&["job", "run", "cargo-build"]).unwrap();
     assert_eq!(
         crate::experimental_command(cli.command.as_ref().unwrap()),
-        Some(("job", thegn_core::channel::Feature::Providers))
+        None
+    );
+    // The managed pool and fleet verbs stay dev-only.
+    let host = parse(&["host", "list"]).unwrap();
+    assert_eq!(
+        crate::experimental_command(host.command.as_ref().unwrap()),
+        Some(("host", thegn_core::channel::Feature::Providers))
     );
 }
 

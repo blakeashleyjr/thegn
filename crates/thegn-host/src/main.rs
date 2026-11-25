@@ -1372,7 +1372,8 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
         Command::Host { .. } => ("host", Feature::Providers),
         Command::Placement { .. } => ("placement", Feature::Placement),
         Command::Fleet { .. } => ("fleet", Feature::Providers),
-        Command::Job { .. } => ("job", Feature::Providers),
+        // `thegn job` is stable: its selected runners are Sprites and Vercel
+        // only (`selected_runner::build_from`), which graduated to stable.
         #[cfg(feature = "iroh")]
         Command::Serve {
             iroh_direct: true, ..

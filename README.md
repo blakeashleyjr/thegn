@@ -561,8 +561,9 @@ panel, PR) keep working.
   `THEGN_SANDBOX_PROFILE=sealed` to opt in.
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(SSH, Kubernetes and managed-provider placement are **dev channel only** —
-  see Channels.)_
+  selects them. Sprites and Vercel Sandbox environments, and `thegn job run` on
+  them, are supported on the stable channel. _(SSH, Kubernetes and the other
+  managed providers are **dev channel only** — see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over
   **ssh**; composes with the container backends. _(**Dev channel only.**)_
@@ -578,8 +579,9 @@ also build and install it with `./install.sh`. A set of experimental
 subsystems is compiled in but **clamped off** outside the dev channel:
 
 - remote worktrees over SSH and named environments over SSH or managed
-  providers,
-- cloud execution providers and the managed pool,
+  providers other than Sprites and Vercel,
+- the other cloud execution providers (Fly, DigitalOcean, Hetzner, Machine0,
+  Daytona), the managed pool and `thegn fleet`,
 - the placement engine,
 - voice mode.
 

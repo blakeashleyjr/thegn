@@ -18,6 +18,15 @@ All notable changes to **thegn** are documented here. The format follows
   from the palette with **Welcome tour…**; `thegn setup` still opens the
   classic setup wizard.
 
+### Changed
+
+- Sprites and Vercel Sandbox environments are supported on the stable channel:
+  their `[env.*]` tables survive the stable config clamp, worktrees can open on
+  them, the panel shows the environments section, and `thegn job run` with a
+  Sprites or Vercel runner is no longer refused. Every other cloud provider,
+  the managed `[host.*]` pool, SSH/Kubernetes placement and `thegn fleet`,
+  `thegn host` and `thegn placement` stay dev-channel only.
+
 ## [0.1.0-alpha.131] — 2026-11-24
 
 ### Added

@@ -1868,6 +1868,11 @@ fn feature_state_line(
         )
     } else if thegn_core::channel::Feature::PROGRAMME.contains(&feature) {
         format!("{state}; experimental, not yet implemented")
+    } else if feature == thegn_core::channel::Feature::Providers && !feature.allowed_in(channel) {
+        // Sprites and Vercel envs graduated out of this gate
+        // (`EnvProviderKind::stable_channel`); say so, or the row reads as
+        // "no cloud environments on stable".
+        format!("{state}; Sprites and Vercel environments are stable and stay enabled")
     } else {
         state.to_string()
     }
@@ -9154,6 +9159,14 @@ args = ["--verbose"]
         );
         assert_eq!(
             feature_state_line(Feature::Observe, Channel::Stable),
+            "enabled"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Providers, Channel::Stable),
+            "disabled (dev-only); Sprites and Vercel environments are stable and stay enabled"
+        );
+        assert_eq!(
+            feature_state_line(Feature::Providers, Channel::Dev),
             "enabled"
         );
     }

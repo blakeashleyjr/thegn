@@ -590,7 +590,7 @@ set, provisioning first reads that provider's fleet and refuses with "cannot
 verify fleet budget" when the read fails or is incomplete. `fleet list --env`
 reads one env only, so its JSON `cost.budget` is always empty.
 
-On the dev channel, `thegn job run [--runner <env>] [--deadline <secs>]
+On both channels, `thegn job run [--runner <env>] [--deadline <secs>]
 <cargo-build|cargo-test>` runs a typed recipe on one explicitly selected
 runner and exits with the job's exit code. The runner is `--runner`, else
 `[jobs] runner`: an `[env.<name>]` whose provider is `sprites` (its `id` names

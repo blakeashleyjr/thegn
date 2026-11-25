@@ -12,6 +12,12 @@ contexts: [panel:environments]
 
 Part of [[sandboxing]]. Named environments, worktree toolchains, lifecycle hooks and remote worktrees.
 
+Sprites and [[vercel-sandbox]] environments are supported on the stable
+channel. SSH, Kubernetes, every other cloud provider, `[host.*]` and
+`thegn fleet` are dev channel only (see [[release-channels]]). Where this page
+says "on the dev channel" about provider behaviour, the same behaviour applies
+to Sprites and Vercel environments on the stable channel.
+
 ## Environments
 
 Named `[env.<name>]` execution environments (local, container, or a cloud
@@ -382,7 +388,8 @@ stay plan-only without the spend flags.
 
 ### Retry, inspect, drain and provision
 
-Dev channel, unverified live.
+Unverified live. `thegn fleet inspect` needs the dev channel; the rest works on
+both channels for Sprites and Vercel environments.
 
 - **Retry failed pull-backs.** The palette action "Retry failed pull-backs"
   (`retry-pullbacks`, no default chord) runs the same code as
@@ -405,7 +412,9 @@ Dev channel, unverified live.
 
 ### Adopt, the daily loop and release
 
-Everything below is dev channel (`THEGN_CHANNEL=dev`) and unverified live.
+Everything below is unverified live. It works on both channels for Sprites and
+Vercel environments; the Fly and machine0 parts need the dev channel
+(`THEGN_CHANNEL=dev`).
 
 - **Adopt.** `thegn env adopt <sprite> --env <S> [--yes] [--json]` records a
   sprite you made elsewhere so thegn may manage it. It reads the sprite (a 404
@@ -568,7 +577,7 @@ lists the sandbox. A partial listing proves nothing.
 
 A project can bind one Sprite as the runner for pinned `cargo build` and
 `cargo test` jobs. Set `[jobs] runner = "<env name>"` and run
-`thegn job run cargo-test` (dev channel; see [[cli]]). Each attempt runs in a
+`thegn job run cargo-test` (both channels; see [[cli]]). Each attempt runs in a
 scrubbed environment with a private home, one dispatch per attempt. A deadline
 kills the remote process group, and secrets stay out of the uploaded snapshot.
 Ctrl-C cancels the attempt. If thegn dies mid-job, the daemon reattaches the
@@ -784,8 +793,8 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
-> Remote worktrees and cloud providers are **dev-channel only** — see
-> [[release-channels]].
+> Remote worktrees and cloud providers other than Sprites and Vercel are
+> **dev-channel only** — see [[release-channels]].
 
 Daytona is in maintenance: thegn drives its REST API; interactive panes need
 the ssh gateway (planned). `thegn doctor` marks a Daytona env experimental and
