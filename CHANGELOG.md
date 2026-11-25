@@ -23,6 +23,8 @@ other slow setup steps finish in the background.
 - At daemon start, job ledgers of every Sprites and Vercel environment are reconciled and
   reattached once, not only the configured runner's; an environment that cannot be resolved
   is skipped with a warning.
+- Background prefetch and pull-request refresh workers share two database slots, so a
+  startup burst no longer holds many SQLite connections open at once.
 
 ## [0.1.0-alpha.134] — 2026-11-25
 
