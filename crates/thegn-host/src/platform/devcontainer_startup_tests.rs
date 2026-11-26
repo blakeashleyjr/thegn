@@ -524,10 +524,8 @@ mod unix {
         let digest = super::super::super::config_digest(&config).unwrap();
         std::fs::write(&script, format!("#!{}\nif [ \"$1\" = --version ]; then printf 'fixture 1\\n'; exit 0; fi\n[ \"$#\" = 5 ] && [ \"$1\" = up ] && [ \"$2\" = --workspace-folder ] && [ \"$4\" = --config ] || exit 91\n[ -f \"$5\" ] || exit 92\nprintf 'up\\n' >> \"$3/starts\"\n{body}\n", tool("sh").display())).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // The first exec of a freshly written script is slow on macOS (Gatekeeper/XProtect
-        // scan). Production refuses a late spawn once the caller deadline has passed, so a
-        // slow first `--version` probe would turn the short-deadline fixtures into
-        // never-spawned ones. Pay that cost here, before any deadline starts.
+        // Pay the first exec of the freshly written script (slow on macOS) before any
+        // caller deadline starts.
         let warmed = std::process::Command::new(&script)
             .arg("--version")
             .output()
@@ -626,6 +624,12 @@ mod unix {
         }
     }
 
+    /// Caller deadline for fixtures whose child (or barrier) is held until
+    /// release, so the deadline always expires. It must outlast the worker's
+    /// startup path (owner thread at Utility QoS, `--version` probe, config
+    /// snapshot): production refuses a spawn claimed after the deadline, and on
+    /// a loaded macOS host that path alone exceeded the old 150-400 ms values.
+    const HELD_DEADLINE: Duration = Duration::from_secs(3);
     const HOLD: &str = "while [ ! -f \"$FIXTURE_RELEASE\" ]; do \"$FIXTURE_SLEEP\" 0.01; done";
     fn assert_held(
         result: Result<PendingSession, StartFailure>,
@@ -702,11 +706,8 @@ mod unix {
             };
             let h = harness(&body);
             let before = Instant::now();
-            assert_held(
-                h.fixture.pending(Duration::from_millis(300)),
-                StartReason::Deadline,
-            );
-            assert!(before.elapsed() < Duration::from_secs(2));
+            assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
+            assert!(before.elapsed() < HELD_DEADLINE + Duration::from_secs(2));
             assert!(
                 eventually_exists(&h.directory.path().join("resource")),
                 "deadline fixture never actually spawned"
@@ -922,9 +923,9 @@ mod unix {
             let h = harness(&body);
             let fallback = AtomicUsize::new(0);
             let mut warnings = Vec::new();
-            let result =
-                h.fixture
-                    .agent_decision(Duration::from_millis(1000), &fallback, &mut warnings);
+            let result = h
+                .fixture
+                .agent_decision(HELD_DEADLINE, &fallback, &mut warnings);
             assert!(matches!(result, Err(StartFailure::HeldUnknown(_, _))));
             assert_eq!(fallback.load(Ordering::Acquire), 0);
             assert!(warnings.is_empty());
@@ -1128,13 +1129,9 @@ mod unix {
     #[test]
     fn held_startup_does_not_occupy_git_or_capability_capture_lanes() {
         let h = harness(HOLD);
-        assert_held(
-            h.fixture.pending(Duration::from_millis(300)),
-            StartReason::Deadline,
-        );
-        // The worker's `--version` probe uses the one capability slot; under
-        // load it can outlive the 300 ms deadline. `starts` is written by the
-        // held `up` child, which is spawned only after that probe returned.
+        assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
+        // `starts` is written by the held `up` child, which is spawned only
+        // after the worker's `--version` probe (the capability slot) returned.
         assert!(eventually_exists(&h.directory.path().join("starts")));
         let git_path = tool("git");
         let mut git = std::process::Command::new(git_path);
@@ -1164,10 +1161,7 @@ mod unix {
         for (point, expected_spawns) in [(Point::BeforeSpawnClaim, 0), (Point::SpawnClaimed, 1)] {
             let h = harness("exit 0");
             let gate = h.fixture.controller.hooks.hold(point);
-            assert_held(
-                h.fixture.pending(Duration::from_millis(150)),
-                StartReason::Deadline,
-            );
+            assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
             gate.entered();
             h.fixture.finish();
             assert_eq!(

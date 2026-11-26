@@ -783,13 +783,22 @@ fn cancelling_token_future_terminates_owned_group() {
     });
     for file in ["parent.pid", "descendant.pid"] {
         let pid = std::fs::read_to_string(dir.path().join(file)).unwrap();
-        let out = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", pid.trim()])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&out.stdout);
+        // The group SIGKILL is sent on drop, but the reparented descendant exits
+        // asynchronously; give it a bounded moment before calling it running.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let state = loop {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') || std::time::Instant::now() >= deadline {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(
-            state.trim().is_empty() || state.trim().starts_with('Z'),
+            state.is_empty() || state.starts_with('Z'),
             "running helper after cancellation: {state}"
         );
         let fds = std::path::PathBuf::from(format!("/proc/{}/fd", pid.trim()));

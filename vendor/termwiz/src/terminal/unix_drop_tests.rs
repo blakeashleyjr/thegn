@@ -96,7 +96,7 @@ fn healthy_drop_restores_saved_terminal_modes() {
     };
     // The kernel sets PENDIN itself (retype pending input) when a mode change races
     // buffered input; macOS leaves it set after the restore. It is not a mode we own.
-    let own = !(libc::PENDIN as libc::tcflag_t);
+    let own = !libc::PENDIN;
     assert_eq!(saved.c_lflag & own, restored.c_lflag & own);
     assert_eq!(saved.c_iflag, restored.c_iflag);
     assert_eq!(saved.c_oflag, restored.c_oflag);
