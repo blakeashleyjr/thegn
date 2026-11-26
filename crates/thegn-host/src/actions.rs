@@ -2440,6 +2440,15 @@ impl CiActionCtx<'_> {
                     ov.remove_selected();
                 }
             }
+            DetailAction::DismissBatch { ids, acks, keys } => {
+                for a in acks {
+                    self.ack_attention(a.path, a.reason, a.since, a.episode);
+                }
+                self.mutate_notifications_many(ids);
+                if let Some(ov) = overlay.as_mut() {
+                    ov.remove_notif_leaves(&keys);
+                }
+            }
             DetailAction::OpenLogPager => self.open_log_pager(),
             DetailAction::CopyLine(line) => {
                 self.model.status = match crate::clipboard::copy(&line) {
@@ -2485,12 +2494,24 @@ impl CiActionCtx<'_> {
     /// [`DetailAction::AckAllAttention`] → `mark_all_read`, the one total-clear
     /// path every surface shares.)
     fn mutate_notifications(&mut self, id: i64) {
+        self.mutate_notifications_many(vec![id]);
+    }
+
+    /// [`Self::mutate_notifications`] for a batch: one off-loop DB open and one
+    /// refresh pulse for every id (a group or stale dismissal can be hundreds).
+    fn mutate_notifications_many(&mut self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
         let epoch = crate::hydrate_feed::issue_notification_write();
+        let optimistic = ids.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.mark_notification_read(id); // best-effort: DB is a cache
+                for id in ids {
+                    let _ = db.mark_notification_read(id); // best-effort: DB is a cache
+                }
             }
             crate::hydrate_feed::commit_notification_write(epoch);
             if tx.send(RefreshKind::Model).is_ok() {
@@ -2498,7 +2519,7 @@ impl CiActionCtx<'_> {
             }
         });
         // Optimistic: the chip drops on the next frame, not after the rehydrate.
-        self.model.panel.mark_read_ids_at(epoch, [id]);
+        self.model.panel.mark_read_ids_at(epoch, optimistic);
         self.model.status = "Dismissed notification".into();
     }
 

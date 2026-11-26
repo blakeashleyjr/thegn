@@ -299,7 +299,7 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
                 kind: thegn_core::notification::NotificationKind::AgentFailed,
                 source_ref: "wt".into(),
                 message: "boom".into(),
-                created_at_ms: 0,
+                created_at_ms: thegn_core::util::now(),
                 read: false,
                 worktree_path: String::new(),
             }],

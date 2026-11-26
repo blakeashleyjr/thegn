@@ -392,7 +392,7 @@ mod tests {
             kind,
             source_ref: "src".into(),
             message: "msg".into(),
-            created_at_ms: 0,
+            created_at_ms: thegn_core::util::now(),
             read,
             worktree_path: path.into(),
         }

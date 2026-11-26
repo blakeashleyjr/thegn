@@ -222,6 +222,7 @@ pub(super) fn open(
         pending_ci: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     })
 }
 
@@ -488,6 +489,7 @@ mod request_tests {
             monitor_tab: None,
             live_ci: None,
             ci_autofix: None,
+            notif: None,
         }
     }
 
