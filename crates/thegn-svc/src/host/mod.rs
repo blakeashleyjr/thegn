@@ -892,27 +892,28 @@ impl OciRunner {
     }
 
     /// Warn once per ssh host when systemd lingering is off (agents die when the
-    /// session ends). Best-effort: a failed or slow probe is treated as unknown.
+    /// session ends). Probes at most once per host per process (reconnects and
+    /// connect retries skip it). Best-effort: a failed or slow probe is unknown.
     fn warn_if_no_linger(&self) {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         use thegn_core::host_probe::{LINGER_PROBE_SCRIPT, Linger, linger_notice, parse_linger};
-        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        static PROBED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         let Placement::Ssh(ssh) = &self.placement else {
             return;
         };
-        let Ok(out) = self.exec(LINGER_PROBE_SCRIPT, Duration::from_secs(5)) else {
-            return;
-        };
-        if !out.ok || parse_linger(&out.stdout) != Linger::Off {
-            return;
-        }
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-        let first = seen
+        let first = PROBED
+            .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
             .map(|mut g| g.insert(ssh.host.clone()))
             .unwrap_or(false);
-        if first {
+        if !first {
+            return;
+        }
+        let Ok(out) = self.exec(LINGER_PROBE_SCRIPT, Duration::from_secs(5)) else {
+            return;
+        };
+        if out.ok && parse_linger(&out.stdout) == Linger::Off {
             thegn_core::msg::warn(&linger_notice(&ssh.host));
         }
     }
