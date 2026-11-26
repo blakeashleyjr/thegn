@@ -685,6 +685,11 @@ impl GitLoc {
     /// removed; the shared base image + warm volumes (labelled
     /// `thegn.managed`) are untouched. No-op for a local loc (the caller
     /// removes that itself) or an empty/`~`/`/` path (never `rm -rf /`).
+    ///
+    /// THE-2731: bounded by a 10 s deadline, and complete when the ssh client
+    /// exits even if a `ControlPersist` mux master it spawned keeps the
+    /// inherited stdio pipes open. `Err` is for the caller to warn about; a
+    /// lingering remote dir is reclaimable via `host rm-cache`.
     pub fn remove_remote_dir(&self) -> Result<(), String> {
         let path = self.path();
         let p = path.trim();
@@ -1356,6 +1361,10 @@ fn run_remote_cleanup(mut command: Command, deadline: Duration) -> Result<(), St
     };
     match crate::git_run::run_command(&mut command, &policy, &cancel) {
         outcome if outcome.is_success() => Ok(()),
+        crate::git_run::GitOutcome::Timeout => Err(format!(
+            "remote worktree cleanup timed out after {}s",
+            deadline.as_secs_f32()
+        )),
         outcome => Err(format!("remote worktree cleanup failed: {outcome}")),
     }
 }
@@ -2447,6 +2456,23 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "cleanup exceeded its bounded deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The reported hang: the ssh client exits but a `ControlPersist` master it
+    /// forked keeps the inherited stderr open, so a read-to-EOF never returns.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_completes_when_a_helper_keeps_the_pipe_open() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 >&2 & exit 0"]);
+        let started = std::time::Instant::now();
+        run_remote_cleanup(command, Duration::from_secs(20))
+            .expect("the leader exited successfully");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cleanup waited on a lingering pipe holder: {:?}",
             started.elapsed()
         );
     }
