@@ -303,6 +303,30 @@ pub fn ack_at(path: &Path, tab: &str) {
     }
 }
 
+/// Mark a worktree's tab as unread: the inverse of [`ack`]. A `read` (hollow)
+/// dot returns to `waiting` (filled amber/red) until the tab is focused again.
+/// No-op for any other state, so a row with no dot stays dot-free and a working
+/// row is untouched.
+pub fn mark_unread(tab: &str) {
+    mark_unread_at(&state_path(), tab);
+}
+
+/// [`mark_unread`] against an explicit path (testable).
+pub fn mark_unread_at(path: &Path, tab: &str) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut snap = load(path);
+    let mut changed = false;
+    for e in snap.worktrees.values_mut() {
+        if e.tab == tab && e.state == "read" {
+            e.state = "waiting".into();
+            changed = true;
+        }
+    }
+    if changed {
+        save(path, &snap);
+    }
+}
+
 /// Drop a deleted worktree's FSM entry. Entries are otherwise carried forward
 /// forever (deliberately — dormant workspaces' dots must survive a switch),
 /// and `read_states()` re-keys them by TAB name, so a worktree recreated on
@@ -2261,6 +2285,44 @@ mod tests {
         // Missing file: no write, no panic.
         coerce_stale_states_at(&path, 600_000, 2000.0);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn mark_unread_restores_waiting_only_from_read() {
+        let path = std::env::temp_dir().join(format!(
+            "thegn-mark-unread-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut snap = load(&path);
+        for (wt, tab, state) in [
+            ("/wt/a", "app/a", "read"),
+            ("/wt/b", "app/b", "none"),
+            ("/wt/c", "app/c", "active"),
+        ] {
+            snap.worktrees.insert(
+                wt.into(),
+                serde_json::from_value(serde_json::json!({"tab": tab, "state": state}))
+                    .expect("entry json"),
+            );
+        }
+        save(&path, &snap);
+        mark_unread_at(&path, "app/a");
+        mark_unread_at(&path, "app/b");
+        mark_unread_at(&path, "app/c");
+        mark_unread_at(&path, "no/such-tab");
+        let st = read_states_at(&path);
+        assert_eq!(st.get("app/a").map(String::as_str), Some("waiting"));
+        assert_eq!(st.get("app/b").map(String::as_str), Some("none"));
+        assert_eq!(st.get("app/c").map(String::as_str), Some("active"));
+        // Round trip: focusing again re-reads it.
+        ack_at(&path, "app/a");
+        assert_eq!(
+            read_states_at(&path).get("app/a").map(String::as_str),
+            Some("read")
+        );
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression: concurrent in-process ack + poll must never (a) lose the ack
