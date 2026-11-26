@@ -2009,7 +2009,12 @@ fn git_policy_mounts(
         mounts.push(path_mount(&config, true));
     }
     for path in &plan.ro_after {
+        // Pins directly in the common dir (`hooks`, `config`, `info`) sit
+        // under its read-only bind, so a missing one cannot be planted from
+        // the sandbox; never create them (a `hooks`/`info` FILE would break
+        // host git). Only per-worktree files are created so their pin applies.
         if !path.exists()
+            && path.parent() != Some(common)
             && let Err(error) = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

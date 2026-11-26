@@ -7334,6 +7334,15 @@ fn git_policy_read_only_makes_the_worktree_ro() {
         triple_at(&argv, "--ro-bind", &fx.common).is_some(),
         "{argv:?}"
     );
+    // Planting pin targets in the main git dir would break host git (an
+    // empty `commondir` is fatal); a missing `info` must not become a file.
+    for planted in ["commondir", "gitdir", "config.worktree", "info"] {
+        assert!(!fx.common.join(planted).exists(), "{planted} was created");
+    }
+    assert!(
+        triple_at(&argv, "--ro-bind", &fx.common.join("hooks")).is_some(),
+        "{argv:?}"
+    );
 }
 
 #[test]

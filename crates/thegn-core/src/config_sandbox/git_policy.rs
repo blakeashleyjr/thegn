@@ -237,19 +237,32 @@ pub fn pin_target_ok(path: &Path, common: &Path, facts: PinTargetFacts) -> bool 
 }
 
 /// Git control paths that must be re-pinned read-only after git carve-outs.
+///
+/// When `admin` is the common dir itself (read-only mode, a main checkout or
+/// any structural fallback) there is no per-worktree admin dir: the
+/// `commondir`/`gitdir`/`config.worktree` pins are skipped, because the common
+/// dir is bound read-only already and a caller that creates missing pin
+/// targets must never plant an empty `commondir` in the main git dir (git
+/// refuses to run on an unreadable one). A main checkout's `<worktree>/.git`
+/// is the common dir itself and is skipped too.
 pub fn control_pins(common: &Path, admin: &Path, worktree: &Path) -> Vec<PathBuf> {
-    [
+    let gitfile = worktree.join(".git");
+    let mut pins = vec![
         common.join("hooks"),
         common.join("config"),
         common.join("info"),
-        admin.join("config.worktree"),
-        admin.join("commondir"),
-        admin.join("gitdir"),
-        worktree.join(".git"),
-    ]
-    .into_iter()
-    .filter(|path| !(path == &worktree.join(".git") && path == common))
-    .collect()
+    ];
+    if admin != common {
+        pins.extend(
+            ["config.worktree", "commondir", "gitdir"]
+                .iter()
+                .map(|name| admin.join(name)),
+        );
+    }
+    if gitfile != common {
+        pins.push(gitfile);
+    }
+    pins
 }
 
 /// The directory under `refs/heads/` holding `branch`'s loose ref, or an error
@@ -729,6 +742,26 @@ mod tests {
         )
         .expect("plan");
         assert!(plan.ro_after.contains(&common.join("info")));
+    }
+
+    #[test]
+    fn control_pins_skip_admin_files_without_an_admin_dir() {
+        let common = Path::new("/repo/.git");
+        // Read-only mode / structural fallback: admin is the common dir.
+        let pins = control_pins(common, common, Path::new("/wt"));
+        assert_eq!(
+            pins,
+            [
+                common.join("hooks"),
+                common.join("config"),
+                common.join("info"),
+                PathBuf::from("/wt/.git"),
+            ]
+        );
+        // Main checkout: `<worktree>/.git` is the common dir, not re-bound.
+        let pins = control_pins(common, common, Path::new("/repo"));
+        assert!(!pins.iter().any(|p| p == common), "{pins:?}");
+        assert!(!pins.iter().any(|p| p.ends_with("commondir")), "{pins:?}");
     }
 
     #[test]
