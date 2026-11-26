@@ -12,8 +12,9 @@ config_enum! {
     /// How the Lead's sandbox reaches the network (THE-2220). "isolated" runs
     /// it in its own network namespace through `pasta` (outbound internet,
     /// no host loopback or abstract sockets; only the Lead listener port is
-    /// forwarded); without `pasta` the Lead refuses to start. "host" shares
-    /// the host network namespace and logs a warning on every launch.
+    /// forwarded); without `pasta` the Lead refuses to start. "host" is kept
+    /// to diagnose old configs, but Lead admission refuses it because it
+    /// exposes host loopback services and abstract sockets.
     pub enum LeadNetwork: "lead network" {
         Isolated = "isolated", Host = "host",
     } default = Isolated;

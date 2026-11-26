@@ -129,9 +129,9 @@ pub(crate) fn check_pasta(isolated: bool, available: bool) -> Check {
     if !isolated {
         return check(
             "pasta",
-            Level::Warn,
-            "network = \"host\": the Lead shares the host network",
-            Some("warn: shared network; prefer [lead] network = \"isolated\""),
+            Level::Fail,
+            "network = \"host\" is refused",
+            Some("set [lead] network = \"isolated\""),
         );
     }
     pass_or(
@@ -140,7 +140,7 @@ pub(crate) fn check_pasta(isolated: bool, available: bool) -> Check {
         Level::Fail,
         "pasta available (isolated network)",
         "pasta is not available for the isolated network",
-        Some("install passt, or [lead] network = \"host\" (warn: shared network)"),
+        Some("install passt (required for the isolated Lead network)"),
     )
 }
 
@@ -982,7 +982,7 @@ mod tests {
     fn pasta_ok_miss_and_host() {
         assert_eq!(lv(&check_pasta(true, true)), Level::Ok);
         assert_eq!(lv(&check_pasta(true, false)), Level::Fail);
-        assert_eq!(lv(&check_pasta(false, false)), Level::Warn);
+        assert_eq!(lv(&check_pasta(false, false)), Level::Fail);
     }
 
     #[test]

@@ -30,7 +30,7 @@ sidebar and the jump key only says the Lead is not configured.
 Every `thegn lead` step needs the dev channel, because on stable `[lead]` is
 clamped off. Not yet verified live.
 
-1. Install bubblewrap and `pasta` (or set `[lead] network = "host"`).
+1. Install bubblewrap and `pasta`; the Lead refuses to launch without both.
 2. Set `[daemon] enabled = true` and `[lead] agent = "claude"`.
 3. Run `THEGN_CHANNEL=dev thegn daemon stop`, then open thegn with
    `THEGN_CHANNEL=dev`. Lead tabs end when the daemon restarts, so reopen them.
