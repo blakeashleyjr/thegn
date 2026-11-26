@@ -8872,6 +8872,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drive_exec_tty_preserves_line_endings_across_text_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (first, second) in [("/dev/pts/0\n", "ok\n"), ("/dev/pts/0\r\n", "ok\r\n")] {
+            let expected = [first.as_bytes(), second.as_bytes()].concat();
+            let (frames, fault, _) = drive_exec_messages(
+                true,
+                vec![
+                    Message::Text(first.into()),
+                    Message::Text(second.into()),
+                    Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
+                ],
+                false,
+            )
+            .await;
+            let output: Vec<u8> = frames
+                .iter()
+                .filter_map(|frame| match frame {
+                    ExecFrame::Stdout(bytes) => Some(bytes.as_slice()),
+                    ExecFrame::Exit(_) => None,
+                })
+                .flatten()
+                .copied()
+                .collect();
+
+            assert_eq!(output, expected);
+            assert_eq!(frames.last(), Some(&ExecFrame::Exit(0)));
+            assert_eq!(fault, None);
+        }
+    }
+
+    #[tokio::test]
     async fn drive_exec_non_tty_refuses_non_json_text_frames() {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
