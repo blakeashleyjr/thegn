@@ -5168,6 +5168,10 @@ endpoint = ""
 live_preview = true
 # Separate total deadline for each inference/HTTP request, clamped 1..=300.
 timeout_seconds = 60
+# Ordered find/replace rules for each final transcript (at most 200). Matching is
+# case-insensitive, on whole words; an empty `to` deletes the phrase.
+# replacements = [{ from = "open code", to = "OpenCode" }]
+replacements = []
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
