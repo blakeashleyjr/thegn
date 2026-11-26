@@ -8184,18 +8184,24 @@ fn systemd_common_outside_home_is_readonly() {
     }
 }
 
-#[test]
-fn host_exec_files_are_pinned_after_the_worktree_for_standard_not_open() {
-    let fx = git_fixture();
+/// `fx`'s worktree with `.claude/`, `.envrc` and `.mcp.json` present (no
+/// `.vscode/tasks.json`), bound writable and then host-exec pinned.
+fn host_exec_fixture_mounts(fx: &GitFixture, profile: SandboxProfile) -> Vec<Mount> {
     std::fs::create_dir_all(fx.wt.join(".claude")).unwrap();
+    std::fs::write(fx.wt.join(".claude/settings.json"), "{}").unwrap();
     std::fs::write(fx.wt.join(".envrc"), "").unwrap();
     std::fs::write(fx.wt.join(".mcp.json"), "{}").unwrap();
-    assert!(host_exec_mounts(&fx.wt, SandboxProfile::Open).is_empty());
-    let pins = host_exec_mounts(&fx.wt, SandboxProfile::Hardened);
-    assert!(pins.iter().all(|m| m.ro));
     let mut mounts = vec![path_mount(&fx.wt, false)];
-    mounts.extend(pins);
-    let argv = argv_for(Backend::Bwrap, &fx, mounts.clone());
+    mounts.extend(host_exec_mounts(&fx.wt, profile));
+    mounts
+}
+
+#[test]
+fn bwrap_host_exec_files_ro_after_worktree() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Hardened);
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
     let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree");
     for name in [".claude", ".envrc", ".mcp.json"] {
         let at =
@@ -8206,28 +8212,175 @@ fn host_exec_files_are_pinned_after_the_worktree_for_standard_not_open() {
         triple_at(&argv, "--ro-bind", &fx.wt.join(".vscode/tasks.json")).is_none(),
         "missing entries are not pinned"
     );
-    let mut s = spec(Backend::Systemd);
-    s.worktree = fx.wt.clone();
-    s.mounts = mounts;
-    let props = systemd_mount_props(&s).unwrap();
-    let claude = fx.wt.join(".claude").display().to_string();
+}
+
+#[test]
+fn open_profile_does_not_pin_host_exec_files() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Open);
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    assert!(triple_at(&argv, "--ro-bind", &fx.wt.join(".envrc")).is_none());
+    // Sealed is above standard: pinned too.
+    let sealed = host_exec_mounts(&fx.wt, SandboxProfile::Sealed);
     assert!(
-        props.contains(&format!("ReadOnlyPaths={claude}")),
-        "{props:?}"
+        sealed.iter().any(|m| m.ro && m.dest.ends_with("/.envrc")),
+        "{sealed:?}"
     );
 }
 
 #[test]
-fn legacy_remote_placement_pins_without_stat() {
+fn claude_dir_pinned_as_directory() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Hardened);
+    let claude = fx.wt.join(".claude").display().to_string();
+    let settings = fx.wt.join(".claude/settings.json").display().to_string();
+    assert!(
+        mounts.iter().any(|m| m.ro && m.dest == claude),
+        "{mounts:?}"
+    );
+    assert!(!mounts.iter().any(|m| m.dest == settings), "{mounts:?}");
+}
+
+#[test]
+fn systemd_emits_readonlypaths_for_every_ro_pin() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    std::fs::create_dir_all(fx.wt.join(".claude")).unwrap();
+    std::fs::write(fx.wt.join(".envrc"), "").unwrap();
+    let (mut mounts, _) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    mounts.extend(host_exec_mounts(&fx.wt, SandboxProfile::Hardened));
+    let mut s = spec(Backend::Systemd);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    let props = systemd_mount_props(&s).unwrap();
+    for pin in seven_pins(&fx)
+        .into_iter()
+        .chain([fx.wt.join(".claude"), fx.wt.join(".envrc")])
+    {
+        let p = pin.display().to_string();
+        assert!(
+            props.contains(&format!("ReadOnlyPaths={p}")),
+            "{p}: {props:?}"
+        );
+    }
+}
+
+#[test]
+fn oci_pins_are_ro_volumes() {
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    let mut mounts = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+    std::fs::write(fx.wt.join(".envrc"), "").unwrap();
+    mounts.extend(host_exec_mounts(&fx.wt, SandboxProfile::Hardened));
+    let mut s = spec(Backend::Podman);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    let oci = oci_create_opts(&s).expect("oci opts");
+    for pin in seven_pins(&fx).into_iter().chain([fx.wt.join(".envrc")]) {
+        let p = pin.display().to_string();
+        assert!(
+            oci.iter().any(|a| a == &format!("{p}:{p}:ro")),
+            "{p}: {oci:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_guard_hook_visible_ro() {
+    // thegn's `pre-merge-commit` guard lives in the shared hooks dir on the
+    // host; the sandbox sees it (no hide) but read-only, so it still fires
+    // and cannot be removed or rewritten.
+    let fx = git_fixture();
+    std::fs::write(fx.common.join("hooks/pre-merge-commit"), "#!/bin/sh\n").unwrap();
+    let (mounts, _) = git_policy_mounts(
+        &git_cfg(crate::config::SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    let hooks = triple_at(&argv, "--ro-bind", &fx.common.join("hooks")).expect("hooks ro");
+    let common = triple_at(&argv, "--ro-bind", &fx.common).expect("common ro");
+    assert!(common < hooks, "{argv:?}");
+    let hooks_dest = fx.common.join("hooks").display().to_string();
+    assert!(
+        !argv
+            .windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == hooks_dest),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn legacy_mounts_pin_hooks_and_config_worktree() {
+    let fx = git_fixture();
+    // No `config.worktree` yet: the writable common dir would let the sandbox
+    // plant one, so the legacy path creates it empty and pins it.
+    let cw = fx.admin.join("config.worktree");
+    assert!(!cw.exists());
+    let mounts = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+    assert!(cw.is_file());
+    let common = fx.common.display().to_string();
+    let at = |dest: &std::path::Path| {
+        let dest = dest.display().to_string();
+        mounts.iter().position(|m| m.ro && m.dest == dest)
+    };
+    let common_at = mounts
+        .iter()
+        .position(|m| !m.ro && m.dest == common)
+        .expect("common rw");
+    for pin in seven_pins(&fx) {
+        let pin_at = at(&pin).unwrap_or_else(|| panic!("{}: {mounts:?}", pin.display()));
+        assert!(common_at < pin_at, "{} after common", pin.display());
+    }
+}
+
+#[test]
+fn full_fallback_pins_hooks() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    // A top-level branch cannot be confined: `full` falls back to the legacy
+    // read-write common dir, which still pins every control file.
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::Full),
+        &fx.wt,
+        &git_probe(&fx, "lane", Some("main")),
+    );
+    assert!(warning.is_some_and(|w| w.contains("read-write")));
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    assert!(triple_at(&argv, "--bind", &fx.common).is_some(), "{argv:?}");
+    for pin in seven_pins(&fx) {
+        assert!(
+            triple_at(&argv, "--ro-bind", &pin).is_some(),
+            "{}: {argv:?}",
+            pin.display()
+        );
+    }
+}
+
+#[test]
+fn remote_placement_pins_hooks() {
     let common = std::path::Path::new("/remote/repo/.git");
     let admin = common.join("worktrees/lane");
     let wt = std::path::Path::new("/remote/wt");
     let mounts = legacy_git_mounts(wt, Some(common), Some(&admin), false);
-    for pin in ["hooks", "config", "info"] {
-        let dest = common.join(pin).display().to_string();
-        assert!(mounts.iter().any(|m| m.ro && m.dest == dest), "{pin}");
+    for pin in [
+        common.join("hooks"),
+        common.join("config"),
+        common.join("info"),
+        admin.join("config.worktree"),
+        admin.join("commondir"),
+        admin.join("gitdir"),
+        wt.join(".git"),
+    ] {
+        let dest = pin.display().to_string();
+        assert!(mounts.iter().any(|m| m.ro && m.dest == dest), "{dest}");
     }
-    assert!(mounts.iter().any(|m| m.ro && m.dest == "/remote/wt/.git"));
 }
 
 #[cfg(unix)]

@@ -706,16 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mounts_pin_hooks_and_config_worktree() {
-        let (common, admin) = fixture();
-        let pins = control_pins(&common, &admin, Path::new("/wt"));
-        assert!(pins.contains(&common.join("hooks")));
-        assert!(pins.contains(&common.join("config")));
-        assert!(pins.contains(&admin.join("config.worktree")));
-    }
-
-    #[test]
-    fn full_fallback_pins_hooks() {
+    fn full_mode_plan_pins_hooks() {
         let (common, admin) = fixture();
         let plan = plan_git_mounts(
             &mode_cfg(SandboxGitMode::Full),
@@ -728,14 +719,6 @@ mod tests {
         )
         .expect("plan");
         assert!(plan.ro_after.contains(&common.join("hooks")));
-    }
-
-    #[test]
-    fn remote_placement_pins_hooks() {
-        let common = Path::new("/remote/repo/.git");
-        let admin = common.join("worktrees/lane");
-        let pins = control_pins(common, &admin, Path::new("/remote/repo/wt"));
-        assert!(pins.contains(&common.join("hooks")));
     }
 
     #[test]

@@ -1966,10 +1966,11 @@ fn pin_target_facts(
 /// top, so no mode or placement leaves them writable (THE-2147).
 ///
 /// `verify` is true for a local worktree: pin targets are checked without
-/// following symlinks and a missing `hooks`/`info` directory is created; an
-/// unsafe target fails closed by binding the whole common dir read-only. For a
-/// remote placement the paths are the remote's and cannot be checked here, so
-/// every pin is emitted as is.
+/// following symlinks and a missing `hooks`/`info` directory or linked-worktree
+/// `config.worktree` is created; an unsafe or uncreatable target fails closed
+/// by binding the whole common dir read-only. For a remote placement the paths
+/// are the remote's and cannot be checked here, so every pin is emitted as is
+/// (the caller drops the ones the remote reports absent).
 fn legacy_git_mounts(
     worktree: &std::path::Path,
     common: Option<&std::path::Path>,
@@ -1989,15 +1990,43 @@ fn legacy_git_mounts(
             continue;
         }
         let mut facts = pin_target_facts(&pin, gc);
-        if facts.is_none()
-            && pin.parent() == Some(gc)
-            && matches!(
-                pin.file_name().and_then(|n| n.to_str()),
-                Some("hooks" | "info")
-            )
-            && std::fs::create_dir(&pin).is_ok()
-        {
-            facts = pin_target_facts(&pin, gc);
+        let name = pin.file_name().and_then(|n| n.to_str());
+        // Under the writable common dir a missing `hooks`/`info` or
+        // `config.worktree` could be planted by the sandbox, so create it
+        // (`config.worktree` only in a real linked-worktree admin dir, never
+        // in the main git dir); if that fails, fail closed below.
+        let creatable = match name {
+            Some("hooks" | "info") => pin.parent() == Some(gc),
+            Some("config.worktree") => {
+                pin.parent() == Some(admin)
+                    && admin != gc
+                    && std::fs::symlink_metadata(admin.join("commondir"))
+                        .is_ok_and(|m| m.file_type().is_file())
+            }
+            _ => false,
+        };
+        if facts.is_none() && creatable {
+            let created = if name == Some("config.worktree") {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&pin)
+                    .map(drop)
+            } else {
+                std::fs::create_dir(&pin)
+            };
+            if created.is_ok() {
+                facts = pin_target_facts(&pin, gc);
+            }
+            if facts.is_none() {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    path = %pin.display(),
+                    "git control path could not be created; shared .git mounted read-only"
+                );
+                mounts[common_index].ro = true;
+                continue;
+            }
         }
         let Some(facts) = facts else { continue };
         if crate::config_sandbox::git_policy::pin_target_ok(&pin, gc, facts) {
@@ -2047,8 +2076,8 @@ pub(crate) const GIT_CARVE_KEEP_DIR: &str = ".thegn-keep";
 /// The worktree + git common-dir binds for a LOCAL worktree under `git`
 /// (THE-2009/THE-2021), plus the warning to log when the plan fell back.
 ///
-/// Order: the worktree, the common dir read-only, the writable carve-outs, the
-/// shared `config` pin, then the `ro_after` re-pins (bwrap applies binds in
+/// Order: the worktree, the common dir read-only, the writable carve-outs,
+/// then the `ro_after` re-pins (git control files, alternates; bwrap applies binds in
 /// argument order). Missing carve-out dirs are created first (best-effort);
 /// a carve-out or re-pin whose source still does not exist is dropped (a
 /// dropped carve-out only removes write access). When the branch cannot be
@@ -2449,12 +2478,30 @@ fn resolve_placed_with(
                         .ok()
                         .filter(|p| p.as_path() != common)
                 });
-                mounts.extend(legacy_git_mounts(
-                    &worktree,
-                    gc.as_deref(),
-                    admin.as_deref(),
-                    !loc.is_remote(),
-                ));
+                let mut git_mounts =
+                    legacy_git_mounts(&worktree, gc.as_deref(), admin.as_deref(), !loc.is_remote());
+                // A bind of a missing source aborts the remote launch, and
+                // `info/` and `config.worktree` are often absent: drop a pin
+                // the remote reports absent (a read error keeps it, failing
+                // closed). `hooks` is not probed: `--git-path hooks` follows
+                // `core.hooksPath`, and git's templates create it.
+                if loc.is_remote()
+                    && let Some(common) = gc.as_deref()
+                {
+                    let mut absent = Vec::new();
+                    if matches!(loc.read_git_path_checked("info"), Ok(None)) {
+                        absent.push(common.join("info"));
+                    }
+                    if let Some(admin) = &admin
+                        && matches!(loc.read_git_path_checked("config.worktree"), Ok(None))
+                    {
+                        absent.push(admin.join("config.worktree"));
+                    }
+                    git_mounts.retain(|m| {
+                        !m.ro || !absent.iter().any(|p| p.as_os_str() == m.dest.as_str())
+                    });
+                }
+                mounts.extend(git_mounts);
             }
         }
         // THE-2147: files the host later executes from the worktree, pinned
