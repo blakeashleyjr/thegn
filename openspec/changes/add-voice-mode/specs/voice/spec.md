@@ -79,6 +79,28 @@ SHALL remain the default provider.
 - **THEN** send overlapping windows sequentially and one complete recording on stop
 - **AND** with final-only enabled send just the complete recording
 
+### Requirement: Level-based silence rejection and final edge trim
+
+Voice transcription SHALL use DC-removed RMS levels over 30 ms windows. It
+SHALL accept a window at or above -50 dBFS immediately, or accept a contiguous
+run of at least six windows at or above the greater of the 10th-percentile noise
+floor plus 12 dB and -66 dBFS. One quiet window MAY be bridged within a run;
+two consecutive quiet windows SHALL end it. The final embedded decode SHALL
+include 200 ms of context around detected speech, clamped to the recording;
+previews SHALL retain their original sample offsets. HTTP SHALL skip both
+preview and final requests when the recording has no detected speech.
+
+#### Scenario: Silence and noise do not reach transcription
+
+- **WHEN** a recording is digital silence or only low-level stationary noise
+- **THEN** embedded transcription returns empty text and HTTP sends no request
+
+#### Scenario: Final decode keeps speech context
+
+- **WHEN** speech is detected in the final recording
+- **THEN** embedded final inference uses the speech span plus up to 200 ms on
+  either side, while preview inference uses the untrimmed preview window
+
 ### Requirement: Measured release acceptance
 
 Native desktop enablement SHALL wait for Linux and Apple silicon real-device

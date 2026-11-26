@@ -89,7 +89,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     };
     use std::time::{Duration, Instant};
     use thegn_core::config::VoiceKind;
-    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES, whisper::Pass};
+    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES, level, whisper::Pass};
     let cfg = request.cfg;
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -184,6 +184,10 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
             let began = Instant::now();
             // The stop flag aborts a preview to make room for the final pass.
             // No queue: after decoding, snapshot the newest window directly.
+            if cfg.kind == VoiceKind::Http && !level::has_speech(&samples) {
+                decoded_end = end;
+                continue;
+            }
             match transcribe(&samples, stop.clone(), Pass::Preview) {
                 Ok(text) if !stop.load(Ordering::Acquire) => {
                     let text = rolling.update(start, &text);
@@ -222,6 +226,9 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     }
     let (_, samples, _) = capture.snapshot(None)?;
     let began = Instant::now();
+    if cfg.kind == VoiceKind::Http && !level::has_speech(&samples) {
+        return emit(Event::Final(String::new()));
+    }
     let text = transcribe(&samples, cancel, Pass::Final)?;
     emit(Event::Timing {
         final_pass: true,
