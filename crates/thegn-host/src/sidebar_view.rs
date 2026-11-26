@@ -63,6 +63,9 @@ pub struct SidebarDisplay {
     /// Loose worktrees sharing a batch token fold into one row once at least
     /// this many share it (`[ui] sidebar_batch_group_min`); `0` = off.
     pub batch_group_min: usize,
+    /// Days a finished pipeline stays in the sidebar (`[ui]
+    /// sidebar_finished_pipeline_days`); `0` = never age out.
+    pub finished_pipeline_days: u32,
 }
 
 impl Default for SidebarDisplay {
@@ -101,6 +104,9 @@ impl Default for SidebarDisplay {
             // Exception: unit-built models do not group batches (config
             // default 2), so fixtures with batch-named branches stay loose.
             batch_group_min: 0,
+            // Exception: unit-built models never age pipelines out (config
+            // default 7 days).
+            finished_pipeline_days: 0,
         }
     }
 }
@@ -139,6 +145,7 @@ impl SidebarDisplay {
             group_row_limit: ui.sidebar_group_row_limit,
             group_row_limits: ui.sidebar_group_row_limits.clone(),
             batch_group_min: ui.sidebar_batch_group_min,
+            finished_pipeline_days: ui.sidebar_finished_pipeline_days,
         }
     }
 

@@ -232,6 +232,9 @@ sidebar_group_row_limit = 7
 # sidebar_group_row_limits = { Other = 5 }
 # Loose worktrees sharing a batch token fold into one row once this many share it; 0 = off.
 sidebar_batch_group_min = 2
+# Days a finished pipeline stays in the sidebar's Pipelines section; 0 = never age out.
+# The worktree is never deleted (`wt prune` does that).
+sidebar_finished_pipeline_days = 7
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused

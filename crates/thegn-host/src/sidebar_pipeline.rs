@@ -59,6 +59,11 @@ pub(crate) struct Lane {
     /// (degrading to the worktree basename when the rows carry none); its
     /// worktrees hang below it as leaves, so the label needs no suffix.
     pub label: String,
+    /// True when every roster row of the lane is terminal (merged, done,
+    /// failed, abandoned). Lanes with no roster rows are never finished.
+    pub finished: bool,
+    /// Latest dispatch or exit time across the lane's rows (ms); `0` with no rows.
+    pub last_ms: i64,
     /// Every worktree the lane's roster rows reference — rows of **any**
     /// status — deduped by path, oldest reference first.
     pub worktrees: Vec<LaneWorktree>,
@@ -197,11 +202,19 @@ pub(crate) fn lanes_with_persisted_paths(
             }
             seen.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.name.cmp(&b.name)));
             let earliest = rows.iter().map(|d| d.dispatched_at_ms).min()?;
+            let finished = rows.iter().all(|d| d.status.is_terminal());
+            let last_ms = rows
+                .iter()
+                .map(|d| d.dispatched_at_ms.max(d.exited_at_ms.unwrap_or(0)))
+                .max()
+                .unwrap_or(0);
             Some((
                 earliest,
                 Lane {
-                    label: thegn_core::pipeline_report::display_cell(&key),
+                    label: thegn_core::pipeline_report::display_cell(lane_label(&key)),
                     key,
+                    finished,
+                    last_ms,
                     worktrees: seen,
                 },
             ))
@@ -227,6 +240,8 @@ pub(crate) fn lanes_with_persisted_paths(
     lanes.extend(durable_only.into_iter().map(|path| Lane {
         key: format!("worktree:{path}"),
         label: thegn_core::pipeline_report::display_cell(thegn_core::util::basename(path)),
+        finished: false,
+        last_ms: 0,
         worktrees: vec![LaneWorktree {
             path: path.to_string(),
             name: thegn_core::pipeline_report::display_cell(thegn_core::util::basename(path)),
@@ -234,6 +249,38 @@ pub(crate) fn lanes_with_persisted_paths(
         }],
     }));
     lanes
+}
+
+/// A lane's display name: its key without the `local:` provider prefix, which
+/// says nothing to a reader (other providers' prefixes still disambiguate).
+pub(crate) fn lane_label(key: &str) -> &str {
+    key.strip_prefix("local:").unwrap_or(key)
+}
+
+/// True for the integration and release worktrees of a batch
+/// (`tg/b171-integration`, `tg-b171-release`, ...). No issue pipeline drives
+/// them, so the sidebar files them with ordinary worktrees. Takes a path or a
+/// branch name; only the last path segment is read.
+pub(crate) fn is_integration_path(path: &str) -> bool {
+    let name = thegn_core::util::basename(path.trim());
+    let rest = name
+        .strip_prefix("tg-")
+        .or_else(|| name.strip_prefix("tg/"))
+        .unwrap_or(name);
+    let Some((token, tail)) = rest.split_once('-') else {
+        return false;
+    };
+    let letters = token.chars().take_while(char::is_ascii_alphabetic).count();
+    let digits = token.len() - letters;
+    if !(1..=3).contains(&letters) || !(1..=6).contains(&digits) {
+        return false;
+    }
+    if !token[letters..].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    ["integration", "release"]
+        .iter()
+        .any(|word| tail == *word || tail.strip_prefix(word).is_some_and(|r| r.starts_with('-')))
 }
 
 /// Drop worktrees whose directory is gone, then every lane left with none.
@@ -353,6 +400,48 @@ mod tests {
     // rows of ANY status, and the roster is SQLite state — so the same fold
     // over the same rows after a restart yields the same folders. A lane does
     // not vanish when its last dispatch goes terminal.
+    #[test]
+    fn integration_and_release_worktrees_are_recognized() {
+        for yes in [
+            "tg/b171-integration",
+            "/wt/tg-b171-release",
+            "tg-b9-integration-2",
+            "b215-release",
+        ] {
+            assert!(is_integration_path(yes), "{yes}");
+        }
+        for no in [
+            "tg/b171-factory",
+            "tg-integration",
+            "main",
+            "tg/the-2741-release-notes",
+            "tg/b171-integrations",
+        ] {
+            assert!(!is_integration_path(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn the_label_drops_the_local_prefix_and_keeps_other_providers() {
+        assert_eq!(lane_label("local:tg-b1-x"), "tg-b1-x");
+        assert_eq!(lane_label("linear:THE-5"), "linear:THE-5");
+    }
+
+    #[test]
+    fn a_lane_is_finished_only_when_every_row_is_terminal() {
+        let both = lanes(&[
+            dispatch(1, "THE-1", "/wt/a", AgentDispatchStatus::Merged, 10),
+            dispatch(2, "THE-1", "/wt/a", AgentDispatchStatus::Failed, 20),
+        ]);
+        assert!(both[0].finished);
+        assert_eq!(both[0].last_ms, 20);
+        let mixed = lanes(&[
+            dispatch(1, "THE-2", "/wt/b", AgentDispatchStatus::Merged, 10),
+            dispatch(2, "THE-2", "/wt/b", AgentDispatchStatus::Running, 20),
+        ]);
+        assert!(!mixed[0].finished);
+    }
+
     #[test]
     fn a_lane_survives_its_rows_going_terminal() {
         let rows = vec![dispatch(

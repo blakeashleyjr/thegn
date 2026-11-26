@@ -386,6 +386,10 @@ pub struct UiConfig {
     /// Loose worktrees sharing a batch token (`tg/b158-…` → `b158`) fold into one
     /// collapsible row per batch once at least this many share it; `0` = off.
     pub sidebar_batch_group_min: usize,
+    /// Days a finished pipeline (every dispatch merged, done, failed or
+    /// abandoned) stays in the sidebar's `Pipelines` section before it ages out;
+    /// `0` = never. The worktree is never deleted — `wt prune` does that.
+    pub sidebar_finished_pipeline_days: u32,
 }
 
 impl Default for UiConfig {
@@ -434,6 +438,7 @@ impl Default for UiConfig {
             sidebar_group_row_limit: 7,
             sidebar_group_row_limits: std::collections::BTreeMap::new(),
             sidebar_batch_group_min: 2,
+            sidebar_finished_pipeline_days: 7,
         }
     }
 }
@@ -861,5 +866,6 @@ sidebar_group_row_limits={Other=5,"agents wip"=0}"#;
         let cfg: UiConfig = toml::from_str("sidebar_group_row_limit = 15").unwrap();
         assert_eq!(cfg.sidebar_group_row_limit, 15);
         assert_eq!(cfg.sidebar_batch_group_min, 2);
+        assert_eq!(cfg.sidebar_finished_pipeline_days, 7);
     }
 }

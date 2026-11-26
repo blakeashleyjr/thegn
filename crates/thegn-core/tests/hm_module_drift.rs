@@ -1688,6 +1688,10 @@ fn every_numeric_option_matches_its_destination_range() {
         ("themePanePadding", "theme.pane_padding"),
         ("uiSidebarGroupRowLimit", "ui.sidebar_group_row_limit"),
         ("uiSidebarBatchGroupMin", "ui.sidebar_batch_group_min"),
+        (
+            "uiSidebarFinishedPipelineDays",
+            "ui.sidebar_finished_pipeline_days",
+        ),
         ("searchMaxResults", "search.max_results"),
         ("paletteContentMaxResults", "palette.content_max_results"),
         ("paletteFileMaxResults", "palette.file_max_results"),

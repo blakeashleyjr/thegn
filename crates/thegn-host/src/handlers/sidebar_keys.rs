@@ -613,6 +613,13 @@ impl SidebarState {
                     "Collapse / expand",
                     Some(chord_of(Id::Activate)),
                 ));
+                // The one write a `Finished` row has: hide what is in it now.
+                // View state only — the worktrees stay until `wt prune`.
+                if row.kind == RowKind::PipelineLane
+                    && row.pin_key == crate::sidebar::finished_group_key(&row.workspace_slug)
+                {
+                    entries.push(e("clear-finished", "Clear finished", None));
+                }
             }
             // The "show more"/"show fewer" toggle does one thing (Enter,
             // Space or a click); a menu would only repeat it.
@@ -1452,6 +1459,21 @@ impl SidebarState {
                 }
             }
             "toggle" => return self.toggle_collapse(model, session),
+            "clear-finished" => {
+                if let Some(slug) = self
+                    .selected_row(model)
+                    .filter(|row| {
+                        row.pin_key == crate::sidebar::finished_group_key(&row.workspace_slug)
+                    })
+                    .map(|row| row.workspace_slug.clone())
+                {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as i64);
+                    self.clear_finished(&slug, now_ms);
+                    self.rebuild(model, session);
+                }
+            }
             "toggle-flat" => return self.toggle_flat(model, session),
             "cycle-detail" => return self.cycle_focus_detail(model),
             // The menu is anchored to ONE row (the caller re-lands the cursor
