@@ -6,6 +6,7 @@
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::voice::{VoiceEffect, VoiceEvent, VoiceState, reduce};
+use thegn_core::voice_text;
 
 use crate::chrome::FrameModel;
 use crate::panes::Panes;
@@ -174,7 +175,7 @@ pub(crate) fn drain(
                 crate::voice_worker::Event::Final(transcript) => VoiceEvent::TranscriptSucceeded {
                     pane_id,
                     request_id,
-                    transcript,
+                    transcript: voice_text::strip_non_speech(&transcript, &voice.config().language),
                 },
                 crate::voice_worker::Event::Failed(reason) => VoiceEvent::TranscriptFailed {
                     pane_id,
@@ -199,7 +200,7 @@ pub(crate) fn drain(
             } => VoiceEvent::TranscriptSucceeded {
                 pane_id,
                 request_id,
-                transcript,
+                transcript: voice_text::strip_non_speech(&transcript, &voice.config().language),
             },
             VoiceMessage::TranscriptFailed {
                 pane_id,

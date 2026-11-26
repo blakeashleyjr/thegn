@@ -16,6 +16,9 @@ and the status shows a preview. `Alt v` inserts it into the focused pane;
 config change clears it. Text is pasted without a newline and is never
 auto-submitted.
 Line breaks and control characters in a transcript are inserted as spaces.
+Whisper annotations such as `[BLANK_AUDIO]`, `[Music]` or `(laughter)` are removed,
+along with one trailing subtitle credit such as `Thanks for watching!`. A bare
+`Thank you.` is kept.
 
 Run `thegn voice setup --language en` to configure a provider and model. Use
 `--kind embedded` (the default), `--kind http`, or `--kind command`; setup saves
