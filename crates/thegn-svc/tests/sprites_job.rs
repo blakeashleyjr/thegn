@@ -2764,6 +2764,14 @@ fn the_launcher_links_the_real_toolchain_into_the_job_cargo_home() {
     let real = work.path().join("realcargo");
     std::fs::create_dir_all(real.join("bin")).unwrap();
     std::fs::write(real.join("bin/cargo"), "#!/bin/sh\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            real.join("bin/cargo"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     let cache = work.path().join("cache");
     let output = launcher(
         &work.path().join("ctl/k.pid"),
