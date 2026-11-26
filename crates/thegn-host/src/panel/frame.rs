@@ -1560,6 +1560,30 @@ mod tests {
     }
 
     #[test]
+    fn files_empty_body_distinguishes_pending_from_empty() {
+        let body = |load| {
+            let model = model_with(PanelData {
+                files_load: load,
+                ..Default::default()
+            });
+            let ui = PanelUi {
+                open: Section::Files,
+                ..Default::default()
+            };
+            let ctx = section_ctx(&model, &ui, 100, 30, 4);
+            sections::content(Section::Files, &ctx)
+                .iter()
+                .map(|row| text_of(&row.line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let pending = body(crate::panel::gitui::DocLoad::Pending);
+        assert!(pending.contains("loading files"), "{pending}");
+        let ready = body(crate::panel::gitui::DocLoad::Ready);
+        assert!(ready.contains("no tracked files"), "{ready}");
+    }
+
+    #[test]
     fn detached_head_in_colocated_repo_reads_as_working_copy() {
         let mut model = FrameModel {
             panel: crate::panel::PanelData {

@@ -47,7 +47,13 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         fallback_tree = crate::panel::build_file_tree(&paths);
         &fallback_tree
     } else {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no files")])));
+        // Distinguish "listing not fetched yet" from "genuinely empty" so the
+        // body never contradicts a populated header (`1.4M loc` over `no files`).
+        let msg = match &data.files_load {
+            crate::panel::gitui::DocLoad::Pending => "loading files…",
+            _ => "no tracked files",
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), msg)])));
         return rows;
     };
 

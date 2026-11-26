@@ -15608,6 +15608,15 @@ async fn event_loop<T: Terminal>(
             current_config.semantic.file_cap(),
             &waker,
         );
+        // Self-heal: the tracked-file listing is only fetched while Files is the
+        // open section, so a model built under other hints (startup, restored
+        // `open`, a prefetch) leaves it Pending — refresh once with the live hints.
+        want_model_refresh |= panel_ui.open == crate::panel::Section::Files
+            && matches!(
+                model.panel.files_load,
+                crate::panel::gitui::DocLoad::Pending
+            )
+            && inflight_hydration_gen.is_none();
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         // A switch's hydration may overlap ONE in-flight ticker hydration: the
         // generation checks at the arrival site make the older result inert

@@ -100,6 +100,10 @@ off banner when its feature is unavailable.
 | `stash`    | stash entries                  |
 | `files`    | the worktree tree              |
 
+The `files` body reads `loading files…` until the tracked-file listing
+arrives (it is fetched only while `files` is open), and `no tracked files` only
+when git lists none.
+
 **work**
 
 | Section    | Shows                                                                |
