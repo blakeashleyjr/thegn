@@ -155,7 +155,7 @@ fn trailing_credit_start(text: &str, credits: &[String]) -> Option<usize> {
         if suffix.len() > max_len {
             break;
         }
-        if credits.iter().any(|credit| *credit == suffix) {
+        if credits.contains(&suffix) {
             let at_boundary = text[..index]
                 .chars()
                 .next_back()

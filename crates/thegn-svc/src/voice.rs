@@ -154,7 +154,7 @@ impl CommandVoiceProvider {
             ));
         }
         let command_argv = Self::command_argv(&self.cfg);
-        let Some(program) = command_argv.first() else {
+        let Some(program) = command_argv.first().cloned() else {
             return Err(VoiceError::NotConfigured);
         };
         // The `{wav}` path placeholder is a Hex-preset contract only; plain command
