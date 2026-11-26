@@ -921,6 +921,13 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
+**Persistence needs dtach or mosh-server on the remote.** A pane survives a
+detach only if the remote has `dtach` (plain ssh panes) or `mosh-server` (mosh
+panes). Without either, the remote shell ends when the client detaches or is
+killed, and relaunching opens a fresh shell. thegn prints a one-line warning
+in the pane at launch when `dtach` is missing over ssh. Fix: `brew install
+dtach` (macOS) or `apt install dtach` (Debian/Ubuntu), or install mosh.
+
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —
 > see [[release-channels]].
