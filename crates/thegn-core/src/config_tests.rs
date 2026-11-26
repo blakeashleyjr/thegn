@@ -3489,13 +3489,15 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     // SSH remotes ship on stable, so `[sandbox.remote]` survives the clamp.
     assert_eq!(cfg.sandbox.remote.host, "box.example");
     assert!(cfg.host.is_empty());
-    assert!(!cfg.voice.enabled);
+    // Voice graduated to stable, so its opt-in survives the clamp.
+    assert!(cfg.voice.enabled);
+    assert!(!clamped.contains(&Feature::Voice));
     assert!(cfg.lead.is_none());
     assert!(clamped.contains(&Feature::Lead));
     // Every gated feature that changed reports as clamped; SSH remotes are
     // stable now, so `Remote` has nothing to drop here.
     assert!(!clamped.contains(&Feature::Remote));
-    assert_eq!(clamped.len(), 4);
+    assert_eq!(clamped.len(), 3);
     assert!(!clamped.contains(&Feature::Observe));
     assert!(!clamped.contains(&Feature::PluginApps));
 

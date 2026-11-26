@@ -339,8 +339,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "details"),
         ("l", "link"),
         ("T", "team"),
-        ("o", "browser"),
-        ("a", "assign me"),
+        ("o", "web"),
+        ("a", "assign"),
         ("b", "branch"),
     ]));
     rows

@@ -5732,8 +5732,8 @@ mod tests {
             .collect();
         assert_eq!(
             mirrors,
-            vec!["home"],
-            "only the referenced worktree mirrors"
+            vec!["home", "zz-sibling"],
+            "only the worktrees the lane references mirror"
         );
         assert!(
             rows.iter()
@@ -6022,7 +6022,8 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1, "no duplicate ordinary row is emitted");
         assert_eq!(matching[0].kind, RowKind::PipelineWorktree);
-        assert_eq!(matching[0].depth, 3);
+        // A single-worktree lane is one row, directly under its group.
+        assert_eq!(matching[0].depth, 2);
         assert_eq!(matching[0].tab_target, Some(RowTarget::Tab(0, 0)));
         assert!(rows.iter().any(|row| row.kind == RowKind::PipelineGroup));
     }
@@ -6345,7 +6346,8 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(derived.len(), 3);
+        // Group + lane folder + the two worktrees the fixture lane references.
+        assert_eq!(derived.len(), 4);
         for r in derived
             .iter()
             .filter(|r| r.kind != RowKind::PipelineWorktree)
