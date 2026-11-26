@@ -474,12 +474,16 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             hit: None,
         });
     }
+    // The full set is wider than the 75-column view: wrap by priority, the
+    // essential keys first.
     rows.push(hint_row(&[
         ("↵", "details"),
         ("l", "link"),
         ("T", "team"),
         ("o", "browser"),
         ("a", "assign me"),
+    ]));
+    rows.push(hint_row(&[
         ("b", "branch"),
         ("D", "dispatch"),
         ("r", "refresh"),
