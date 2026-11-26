@@ -486,12 +486,11 @@ async fn linux_auto_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     }
 }
 
-/// The built-in MPD endpoint; matches `MpdMediaConfig::default()`.
-const DEFAULT_MPD_SOCKET: &str = "127.0.0.1:6600";
-
 /// Whether `auto` may dial MPD: only for an endpoint the user chose.
 #[cfg(any(target_os = "linux", test))]
 fn auto_probes_mpd(socket: &str) -> bool {
+    /// The built-in MPD endpoint; matches `MpdMediaConfig::default()`.
+    const DEFAULT_MPD_SOCKET: &str = "127.0.0.1:6600";
     let socket = socket.trim();
     !socket.is_empty() && socket != DEFAULT_MPD_SOCKET
 }
