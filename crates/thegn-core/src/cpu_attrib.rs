@@ -47,6 +47,10 @@ pub const TOP_PER_PANE: usize = 3;
 /// here); the rest fold into the unnamed row.
 pub const MAX_LOOSE_JOBS: usize = 8;
 
+/// Most worktrees [`build_compact`] lists; idle and trimmed worktrees fold
+/// into one summary row.
+pub const TOP_WORKTREES: usize = 8;
+
 /// Label of the row summing the slice's anonymous scopes.
 pub const UNNAMED_JOBS: &str = "thegn jobs (unnamed)";
 
@@ -288,6 +292,87 @@ fn share(value: Usage, total: Usage, sort: SortKey) -> Option<f32> {
 /// Build the attribution tree. `top_per_pane` caps the process rows under each
 /// pane (see [`TOP_PER_PANE`]); the whole list is capped at [`MAX_ROWS`].
 pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> AttribTree {
+    build_inner(inputs, sort, top_per_pane, None)
+}
+
+/// [`build`] for the masthead popups: worktrees with no readings (no pane
+/// totals, background jobs or sampled processes) are dropped, only the
+/// `max_worktrees` heaviest of the rest (across all workspaces) are listed,
+/// workspaces left empty go, and one "N idle worktrees" row stands in for the
+/// dropped ones. Folding happens before the [`MAX_ROWS`] cap, so hundreds of
+/// idle worktrees never squeeze out the live ones' panes and processes.
+pub fn build_compact(
+    inputs: &AttribInputs<'_>,
+    sort: SortKey,
+    top_per_pane: usize,
+    max_worktrees: usize,
+) -> AttribTree {
+    build_inner(inputs, sort, top_per_pane, Some(max_worktrees))
+}
+
+/// Whether a worktree has anything live to show.
+fn has_readings(wt: &Group<'_, PaneNode<'_>>, procs: &[TopProc]) -> bool {
+    wt.usage.cpu_pct.is_some()
+        || wt.usage.rss.is_some()
+        || !wt.jobs.is_empty()
+        || wt.children.iter().any(|pane| {
+            procs
+                .iter()
+                .any(|p| p.owner == Owner::Pane(pane.owner.pane_id))
+        })
+}
+
+/// Drop worktrees without readings, keep the `max` heaviest of the rest, and
+/// drop workspaces left empty. Returns `(trimmed, idle)` counts.
+fn fold_worktrees<'a>(
+    workspaces: &mut Vec<Group<'a, Group<'a, PaneNode<'a>>>>,
+    procs: &[TopProc],
+    sort: SortKey,
+    max: usize,
+) -> (usize, usize) {
+    let mut idle = 0;
+    for ws in workspaces.iter_mut() {
+        let before = ws.children.len();
+        ws.children.retain(|wt| has_readings(wt, procs));
+        idle += before - ws.children.len();
+    }
+    let mut ranked: Vec<(Usage, &'a str, &'a str)> = Vec::new();
+    for ws in workspaces.iter() {
+        for wt in &ws.children {
+            ranked.push((wt.usage, ws.name, wt.name));
+        }
+    }
+    ranked.sort_by(|a, b| by_weight(a.0, a.2, b.0, b.2, sort).then_with(|| a.1.cmp(b.1)));
+    let trimmed = ranked.len().saturating_sub(max);
+    ranked.truncate(max);
+    for ws in workspaces.iter_mut() {
+        let ws_name = ws.name;
+        ws.children.retain(|wt| {
+            ranked
+                .iter()
+                .any(|(_, w, t)| *w == ws_name && *t == wt.name)
+        });
+    }
+    workspaces.retain(|ws| !ws.children.is_empty());
+    (trimmed, idle)
+}
+
+/// The summary row's label for `trimmed` live and `idle` worktrees.
+fn fold_label(trimmed: usize, idle: usize) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    match (trimmed, idle) {
+        (t, 0) => format!("+{t} more worktree{}", plural(t)),
+        (0, i) => format!("{i} idle worktree{}", plural(i)),
+        (t, i) => format!("+{t} more · {i} idle worktree{}", plural(i)),
+    }
+}
+
+fn build_inner(
+    inputs: &AttribInputs<'_>,
+    sort: SortKey,
+    top_per_pane: usize,
+    max_worktrees: Option<usize>,
+) -> AttribTree {
     let partial = inputs.panes.is_none();
     let pane_usage: BTreeMap<u32, Usage> = inputs
         .panes
@@ -374,6 +459,9 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
     }
 
     workspaces.sort_by(|a, b| by_weight(a.usage, a.name, b.usage, b.name, sort));
+    let folded = max_worktrees
+        .map(|max| fold_worktrees(&mut workspaces, inputs.procs, sort, max))
+        .filter(|(trimmed, idle)| trimmed + idle > 0);
 
     let mut tree_rows: Vec<AttribRow> = Vec::new();
     let row_t =
@@ -432,6 +520,14 @@ pub fn build(inputs: &AttribInputs<'_>, sort: SortKey, top_per_pane: usize) -> A
                 }
             }
         }
+    }
+    if let Some((trimmed, idle)) = folded {
+        tree_rows.push(row(
+            0,
+            RowKind::More,
+            fold_label(trimmed, idle),
+            Usage::default(),
+        ));
     }
 
     // Panes the sampler saw but no owner row claims (closed since the sample).
@@ -564,8 +660,8 @@ fn cap_rows(rows: Vec<AttribRow>, budget: usize) -> Vec<AttribRow> {
 mod tests {
     use super::{
         AttribInputs, AttribRow, MAX_LOOSE_JOBS, MAX_ROWS, Owner, PaneOwner, PaneUsage, RowKind,
-        ScopeKind, ScopeUsage, SelfUsage, SortKey, TOP_PER_PANE, TopProc, UNNAMED_JOBS, Usage,
-        at_least, build, pane_label,
+        ScopeKind, ScopeUsage, SelfUsage, SortKey, TOP_PER_PANE, TOP_WORKTREES, TopProc,
+        UNNAMED_JOBS, Usage, at_least, build, build_compact, pane_label,
     };
 
     const EPS: f32 = 1e-4;
@@ -1057,5 +1153,69 @@ mod tests {
     fn pane_label_joins_tab_and_program() {
         assert_eq!(pane_label(&owner(1, "w", "t", "2", Some("pi"))), "2 · pi");
         assert_eq!(pane_label(&owner(1, "w", "t", "2", None)), "2");
+    }
+
+    #[test]
+    fn compact_lists_top_live_worktrees_and_folds_idle_ones_before_the_row_cap() {
+        let (mut owners, mut panes, mut procs) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..12_u32 {
+            owners.push(owner(i + 1, "w", &format!("w/{i}"), "t", None));
+            panes.push(pane(i + 1, 20.0 - i as f32, 1));
+            procs.push(proc_row(1000 + i, "p", 1.0, 1, Owner::Pane(i + 1)));
+        }
+        // The heaviest worktree lives in a lighter-sorted second workspace.
+        owners.push(owner(50, "x", "x/hot", "t", None));
+        panes.push(pane(50, 100.0, 1));
+        procs.push(proc_row(5000, "hot", 90.0, 1, Owner::Pane(50)));
+        // 300 idle worktrees (far more than MAX_ROWS) and an all-idle workspace.
+        for k in 0..300_u32 {
+            owners.push(owner(100 + k, "w", &format!("idle/{k}"), "t", None));
+        }
+        owners.push(owner(999, "z", "z/idle", "t", None));
+        let tree = build_compact(
+            &inputs(&owners, Some(panes.as_slice()), &procs),
+            SortKey::Cpu,
+            TOP_PER_PANE,
+            TOP_WORKTREES,
+        );
+        let count = |k: RowKind| tree.rows.iter().filter(|r| r.kind == k).count();
+        assert_eq!(count(RowKind::Worktree), TOP_WORKTREES);
+        // Live worktrees keep their panes and processes (the cap never bit).
+        assert_eq!(count(RowKind::Pane), TOP_WORKTREES);
+        assert_eq!(count(RowKind::Proc), TOP_WORKTREES);
+        assert_eq!(count(RowKind::More), 1);
+        find(&tree.rows, "x/hot");
+        find(&tree.rows, "w/6");
+        assert!(tree.rows.iter().all(|r| r.label != "w/7" && r.label != "z"));
+        let more = tree
+            .rows
+            .iter()
+            .position(|r| r.kind == RowKind::More)
+            .expect("summary row");
+        assert_eq!(tree.rows[more].label, "+5 more · 301 idle worktrees");
+        assert_eq!(tree.rows[more].share_of_total, None);
+        assert_eq!(tree.rows[more + 1].kind, RowKind::Thegn);
+    }
+
+    #[test]
+    fn compact_counts_sampled_processes_as_live_and_is_quiet_without_folds() {
+        let owners = [
+            owner(1, "w", "w/a", "t", None),
+            owner(2, "w", "w/b", "t", None),
+        ];
+        let procs = [proc_row(10, "p", 1.0, 1, Owner::Pane(1))];
+        // No per-pane totals: `w/a` is live through its sampled process.
+        let tree = build_compact(&inputs(&owners, None, &procs), SortKey::Cpu, 3, 8);
+        find(&tree.rows, "w/a");
+        assert!(tree.rows.iter().all(|r| r.label != "w/b"));
+        assert_eq!(find(&tree.rows, "1 idle worktree").kind, RowKind::More);
+
+        let panes = [pane(1, 1.0, 1), pane(2, 2.0, 2)];
+        let input = inputs(&owners, Some(&panes), &[]);
+        let compact = build_compact(&input, SortKey::Mem, 3, 8);
+        assert_eq!(compact, build(&input, SortKey::Mem, 3));
+        let trimmed = build_compact(&input, SortKey::Mem, 3, 1);
+        find(&trimmed.rows, "w/b");
+        assert_eq!(find(&trimmed.rows, "+1 more worktree").kind, RowKind::More);
     }
 }
