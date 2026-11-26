@@ -96,6 +96,12 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   and [[sandbox-profiles]].
 - **Native plugins run unsandboxed as your user.** Enable only plugins you
   trust; see [[plugins]].
+- **On bwrap, mount sources are re-resolved by path at launch.** If you add a
+  writable mount that contains another mount's source (for example all of
+  `~/.claude-profiles`), a sandboxed process can swap that source for a symlink
+  before the next pane starts and see the file it points to. The default plan
+  has no such overlap. podman and docker re-check bind identities after
+  creation and refuse a changed source. See [[sandbox-security-model]].
 
 ## Experimental subsystems
 

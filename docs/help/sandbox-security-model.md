@@ -117,6 +117,10 @@ sibling repositories listed in [[sandboxing]], and keeps agent settings in
 - ⚠ Writable `~/.keychain` (sourced by host login shells) and
   `~/.claude-profiles` (agent settings, hooks and credentials).
 - ⚠ A shared `.git` that stays writable in some launches (see Git and landing).
+- ⚠ On bwrap, a bind source is resolved by path when the pane starts, not
+  when thegn checks it. A writable mount that contains another mount's source
+  lets a sandbox redirect that bind. podman and docker re-attest bind sources
+  after creation.
 
 `sealed` lists the shared kernel as its limit. Its gaps:
 
@@ -126,6 +130,10 @@ sibling repositories listed in [[sandboxing]], and keeps agent settings in
   and not private.
 - ⚠ In linked mode a sandbox can rewrite the shared object store.
 - ⚠ There is no private copy of the workspace yet.
+- ⚠ On bwrap, a bind source is resolved by path when the pane starts, not
+  when thegn checks it. A writable mount that contains another mount's source
+  lets a sandbox redirect that bind. podman and docker re-attest bind sources
+  after creation.
 
 Process limits and privilege locking vary by backend:
 
