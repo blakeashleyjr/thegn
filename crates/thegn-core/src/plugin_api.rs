@@ -2612,10 +2612,10 @@ pub static HOST_VERB_SUPPORT: &[HostVerbSupport] = &[
     HostVerbSupport {
         verb: HostVerb::HostValue,
         since: ApiVersion::new(0, 2, 0),
-        state: SupportState::Wired,
+        state: SupportState::Reserved,
         authority: "none",
         modes: RESIDENT_MODE,
-        owner: "host value projection",
+        owner: "THE-162 (the host seeds no host values)",
     },
     HostVerbSupport {
         verb: HostVerb::HostCall,
@@ -4520,6 +4520,19 @@ timeout_secs = 5
             .iter()
             .find(|row| row.verb == HostVerb::Io)
             .expect("io has a host support row");
+
+        assert_eq!(row.state, SupportState::Reserved);
+        assert!(row.owner.contains("THE-162"));
+    }
+
+    #[test]
+    fn host_value_verb_is_reserved_in_the_support_matrix() {
+        // No production path seeds `PluginRuntime::with_host_value`, so a
+        // wired `host.value` would answer `null` for every key.
+        let row = HOST_VERB_SUPPORT
+            .iter()
+            .find(|row| row.verb == HostVerb::HostValue)
+            .expect("host.value has a host support row");
 
         assert_eq!(row.state, SupportState::Reserved);
         assert!(row.owner.contains("THE-162"));
