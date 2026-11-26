@@ -152,10 +152,7 @@ fn group_lines(group: &KeyGroup) -> Vec<Line> {
     out.extend(group.rows.iter().map(|row| {
         Line::segs(vec![
             sp(1),
-            Seg::chip(
-                Tok::Slot(crate::chrome::S::Raise),
-                format!(" {} ", row.chord),
-            ),
+            Seg::key(format!(" {} ", row.chord)),
             seg(d(), format!("  {}", row.label)),
         ])
     }));
@@ -563,6 +560,45 @@ mod tests {
             assert!(
                 format!("{rendered:?}").contains(&last_visible.label),
                 "{width:?}"
+            );
+        }
+    }
+
+    /// The chord chip is a keycap (readable text on the raised surface), not
+    /// the inverse chip, whose dim `chip_fg` washed out on the dark default.
+    #[test]
+    fn key_chord_chips_render_as_readable_keycaps() {
+        let group = KeyGroup {
+            title: "Projects".into(),
+            rows: vec![KeyRow {
+                chord: "Alt-w".into(),
+                label: "New worktree".into(),
+                origin: KeyOrigin::Cheatsheet,
+            }],
+        };
+        let lines = group_lines(&group);
+        let Line::Segs(row) = &lines[1] else {
+            panic!("chord row is a segment line");
+        };
+        let chip = &row[1];
+        assert_eq!(chip.text, " Alt-w ");
+        assert_eq!(chip.fg, Tok::Slot(crate::chrome::S::Text));
+        assert_eq!(chip.bg, Some(Tok::Slot(crate::chrome::S::Raise)));
+        assert!(chip.bold);
+    }
+
+    /// The keycap pair (`text` on `raise`) clears the contrast contract's
+    /// `text` floor on the shipped default and on the light preset. Uses the
+    /// same resolved-palette path chrome draws with.
+    #[test]
+    fn key_chord_keycap_meets_text_contrast_on_default_and_light() {
+        for (name, floor) in [("prism", 7.0_f32), ("light", 4.5_f32)] {
+            let mut palette = thegn_core::theme::preset(name).expect("shipped preset");
+            thegn_core::theme::extend_palette(&mut palette);
+            let ratio = thegn_core::theme::contrast_ratio(&palette.text, &palette.raise);
+            assert!(
+                ratio >= floor,
+                "{name}: keycap text on raise is {ratio:.2}:1, want >= {floor}"
             );
         }
     }
