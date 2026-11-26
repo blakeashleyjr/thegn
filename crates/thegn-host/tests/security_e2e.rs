@@ -822,9 +822,15 @@ fn with_fake_listener(
                         stream
                             .set_nonblocking(false)
                             .expect("make accepted fake connection blocking");
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(500)))
-                            .expect("bound fake connection read");
+                        // macOS rejects SO_RCVTIMEO with EINVAL once the peer
+                        // has already closed; the read below then sees EOF
+                        // immediately, so only other errors are fatal.
+                        if let Err(error) =
+                            stream.set_read_timeout(Some(Duration::from_millis(500)))
+                            && error.kind() != std::io::ErrorKind::InvalidInput
+                        {
+                            panic!("bound fake connection read: {error}");
+                        }
                         let mut buf = Vec::new();
                         match (&mut stream).take(OUTPUT_LIMIT).read_to_end(&mut buf) {
                             Ok(_) => report.bytes += buf.len(),
