@@ -1190,6 +1190,30 @@ The control plane MUST remain ssh (mosh cannot pipe non-interactive commands).
 - **THEN** it attaches over mosh if the VM has `mosh-server` (and the host has
   `mosh`), otherwise it transparently falls back to ssh — never failing the pane
 
+### Requirement: SSH-placement mosh panes fall back to ssh when mosh cannot start
+
+thegn SHALL wrap an ssh-placement interactive pane whose transport is mosh in a
+local fallback that captures mosh's stderr. When mosh exits non-zero and its
+output shows the remote `mosh-server` is missing (`mosh-server: command not
+found` and the other shells' wordings) or that no server startup message
+arrived, the pane SHALL replay that diagnostic, print one notice line (for a
+missing server: how to install mosh, or set `transport = "ssh"`), and continue
+as the plain-ssh pane for the same remote command. Any other mosh failure SHALL
+keep mosh's exit status. A pane's last-error status SHALL skip sshd login
+banners and thegn's fallback notice, showing the last real diagnostic line.
+
+#### Scenario: A host without mosh-server still gets a shell
+
+- **WHEN** a pane opens with `transport = "mosh"` on a host lacking
+  `mosh-server`
+- **THEN** the pane shows mosh's diagnostic and a one-line install notice, then
+  runs the same remote shell over `ssh -t` instead of crash-looping
+
+#### Scenario: Last error skips the login banner
+
+- **WHEN** a remote pane keeps crashing and its output ends with `Last login:`
+- **THEN** the status names the last diagnostic line before the banner
+
 ### Requirement: Tailnet host discovery is a provider seam
 
 thegn SHALL discover remote-host candidates from the user's mesh VPN through a

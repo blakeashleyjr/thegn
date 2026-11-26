@@ -938,6 +938,12 @@ to run bare on that host with no sandbox. The halt also offers
 `[h] run on host`, which runs that worktree bare on the ssh host (never on your
 machine) for this session only; nothing is remembered.
 
+If the remote host has no `mosh-server`, the pane prints mosh's error and a
+one-line notice saying how to install mosh (or set `transport = "ssh"`), then
+continues over plain ssh. The same happens when mosh cannot start a server for
+another reason. A pane that keeps crashing reports its last real error line,
+not the ssh login banner.
+
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —
 > see [[release-channels]].

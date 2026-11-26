@@ -1628,7 +1628,10 @@ fn mosh_wraps_backend_over_ssh() {
         TransportKind::Mosh,
     ));
     let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh");
+    assert_eq!(
+        argv[4], "mosh",
+        "mosh argv rides the fallback wrapper: {argv:?}"
+    );
     assert!(argv.iter().any(|a| a.starts_with("--ssh=")));
     assert!(argv.iter().any(|a| a.contains("-p 2222")));
     assert!(argv.contains(&"user@box".to_string()));
@@ -2977,7 +2980,10 @@ fn remote_none_bare_shell_cds_and_moshes() {
         TransportKind::Mosh,
     ));
     let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh");
+    assert_eq!(
+        argv[4], "mosh",
+        "mosh argv rides the fallback wrapper: {argv:?}"
+    );
     let body = argv.last().unwrap();
     assert!(body.contains("cd /wt/feat"));
     assert!(body.contains("exec ${SHELL:-/bin/sh} -l"));
@@ -3340,7 +3346,8 @@ fn remote_enter_argv_wraps_with_mosh() {
     // With a real image + OCI backend on a remote, enter_argv should
     // produce a mosh wrapper.
     let argv = enter_argv(&s, "bash -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh", "outer command must be mosh: {argv:?}");
+    assert_eq!(argv[0], "/bin/sh", "local fallback wrapper: {argv:?}");
+    assert_eq!(argv[4], "mosh", "mosh argv rides the wrapper: {argv:?}");
     // The remote host must appear in the argv.
     assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
 }

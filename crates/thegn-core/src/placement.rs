@@ -73,6 +73,109 @@ pub enum TransportKind {
     Mosh,
 }
 
+/// Prefix of every notice the mosh pane wrapper prints before falling back to
+/// ssh, so crash reporting can skip them and name the real error instead.
+pub const MOSH_NOTICE_PREFIX: &str = "thegn: mosh";
+
+/// Shown when the remote host has no `mosh-server`; names the fix.
+pub const MOSH_SERVER_MISSING_NOTICE: &str = "thegn: mosh-server is not installed on the remote \
+     host; install mosh there (Debian/Ubuntu: apt install mosh; Fedora: dnf install mosh; \
+     macOS: brew install mosh; Nix: nixpkgs#mosh) or set transport = \"ssh\". Continuing over ssh.";
+
+/// Shown when mosh's ssh bootstrap never got a server startup message.
+pub const MOSH_STARTUP_FAILED_NOTICE: &str =
+    "thegn: mosh could not start a server on the remote host; continuing over ssh.";
+
+/// Case-insensitive stderr markers of a missing remote `mosh-server` (bash,
+/// dash and zsh wordings).
+const MOSH_SERVER_MISSING_MARKERS: &[&str] = &[
+    "mosh-server: command not found",
+    "mosh-server: not found",
+    "command not found: mosh-server",
+];
+
+/// Case-insensitive stderr marker of any failed mosh bootstrap.
+const MOSH_STARTUP_FAILED_MARKERS: &[&str] = &["did not find mosh server startup message"];
+
+/// Why a mosh pane exited non-zero, from its captured stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoshFailure {
+    /// The remote host has no `mosh-server`.
+    ServerMissing,
+    /// The ssh bootstrap ran but mosh-server never reported a session.
+    StartupFailed,
+    /// Anything else (including a session that ended badly) — no fallback.
+    Other,
+}
+
+/// Classify mosh's stderr. The pane wrapper script (`mosh_fallback_script`)
+/// greps for the same markers; this is its pure, unit-tested mirror.
+pub fn classify_mosh_failure(stderr: &str) -> MoshFailure {
+    let lower = stderr.to_ascii_lowercase();
+    let hit = |markers: &[&str]| markers.iter().any(|m| lower.contains(m));
+    if hit(MOSH_SERVER_MISSING_MARKERS) {
+        MoshFailure::ServerMissing
+    } else if hit(MOSH_STARTUP_FAILED_MARKERS) {
+        MoshFailure::StartupFailed
+    } else {
+        MoshFailure::Other
+    }
+}
+
+/// The one-line notice printed before the ssh fallback, or `None` when the
+/// failure does not fall back (the pane exits with mosh's own status).
+pub fn mosh_fallback_notice(failure: MoshFailure) -> Option<&'static str> {
+    match failure {
+        MoshFailure::ServerMissing => Some(MOSH_SERVER_MISSING_NOTICE),
+        MoshFailure::StartupFailed => Some(MOSH_STARTUP_FAILED_NOTICE),
+        MoshFailure::Other => None,
+    }
+}
+
+/// Whether a mosh pane that exited (`exit_ok`) with `stderr` re-runs over ssh:
+/// only when mosh never started a session, so a real session that ended is not
+/// silently replaced by a fresh ssh shell.
+pub fn mosh_falls_back_to_ssh(exit_ok: bool, stderr: &str) -> bool {
+    !exit_ok && mosh_fallback_notice(classify_mosh_failure(stderr)).is_some()
+}
+
+/// Local `sh -c` body wrapping a mosh pane (the mosh argv is `"$@"`): capture
+/// mosh's stderr, and when mosh could not start on the remote host replay that
+/// diagnostic, print one notice line and `exec` the plain-ssh pane instead.
+/// Mirrors [`mosh_falls_back_to_ssh`].
+fn mosh_fallback_script(ssh_fallback: &[String]) -> String {
+    let greps = |markers: &[&str]| {
+        markers
+            .iter()
+            .map(|m| format!("-e {}", util::sh_quote(m)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "f=$(mktemp \"${{TMPDIR:-/tmp}}/thegn-mosh.XXXXXX\" 2>/dev/null) || exec \"$@\"\n\
+         trap 'rm -f \"$f\"' EXIT\n\
+         trap 'exit 129' HUP\n\
+         trap 'exit 130' INT\n\
+         trap 'exit 143' TERM\n\
+         \"$@\" 2>\"$f\"\n\
+         rc=$?\n\
+         [ \"$rc\" -eq 0 ] && exit 0\n\
+         cat \"$f\" >&2\n\
+         if grep -qiF {missing} \"$f\"; then n={missing_notice}\n\
+         elif grep -qiF {startup} \"$f\"; then n={startup_notice}\n\
+         else exit \"$rc\"; fi\n\
+         rm -f \"$f\"\n\
+         trap - EXIT\n\
+         printf '%s\\n' \"$n\" >&2\n\
+         exec {fallback}\n",
+        missing = greps(MOSH_SERVER_MISSING_MARKERS),
+        startup = greps(MOSH_STARTUP_FAILED_MARKERS),
+        missing_notice = util::sh_quote(MOSH_SERVER_MISSING_NOTICE),
+        startup_notice = util::sh_quote(MOSH_STARTUP_FAILED_NOTICE),
+        fallback = util::sh_join(ssh_fallback),
+    )
+}
+
 /// Outcome of a runtime (container-backend) presence probe. `Present`/`Absent`
 /// are *definite* answers about the binary; `Unreachable` means the transport
 /// (ssh) failed, so we learned **nothing** about what runtimes exist and MUST
@@ -185,7 +288,14 @@ impl SshPlacement {
         match self.kind {
             TransportKind::Mosh => {
                 let ssh = util::sh_join(&self.ssh_base(false));
+                // The mosh argv rides as the wrapper's positional args ("$@"),
+                // so it stays a contiguous suffix ending in the remote command.
+                let fallback = self.ssh_tty_argv(&remote_cmd);
                 vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    mosh_fallback_script(&fallback),
+                    "thegn-mosh".into(),
                     "mosh".into(),
                     format!("--ssh={ssh}"),
                     self.host.clone(),
@@ -195,25 +305,29 @@ impl SshPlacement {
                     remote_cmd,
                 ]
             }
-            TransportKind::Ssh => {
-                let mut v = self.ssh_base(false);
-                v.push("-t".into());
-                v.push(self.host.clone());
-                v.push("--".into());
-                // ssh appends the remaining argv space-joined and hands the
-                // RESULT to the remote login shell — it does NOT re-quote. So a
-                // multi-word `if…then…fi` script must be ONE pre-quoted arg,
-                // else the remote shell re-parses it ("syntax error near
-                // `then`"). sh_join quotes `/bin/sh -lc <script>` as one word —
-                // matching how `control_wrap` passes control-plane commands.
-                v.push(util::sh_join(&[
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    remote_cmd,
-                ]));
-                v
-            }
+            TransportKind::Ssh => self.ssh_tty_argv(&remote_cmd),
         }
+    }
+
+    /// `ssh -t host -- /bin/sh -lc <remote_cmd>`: the plain-ssh interactive pane,
+    /// also the fallback when mosh cannot start on the remote host.
+    fn ssh_tty_argv(&self, remote_cmd: &str) -> Vec<String> {
+        let mut v = self.ssh_base(false);
+        v.push("-t".into());
+        v.push(self.host.clone());
+        v.push("--".into());
+        // ssh appends the remaining argv space-joined and hands the RESULT to
+        // the remote login shell — it does NOT re-quote. So a multi-word
+        // `if…then…fi` script must be ONE pre-quoted arg, else the remote shell
+        // re-parses it ("syntax error near `then`"). sh_join quotes
+        // `/bin/sh -lc <script>` as one word — matching how `control_wrap`
+        // passes control-plane commands.
+        v.push(util::sh_join(&[
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            remote_cmd.to_string(),
+        ]));
+        v
     }
 
     /// Wrap an argv for a non-interactive control-plane call (always ssh batch).
@@ -997,12 +1111,102 @@ mod tests {
             TransportKind::Mosh,
         ));
         let out = p.interactive_argv(&["echo".into(), "hi".into()]);
-        assert_eq!(out[0], "mosh");
-        assert!(out[1].starts_with("--ssh="));
+        // A local `sh -c` fallback wrapper carries the mosh argv as "$@".
+        assert_eq!(out[0], "/bin/sh");
+        assert_eq!(out[1], "-c");
+        assert_eq!(out[3], "thegn-mosh");
+        let mosh = &out[4..];
+        assert_eq!(mosh[0], "mosh");
+        assert!(mosh[1].starts_with("--ssh="));
         // Non-default port is carried into the inner ssh.
-        assert!(out[1].contains("-p"));
-        assert!(out[1].contains("2222"));
-        assert_eq!(out[2], "h");
+        assert!(mosh[1].contains("-p"));
+        assert!(mosh[1].contains("2222"));
+        assert_eq!(mosh[2], "h");
+    }
+
+    #[test]
+    fn mosh_wrapper_falls_back_to_the_ssh_pane_with_a_notice() {
+        let s = SshPlacement::plain("h".into(), 22, false, TransportKind::Mosh);
+        let out = Placement::Ssh(s.clone()).interactive_argv(&["echo".into(), "hi".into()]);
+        let script = &out[2];
+        let remote = out.last().unwrap();
+        // The fallback is exactly the plain-ssh pane for the same remote command.
+        let ssh = util::sh_join(&s.ssh_tty_argv(remote));
+        assert!(script.contains(&format!("exec {ssh}\n")), "{script}");
+        assert!(ssh.contains(" -t h -- "), "{ssh}");
+        // stderr is captured, replayed, and the notices are the shared constants.
+        assert!(script.contains("\"$@\" 2>\"$f\""), "{script}");
+        assert!(script.contains("cat \"$f\" >&2"), "{script}");
+        assert!(script.contains(&util::sh_quote(MOSH_SERVER_MISSING_NOTICE)));
+        assert!(script.contains(&util::sh_quote(MOSH_STARTUP_FAILED_NOTICE)));
+        for m in MOSH_SERVER_MISSING_MARKERS
+            .iter()
+            .chain(MOSH_STARTUP_FAILED_MARKERS)
+        {
+            assert!(script.contains(&util::sh_quote(m)), "marker {m}: {script}");
+        }
+        // Any other failure keeps mosh's own exit status (no fallback).
+        assert!(script.contains("else exit \"$rc\"; fi"), "{script}");
+    }
+
+    #[test]
+    fn mosh_failure_classification_covers_shell_wordings() {
+        for stderr in [
+            "bash: mosh-server: command not found\n\
+             /usr/bin/mosh: Did not find mosh server startup message.",
+            "sh: 1: mosh-server: not found",
+            "zsh:1: command not found: mosh-server",
+            "BASH: MOSH-SERVER: COMMAND NOT FOUND",
+        ] {
+            assert_eq!(
+                classify_mosh_failure(stderr),
+                MoshFailure::ServerMissing,
+                "{stderr}"
+            );
+        }
+        assert_eq!(
+            classify_mosh_failure(
+                "ssh: connect to host h port 22: Connection refused\n\
+                 /usr/bin/mosh: Did not find mosh server startup message."
+            ),
+            MoshFailure::StartupFailed
+        );
+        assert_eq!(
+            classify_mosh_failure("mosh: Nothing received from server on UDP port 60001."),
+            MoshFailure::Other
+        );
+        assert_eq!(classify_mosh_failure(""), MoshFailure::Other);
+    }
+
+    #[test]
+    fn mosh_falls_back_only_when_no_session_started() {
+        let missing = "bash: mosh-server: command not found";
+        assert!(mosh_falls_back_to_ssh(false, missing));
+        assert!(mosh_falls_back_to_ssh(
+            false,
+            "Did not find mosh server startup message"
+        ));
+        // A clean exit never falls back, even with a stale marker in stderr.
+        assert!(!mosh_falls_back_to_ssh(true, missing));
+        // A session that ended badly exits with mosh's status instead.
+        assert!(!mosh_falls_back_to_ssh(
+            false,
+            "mosh-client: connection lost"
+        ));
+    }
+
+    #[test]
+    fn mosh_fallback_notice_names_the_fix() {
+        let missing = mosh_fallback_notice(MoshFailure::ServerMissing).unwrap();
+        assert!(missing.starts_with(MOSH_NOTICE_PREFIX));
+        assert!(missing.contains("install mosh"), "{missing}");
+        assert!(missing.contains("transport = \"ssh\""), "{missing}");
+        assert!(missing.ends_with("Continuing over ssh."), "{missing}");
+        assert!(!missing.contains('\n'), "one line: {missing}");
+        let startup = mosh_fallback_notice(MoshFailure::StartupFailed).unwrap();
+        assert!(startup.starts_with(MOSH_NOTICE_PREFIX));
+        assert!(startup.contains("continuing over ssh"), "{startup}");
+        assert_eq!(mosh_fallback_notice(MoshFailure::Other), None);
     }
 
     #[test]
