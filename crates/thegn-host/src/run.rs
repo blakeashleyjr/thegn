@@ -8086,6 +8086,8 @@ async fn event_loop<T: Terminal>(
     // Alt+[ is ambiguous with a split CSI introducer. Give a following marker
     // a brief chance to arrive, then replay the standalone chord to dispatch.
     let mut residue_deadline: Option<std::time::Instant> = None;
+    // THE-2753b: when the last mouse-wheel report arrived (guards the Alt+[/] tab chord).
+    let mut last_wheel_at: Option<std::time::Instant> = None;
     // Events read ahead of their turn by the key-repeat coalescer; consumed
     // before blocking on poll_input again.
     let mut pending_input: std::collections::VecDeque<InputEvent> =
@@ -17906,6 +17908,11 @@ async fn event_loop<T: Terminal>(
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
                 plugins_state.user_input();
+                if m.mouse_buttons
+                    .contains(termwiz::input::MouseButtons::VERT_WHEEL)
+                {
+                    last_wheel_at = Some(std::time::Instant::now());
+                }
                 crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
                 loop_perf.input_event();
                 use termwiz::input::MouseButtons;
@@ -20490,14 +20497,25 @@ async fn event_loop<T: Terminal>(
                 // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
                 // for the first N tabs by design; the sidebar hints agree.
                 {
-                    let target =
-                        match crate::apps::tab_chord(k.modifiers, &k.key, app_host.tab_count()) {
-                            Some(crate::apps::TabChord::Select(idx)) => app_host.tab_target(idx),
-                            Some(crate::apps::TabChord::Cycle(delta)) => {
-                                Some(app_host.cycle(app_host.active, delta))
-                            }
-                            None => None,
-                        };
+                    let chord = crate::apps::tab_chord(k.modifiers, &k.key, app_host.tab_count());
+                    if chord.as_ref().is_some_and(|c| {
+                        crate::apps::cycle_chord_is_wheel_residue(
+                            c,
+                            last_wheel_at,
+                            std::time::Instant::now(),
+                        )
+                    }) {
+                        // THE-2753b: a cycle chord straight after a wheel report is the
+                        // torn head of a split SGR report; drop it, never flip the view.
+                        continue;
+                    }
+                    let target = match chord {
+                        Some(crate::apps::TabChord::Select(idx)) => app_host.tab_target(idx),
+                        Some(crate::apps::TabChord::Cycle(delta)) => {
+                            Some(app_host.cycle(app_host.active, delta))
+                        }
+                        None => None,
+                    };
                     if let Some(target) = target {
                         if ensure_app_loaded(
                             &mut app_host,

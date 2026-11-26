@@ -1019,10 +1019,53 @@ pub fn tab_chord(
     }
 }
 
+/// How soon after a mouse-wheel report an `Alt+[`/`Alt+]` cycle chord is treated as
+/// the torn head of a split SGR report (THE-2753b), not a deliberate keypress.
+const WHEEL_CHORD_GUARD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// True when `chord` is a tab-cycle chord arriving within [`WHEEL_CHORD_GUARD`] of a
+/// wheel event: trackpad scrolling must never flip the app tab. Direct `Alt+<digit>`
+/// selects are not guarded.
+pub fn cycle_chord_is_wheel_residue(
+    chord: &TabChord,
+    last_wheel: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    matches!(chord, TabChord::Cycle(_))
+        && last_wheel.is_some_and(|t| now.saturating_duration_since(t) < WHEEL_CHORD_GUARD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use termwiz::input::{KeyCode, Modifiers};
+
+    #[test]
+    fn cycle_chord_right_after_a_wheel_event_is_ignored() {
+        let t0 = std::time::Instant::now();
+        let soon = t0 + std::time::Duration::from_millis(10);
+        let later = t0 + std::time::Duration::from_millis(200);
+        assert!(cycle_chord_is_wheel_residue(
+            &TabChord::Cycle(-1),
+            Some(t0),
+            soon
+        ));
+        assert!(!cycle_chord_is_wheel_residue(
+            &TabChord::Cycle(-1),
+            Some(t0),
+            later
+        ));
+        assert!(!cycle_chord_is_wheel_residue(
+            &TabChord::Cycle(1),
+            None,
+            soon
+        ));
+        assert!(!cycle_chord_is_wheel_residue(
+            &TabChord::Select(1),
+            Some(t0),
+            soon
+        ));
+    }
 
     #[test]
     fn observe_feed_fills_only_while_armed() {

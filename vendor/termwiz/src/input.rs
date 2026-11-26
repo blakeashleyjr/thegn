@@ -643,6 +643,12 @@ pub struct InputParser {
     key_map: KeyMap<InputEvent>,
     buf: ReadBuffer,
     state: InputState,
+    /// THE-2753b: when set, an incomplete CSI (`ESC [` plus parameter bytes and
+    /// no final byte) stays buffered even when `maybe_more` is false, until more
+    /// bytes arrive or `flush_pending` is called. Off by default (upstream behaviour).
+    hold_partial_csi: bool,
+    /// Set by `flush_pending` to let a held partial CSI resolve once.
+    force_flush: bool,
 }
 
 #[cfg(windows)]
@@ -898,7 +904,36 @@ impl InputParser {
             key_map: Self::build_basic_key_map(),
             buf: ReadBuffer::new(),
             state: InputState::Normal,
+            hold_partial_csi: false,
+            force_flush: false,
         }
+    }
+
+    /// Hold an incomplete CSI across reads instead of resolving `ESC [` as Alt+`[`
+    /// (THE-2753b). The caller must call `flush_pending` after a short timeout.
+    pub fn set_hold_partial_csi(&mut self, hold: bool) {
+        self.hold_partial_csi = hold;
+    }
+
+    /// True when the buffer holds an incomplete CSI that `hold_partial_csi` is deferring.
+    pub fn has_pending_csi(&self) -> bool {
+        self.hold_partial_csi && self.state == InputState::Normal && self.is_partial_csi()
+    }
+
+    fn is_partial_csi(&self) -> bool {
+        let b = self.buf.as_slice();
+        b.len() >= 2
+            && b.len() <= 64
+            && b[0] == 0x1b
+            && b[1] == b'['
+            && b[2..].iter().all(|c| (0x20..=0x3f).contains(c))
+    }
+
+    /// Resolve whatever is buffered as if no more input will arrive (the hold timed out).
+    pub fn flush_pending<F: FnMut(InputEvent)>(&mut self, callback: F) {
+        self.force_flush = true;
+        self.process_bytes(callback, false);
+        self.force_flush = false;
     }
 
     fn build_basic_key_map() -> KeyMap<InputEvent> {
@@ -1327,6 +1362,9 @@ impl InputParser {
 
     fn process_bytes<F: FnMut(InputEvent)>(&mut self, mut callback: F, maybe_more: bool) {
         while !self.buf.is_empty() {
+            if !maybe_more && !self.force_flush && self.has_pending_csi() {
+                return;
+            }
             match self.state {
                 InputState::Pasting(offset) => {
                     let end_paste = b"\x1b[201~";
@@ -1966,5 +2004,49 @@ mod test {
                 mods
             );
         }
+    }
+
+    #[test]
+    fn split_sgr_wheel_report_never_yields_alt_bracket() {
+        let report = b"\x1b[<65;12;34M";
+        for cut in 1..report.len() {
+            let mut p = InputParser::new();
+            p.set_hold_partial_csi(true);
+            let mut evs = p.parse_as_vec(&report[..cut], false);
+            evs.extend(p.parse_as_vec(&report[cut..], false));
+            let alt = evs.iter().any(|e| {
+                matches!(e, InputEvent::Key(KeyEvent { modifiers, key: KeyCode::Char('[') })
+                    if modifiers.contains(Modifiers::ALT))
+            });
+            assert!(!alt, "cut {cut}: {evs:?}");
+            if cut == 1 {
+                // A lone ESC is still immediate.
+                assert!(matches!(evs[0], InputEvent::Key(KeyEvent { key: KeyCode::Escape, .. })));
+                continue;
+            }
+            assert!(
+                evs.iter().any(|e| matches!(e, InputEvent::Mouse(_))),
+                "cut {cut}: {evs:?}"
+            );
+            assert_eq!(evs.len(), 1, "cut {cut}: {evs:?}");
+        }
+    }
+
+    #[test]
+    fn held_partial_csi_flushes_as_alt_bracket_on_timeout() {
+        let mut p = InputParser::new();
+        p.set_hold_partial_csi(true);
+        assert!(p.parse_as_vec(b"\x1b[", false).is_empty());
+        assert!(p.has_pending_csi());
+        let mut out = Vec::new();
+        p.flush_pending(|e| out.push(e));
+        assert_eq!(
+            out,
+            vec![InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::ALT,
+                key: KeyCode::Char('['),
+            })]
+        );
+        assert!(!p.has_pending_csi());
     }
 }

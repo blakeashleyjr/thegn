@@ -25,6 +25,12 @@ byte-identical to the published package; applying the compiler's `cargo fix`
 suggestion would edit 13 source sites instead. Drop the table if a later
 upstream release fixes the signatures.
 
+THE-2753b: `src/input.rs` gains an opt-in `set_hold_partial_csi`/`has_pending_csi`/
+`flush_pending` trio and `src/terminal/unix.rs` enables it with a 40 ms flush. A short
+read that ended inside an SGR mouse report (`ESC [ <65;..`) used to be flushed with
+`maybe_more = false`, decoding `ESC [` as Alt+`[` (the previous-app chord). Default
+parser behaviour is unchanged; a lone ESC still resolves immediately.
+
 Upstream source, examples, benches, README, changelog and license are otherwise
 unchanged, and the manifest differs only by that table. Cargo registry
 bookkeeping, the package's independent lockfile, original unnormalized manifest
