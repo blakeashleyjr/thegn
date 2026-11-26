@@ -16637,6 +16637,17 @@ async fn event_loop<T: Terminal>(
             let mut title_writes: Vec<(String, String)> = Vec::new();
             if title_gen_now != last_title_gen || dirty || switch_at.is_some() {
                 last_title_gen = title_gen_now;
+                let tab_titles = crate::tab_titles::labels(
+                    &session,
+                    &panes,
+                    current_config.ui.tab_title_from_terminal,
+                );
+                if model.tabs != tab_titles {
+                    model.tabs = tab_titles;
+                    // Tab chips share the chrome damage path. The current
+                    // frame can carry an OSC title change without pane damage.
+                    dirty = true;
+                }
                 for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
                     if model.sidebar_window_titles.get(&path) != Some(&title) {
                         title_writes.push((path.clone(), title.clone()));
