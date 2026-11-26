@@ -68,3 +68,4 @@ the page for whatever has focus.
 - [[privacy]] — what stays on your machine and what can leave it
 - [[media]] — the now-playing controls
 - [[help]] — how this help system itself works
+- [[acknowledgments]] — what thegn is built on, and who inspired it

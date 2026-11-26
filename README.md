@@ -705,6 +705,15 @@ Please report vulnerabilities **privately** — see
 credential leakage between worktrees, or command injection through untrusted
 repo content are especially valued.
 
+## Acknowledgments
+
+thegn stands on a lot of other people's work: termwiz and wezterm,
+alacritty_terminal, tokio, gix, SQLite, tree-sitter, whisper.cpp and many more,
+with ideas borrowed from zellij, tmux, Zed, Jujutsu and others. The
+[acknowledgments help page](docs/help/acknowledgments.md) (press `F1`) says
+who and why; [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists every
+dependency and its licence.
+
 ## License
 
 Dual-licensed under either
