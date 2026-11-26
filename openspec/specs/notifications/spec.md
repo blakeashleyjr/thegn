@@ -6,6 +6,58 @@ The aggregated notification and event bus: user-defined routing rules, DND / qui
 
 ## Requirements
 
+### Requirement: Notification age classification
+
+The notification model SHALL expose `is_stale(now)` using Unix seconds. Info
+notifications older than 24 hours SHALL be stale. `agent_attention`
+notifications older than 24 hours SHALL be stale only when a non-interactive
+pipeline lane raised them (source `escalation:{row}@…`); interactive agent
+attention SHALL not age out by time alone.
+
+#### Scenario: Old informational notification
+
+- **WHEN** an Info notification is more than 24 hours old
+- **THEN** `is_stale(now)` returns true
+
+#### Scenario: Old lane attention and interactive attention
+
+- **WHEN** pipeline lane attention is more than 24 hours old
+- **THEN** `is_stale(now)` returns true, while an equally old interactive
+  agent attention returns false
+
+### Requirement: Lane attention carries its group
+
+A pipeline lane escalation SHALL carry its dispatch row in its source ref, and
+the model SHALL expose it as a group key (`pipeline:{row}`) so the inbox can
+fold a lane's rows into one group.
+
+#### Scenario: Escalation row
+
+- **WHEN** a lane escalation has source `escalation:42@abcdefg:awaiting-approval`
+- **THEN** its group key is `pipeline:42`
+
+### Requirement: Attention notifications resolve with their cause
+
+An unread `agent_attention` notification SHALL be marked read, on the existing
+state-change event and without polling, when the session that raised it ends,
+when its worktree is removed, or when the pipeline lane that raised it reaches a
+terminal status. On daemon boot (and on host boot with the daemon route off)
+thegn SHALL resolve, off the render loop, every unread `agent_attention` row
+whose session is not live or whose worktree is unregistered and missing.
+
+#### Scenario: Lane reaches a terminal status
+
+- **WHEN** a dispatch row becomes failed, done, merged or abandoned
+- **THEN** its `escalation:{row}@…` rows and its worker's agent-hook rows in
+  the lane worktree are marked read, and other lanes' rows are untouched
+
+#### Scenario: Boot clears the backlog
+
+- **WHEN** thegn starts with unread attention rows from dead sessions or
+  removed worktrees
+- **THEN** those rows are marked read, while rows for a registered remote
+  worktree or a lane on a live worktree stay
+
 ### Requirement: User-defined action rules route notifications
 
 Notification delivery SHALL be governed by an ordered list of user rules

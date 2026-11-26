@@ -23,6 +23,13 @@ still-failing process from producing a new failure. An agent failure clears when
 agent run in that worktree finishes cleanly, and a test failure clears when a test runner
 (`pytest`, `nextest`, `jest`, `vitest`, `rspec`) later exits cleanly there.
 
+An "agent needs input" notification clears itself when its cause is gone: the
+agent session ends, the worktree is removed, or the pipeline lane that raised it
+finishes. On startup thegn also clears the ones left behind by sessions that are
+no longer running or by worktrees that no longer exist. Pipeline lane rows carry
+their lane, so the inbox can group them, and they count as stale after 24 hours,
+as does any informational notification.
+
 ### `agent_error_signatures`
 
 A list of case-insensitive substrings. When any line of live agent output

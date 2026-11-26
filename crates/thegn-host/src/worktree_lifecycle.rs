@@ -13,7 +13,7 @@ use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
 use thegn_core::git_run::GitOutcome;
 use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode, ResolvedHooks};
-use thegn_core::store::{RepoTrustStore, WorkspaceStore};
+use thegn_core::store::{NotificationStore, RepoTrustStore, WorkspaceStore};
 
 static NOTIFY_STATE: OnceLock<Arc<crate::notify::NotifyState>> = OnceLock::new();
 static REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>> =
@@ -1108,6 +1108,7 @@ pub(crate) fn destroy_one_checked(
     if !is_remote {
         note_worktree_removed(worktree);
     }
+    resolve_removed_worktree_attention(worktree, db);
     // Removal is finished; hooks after this no longer need the admission hold.
     drop(admission);
 
@@ -1695,6 +1696,20 @@ fn physical_destroy_in_progress(key: &Path) -> bool {
             .expect("physical claim mutex poisoned")
             .contains(key)
     })
+}
+
+/// A removed worktree has nobody left to answer its `agent_attention` rows:
+/// mark them read on the removal itself (THE-2732). Worker/CLI thread only.
+fn resolve_removed_worktree_attention(worktree: &Path, db: Option<&Db>) {
+    let path = worktree.to_string_lossy();
+    let kind = thegn_core::notification::NotificationKind::AgentAttention.as_str();
+    let resolved = match db {
+        Some(db) => db.mark_kind_read_for_worktree(kind, &path),
+        None => Db::open().and_then(|db| db.mark_kind_read_for_worktree(kind, &path)),
+    };
+    if let Err(error) = resolved {
+        tracing::debug!(target: "thegn::db", %error, "could not resolve a removed worktree's attention rows");
+    }
 }
 
 /// Bound on remembered removals; the oldest entry is dropped first.
