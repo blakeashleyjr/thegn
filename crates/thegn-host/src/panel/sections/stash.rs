@@ -16,6 +16,10 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(fr);
     }
     if data.stashes.is_empty() {
+        if data.stash_count == 0 && !data.stash_unknown {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no stashes")])));
+            return rows;
+        }
         let message = match &data.stashes_load {
             DocLoad::Pending => "loading stashes…".to_string(),
             DocLoad::Ready => "no stashes".to_string(),
@@ -57,9 +61,15 @@ mod tests {
     #[test]
     fn stash_pending_ready_failed_render_distinctly() {
         let render = |load| {
+            let stash_count = if matches!(&load, DocLoad::Ready) {
+                0
+            } else {
+                1
+            };
             let model = FrameModel {
                 panel: crate::panel::PanelData {
                     stashes_load: load,
+                    stash_count,
                     ..Default::default()
                 },
                 ..Default::default()
