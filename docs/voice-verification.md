@@ -193,8 +193,10 @@ in its trampoline. The leaf uses a documented concrete FFI callback context
 owned across the synchronous native call instead, with a regression test for
 cancellation/deadline/ownership. The supplied-audio `verify` example exercises
 real inference without opening a microphone. Metal startup also preflights
-compute-state allocation before capture so a state-allocation failure can use
-the CPU fallback. Apple behavior is unverified.
+compute-state allocation during model load so a state-allocation failure can
+use the CPU fallback. The worker opens the microphone first and loads the model
+while capture runs, so the first words are kept; capture also keeps a 250 ms
+tail after stop (cancel skips it). Apple behavior is unverified.
 
 Native release acceptance remains open: broader ALSA/PipeWire routing, device
 removal, macOS TCC/Metal/CPU fallback and packaging, broader speech/noise corpus,
