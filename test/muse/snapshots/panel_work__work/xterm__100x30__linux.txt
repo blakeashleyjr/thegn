@@ -4,9 +4,9 @@
                                  ╭─ e2esh · home ─────╮  main
  ▾ repo                          │$                   │ ────────────────────────────────────────────
 ▐   └   home                     │                    │  1 mine                               clear
-                                 │                    │  2 across                             clear
+                                 │                    │  2 attention                          clear
  TERMINALS                       │                    │
- ▾ ≡ local                       │                    │   nothing needs attention across worktrees
+ ▾ ≡ local                       │                    │   nothing needs attention in any worktree
    └ ≡ local                     │                    │
                                  │                    │  3 pr                                 no pr
                                  │                    │  4 ci                                     —

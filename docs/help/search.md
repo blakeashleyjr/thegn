@@ -106,5 +106,5 @@ you one result per mention, so you land on the right one. See [[help]].
 ## Related
 
 - [[copy-and-select]] — scrollback, selections, and registers
-- [[panel]]'s **work → across** section is search-adjacent: it surfaces
+- [[panel]]'s **work → attention** section is search-adjacent: it surfaces
   failing CI across every worktree without you asking

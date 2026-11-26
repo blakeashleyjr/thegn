@@ -29,8 +29,8 @@ rightmost pane) focuses it; `Ctrl-Alt-p` hides it. It is a tabbed
 accordion — four tabs, one open section at a time:
 
 - **git** — changes (diff), commits, branches, stash, files
-- **work** — mine (your unified work feed), across (cross-worktree
-  attention), the branch's PR + the repo's open PRs, CI runs, the merge
+- **work** — mine (your unified work feed), attention (failing CI in your
+  other worktrees), the branch's PR + the repo's open PRs, CI runs, the merge
   queue, the PR queue, issues, problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
   port forwards, telemetry, keys, media, usage
@@ -102,19 +102,19 @@ off banner when its feature is unavailable.
 
 **work**
 
-| Section    | Shows                                                                |
-| ---------- | -------------------------------------------------------------------- |
-| `mine`     | one feed of everything assigned to you: issues, review requests, PRs |
-| `across`   | failing CI for the active project (`a` widens), grouped by worktree  |
-| `pr`       | PR state, CI check rollup, review decision for this branch           |
-| `ci`       | run history and per-run state across providers                       |
-| `merge`    | the local merge queue — per-branch land/defer status                 |
-| `prq`      | PR queue (hidden until `[pr_queue] enabled = true`)                  |
-| `issues`   | tracker issues                                                       |
-| `problems` | compiler, linter, and test diagnostics                               |
-| `jobs`     | configured shell jobs (build, test, run)                             |
-| `tests`    | test results and the pass/fail rollup                                |
-| `symbols`  | the LSP / tree-sitter outline for the file you edit or pick          |
+| Section     | Shows                                                                                |
+| ----------- | ------------------------------------------------------------------------------------ |
+| `mine`      | one feed of everything assigned to you: issues, review requests, PRs                 |
+| `attention` | failing CI in your worktrees, grouped by worktree (this project; `a` = all projects) |
+| `pr`        | PR state, CI check rollup, review decision for this branch                           |
+| `ci`        | run history and per-run state across providers                                       |
+| `merge`     | the local merge queue — per-branch land/defer status                                 |
+| `prq`       | PR queue (hidden until `[pr_queue] enabled = true`)                                  |
+| `issues`    | tracker issues                                                                       |
+| `problems`  | compiler, linter, and test diagnostics                                               |
+| `jobs`      | configured shell jobs (build, test, run)                                             |
+| `tests`     | test results and the pass/fail rollup                                                |
+| `symbols`   | the LSP / tree-sitter outline for the file you edit or pick                          |
 
 **system**
 
@@ -274,13 +274,18 @@ scope.
 If the repo has no `origin` remote the repo-scoped PR search cannot run;
 the section says so rather than silently searching every repo.
 
-### across — cross-worktree attention
+### attention — failing CI in your worktrees
 
-A read-mostly stream of things needing attention in your _other_
-worktrees — currently each worktree's failing CI (latest run per
-workflow), grouped by worktree. Scoped to the active project by
-default; `a` widens to every project. `↵` jumps to that worktree's tab,
+A read-only list of what needs you across your worktrees. Right now that
+is each worktree's failing CI (the latest run per workflow), grouped by
+worktree. The hint line reads `(this project · a = all projects)`: the
+list covers the active project by default, and `a` switches it to every
+project. Press `a` again to go back. `↵` jumps to that worktree's tab,
 or opens the registered worktree if it has no open tab.
+
+The section was called `across` before; that name still works as the
+`[panel] sections` key, and keybindings and help contexts still use
+`across`.
 
 {{keys:across}}
 
@@ -355,7 +360,7 @@ Sidebar attention follows the same provider-context rule: a cached CI
 failure from another context does not mark a worktree for attention, while an
 unknown current context keeps the cached failure.
 It also skips runs cached for another branch, or with no recorded branch, in
-the sidebar and **across**; when the current branch is unknown, cached runs
+the sidebar and **attention**; when the current branch is unknown, cached runs
 still count.
 Background log ingestion reuses a cached job log as evidence only when it
 was fetched for the worktree's current provider context
