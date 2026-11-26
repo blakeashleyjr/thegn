@@ -6,9 +6,9 @@
 //! pipeline batch, or the project a worktree lives in), with anything older
 //! than a day parked in a collapsed "Older" group at the bottom.
 //!
-//! [`layout`] is the pure part (leaves + expanded set + filter in, ordered
+//! `layout` is the pure part (leaves + expanded set + filter in, ordered
 //! entries out) so the grouping and ordering are unit-testable without a
-//! terminal. [`NotifTree`] and the `impl DetailOverlay` below drive it from key
+//! terminal. `NotifTree` and the `impl DetailOverlay` below drive it from key
 //! presses and rebuild the overlay's row list.
 
 use std::collections::{BTreeMap, HashSet};
@@ -298,8 +298,10 @@ fn dismissal(leaves: &[Leaf], members: &[usize]) -> DetailAction {
     }
 }
 
-const BASE_HINT: &str =
-    "\u{21b5}/\u{2192} expand \u{b7} \u{2190} fold \u{b7} x dismiss \u{b7} D stale \u{b7} / filter";
+/// Footer keys. `a` (clear all) and the per-row `l`/`r`/`o` actions still work
+/// on the rows that carry them; the footer names the fold/dismiss/filter keys
+/// this view adds plus the one total clear.
+const BASE_HINT: &str = "\u{21b5}/\u{2192} open \u{b7} \u{2190} fold \u{b7} x dismiss \u{b7} D stale \u{b7} / filter \u{b7} a clear all";
 
 /// Live state of the grouped overlay: the items, which groups are open, the
 /// filter, and the fixed rows after the tree.
@@ -410,7 +412,7 @@ impl NotifTree {
 
 impl DetailOverlay {
     /// Build the grouped overlay over `leaves`, with `tail` rows kept after the
-    /// tree. `cols`/`height` size the box like [`super::list`].
+    /// tree. `cols`/`height` size the box like `super::list`.
     pub(super) fn notif_overlay(
         title: &str,
         leaves: Vec<Leaf>,
@@ -463,6 +465,11 @@ impl DetailOverlay {
     /// Key handling for the grouped list; `None` means "not mine, fall through
     /// to the generic list keys". Called after the Ctrl/Alt guards.
     pub(super) fn notif_key(&mut self, key: &KeyCode) -> Option<DetailOutcome> {
+        // Only while the grouped list itself is showing (an in-place drill
+        // swaps the content for its own keys).
+        if !matches!(self.content, DetailContent::List(_)) {
+            return None;
+        }
         let editing = self.notif.as_ref()?.editing;
         if editing {
             let t = self.notif.as_mut()?;
@@ -554,6 +561,9 @@ impl DetailOverlay {
     /// selected group, or the selected fixed row. Returns false when this
     /// overlay has no tree.
     pub(super) fn notif_remove_selected(&mut self) -> bool {
+        if !matches!(self.content, DetailContent::List(_)) {
+            return false;
+        }
         let Some(t) = self.notif.as_mut() else {
             return false;
         };

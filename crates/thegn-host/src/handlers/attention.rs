@@ -111,8 +111,9 @@ pub(crate) fn needs_user_out_of_scope(model: &FrameModel) -> Vec<(String, Attent
 }
 
 /// Everything the single `✋` statusbar chip and the unified popup's live groups
-/// (older than a day folds into "Older" and is not counted) are built from — **one** rollup so the chip's count is exactly the number
-/// of rows the popup's "Needs you" + "Alerts" groups show, and the two can't
+/// are built from — **one** rollup so the chip's count is exactly the number of
+/// live needs-you + alert items the popup shows (anything older than a day
+/// folds into its "Older" group and is not counted), and the two can't
 /// drift (they used to be two badges fed by two predicates: a failed pane lit
 /// both a `⚑` inbox flag and the `✋` hand for the same event).
 #[derive(Debug, Default)]

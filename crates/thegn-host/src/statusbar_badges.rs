@@ -8,9 +8,9 @@ use crate::seg::{Seg, Tok};
 use thegn_core::theme::Hue;
 
 /// **The** attention chip — the one statusbar signal that something needs the
-/// user. Counts the rows the unified popup's "Needs you" + "Alerts" groups
-/// show (attention tiers T0–T2 for this repo's worktrees, plus unread
-/// alert-priority inbox rows not already covered by one of those worktrees):
+/// user. Counts the live (under a day old) needs-you and alert items the
+/// unified popup shows (attention tiers T0–T2 for this repo's worktrees, plus
+/// unread alert-priority inbox rows not already covered by one of those worktrees):
 /// red while anything is blocked/failing, amber when only finished work waits.
 /// When nothing needs the user but notice-priority unread rows exist, a quiet
 /// blue `✉ N` inbox count takes its place; info-priority rows never show.
