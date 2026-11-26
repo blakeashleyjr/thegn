@@ -312,14 +312,22 @@ fn installer_toolchain_dirs(
     {
         dirs.push(rustup_home.to_path_buf());
     }
+    // The tool path is canonicalized, so compare it against the canonical home
+    // too (macOS: `/var` and `/tmp` are symlinks into `/private`), and bind the
+    // prefix under the home spelling every other entry uses.
+    let canonical_home = host_home.canonicalize().ok();
     if let Some(tool_bin) = tool_bin
         && let Ok(canonical) = tool_bin.canonicalize()
         && let Some(prefix) = canonical.parent().and_then(Path::parent)
-        && prefix.starts_with(host_home)
-        && prefix != host_home
+        && let Some(relative) = prefix.strip_prefix(host_home).ok().or_else(|| {
+            canonical_home
+                .as_deref()
+                .and_then(|home| prefix.strip_prefix(home).ok())
+        })
+        && !relative.as_os_str().is_empty()
         && (prefix.join("bin/node").exists() || prefix.join("lib/node_modules").is_dir())
     {
-        dirs.push(prefix.to_path_buf());
+        dirs.push(host_home.join(relative));
     }
     let mut unique = Vec::new();
     for path in dirs {
