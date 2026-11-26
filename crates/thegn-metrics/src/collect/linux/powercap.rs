@@ -54,6 +54,8 @@ impl PowercapFs for RealFs {
     fn access_read(&mut self, path: &Path) -> io::Result<()> {
         let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in sysfs path"))?;
+        // SAFETY: `path` is a live NUL-terminated CString that outlives the call, and access
+        // only reads it.
         let result = unsafe { libc::access(path.as_ptr(), libc::R_OK) };
         if result == 0 {
             Ok(())

@@ -450,6 +450,8 @@ fn read_boot_time() -> Option<u64> {
 }
 
 fn page_size() -> Option<u64> {
+    // SAFETY: sysconf takes a valid name constant and has no memory-safety preconditions; a
+    // negative result is rejected by the caller.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(value).ok().filter(|value| *value > 0)
 }

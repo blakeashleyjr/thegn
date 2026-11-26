@@ -1262,6 +1262,7 @@ mod tests {
     fn fixture_group_pid() -> libc::pid_t {
         // The real group keeps killpg(pid, 0) successful while all /proc data
         // below is supplied by the fixture.
+        // SAFETY: getpgrp takes no arguments, reads no memory and cannot fail.
         unsafe { libc::getpgrp() }
     }
 
