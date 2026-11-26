@@ -440,6 +440,15 @@ for two accounts stay separate. With
 its PR merges raises an `automation_failed` inbox notification with the error
 redacted; the same issue and error are reported once.
 
+The list is scoped to one team by default: the team of the issue linked to
+the active worktree, else the team with the most issues. The scope shows in
+the header (`[team THE]`) and `T` cycles each team, then all teams. `↵`
+opens a detail page for the issue — state, assignee, labels, priority,
+project, blockers, link and the description rendered as light markdown;
+`↵` again returns to the list. `l` links or unlinks the issue to the
+active worktree (a `◈` marks linked rows). Comments are not shown yet; `o`
+opens the issue in the browser.
+
 {{keys:issues}}
 
 ### problems — diagnostics

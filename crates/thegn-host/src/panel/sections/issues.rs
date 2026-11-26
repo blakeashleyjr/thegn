@@ -74,6 +74,76 @@ pub(crate) fn sorted_filtered_issues<'a>(
     query: &str,
     project: Option<&str>,
 ) -> Vec<&'a Issue> {
+    sorted_filtered_issues_scoped(data, query, project, None)
+}
+
+/// The team key of an issue number: `THE` for `THE-2748`. `None` for numbers
+/// without a `<KEY>-<digits>` shape (GitHub's `#42`), which no team scope hides.
+pub(crate) fn team_key(number: &str) -> Option<&str> {
+    let (key, n) = number.rsplit_once('-')?;
+    (!key.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(key)
+}
+
+/// Every team key present in the loaded issues, commonest first.
+pub(crate) fn team_keys(data: &crate::panel::PanelData) -> Vec<String> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for issue in &data.tracker_issues {
+        if let Some(key) = team_key(&issue.number) {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    let mut keys: Vec<(&str, usize)> = counts.into_iter().collect();
+    keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    keys.into_iter().map(|(key, _)| key.to_string()).collect()
+}
+
+/// The team scope in force: the explicit `T` choice, else the active
+/// worktree's linked-issue team, else the commonest team. `None` = unscoped
+/// (explicitly, or because only one team is present).
+pub(crate) fn effective_team(
+    data: &crate::panel::PanelData,
+    ui: &crate::panel::PanelUi,
+) -> Option<String> {
+    match ui.issues_team.as_deref() {
+        Some("") => return None,
+        Some(key) => return Some(key.to_string()),
+        None => {}
+    }
+    let keys = team_keys(data);
+    if keys.len() < 2 {
+        return None;
+    }
+    data.tracker_links
+        .iter()
+        .find_map(|id| {
+            let number = id.split_once(':').map_or(id.as_str(), |(_, n)| n);
+            team_key(number).filter(|k| keys.iter().any(|x| x == k))
+        })
+        .map(str::to_string)
+        .or_else(|| keys.into_iter().next())
+}
+
+/// The scope `T` switches to: the next team key, then "all teams" (`""`).
+pub(crate) fn next_team_scope(
+    data: &crate::panel::PanelData,
+    ui: &crate::panel::PanelUi,
+) -> String {
+    let mut order = team_keys(data);
+    order.push(String::new());
+    let current = effective_team(data, ui).unwrap_or_default();
+    match order.iter().position(|key| *key == current) {
+        Some(i) => order[(i + 1) % order.len()].clone(),
+        None => order[0].clone(),
+    }
+}
+
+/// [`sorted_filtered_issues`] narrowed to one team key (`None` = every team).
+pub(crate) fn sorted_filtered_issues_scoped<'a>(
+    data: &'a crate::panel::PanelData,
+    query: &str,
+    project: Option<&str>,
+    team: Option<&str>,
+) -> Vec<&'a Issue> {
     let query = query.to_lowercase();
     let mut list: Vec<&Issue> = data
         .tracker_issues
@@ -87,6 +157,12 @@ pub(crate) fn sorted_filtered_issues<'a>(
             }
             if let Some(pid) = project
                 && !i.project_ids.iter().any(|p| p == pid)
+            {
+                return false;
+            }
+            if let Some(team) = team
+                && let Some(key) = team_key(&i.number)
+                && key != team
             {
                 return false;
             }
@@ -106,26 +182,33 @@ pub(crate) fn issue_at_cursor<'a>(
     panel: &'a crate::panel::PanelData,
     ui: &crate::panel::PanelUi,
 ) -> Option<&'a Issue> {
-    sorted_filtered_issues(
+    sorted_filtered_issues_scoped(
         panel,
         &ui.issues_filter,
         ui.issues_project_filter.as_deref(),
+        effective_team(panel, ui).as_deref(),
     )
     .into_iter()
     .nth(ui.cursor)
 }
 
 pub(super) fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
-    sorted_filtered_issues(
+    sorted_filtered_issues_scoped(
         &ctx.model.panel,
         &ctx.ui.issues_filter,
         ctx.ui.issues_project_filter.as_deref(),
+        effective_team(&ctx.model.panel, ctx.ui).as_deref(),
     )
 }
 
 // ---- main entry point -------------------------------------------------------
 
 pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
+    if let Some(id) = ctx.ui.issues_detail.as_deref()
+        && let Some(issue) = ctx.model.panel.tracker_issues.iter().find(|i| i.id == id)
+    {
+        return detail_page(ctx, issue);
+    }
     if ctx.full() {
         full_view(ctx)
     } else if ctx.deep() {
@@ -185,6 +268,13 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
+    let scope = team_tag(data, ctx.ui);
+    if !scope.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            format!("scope{scope} · T switches"),
+        )])));
+    }
     let shared = thegn_core::issue::ids_shared_across_accounts(
         data.tracker_issues
             .iter()
@@ -243,7 +333,9 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(row);
     }
     rows.push(hint_row(&[
-        ("↵", "link"),
+        ("↵", "details"),
+        ("l", "link"),
+        ("T", "team"),
         ("o", "browser"),
         ("a", "assign me"),
         ("b", "branch"),
@@ -389,7 +481,9 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         });
     }
     rows.push(hint_row(&[
-        ("↵", "link"),
+        ("↵", "details"),
+        ("l", "link"),
+        ("T", "team"),
         ("o", "browser"),
         ("a", "assign me"),
         ("b", "branch"),
@@ -438,6 +532,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .as_deref()
             .map(|p| format!(" [{p}]"))
             .unwrap_or_default();
+        let filter_tag = format!("{filter_tag}{}", team_tag(&ctx.model.panel, ctx.ui));
         format!("{sigils} {names}  {open} open / {total}{filter_tag}")
     };
     let provider_label = if data.tracker_partial.is_empty() {
@@ -527,12 +622,92 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     rows.push(rule());
     rows.push(hint_row(&[
-        ("↵", "link"),
+        ("↵", "details"),
+        ("l", "link"),
+        ("T", "team"),
         ("o", "browser"),
         ("a", "assign me"),
         ("b", "branch"),
         ("D", "dispatch"),
         ("r", "refresh"),
+    ]));
+    rows
+}
+
+/// The full-page detail view opened by `↵`: every field the tracker cache
+/// holds, with the description rendered as light markdown.
+fn detail_page(ctx: &SectionCtx, issue: &Issue) -> Vec<PanelRow> {
+    let w = ctx.cols.saturating_sub(2).max(10);
+    let data = &ctx.model.panel;
+    let mut rows = vec![
+        PanelRow::plain(Line::segs(vec![
+            seg(d(), "ISSUE".to_string()),
+            seg(g2(), format!("  {}", display_cell(&issue.number))),
+        ])),
+        rule(),
+    ];
+    for segs in issue_detail_segs(issue, &data.tracker_links, w) {
+        rows.push(PanelRow::plain(Line::segs(segs)));
+    }
+    if !issue.project_ids.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g2(), "project  ".to_string()),
+            seg(
+                f(),
+                display_clip(&issue.project_ids.join(", "), w.saturating_sub(9)),
+            ),
+        ])));
+    }
+    if !issue.blocked_by.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g2(), "blocked by  ".to_string()),
+            seg(
+                hue(Hue::Amber),
+                display_clip(&issue.blocked_by.join(", "), w.saturating_sub(12)),
+            ),
+        ])));
+    }
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(g2(), "link  ".to_string()),
+        seg(f(), display_clip(&issue.url, w.saturating_sub(6))),
+    ])));
+    if let Some(body) = issue.body.as_deref().filter(|b| !b.trim().is_empty()) {
+        rows.push(rule());
+        let mut in_code = false;
+        for line in body.lines().take(200) {
+            let trimmed = line.trim_end();
+            if trimmed.trim_start().starts_with("```") {
+                in_code = !in_code;
+                continue;
+            }
+            let segs = if in_code {
+                seg(f(), display_clip(&format!("  {trimmed}"), w))
+            } else if let Some(h) = trimmed.trim_start_matches('#').strip_prefix(' ')
+                && trimmed.starts_with('#')
+            {
+                seg(t(), display_clip(h, w)).bold()
+            } else if let Some(item) = trimmed
+                .trim_start()
+                .strip_prefix("- ")
+                .or_else(|| trimmed.trim_start().strip_prefix("* "))
+            {
+                seg(g(), display_clip(&format!("• {item}"), w))
+            } else {
+                seg(g(), display_clip(trimmed, w))
+            };
+            rows.push(PanelRow::plain(Line::segs(vec![segs])));
+        }
+    }
+    rows.push(PanelRow::plain(Line::segs(vec![seg(
+        g3(),
+        "comments: open in browser (o)".to_string(),
+    )])));
+    rows.push(rule());
+    rows.push(hint_row(&[
+        ("↵", "details"),
+        ("l", "link"),
+        ("o", "browser"),
+        ("b", "branch"),
     ]));
     rows
 }
@@ -611,6 +786,18 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
     }
 
     out
+}
+
+/// ` [team THE]` / ` [all teams]` when more than one team is loaded, so the
+/// scope is always visible; empty when there is nothing to scope.
+fn team_tag(data: &crate::panel::PanelData, ui: &crate::panel::PanelUi) -> String {
+    if team_keys(data).len() < 2 {
+        return String::new();
+    }
+    match effective_team(data, ui) {
+        Some(team) => format!(" [team {}]", display_cell(&team)),
+        None => " [all teams]".to_string(),
+    }
 }
 
 // ---- empty state ------------------------------------------------------------
@@ -1173,5 +1360,47 @@ mod tests {
             .join("\n");
         assert!(text.contains("account"), "{text}");
         assert!(text.contains("work"), "{text}");
+    }
+
+    #[test]
+    fn team_scope_defaults_to_commonest_team_and_switches() {
+        let data = panel_with(vec![
+            issue("THE-1", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("THE-2", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("AGE-1", IssuePriority::High, IssueStatus::Todo, ""),
+        ]);
+        let mut ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            ..Default::default()
+        };
+        assert_eq!(effective_team(&data, &ui).as_deref(), Some("THE"));
+        assert_eq!(
+            issue_at_cursor(&data, &ui).map(|i| i.id.as_str()),
+            Some("THE-1")
+        );
+        assert_eq!(next_team_scope(&data, &ui), "AGE");
+        ui.issues_team = Some("AGE".into());
+        assert_eq!(next_team_scope(&data, &ui), "");
+        assert_eq!(
+            sorted_filtered_issues_scoped(&data, "", None, Some("AGE")).len(),
+            1
+        );
+        ui.issues_team = Some(String::new());
+        assert_eq!(effective_team(&data, &ui), None);
+        assert_eq!(team_tag(&data, &ui), " [all teams]");
+    }
+
+    #[test]
+    fn linked_issue_team_wins_the_default_scope() {
+        let mut data = panel_with(vec![
+            issue("THE-1", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("THE-2", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("AGE-1", IssuePriority::High, IssueStatus::Todo, ""),
+        ]);
+        data.tracker_links = vec!["linear:AGE-1".into()];
+        let ui = crate::panel::PanelUi::default();
+        assert_eq!(effective_team(&data, &ui).as_deref(), Some("AGE"));
+        assert_eq!(team_key("42"), None);
+        assert_eq!(team_key("THE-2748"), Some("THE"));
     }
 }

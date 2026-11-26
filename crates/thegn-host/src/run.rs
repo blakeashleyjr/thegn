@@ -24146,9 +24146,9 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Issues => {
-                                            // Enter toggles the worktree↔issue link for
-                                            // the cursor row.
-                                            crate::handlers::tracker::toggle_link(
+                                            // Enter opens the issue's detail page
+                                            // (`l` links it to the worktree).
+                                            crate::handlers::tracker::toggle_detail(
                                                 &mut crate::handlers::tracker::TrackerCtx {
                                                     model: &mut model,
                                                     panel_ui: &mut panel_ui,
@@ -25614,25 +25614,26 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- issues: open URL, refresh, self-assign, dispatch --
-                        (Section::Issues, KeyCode::Char(c @ ('o' | 'r' | 'a' | 'D'))) => {
-                            crate::handlers::tracker::issues_key(
-                                c,
-                                &mut crate::handlers::tracker::TrackerCtx {
-                                    model: &mut model,
-                                    panel_ui: &mut panel_ui,
-                                    session: &session,
-                                    cfg: keymap.config(),
-                                    live_cfg: &current_config,
-                                    waker: &waker,
-                                    refresh_tx: &refresh_tx,
-                                    create_gen: &mut create_gen,
-                                    create_tx: &create_tx,
-                                    inflight: &mut inflight,
-                                    wizard_ui: &mut wizard_ui,
-                                    pending_issue_link: &mut pending_issue_link,
-                                },
-                            )
-                        }
+                        (
+                            Section::Issues,
+                            KeyCode::Char(c @ ('o' | 'r' | 'a' | 'D' | 'l' | 'T')),
+                        ) => crate::handlers::tracker::issues_key(
+                            c,
+                            &mut crate::handlers::tracker::TrackerCtx {
+                                model: &mut model,
+                                panel_ui: &mut panel_ui,
+                                session: &session,
+                                cfg: keymap.config(),
+                                live_cfg: &current_config,
+                                waker: &waker,
+                                refresh_tx: &refresh_tx,
+                                create_gen: &mut create_gen,
+                                create_tx: &create_tx,
+                                inflight: &mut inflight,
+                                wizard_ui: &mut wizard_ui,
+                                pending_issue_link: &mut pending_issue_link,
+                            },
+                        ),
                         // `y` / `n` approve / reject the cursor row when it is an
                         // approval request (b155 6a); `y`/`n` were free here.
                         (Section::Notifications, KeyCode::Char(c @ ('y' | 'n'))) => {

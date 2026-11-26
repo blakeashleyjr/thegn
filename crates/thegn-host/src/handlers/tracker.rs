@@ -78,8 +78,33 @@ fn cursor_issue(ctx: &TrackerCtx) -> Option<thegn_core::issue::Issue> {
     crate::panel::sections::issues::issue_at_cursor(&ctx.model.panel, ctx.panel_ui).cloned()
 }
 
-/// Enter on the Issues section: toggle the worktree↔issue link for the
-/// cursor row, then re-hydrate so the badge updates.
+/// Enter on the Issues section: open (or close) the detail page of the cursor
+/// issue.
+pub(crate) fn toggle_detail(ctx: &mut TrackerCtx) {
+    if ctx.panel_ui.issues_detail.take().is_some() {
+        ctx.model.status = "Closed issue details".into();
+        return;
+    }
+    if let Some(issue) = cursor_issue(ctx) {
+        ctx.model.status = format!("Details for {} — ↵ closes", issue.number);
+        ctx.panel_ui.issues_detail = Some(issue.id);
+    }
+}
+
+/// `T` on the Issues section: switch the team scope (each team, then all).
+fn cycle_team(ctx: &mut TrackerCtx) {
+    let next = crate::panel::sections::issues::next_team_scope(&ctx.model.panel, ctx.panel_ui);
+    ctx.model.status = if next.is_empty() {
+        "Issues: all teams".into()
+    } else {
+        format!("Issues: team {next}")
+    };
+    ctx.panel_ui.issues_team = Some(next);
+    ctx.panel_ui.cursor = 0;
+}
+
+/// `l` on the Issues section: toggle the worktree↔issue link for the cursor
+/// row, then re-hydrate so the badge updates.
 pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
     let wt = active_tab_path(ctx.session);
     let wt_str = wt.to_string_lossy().to_string();
@@ -235,6 +260,14 @@ pub(crate) fn branch_root(
 /// key was consumed.
 pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
     match key {
+        'l' => {
+            toggle_link(ctx);
+            true
+        }
+        'T' => {
+            cycle_team(ctx);
+            true
+        }
         'o' => {
             if let Some(issue) = cursor_issue(ctx) {
                 ctx.model.status =
