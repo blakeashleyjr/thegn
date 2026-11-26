@@ -128,6 +128,20 @@ completes.
 - **THEN** the global entries run first, then the workspace entries, before
   `git worktree remove`
 
+### Requirement: Remote checkout cleanup is bounded and best-effort
+
+After removing a local worktree registered at a remote or provider location,
+thegn SHALL attempt to remove that checkout remotely with a finite deadline of
+10 seconds. A failed or timed-out remote cleanup MUST warn and leave the local
+worktree removal successful, including when `--force` is used.
+
+#### Scenario: An unreachable remote does not hold up forced removal
+
+- **WHEN** `thegn wt rm <path> --force` removes a worktree whose remote cleanup
+  hangs or fails
+- **THEN** local removal completes after the bounded remote attempt and the
+  cleanup problem is reported as a warning
+
 ### Requirement: Hook failure semantics are per-event with safe defaults
 
 A failing `pre_create` hook SHALL block creation (nothing exists yet). A
