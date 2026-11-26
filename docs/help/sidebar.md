@@ -334,8 +334,19 @@ tree — holding one folder per pipeline, named from the roster's issue id:
     ▾ THE-74 (2)
         tg-the-74
         tg-the-74-review
-    ▸ THE-9 (1)
+      THE-9
+    ▸ Finished (3)
 ```
+
+A lane is named for its issue (or lane name) without a `local:` prefix. A lane
+with a single worktree is one row, not a header plus a repeated child. Lanes
+whose roster rows have all finished (merged, done, failed or abandoned) fold
+into one `Finished (N)` group. After `sidebar_finished_pipeline_days` days
+(default `7`; `0` = never) a finished lane leaves the sidebar; its worktree is
+never deleted — `wt prune` does that. The open worktree's lane always stays.
+Integration and release worktrees (`tg/bNNN-integration`, `tg/bNNN-release`)
+are not pipelines: they sit with the ordinary worktrees. Worktrees filed under
+`Merged` show their age and size, not the last commit subject.
 
 Every worktree the pipeline's roster rows reference hangs inside its lane
 folder. `↵` (or a double-click, or a click on the caret) folds and unfolds a
