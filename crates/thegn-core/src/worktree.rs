@@ -1033,8 +1033,8 @@ pub fn add_checked_with_state(
 /// warm volumes stay. The caller resolves `loc` before the DB row is forgotten
 /// and before local removal; a location read after removal can no longer
 /// refuse anything.
-pub fn purge_worktree_files(loc: &crate::remote::GitLoc) {
-    loc.remove_remote_dir();
+pub fn purge_worktree_files(loc: &crate::remote::GitLoc) -> Result<(), String> {
+    loc.remove_remote_dir()
 }
 
 /// Remove a worktree and optionally delete its branch. Returns whether the

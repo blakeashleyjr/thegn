@@ -1084,7 +1084,11 @@ pub(crate) fn destroy_one_checked(
             delete_branch,
         ) {
             Ok(()) => {
-                thegn_core::worktree::purge_worktree_files(&location);
+                if let Err(error) = thegn_core::worktree::purge_worktree_files(&location) {
+                    thegn_core::msg::warn(&format!(
+                        "local worktree was removed, but remote cleanup did not complete: {error}"
+                    ));
+                }
                 !worktree.exists()
             }
             Err(why) => {

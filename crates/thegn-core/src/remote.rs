@@ -23,6 +23,8 @@ use std::time::Duration;
 
 /// Deadline for typed GitLoc reads, matching the thegn-svc default git read timeout.
 pub const GITLOC_READ_DEADLINE: Duration = Duration::from_secs(60);
+/// Remote checkout cleanup is best-effort and must not hold up a local delete.
+const REMOTE_CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Sequencer files and BISECT_LOG are tiny; cap remote/provider capture so a
 /// hostile or corrupted gitdir cannot stream unbounded data into host memory.
@@ -683,21 +685,21 @@ impl GitLoc {
     /// removed; the shared base image + warm volumes (labelled
     /// `thegn.managed`) are untouched. No-op for a local loc (the caller
     /// removes that itself) or an empty/`~`/`/` path (never `rm -rf /`).
-    pub fn remove_remote_dir(&self) {
+    pub fn remove_remote_dir(&self) -> Result<(), String> {
         let path = self.path();
         let p = path.trim();
         if p.is_empty() || p == "/" || p == "~" {
-            return;
+            return Ok(());
         }
         let script = format!("rm -rf {}", util::sh_quote(p));
-        // best-effort: a lingering remote dir is reclaimable via `host rm-cache`.
-        let _ = match self {
-            GitLoc::Local(_) => return,
-            GitLoc::Remote { ssh, .. } => self.ssh_command(ssh, script).output(),
+        let command = match self {
+            GitLoc::Local(_) => return Ok(()),
+            GitLoc::Remote { ssh, .. } => self.ssh_command(ssh, script),
             GitLoc::Provider { control_prefix, .. } => {
-                self.provider_command(control_prefix, script).output()
+                self.provider_command(control_prefix, script)
             }
         };
+        run_remote_cleanup(command, REMOTE_CLEANUP_DEADLINE)
     }
 
     /// A `Command` running `git -C <path> <args>` — locally, or over ssh.
@@ -1341,6 +1343,20 @@ impl GitLoc {
             }),
             _ => self.git_out(ARGS),
         }
+    }
+}
+
+fn run_remote_cleanup(mut command: Command, deadline: Duration) -> Result<(), String> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let policy = crate::git_run::GitPolicy {
+        deadline,
+        stdout_cap: 1024,
+        stderr_tail: 1024,
+        empty_ok: true,
+    };
+    match crate::git_run::run_command(&mut command, &policy, &cancel) {
+        outcome if outcome.is_success() => Ok(()),
+        outcome => Err(format!("remote worktree cleanup failed: {outcome}")),
     }
 }
 
@@ -2400,7 +2416,7 @@ mod tests {
         // A local loc never sshs anything; the caller purges the local dir.
         let dir = std::env::temp_dir().join(format!("tg-rrd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        GitLoc::Local(dir.clone()).remove_remote_dir();
+        GitLoc::Local(dir.clone()).remove_remote_dir().unwrap();
         assert!(
             dir.exists(),
             "local loc must NOT be removed by remove_remote_dir"
@@ -2414,8 +2430,25 @@ mod tests {
                 ssh: SshTarget::plain("nobody@127.0.0.1".into(), 1, false),
                 path: p.to_string(),
             };
-            loc.remove_remote_dir(); // returns without spawning ssh
+            loc.remove_remote_dir().unwrap(); // returns without spawning ssh
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_remote_cleanup_returns_at_its_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = run_remote_cleanup(command, Duration::from_millis(100))
+            .expect_err("a hung remote cleanup must time out");
+
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cleanup exceeded its bounded deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
