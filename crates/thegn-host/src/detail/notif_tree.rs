@@ -396,7 +396,10 @@ impl NotifTree {
     fn entry_id(&self, e: &Entry) -> Option<String> {
         match e {
             Entry::Group { key, .. } => Some(format!("g:{key}")),
-            Entry::Leaf { idx, .. } => Some(format!("l:{}", self.leaves[*idx].key)),
+            // `idx` may predate a removal (the cursor anchor is taken from the
+            // previous entries after the leaves were already pruned), so an
+            // index past the end is "no anchor", not a panic.
+            Entry::Leaf { idx, .. } => self.leaves.get(*idx).map(|l| format!("l:{}", l.key)),
             Entry::Static(j) => Some(format!("s:{j}")),
             _ => None,
         }
