@@ -6375,10 +6375,19 @@ fn effective_first_ready(
 fn containment_line(containment: thegn_core::sandbox_floor::Containment) -> String {
     use thegn_core::sandbox_floor::Containment;
     match containment {
-        Containment::Uncontained => "  containment   NOT CONTAINED — sandbox is enabled but this host would launch at host-process (no runtime in the chain is ready); install/start podman, docker or bwrap (see the backend table above)".to_string(),
-        Containment::Disabled => "  containment   none — [sandbox] enabled = false: panes run on the host".to_string(),
-        Containment::Contained(class) => format!("  containment   contained at `{}`", class.as_str()),
-        Containment::ProviderManaged => "  containment   provider-managed (unverified by thegn)".to_string(),
+        Containment::Uncontained => format!(
+            "  containment   NOT CONTAINED — sandbox is enabled but this host would launch at host-process (no runtime in the chain is ready); {} (see the backend table above). To run unsandboxed deliberately, choose \"run on host\" in the launch prompt or set `[sandbox] enabled = false` (panes then have no containment)",
+            thegn_core::sandbox_floor::no_backend_fix_here()
+        ),
+        Containment::Disabled => {
+            "  containment   none — [sandbox] enabled = false: panes run on the host".to_string()
+        }
+        Containment::Contained(class) => {
+            format!("  containment   contained at `{}`", class.as_str())
+        }
+        Containment::ProviderManaged => {
+            "  containment   provider-managed (unverified by thegn)".to_string()
+        }
     }
 }
 
@@ -9037,7 +9046,10 @@ args = ["--verbose"]
     fn containment_line_for_each_case() {
         use thegn_core::sandbox_floor::Containment;
         assert!(containment_line(Containment::Disabled).contains("enabled = false"));
-        assert!(containment_line(Containment::Uncontained).contains("NOT CONTAINED"));
+        let uncontained = containment_line(Containment::Uncontained);
+        assert!(uncontained.contains("NOT CONTAINED"));
+        assert!(uncontained.contains("no sandbox backend found"));
+        assert!(uncontained.contains("run on host"));
         assert_eq!(
             containment_line(Containment::Contained(IsolationClass::SharedKernel)),
             "  containment   contained at `shared-kernel`"

@@ -329,12 +329,17 @@ impl std::fmt::Display for SandboxHalt {
                 remedy_text_for(class, &self.env_name, &self.reason)
             )
         } else if self.ask {
-            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()
+            format!(
+                "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which): {}",
+                thegn_core::sandbox_floor::no_backend_fix_here()
+            )
         } else {
-            "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
-             set `isolation_floor = \"off\"`, or choose \"run on host\"), \
-             or install/start a container runtime (`thegn doctor` shows which)"
-                .to_string()
+            format!(
+                "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
+                 set `isolation_floor = \"off\"`, or choose \"run on host\"), \
+                 or install/start a container runtime (`thegn doctor` shows which): {}",
+                thegn_core::sandbox_floor::no_backend_fix_here()
+            )
         };
         write!(
             f,

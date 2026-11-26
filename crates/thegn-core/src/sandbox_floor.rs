@@ -151,6 +151,27 @@ impl Containment {
     }
 }
 
+/// The fix to show when no sandbox backend is usable on this host: names the
+/// missing backend and the install command per backend. Pure so the doctor
+/// row, the launch refusal text and the tests share one wording.
+pub fn no_backend_fix(macos: bool) -> String {
+    if macos {
+        "no sandbox backend found (Apple `container`, podman, docker): install one, e.g. \
+         `brew install podman && podman machine init && podman machine start`, or Apple \
+         `container` (`brew install container && container system start`)"
+            .to_string()
+    } else {
+        "no sandbox backend found (podman, docker, bwrap): install one, e.g. \
+         `sudo apt-get install bubblewrap` or `sudo apt-get install podman`"
+            .to_string()
+    }
+}
+
+/// [`no_backend_fix`] for the OS this binary runs on.
+pub fn no_backend_fix_here() -> String {
+    no_backend_fix(cfg!(target_os = "macos"))
+}
+
 /// Summarize whether the selected class is a genuine boundary.
 pub fn containment_summary(enabled: bool, actual: IsolationClass) -> Containment {
     if !enabled {
@@ -633,6 +654,16 @@ pub fn queue_agent_gate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_backend_fix_names_backends_and_install_commands_per_os() {
+        let mac = no_backend_fix(true);
+        assert!(mac.contains("Apple `container`") && mac.contains("brew install podman"));
+        assert!(mac.contains("podman machine init") && mac.contains("podman machine start"));
+        let linux = no_backend_fix(false);
+        assert!(linux.contains("bwrap") && linux.contains("apt-get install podman"));
+        assert!(!linux.contains("brew"));
+    }
+
     use super::*;
 
     fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
