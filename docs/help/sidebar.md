@@ -344,6 +344,10 @@ whose roster rows have all finished (merged, done, failed or abandoned) fold
 into one `Finished (N)` group. After `sidebar_finished_pipeline_days` days
 (default `7`; `0` = never) a finished lane leaves the sidebar; its worktree is
 never deleted — `wt prune` does that. The open worktree's lane always stays.
+**Clear finished** in the `Finished` row's menu hides every lane finished so
+far in that project at once; a lane that finishes later shows up again. A
+folder you made yourself named `Pipelines` does not become a second Pipelines
+group: pipeline worktrees filed there show in the one `Pipelines` group.
 Integration and release worktrees (`tg/bNNN-integration`, `tg/bNNN-release`)
 are not pipelines: they sit with the ordinary worktrees. Worktrees filed under
 `Merged` show their age and size, not the last commit subject.

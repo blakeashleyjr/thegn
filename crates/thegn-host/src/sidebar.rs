@@ -668,6 +668,11 @@ pub struct ViewState {
     pub freeze: Option<std::sync::Arc<crate::sidebar_freeze::SortFreeze>>,
     /// Batch groups the user opened (`batch_open:{key}` = "1"); absent = collapsed.
     pub batch_open: HashSet<String>,
+    /// "Clear finished" cut-offs, keyed by workspace slug (epoch ms): a
+    /// finished pipeline lane whose last activity is at or before the cut-off
+    /// leaves that workspace's sidebar (its worktree is untouched). Persisted
+    /// as `finished_cleared:{slug}` in `ui_state`.
+    pub finished_cleared: std::collections::HashMap<String, i64>,
     /// The focused cursor row's pin_key at rebuild time; the row limit never folds it.
     /// Loop-owned and transient, never persisted.
     pub cursor_key: Option<String>,
@@ -716,6 +721,16 @@ pub struct DbWorktree {
     /// `[ui] sidebar_external_worktrees`. Computed in
     /// `hydrate::db_worktree_list_with_snapshot`.
     pub external: bool,
+}
+
+/// The label of a workspace's derived pipeline group. A user folder spelled
+/// the same is folded into it rather than shown as a second `Pipelines`.
+pub const PIPELINES_LABEL: &str = "Pipelines";
+
+/// The `pin_key` (and collapse key) of a workspace's `Finished` pipelines
+/// sub-group.
+pub fn finished_group_key(slug: &str) -> String {
+    format!("pipeline/finished:{slug}")
 }
 
 /// The `ViewState::collapsed`-style key of a workspace's derived "Other"
@@ -1148,11 +1163,19 @@ pub fn build_rows(
     pipeline_paths.retain(|path| !crate::sidebar_pipeline::is_integration_path(path));
     // An explicit user folder is an override to the default Pipelines filing.
     // Keep that worktree in its chosen folder while leaving all other rows and
-    // folder state untouched.
-    for worktree in db_worktrees
+    // folder state untouched. A user folder that is itself named `Pipelines`
+    // is not such an override: a roster-owned worktree filed there joins the
+    // one derived Pipelines section instead of a second group of that name.
+    let pipelines_named: std::collections::HashSet<i64> = db_folders
         .iter()
-        .filter(|worktree| worktree.folder_id.is_some())
-    {
+        .filter(|folder| folder.name.trim().eq_ignore_ascii_case(PIPELINES_LABEL))
+        .map(|folder| folder.folder_id)
+        .collect();
+    for worktree in db_worktrees.iter().filter(|worktree| {
+        worktree
+            .folder_id
+            .is_some_and(|id| !pipelines_named.contains(&id))
+    }) {
         pipeline_paths.remove(&crate::sidebar_pipeline::path_identity(&worktree.path));
     }
 
@@ -1278,10 +1301,16 @@ pub fn build_rows(
         // A finished lane ages out of the sidebar after the configured window
         // (`[ui] sidebar_finished_pipeline_days`; `0` = never). Its worktree is
         // untouched; only an explicit `wt prune` removes it. The active
-        // worktree's lane always stays.
+        // worktree's lane always stays. "Clear finished" (the `Finished`
+        // row's menu) hides every lane finished by the time it was run.
+        let cleared = home
+            .as_deref()
+            .and_then(|slug| view.finished_cleared.get(slug))
+            .is_some_and(|&cut| lane.last_ms <= cut);
+        let expired =
+            finished_window_ms > 0 && now_ms.saturating_sub(lane.last_ms) > finished_window_ms;
         let aged_out = lane.finished
-            && finished_window_ms > 0
-            && now_ms.saturating_sub(lane.last_ms) > finished_window_ms
+            && (expired || cleared)
             && !session.active_group().is_some_and(|group| {
                 let active = crate::sidebar_pipeline::path_identity(&group.path);
                 lane.worktrees
@@ -1831,7 +1860,12 @@ fn push_pipeline_group(
         collapsed: group_collapsed,
         visible: !context.parent_collapsed,
         child_count: lanes.len(),
-        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", context.group_slug)
+        ..SidebarRow::base(
+            RowKind::PipelineGroup,
+            1,
+            PIPELINES_LABEL,
+            context.group_slug,
+        )
     });
     // A finished lane (every roster row terminal) moves into one `Finished`
     // sub-group so the live pipelines read first.
@@ -1870,7 +1904,7 @@ fn push_pipeline_group(
         }
     }
     if !finished.is_empty() {
-        let key = format!("pipeline/finished:{}", context.group_slug);
+        let key = finished_group_key(context.group_slug);
         let holds_active = context.active_path.is_some_and(|path| {
             let active = crate::sidebar_pipeline::path_identity(path);
             finished.iter().any(|lane| {
@@ -2528,6 +2562,11 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::PipelineWorktree => {
+                // A one-row lane sits directly under its group (depth 2):
+                // the previous lane folder is not its parent.
+                if rows[i].depth <= 2 {
+                    last_lane = None;
+                }
                 if keep[i] {
                     if let Some(w) = last_workspace {
                         keep[w] = true;
@@ -2606,6 +2645,9 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::PipelineWorktree => {
+                if rows[i].depth <= 2 {
+                    reveal_lane = false; // a one-row lane: no lane folder above it
+                }
                 if reveal_ws || reveal_group || reveal_lane {
                     keep[i] = true;
                 }
@@ -6047,6 +6089,109 @@ mod tests {
                 && row.depth == 2
         }));
         assert!(!rows.iter().any(|row| row.kind == RowKind::PipelineWorktree));
+    }
+
+    #[test]
+    fn a_user_folder_named_pipelines_folds_into_the_one_pipelines_group() {
+        let (session, workspaces, mut db_worktrees, mut folders) = folder_fixture();
+        folders[0].name = "pipelines".into();
+        db_worktrees[0].env_name = Some("pipeline".into());
+        let persisted = vec!["/wt/feat".to_string()];
+        let mut status = lane_status(crate::sidebar_pipeline::lanes_with_persisted_paths(
+            &[],
+            &persisted,
+        ));
+        status.pipeline_worktree_paths = persisted
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path))
+            .collect();
+        let rows = build_rows(
+            &session,
+            &workspaces,
+            &ViewState::default(),
+            &status,
+            &db_worktrees,
+            &folders,
+            &[],
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::PipelineWorktree
+                && row.worktree_path.as_deref() == Some("/wt/feat")
+        }));
+        assert!(!rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/feat")
+        }));
+    }
+
+    #[test]
+    fn clear_finished_hides_lanes_finished_by_then_and_keeps_later_ones() {
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/old", "/wt/old"),
+                tab("app/late", "/wt/late"),
+            ],
+            0,
+        );
+        let mut old = lane("THE-9", &["/wt/old"]);
+        old.finished = true;
+        old.last_ms = 100;
+        let mut late = lane("THE-10", &["/wt/late"]);
+        late.finished = true;
+        late.last_ms = 300;
+        let mut view = ViewState::default();
+        view.finished_cleared.insert("app".into(), 200);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![lane("THE-74", &["/wt/home"]), old, late]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!rows.iter().any(|r| r.label == "THE-9"), "cleared");
+        let finished = rows
+            .iter()
+            .find(|r| r.pin_key == finished_group_key("app"))
+            .expect("the later lane keeps the Finished group");
+        assert_eq!(finished.child_count, 1);
+        assert!(rows.iter().any(|r| r.label == "THE-10"));
+        assert!(
+            rows.iter().any(|r| r.label == "THE-74"),
+            "live lanes never clear"
+        );
+    }
+
+    #[test]
+    fn a_matched_lane_does_not_reveal_the_one_row_lane_after_it() {
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/a", "/wt/a"),
+                tab("app/b", "/wt/b"),
+            ],
+            0,
+        );
+        let mut view = ViewState::default();
+        view.filter = "THE-74".into();
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![
+                lane("THE-74", &["/wt/home", "/wt/a"]),
+                lane("ZZZ-1", &["/wt/b"]),
+            ]),
+            &[],
+            &[],
+            &[],
+        );
+        let single = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree && r.label == "ZZZ-1")
+            .expect("the one-row lane is emitted");
+        assert!(!single.visible, "THE-74's match must not leak into ZZZ-1");
     }
 
     #[test]
