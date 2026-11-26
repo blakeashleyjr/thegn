@@ -196,6 +196,7 @@ mod tests {
             help: crate::panel::HelpPanelState {
                 page: "git-and-diffs".to_string(),
                 reg: Some(Arc::clone(&reg)),
+                ..Default::default()
             },
             scroll: 6,
             ..Default::default()

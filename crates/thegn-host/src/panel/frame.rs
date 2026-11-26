@@ -664,12 +664,22 @@ pub fn build_panel(
             left.push(sp(1));
         }
         left.push(label);
-        let mut srow = PanelRow::plain(Line::split(left, {
+        let right = if section == crate::panel::Section::Help {
+            let (text, tok) = if ui.help.searching {
+                (format!("/ {}_", ui.help.query), Tok::Slot(S::Accent))
+            } else if ui.help.query.is_empty() {
+                ("/ Search help".to_string(), Tok::Slot(S::Ghost))
+            } else {
+                (format!("/ {}", ui.help.query), Tok::Slot(S::Text))
+            };
+            vec![seg(tok, text), sp(1)]
+        } else {
             let mut r = sections::summary(section, model);
             r.push(sp(1));
             r
-        }))
-        .with_hit(PanelHit::OpenSection(section));
+        };
+        let mut srow =
+            PanelRow::plain(Line::split(left, right)).with_hit(PanelHit::OpenSection(section));
         if on {
             srow = srow.with_bg(Tok::Slot(S::Bg1));
         }
@@ -1053,6 +1063,47 @@ mod tests {
             git_secs.len()
         );
         assert!(frame.rows.len() <= 50);
+    }
+
+    #[test]
+    fn help_section_header_shows_right_aligned_search_field() {
+        let model = FrameModel::default();
+        let ui = PanelUi {
+            open: crate::panel::Section::Help,
+            tab: PanelTab::Help,
+            ..Default::default()
+        };
+        let frame = build_panel(&model, &ui, 80, 24, true);
+        let row = frame
+            .rows
+            .iter()
+            .find(|row| row.hit == Some(PanelHit::OpenSection(crate::panel::Section::Help)))
+            .expect("Help section header");
+        let (Line::Split { r, .. } | Line::SplitMinLeft { r, .. }) = &row.line else {
+            panic!("Help header should reserve the right side for search");
+        };
+        let right = r.iter().map(|seg| seg.text.as_str()).collect::<String>();
+        assert!(right.contains("/ Search help"), "{right}");
+
+        let ui = PanelUi {
+            help: crate::panel::HelpPanelState {
+                query: "keyboard".into(),
+                searching: true,
+                ..Default::default()
+            },
+            ..ui
+        };
+        let frame = build_panel(&model, &ui, 80, 24, true);
+        let row = frame
+            .rows
+            .iter()
+            .find(|row| row.hit == Some(PanelHit::OpenSection(crate::panel::Section::Help)))
+            .expect("Help section header");
+        let (Line::Split { r, .. } | Line::SplitMinLeft { r, .. }) = &row.line else {
+            panic!("Help header should reserve the right side for search");
+        };
+        let right = r.iter().map(|seg| seg.text.as_str()).collect::<String>();
+        assert!(right.contains("/ keyboard_"), "{right}");
     }
 
     #[test]

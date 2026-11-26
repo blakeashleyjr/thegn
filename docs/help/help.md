@@ -24,6 +24,10 @@ Everything here ships inside the binary — no network, no external docs.
   with copying as fallback.
 - `/` searches every page. Titles match fuzzily, bodies by substring;
   `↵` jumps to the matching section. Long contents show overflow markers.
+- In the docked Help panel, the header's right-side search field uses the same
+  search across every page. Press `/` to focus it, type to filter results,
+  use `↑`/`↓` to choose one, and press `↵` to open its page at the match.
+  Press `Esc` to close the search.
 - `Esc`, `q`, `F1`, Ctrl-C, or your rebound `[keybinds] help` key closes.
 
 ## Where the content comes from

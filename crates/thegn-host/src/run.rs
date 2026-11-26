@@ -23476,6 +23476,116 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // The docked Help search owns unmodified keys while focused.
+                // `/` opens the visible header field; Enter opens the selected
+                // page and its matched section in this panel.
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && panel_ui.open == crate::panel::Section::Help
+                    && panel_ui.tab == crate::panel::PanelTab::Help
+                {
+                    if panel_ui.help.searching {
+                        match (&k.key, k.modifiers) {
+                            (KeyCode::Escape, _) => {
+                                panel_ui.help.searching = false;
+                                panel_ui.help.query.clear();
+                                panel_ui.help.hits.clear();
+                                panel_ui.help.selected = 0;
+                            }
+                            (KeyCode::Backspace, _) => {
+                                panel_ui.help.query.pop();
+                                panel_ui.help.hits =
+                                    panel_ui.help.reg.as_ref().map_or_else(Vec::new, |reg| {
+                                        thegn_core::help::search(
+                                            reg.pages(),
+                                            &panel_ui.help.query,
+                                            &crate::fff_backend::fuzzy_rank,
+                                        )
+                                    });
+                                panel_ui.help.selected = 0;
+                            }
+                            (KeyCode::UpArrow, _) => {
+                                panel_ui.help.selected = panel_ui.help.selected.saturating_sub(1);
+                            }
+                            (KeyCode::DownArrow, _) => {
+                                panel_ui.help.selected = panel_ui
+                                    .help
+                                    .selected
+                                    .saturating_add(1)
+                                    .min(panel_ui.help.hits.len().saturating_sub(1));
+                            }
+                            (KeyCode::Enter, _) => {
+                                if let Some(hit) =
+                                    panel_ui.help.hits.get(panel_ui.help.selected).cloned()
+                                {
+                                    panel_ui.help.page = hit.page;
+                                    panel_ui.help.searching = false;
+                                    panel_ui.help.query.clear();
+                                    panel_ui.help.hits.clear();
+                                    panel_ui.help.selected = 0;
+                                    panel_ui.scroll = 0;
+                                    // Land on the matched section's heading,
+                                    // rendered at the docked panel's width.
+                                    if let Some(section) = hit.snippet.and_then(|sn| sn.section)
+                                        && let Some(reg) = panel_ui.help.reg.as_ref()
+                                    {
+                                        let indent =
+                                            if panel_ui.width == crate::layout::PanelWidth::Full {
+                                                2
+                                            } else {
+                                                3
+                                            };
+                                        let width = panel_geom(&chrome, &model)
+                                            .0
+                                            .saturating_sub(indent)
+                                            .saturating_sub(1)
+                                            .max(8);
+                                        let blocks = crate::help::render::page_blocks(
+                                            reg,
+                                            &panel_ui.help.page,
+                                        );
+                                        let rendered =
+                                            crate::help::render::render_page(&blocks, width, None);
+                                        if let Some((line, _)) = rendered
+                                            .headings
+                                            .iter()
+                                            .find(|(_, heading)| *heading == section)
+                                        {
+                                            panel_ui.scroll = *line;
+                                        }
+                                    }
+                                } else {
+                                    panel_ui.help.searching = false;
+                                    panel_ui.help.query.clear();
+                                }
+                            }
+                            (KeyCode::Char(c), m)
+                                if !m.intersects(Modifiers::CTRL | Modifiers::ALT) =>
+                            {
+                                panel_ui.help.query.push(*c);
+                                panel_ui.help.hits =
+                                    panel_ui.help.reg.as_ref().map_or_else(Vec::new, |reg| {
+                                        thegn_core::help::search(
+                                            reg.pages(),
+                                            &panel_ui.help.query,
+                                            &crate::fff_backend::fuzzy_rank,
+                                        )
+                                    });
+                                panel_ui.help.selected = 0;
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    } else if k.modifiers.is_empty() && k.key == KeyCode::Char('/') {
+                        panel_ui.help.searching = true;
+                        panel_ui.help.query.clear();
+                        panel_ui.help.hits.clear();
+                        panel_ui.help.selected = 0;
+                        dirty = true;
+                        continue;
+                    }
+                }
                 if forced_palette_action.is_none()
                     && focus.panel()
                     && k.modifiers == Modifiers::SHIFT

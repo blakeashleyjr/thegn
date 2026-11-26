@@ -1630,6 +1630,7 @@ mod spec {
                 reg: Some(std::sync::Arc::new(crate::help::pages::registry_logged(
                     &thegn_core::config::Config::default(),
                 ))),
+                ..Default::default()
             },
             ..Default::default()
         }

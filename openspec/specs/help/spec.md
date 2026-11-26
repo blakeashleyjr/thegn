@@ -28,3 +28,16 @@ Every bindable action id SHALL be claimed by some non-generated page's `actions:
 
 - **WHEN** a page claims an id its body never mentions
 - **THEN** the prose ratchet fails
+
+### Requirement: Docked Help exposes corpus search
+
+The docked Help section SHALL show a right-aligned search field in its header.
+Keyboard focus with `/` SHALL search all registered help pages using the same
+search engine and ranker as the F1 overlay. The user SHALL be able to move
+through matches and open a result in the docked panel at its matched section.
+
+#### Scenario: Search from the docked panel
+
+- **WHEN** the Help section has focus and the user presses `/`
+- **THEN** the header field accepts a query, displays matching pages, and Enter
+  opens the selected match in the docked Help panel
