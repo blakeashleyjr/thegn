@@ -84,6 +84,33 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 "placement",
                 format!("{}{mode}", e.placement.as_str()),
             );
+            if is_provider {
+                push_detail(&mut detail, "provider", kind.clone());
+            }
+            let health = match (is_provider, token) {
+                (true, Some(false)) => "needs a token before it can start sandboxes".to_string(),
+                (true, _) => "token present".to_string(),
+                (false, _) => "no live check for this placement".to_string(),
+            };
+            push_detail(&mut detail, "health", health);
+            push_detail(
+                &mut detail,
+                "last check",
+                if is_provider {
+                    "not recorded · press t to test the token".to_string()
+                } else {
+                    "not applicable".to_string()
+                },
+            );
+            push_detail(
+                &mut detail,
+                "used for",
+                if bound == Some(name.as_str()) {
+                    "this worktree and its jobs".to_string()
+                } else {
+                    "not bound to this worktree · enter to use it here".to_string()
+                },
+            );
             push_detail(&mut detail, "host", e.host.clone());
             let target = match e.placement {
                 PlacementMode::Ssh => {
@@ -143,7 +170,7 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 "failover",
                 e.failover
                     .map(|value| value.as_str().to_string())
-                    .unwrap_or_else(|| "inherit".to_string()),
+                    .unwrap_or_else(|| "inherit · follows the default failover".to_string()),
             );
             let key = effective_token_env(&e.provider);
             if is_provider && !key.is_empty() {
@@ -151,7 +178,7 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                     &mut detail,
                     "token",
                     format!(
-                        "{key} {}",
+                        "{} · {key}",
                         if token == Some(true) {
                             "present"
                         } else {
@@ -189,9 +216,6 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                         ),
                     );
                 }
-            }
-            if bound == Some(name.as_str()) {
-                push_detail(&mut detail, "bound", "this worktree".to_string());
             }
             EnvSnapshot {
                 name: name.clone(),
@@ -873,7 +897,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             token.1.as_str(),
-            "THEGN_ENV_DETAIL_TEST_TOKEN_810 missing" | "THEGN_ENV_DETAIL_TEST_TOKEN_810 present"
+            "missing · THEGN_ENV_DETAIL_TEST_TOKEN_810"
+                | "present · THEGN_ENV_DETAIL_TEST_TOKEN_810"
         ));
         assert!(
             !ssh.detail
@@ -882,6 +907,49 @@ mod tests {
         );
         let local = snapshots.iter().find(|env| env.name == "local").unwrap();
         assert!(!local.detail.iter().any(|(label, _)| label == "target"));
+    }
+
+    #[test]
+    fn env_snapshot_detail_expands_provider_health_usage_and_failover() {
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "sp".into(),
+            provider_env("sprites", "THEGN_ENV_DETAIL_TEST_TOKEN_2747", ""),
+        );
+        cfg.env.insert("local".into(), Default::default());
+
+        let snapshots = env_snapshots(&cfg, Some("sp"));
+        let value = |env: &EnvSnapshot, label: &str| {
+            env.detail
+                .iter()
+                .find(|(key, _)| key == label)
+                .map(|(_, value)| value.clone())
+        };
+        let sp = snapshots.iter().find(|env| env.name == "sp").unwrap();
+        assert_eq!(value(sp, "provider").as_deref(), Some("sprites"));
+        assert!(matches!(
+            value(sp, "health").as_deref(),
+            Some("token present" | "needs a token before it can start sandboxes")
+        ));
+        assert!(value(sp, "last check").is_some_and(|v| v.contains("press t")));
+        assert_eq!(
+            value(sp, "used for").as_deref(),
+            Some("this worktree and its jobs")
+        );
+        assert!(value(sp, "failover").is_some_and(|v| v.starts_with("inherit · ")));
+        assert!(value(sp, "credentials").is_some());
+        assert!(
+            value(sp, "bound").is_none(),
+            "bound is folded into used for"
+        );
+
+        let local = snapshots.iter().find(|env| env.name == "local").unwrap();
+        assert!(value(local, "provider").is_none());
+        assert_eq!(
+            value(local, "health").as_deref(),
+            Some("no live check for this placement")
+        );
+        assert!(value(local, "used for").is_some_and(|v| v.starts_with("not bound")));
     }
 
     #[test]
