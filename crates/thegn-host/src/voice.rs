@@ -889,7 +889,10 @@ fn native_session(
             Event::Failed(_) => {}
             Event::Captured(encoded) => {
                 use base64::Engine;
-                if cfg.kind != thegn_core::config::VoiceKind::Command {
+                if !matches!(
+                    cfg.kind,
+                    thegn_core::config::VoiceKind::Command | thegn_core::config::VoiceKind::Hex
+                ) {
                     result = Err("unexpected capture from transcription worker".into());
                 } else {
                     match base64::engine::general_purpose::STANDARD.decode(encoded) {

@@ -68,6 +68,10 @@ cancellation and response sizes, surface failures, and never silently fall back.
 Setup SHALL disclose repeated audio billing for live requests and offer final-only.
 Existing argv WAV-in/text-out command adapters SHALL remain final-only and accept
 external or native capture.
+The Hex preset SHALL invoke `hex transcribe <temporary WAV>` through the bounded
+command adapter, remove the temporary recording after transcription, and report
+when the `hex` executable is unavailable with installation guidance. Whisper
+SHALL remain the default provider.
 
 #### Scenario: HTTP live and final-only
 

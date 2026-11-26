@@ -14,6 +14,7 @@ config_enum! {
         Command = "command",
         Embedded = "embedded",
         Http = "http",
+        Hex = "hex",
     } default = Command;
 }
 
@@ -187,6 +188,13 @@ max_seconds = 17
                 to: "OpenCode".into(),
             }]
         );
+    }
+
+    #[test]
+    fn hex_provider_kind_round_trips() {
+        let cfg: VoiceConfig = toml::from_str("kind = \"hex\"").unwrap();
+        assert_eq!(cfg.kind, VoiceKind::Hex);
+        assert!(toml::to_string(&cfg).unwrap().contains("kind = \"hex\""));
     }
 
     #[test]
