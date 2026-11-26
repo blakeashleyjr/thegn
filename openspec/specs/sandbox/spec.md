@@ -1171,6 +1171,9 @@ thegn SHALL default the machine0 (and provider-over-ssh) interactive pane
 transport to **mosh** (`[env.<name>.provider] transport`, default `mosh`),
 emitting `mosh --ssh="<ssh opts>" <user>@<ip>` when a local mosh client and the
 VM's `mosh-server` are both present, and falling back to plain ssh otherwise.
+When mosh reports that the remote `mosh-server` is missing, the pane SHALL show
+the captured diagnostic, a one-line notice that explains how to fix it, and
+continue over ssh. A failed mosh attach SHALL show a one-line fallback notice.
 The control plane MUST remain ssh (mosh cannot pipe non-interactive commands).
 
 #### Scenario: A pane uses mosh when available, ssh otherwise
@@ -1178,6 +1181,14 @@ The control plane MUST remain ssh (mosh cannot pipe non-interactive commands).
 - **WHEN** a machine0 pane opens with the default `transport = "mosh"`
 - **THEN** it attaches over mosh if the VM has `mosh-server` (and the host has
   `mosh`), otherwise it transparently falls back to ssh — never failing the pane
+- **AND** when mosh reports a missing remote server, the notice tells the user
+  to install mosh on the remote host before the ssh fallback
+
+#### Scenario: Failed startup status skips SSH login banners
+
+- **WHEN** a pane repeatedly exits after an SSH login banner and mosh diagnostic
+- **THEN** its last-error status skips banner and fallback-notice lines and shows
+  the last actual diagnostic line
 
 ### Requirement: Tailnet host discovery is a provider seam
 

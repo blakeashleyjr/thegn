@@ -98,8 +98,20 @@ pub(crate) fn prep_leaf_for_respawn(
 pub(crate) fn crash_reason(tail: &str) -> Option<String> {
     tail.lines()
         .rev()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| {
+            let line = l.trim();
+            !line.is_empty() && !is_login_banner_or_notice(line)
+        })
         .map(|l| l.trim().chars().take(200).collect())
+}
+
+fn is_login_banner_or_notice(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("last login:")
+        || lower.starts_with("welcome to ")
+        || lower.starts_with("mosh-server is missing on the remote host;")
+        || lower.starts_with("mosh failed; falling back to ssh.")
+        || lower.starts_with("mosh previously failed for this host;")
 }
 
 /// Inbox text for a failed non-agent pane. When the exiting program is only a
@@ -201,6 +213,17 @@ mod tests {
         assert_eq!(
             crash_reason(tail).as_deref(),
             Some("Error: crun: readlink: No such file or directory")
+        );
+    }
+
+    #[test]
+    fn reason_skips_ssh_login_banner_and_mosh_fallback_notice() {
+        let tail = "mosh-server: command not found\n\
+            mosh-server is missing on the remote host; install mosh there. Falling back to ssh.\n\
+            Last login: Tue Nov 25 08:00:00 2026 from 192.0.2.1\n";
+        assert_eq!(
+            crash_reason(tail).as_deref(),
+            Some("mosh-server: command not found")
         );
     }
 
