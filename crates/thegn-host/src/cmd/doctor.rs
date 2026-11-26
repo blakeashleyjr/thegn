@@ -3986,6 +3986,13 @@ pub fn run(
     outln!("  native build  {}", voice["native_compiled"]);
     outln!("  live preview  {}", voice["live_preview"]);
     outln!("  credential    {}", voice["credential_configured"]);
+    outln!(
+        "  ready         {}",
+        match voice["next_step"].as_str() {
+            None => "yes (Alt v); microphone access is checked on first use".to_string(),
+            Some(step) => format!("no - {step}"),
+        }
+    );
     let gate_quarantines = crate::integrate::gate_quarantines();
     if gate_quarantines.is_empty() {
         outln!("Merge gate workspaces: none quarantined");

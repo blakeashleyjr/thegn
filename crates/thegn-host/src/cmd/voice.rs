@@ -58,6 +58,58 @@ pub enum ModelAction {
     },
 }
 
+/// Inputs to [`readiness`], separated from the process so every branch is testable.
+struct Facts<'a> {
+    channel_allowed: bool,
+    native_compiled: bool,
+    model_present: bool,
+    model_error: Option<&'a str>,
+}
+
+/// One-line verdict: `None` when dictation can start, else the next step a user
+/// should take. Never opens the microphone, so it cannot prove device access.
+fn readiness(cfg: &VoiceConfig, facts: &Facts) -> Option<String> {
+    if !facts.channel_allowed {
+        return Some(
+            "voice is experimental and off on the stable channel; relaunch with THEGN_CHANNEL=dev"
+                .into(),
+        );
+    }
+    if !cfg.enabled {
+        return Some("voice is disabled; run `thegn voice setup`".into());
+    }
+    let native_capture = cfg.capture_command.is_empty() || cfg.kind == VoiceKind::Embedded;
+    if native_capture && !facts.native_compiled {
+        return Some(
+            "this build has no native capture; use a voice-native/voice-metal build or set [voice] capture_command"
+                .into(),
+        );
+    }
+    match cfg.kind {
+        VoiceKind::Embedded => {
+            if let Some(error) = facts.model_error {
+                return Some(format!(
+                    "model unresolved ({error}); run `thegn voice setup`"
+                ));
+            }
+            if !facts.model_present {
+                return Some(format!(
+                    "model `{}` is not installed; run `thegn voice model pull {}`",
+                    cfg.model, cfg.model
+                ));
+            }
+        }
+        VoiceKind::Http if cfg.endpoint.is_empty() => {
+            return Some("no endpoint; run `thegn voice setup --kind http --endpoint URL`".into());
+        }
+        VoiceKind::Command if cfg.command.is_empty() => {
+            return Some("no [voice] command configured for kind = \"command\"".into());
+        }
+        _ => {}
+    }
+    None
+}
+
 pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
     let (path, model_error) = if cfg.kind == VoiceKind::Embedded {
         match models::resolve(cfg) {
@@ -68,14 +120,28 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
         (None, None)
     };
     let native_capture = cfg.capture_command.is_empty() || cfg.kind == VoiceKind::Embedded;
+    let model_present = path.as_ref().is_some_and(|p| p.is_file());
+    let channel_allowed = crate::channel_state::allows(thegn_core::channel::Feature::Voice);
+    let next_step = readiness(
+        cfg,
+        &Facts {
+            channel_allowed,
+            native_compiled: cfg!(feature = "voice-native"),
+            model_present,
+            model_error: model_error.as_deref(),
+        },
+    );
     serde_json::json!({
+        "channel_allowed": channel_allowed,
+        "ready": next_step.is_none(),
+        "next_step": next_step,
         "enabled": cfg.enabled, "kind": cfg.kind.as_str(), "language": cfg.language,
         "model": cfg.model, "model_path": path.as_ref().map(|p|p.display().to_string()),
         "model_error": model_error,
         "model_present": path.is_some_and(|p|p.is_file()), "native_compiled": cfg!(feature="voice-native"),
         "metal_compiled": cfg!(feature="voice-metal"), "live_preview": cfg.live_preview && cfg.kind != VoiceKind::Command && native_capture && cfg!(feature="voice-native"),
         "credential_configured": cfg.credential.is_some(), "timeout_seconds": cfg.request_timeout().as_secs(),
-        "setup": "thegn voice setup; experimental channel required; model presence does not prove microphone/inference readiness"
+        "setup": "thegn voice setup; experimental channel required; ready means configuration is complete, not that the microphone works (macOS: allow Microphone for your terminal)"
     })
 }
 
@@ -127,6 +193,13 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                     cfg.voice.model,
                     report["native_compiled"],
                     report["live_preview"]
+                );
+                outln!(
+                    "Ready: {}",
+                    match report["next_step"].as_str() {
+                        None => "yes (press Alt v in a pane)".to_string(),
+                        Some(step) => format!("no - {step}"),
+                    }
                 );
                 outln!("{}", report["setup"].as_str().unwrap_or_default());
             }
@@ -345,11 +418,74 @@ mod tests {
             "credential_configured",
             "timeout_seconds",
             "setup",
+            "ready",
+            "next_step",
+            "channel_allowed",
         ] {
             assert!(report.get(key).is_some(), "missing status key {key}");
         }
         assert_eq!(report["enabled"], false);
         assert_eq!(report["kind"], "command");
+        assert_eq!(report["ready"], false);
+        assert!(report["next_step"].is_string());
+    }
+
+    fn facts(channel_allowed: bool, native: bool, model: bool) -> Facts<'static> {
+        Facts {
+            channel_allowed,
+            native_compiled: native,
+            model_present: model,
+            model_error: None,
+        }
+    }
+
+    #[test]
+    fn readiness_names_the_next_step_in_order() {
+        let mut cfg = VoiceConfig {
+            kind: VoiceKind::Embedded,
+            ..VoiceConfig::default()
+        };
+        let stable = readiness(&cfg, &facts(false, true, true)).unwrap();
+        assert!(stable.contains("THEGN_CHANNEL=dev"));
+        assert!(
+            readiness(&cfg, &facts(true, true, true))
+                .unwrap()
+                .contains("thegn voice setup")
+        );
+        cfg.enabled = true;
+        assert!(
+            readiness(&cfg, &facts(true, false, true))
+                .unwrap()
+                .contains("no native capture")
+        );
+        let pull = readiness(&cfg, &facts(true, true, false)).unwrap();
+        assert!(pull.contains(&format!("voice model pull {}", cfg.model)));
+        assert_eq!(readiness(&cfg, &facts(true, true, true)), None);
+    }
+
+    #[test]
+    fn readiness_checks_http_and_command_requirements() {
+        let mut cfg = VoiceConfig {
+            enabled: true,
+            kind: VoiceKind::Http,
+            ..VoiceConfig::default()
+        };
+        cfg.endpoint.clear();
+        assert!(
+            readiness(&cfg, &facts(true, true, false))
+                .unwrap()
+                .contains("no endpoint")
+        );
+        cfg.endpoint = "http://127.0.0.1:8000/v1/audio/transcriptions".into();
+        assert_eq!(readiness(&cfg, &facts(true, true, false)), None);
+        cfg.kind = VoiceKind::Command;
+        cfg.command.clear();
+        cfg.capture_command = vec!["rec".into()];
+        assert!(
+            readiness(&cfg, &facts(true, false, false))
+                .unwrap()
+                .contains("no [voice] command")
+        );
     }
 
     #[test]

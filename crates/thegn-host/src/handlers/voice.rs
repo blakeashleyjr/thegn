@@ -32,6 +32,19 @@ fn paste_held(
     }
 }
 
+/// Why Alt v does nothing, or `None` when voice may start. The channel check
+/// comes first: on stable the config clamp forces `enabled` off, so telling the
+/// user to run setup would loop them forever.
+fn disabled_note(enabled: bool, channel_allowed: bool) -> Option<&'static str> {
+    if !channel_allowed {
+        Some("Voice is experimental: relaunch with THEGN_CHANNEL=dev to use it")
+    } else if !enabled {
+        Some("Voice is off; run `thegn voice setup` in a shell")
+    } else {
+        None
+    }
+}
+
 /// Toggle capture for the currently focused pane. Returns the status line to
 /// show immediately; the actual command starts only through a reducer effect.
 pub(crate) fn toggle(
@@ -57,8 +70,11 @@ pub(crate) fn toggle(
             crate::run::paste_text_into_pane(pane, text).map_err(|error| error.to_string())
         });
     }
-    if !voice.config().enabled {
-        return "Voice is off; run thegn voice setup (experimental channel required)".into();
+    if let Some(note) = disabled_note(
+        voice.config().enabled,
+        crate::channel_state::allows(thegn_core::channel::Feature::Voice),
+    ) {
+        return note.into();
     }
     if !pane_live || pane_id == 0 {
         return "Voice needs a live focused pane".into();
@@ -352,6 +368,15 @@ mod tests {
     use super::*;
     use crate::platform::sound_process::test_support::{UNIX, test_waker};
     use thegn_core::config::VoiceConfig;
+
+    #[test]
+    fn stable_channel_points_at_the_channel_not_setup() {
+        let channel = "THEGN_CHANNEL=dev";
+        assert!(disabled_note(false, false).unwrap().contains(channel));
+        assert!(disabled_note(true, false).unwrap().contains(channel));
+        assert!(disabled_note(false, true).unwrap().contains("voice setup"));
+        assert_eq!(disabled_note(true, true), None);
+    }
 
     fn voice() -> VoiceController {
         VoiceController::new(VoiceConfig {
