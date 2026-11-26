@@ -1222,7 +1222,9 @@ impl PrivateDir {
             // name with ENOENT (macOS: two threads creating one lock or log
             // file). The parent stays open and the name is a single
             // component, so ENOENT here is transient; retry it a few times.
-            let mut enoent_retries = 0;
+            // Sleep rather than yield: on a loaded host the racing creator can
+            // be preempted mid-create for longer than a handful of yields.
+            let mut enoent_retries: u64 = 0;
             let fd = loop {
                 match openat(
                     &self.fd,
@@ -1232,7 +1234,7 @@ impl PrivateDir {
                 ) {
                     Err(nix::errno::Errno::ENOENT) if enoent_retries < 8 => {
                         enoent_retries += 1;
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_millis(enoent_retries));
                     }
                     other => break other,
                 }
