@@ -1533,6 +1533,61 @@ fn rebuild_reanchors_focused_cursor_by_identity_across_a_resort() {
     assert_eq!(sb.cursor, visible_index_of_active(&model));
 }
 
+#[test]
+fn home_and_up_reach_a_removed_projects_fallback_header() {
+    // Startup after removing the current project reconstructs a transient
+    // workspace entry from the live session. THE-2378's fixture includes the
+    // recovered root from ef25cedd90, so this exercises keyboard navigation
+    // with the same top fallback row that the user reported.
+    let session = Session {
+        id: "/tmp/removed-app".into(),
+        worktrees: vec![WorktreeGroup::new(
+            "removed-app/home",
+            GroupKind::Home,
+            "/tmp/removed-app",
+        )],
+        active: 0,
+    };
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.tombstone_workspace("/tmp/removed-app").unwrap();
+    assert!(db.workspaces().unwrap().is_empty());
+    let mut model = build_initial_model(&session, Some(&db));
+    // The startup workspace list must keep this tombstoned project transient
+    // while carrying the root recovered by ef25cedd90.
+    assert!(db.workspace_tombstoned("/tmp/removed-app").unwrap());
+    assert_eq!(model.sidebar_workspaces.len(), 1);
+    assert_eq!(model.sidebar_workspaces[0].3, "/tmp/removed-app");
+    let mut sb = focused_state(&mut model, &session);
+    let fallback = model
+        .sidebar_rows
+        .iter()
+        .find(|row| row.kind == crate::sidebar::RowKind::Workspace)
+        .expect("startup fallback workspace row is present");
+    assert_eq!(fallback.pin_key, "removed-app");
+    assert_eq!(fallback.worktree_path.as_deref(), Some("/tmp/removed-app"));
+    assert_eq!(
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|row| row.visible)
+            .position(|row| row.pin_key == "removed-app"),
+        Some(0),
+        "the fallback is the first visible row"
+    );
+
+    sb.handle_key(&KeyCode::Home, Modifiers::NONE, &mut model, &session);
+    assert_eq!(sb.cursor, 0, "Home lands on the fallback project row");
+    assert_eq!(sb.selected_row(&model).unwrap().pin_key, "removed-app");
+
+    // From the active home worktree immediately below its project header,
+    // Up must visit that header rather than skipping over it.
+    sb.cursor = 1;
+    sb.sync(&mut model);
+    sb.handle_key(&KeyCode::UpArrow, Modifiers::NONE, &mut model, &session);
+    assert_eq!(sb.cursor, 0, "Up lands on the fallback project row");
+    assert_eq!(sb.selected_row(&model).unwrap().pin_key, "removed-app");
+}
+
 /// The freeze arms on the focus edge and is held by focus, and `rebuild`'s lazy
 /// expiry drops it once focus is gone — the no-timer contract. This is the
 /// mechanism the loop wires at the `sidebar_focus_gained` edge; the loop body
