@@ -1259,6 +1259,9 @@ mod tests {
 
         let roots = untrusted_roots_for(&repo.join("doc.pdf")).unwrap();
 
+        // The common dir is resolved through the symlink; a macOS temp root is
+        // itself a symlink into `/private`, so compare canonical spellings.
+        let git_dir = std::fs::canonicalize(&git_dir).unwrap();
         assert!(roots.iter().any(|root| root == &git_dir));
     }
 
