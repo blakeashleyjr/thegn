@@ -195,14 +195,14 @@ const FORWARD: &[SectionKey] = &[
     k('x', "x", "remove"),
 ];
 const HOSTS: &[SectionKey] = &[
-    k('n', "n", "new"),
-    k('p', "p", "provision"),
-    k('r', "r", "probe"),
-    k('m', "m", "menu"),
-    k('c', "c", "grant"),
+    k('n', "n", "add host"),
+    k('p', "p", "provision now"),
+    k('r', "r", "re-probe"),
+    k('m', "m", "more"),
+    k('c', "c", "allow runtime install"),
     // `x` forgets the cached host state (confirmed) — actual host REMOVAL
     // lives behind `m`; labelling this "remove" made users expect deletion.
-    danger('x', "x", "forget cache"),
+    danger('x', "x", "forget cached state"),
 ];
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),

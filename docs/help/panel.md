@@ -563,8 +563,15 @@ while `l` still opens their logs. Actions on owned containers ask first.
 `g` scopes the full table too; Half-width `g` rows are selectable.
 When sandboxing is off, a one-line banner says so. See [[sandboxing]]. **hosts** manages `[host.*]`
 machines: `n` adds one, `p` provisions, `r` re-probes, `m` opens the
-action menu (which holds removal), `c` grants install consent, `x`
-forgets cached state. **environments** lists `[env.*]`: `↵` (re)binds the
+action menu (which holds removal), `c` allows thegn to install a container
+runtime, `x` forgets cached state. The selected host expands to show its
+address (and jump host), OS, architecture and runtime once probed, whether
+it was reached and when it was last probed, its provisioning state with a
+one-line reason and the next key to press, what uses it (envs bound with
+`host = "<name>"` and the `[jobs]` runner), its base image, and install
+consent in plain words. Consent `never (config)` means `install_runtime =
+"never"` is set, so thegn will not install a runtime; `c` overrides it for
+that host. See also `thegn host status`. **environments** lists `[env.*]`: `↵` (re)binds the
 env to this worktree. If placement changes, it asks first; new panes move
 to the new placement while running panes stay where they are. A same-placement
 bind is immediate. `t` tests provider env tokens only, `n` adds, `x` removes

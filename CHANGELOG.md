@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The panel's Hosts section expands the selected host: address and jump host, OS and runtime once
+  probed, last probe, provisioning state with a reason and next action, what uses it, and plain-words
+  install consent. Action labels are clearer.
+
 ## [0.1.0-alpha.137] — 2026-11-25
 
 Remote environments report their health, Sprite and Vercel jobs survive dropped

@@ -62,9 +62,62 @@ pub struct HostSnapshot {
     /// declared in `config.toml` — only these can be removed from the UI
     /// (declarative config hosts are edited in the file). Set by hydration.
     pub is_db_def: bool,
+    /// `ssh -J` bastion for an ssh host; `""` when none.
+    pub jump: String,
+    /// `[env.*]` names bound to this host (config order).
+    pub envs: Vec<String>,
+    /// This host backs the `[jobs] runner` env.
+    pub job_runner: bool,
 }
 
 impl HostSnapshot {
+    /// One plain-words line on why the host is in its current state.
+    pub fn reason(&self) -> String {
+        if self.provisioning {
+            return "provisioning is running now".into();
+        }
+        match self.state.as_str() {
+            "ready" => "runtime, base image and warm volumes are in place".into(),
+            "failed" if !self.error.is_empty() => self.error.clone(),
+            "failed" => "the last provisioning attempt failed".into(),
+            "runtime_ready" => "container runtime found; base image not delivered yet".into(),
+            "image_ready" => "base image delivered; warm volumes not seeded yet".into(),
+            _ if self.last_probe.is_none() => "never probed or provisioned".into(),
+            _ => "probed, but not provisioned yet".into(),
+        }
+    }
+
+    /// The next action key worth pressing, in plain words.
+    pub fn next_action(&self) -> &'static str {
+        if self.provisioning {
+            return "wait for provisioning to finish";
+        }
+        match self.state.as_str() {
+            "ready" => "none needed (r re-checks the host)",
+            "failed" if self.retryable => "p retries provisioning (it also retries on its own)",
+            "failed" => "fix the cause above, then p provisions again",
+            _ if self.last_probe.is_none() => "r probes the host, or p provisions it",
+            _ => "p provisions the host",
+        }
+    }
+
+    /// The install-consent line spelled out. Consent decides whether thegn may
+    /// install a container runtime on the host when it finds none.
+    pub fn consent_plain(&self) -> String {
+        match self.consent.as_str() {
+            "granted" => "granted: thegn may install a container runtime here".into(),
+            "declined" => "declined: thegn will not install a runtime here".into(),
+            "never (config)" => "never: config sets install_runtime = \"never\", so thegn will \
+                 not install a runtime (c grants it anyway)"
+                .into(),
+            "auto (config)" => "auto: config lets thegn install a runtime if none is found".into(),
+            c if c.starts_with("unset") => {
+                "not decided: thegn asks before installing a runtime (c grants)".into()
+            }
+            other => other.to_string(),
+        }
+    }
+
     /// The state glyph shared by the panel, sidebar, and wizard badge:
     /// ● ready / ◐ provisioning / ✗ failed / ○ unprovisioned.
     pub fn glyph(&self) -> &'static str {
@@ -171,8 +224,16 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
                 last_probe: row.and_then(|r| r.last_probe),
                 active_step: row.and_then(|r| r.active_step.clone()),
                 is_db_def: db_defs.contains(name),
+                jump: hc.ssh.jump_host.trim().to_string(),
+                envs: cfg
+                    .env
+                    .iter()
+                    .filter(|(_, e)| e.host.trim() == name)
+                    .map(|(n, _)| n.clone())
+                    .collect(),
                 ..HostSnapshot::default()
             };
+            snap.job_runner = snap.envs.iter().any(|e| *e == cfg.jobs.runner);
             if let Some(HostState::Failed(f)) = row.map(|r| &r.state) {
                 snap.error = crate::host_flow::failure_reason(f);
                 snap.retryable = f.retryable;

@@ -2140,12 +2140,12 @@ mod spec {
         // …and the action hints mirror the statusbar strip (`section_keys::HOSTS`)
         // — the two surfaces used to advertise different key sets.
         for hint in [
-            "n new",
-            "p provision",
-            "r probe",
-            "m menu",
-            "c grant",
-            "x forget cache",
+            "n add host",
+            "p provision now",
+            "r re-probe",
+            "m more",
+            "c allow runtime install",
+            "x forget cached state",
         ] {
             assert!(rendered.contains(hint), "{hint}: {rendered}");
         }

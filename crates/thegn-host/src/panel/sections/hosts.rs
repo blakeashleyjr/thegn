@@ -15,7 +15,7 @@ use crate::seg::{Line, Seg, seg};
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, d, f, fmt_secs, g, g2, hint_row, hue, list_detail,
-    rule, t, wrap_text,
+    rule, t,
 };
 
 /// A host's hued state glyph (● ready / ◐ provisioning / ✗ failed / ○ new).
@@ -91,12 +91,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     // Mirrors the statusbar strip (`section_keys::HOSTS`) — the two used to
     // advertise different key sets.
     rows.push(hint_row(&[
-        ("n", "new"),
-        ("p", "provision"),
-        ("r", "probe"),
-        ("m", "menu"),
-        ("c", "grant"),
-        ("x", "forget cache"),
+        ("n", "add host"),
+        ("p", "provision now"),
+        ("r", "re-probe"),
+        ("m", "more"),
+        ("c", "allow runtime install"),
+        ("x", "forget cached state"),
     ]));
     rows
 }
@@ -135,14 +135,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         })
         .collect();
     let host = &hosts[cursor];
-    let detail_w = ctx.cols.saturating_sub(list_w + 2);
-    let mut detail: Vec<Vec<Seg>> = wrap_text(
-        &format!("reach target  {}", display_cell(&host.target)),
-        detail_w,
-    )
-    .into_iter()
-    .map(|part| vec![seg(g2(), part)])
-    .collect();
+    let mut detail: Vec<Vec<Seg>> = Vec::new();
     detail.extend(
         detail_rows(host, ctx)
             .into_iter()
@@ -162,12 +155,12 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         ctx.rows.saturating_sub(rows.len() + 1),
     ));
     rows.push(hint_row(&[
-        ("n", "new"),
-        ("p", "provision"),
-        ("r", "probe"),
-        ("m", "menu"),
-        ("c", "grant"),
-        ("x", "forget cache"),
+        ("n", "add host"),
+        ("p", "provision now"),
+        ("r", "re-probe"),
+        ("m", "more"),
+        ("c", "allow runtime install"),
+        ("x", "forget cached state"),
     ]));
     rows
 }
@@ -177,7 +170,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
     let kv = |k: &str, v: String| {
         PanelRow::plain(Line::segs(vec![
-            seg(g(), format!("  {k:<8}")),
+            seg(g(), format!("  {k:<9}")),
             seg(f(), display_cell(&v)),
         ]))
     };
@@ -185,28 +178,53 @@ fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
         Some(t) => {
             let ago = thegn_core::util::now().saturating_sub(t);
             if ago <= 0 {
-                "just now".to_string()
+                "last probed just now".to_string()
             } else {
-                format!("{} ago", fmt_secs(ago))
+                format!("last probed {} ago", fmt_secs(ago))
             }
         }
-        None => "never".into(),
+        None => "not probed yet".into(),
     };
-    let mut rows = vec![kv("image", h.image.clone())];
-    if !h.arch_os.is_empty() {
-        rows.push(kv("arch", h.arch_os.clone()));
+    let address = if h.jump.is_empty() {
+        h.target.clone()
+    } else {
+        format!("{} (via jump host {})", h.target, h.jump)
+    };
+    let system = match (h.arch_os.is_empty(), h.runtime.is_empty()) {
+        (true, true) => "unknown until probed".to_string(),
+        (false, true) => h.arch_os.clone(),
+        (true, false) => h.runtime.clone(),
+        (false, false) => format!("{} · {}", h.arch_os, h.runtime),
+    };
+    let mut uses: Vec<String> = Vec::new();
+    if !h.envs.is_empty() {
+        uses.push(format!("envs {}", h.envs.join(", ")));
     }
-    rows.push(kv("probe", probe));
-    rows.push(kv("consent", h.consent.clone()));
+    if h.job_runner {
+        uses.push("job runner".into());
+    }
+    let uses = if uses.is_empty() {
+        "nothing yet (no [env.*] sets host = \"{name}\")".replace("{name}", &h.name)
+    } else {
+        uses.join(" · ")
+    };
+    let mut rows = vec![
+        kv("address", address),
+        kv("system", system),
+        kv("reach", format!("{} — {probe}", h.reach)),
+        kv("state", format!("{} — {}", h.short_status(), h.reason())),
+        kv("next", h.next_action().to_string()),
+        kv("used by", uses),
+        kv("image", h.image.clone()),
+        kv("consent", h.consent_plain()),
+    ];
     for inv in &h.inventory {
         rows.push(kv("have", inv.clone()));
     }
-    if !h.error.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![
-            seg(g(), "  "),
-            seg(hue(Hue::Red), display_cell(&h.error)),
-        ])));
-    }
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(g(), "  "),
+        seg(g2(), "help: panel ▸ hosts · thegn host status"),
+    ])));
     if ctx.deep() && !h.events.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "  EVENTS")])));
         for ev in h.events.iter().take(5) {
@@ -217,4 +235,87 @@ fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content;
+    use crate::chrome::FrameModel;
+    use crate::host_ui::HostSnapshot;
+    use crate::layout::PanelWidth;
+    use crate::panel::sections::{Section, SectionCtx};
+
+    fn render(hosts: Vec<HostSnapshot>) -> Vec<String> {
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                hosts,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Hosts,
+            width: PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        };
+        content(&ctx)
+            .iter()
+            .map(|row| match &row.line {
+                crate::seg::Line::Segs(s) => s.iter().map(|x| x.text.as_str()).collect::<String>(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unprovisioned_host_explains_itself() {
+        let text = render(vec![HostSnapshot {
+            name: "ws".into(),
+            reach: "ssh".into(),
+            target: "ws.example:2222".into(),
+            jump: "bastion".into(),
+            consent: "never (config)".into(),
+            envs: vec!["dev".into()],
+            job_runner: true,
+            ..Default::default()
+        }])
+        .join("\n");
+        for want in [
+            "ws.example:2222 (via jump host bastion)",
+            "unknown until probed",
+            "not probed yet",
+            "never probed or provisioned",
+            "r probes the host, or p provisions it",
+            "envs dev · job runner",
+            "install_runtime = \"never\"",
+            "help: panel ▸ hosts",
+            "allow runtime install",
+        ] {
+            assert!(text.contains(want), "missing {want:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn ready_host_shows_system_and_no_action() {
+        let text = render(vec![HostSnapshot {
+            name: "b".into(),
+            reach: "ssh".into(),
+            target: "b".into(),
+            state: "ready".into(),
+            arch_os: "x86_64 linux".into(),
+            runtime: "podman 5.0".into(),
+            consent: "granted".into(),
+            ..Default::default()
+        }])
+        .join("\n");
+        assert!(text.contains("x86_64 linux · podman 5.0"), "{text}");
+        assert!(text.contains("none needed"), "{text}");
+        assert!(text.contains("nothing yet"), "{text}");
+    }
 }
