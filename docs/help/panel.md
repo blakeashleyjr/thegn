@@ -569,9 +569,10 @@ address (and jump host), OS, architecture and runtime once probed, whether
 it was reached and when it was last probed, its provisioning state with a
 one-line reason and the next key to press, what uses it (envs bound with
 `host = "<name>"` and the `[jobs]` runner), its base image, and install
-consent in plain words. Consent `never (config)` means `install_runtime =
-"never"` is set, so thegn will not install a runtime; `c` overrides it for
-that host. See also `thegn host status`. **environments** lists `[env.*]`: `↵` (re)binds the
+consent in plain words. Consent `never (config)` means the host's config
+sets `install_runtime = "never"`: thegn will never install a runtime there,
+and `c` cannot override it; install one yourself or change the setting to
+`"ask"`. Long values wrap under their label. See also `thegn host status`. **environments** lists `[env.*]`: `↵` (re)binds the
 env to this worktree. If placement changes, it asks first; new panes move
 to the new placement while running panes stay where they are. A same-placement
 bind is immediate. `t` tests provider env tokens only, `n` adds, `x` removes

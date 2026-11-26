@@ -1,7 +1,8 @@
 //! The System ▸ Hosts section (hosts-as-resources): one row per `[host.*]`
 //! config entry with a state glyph + reach + probed runtime, showing the
-//! cursor host's details (target, image, arch, probe age, consent, inventory, last
-//! error, and — deep — recent events). Reads `model.panel.hosts` (built
+//! cursor host's details (address and jump host, system, reach and probe age,
+//! state with a reason and next key, what uses it, image, plain-words consent,
+//! inventory, and — deep — recent events). Reads `model.panel.hosts` (built
 //! off-loop by hydration, live-merged by the loop's `HostRuntime` drain).
 //! Action keys (p/r/c/x on the cursor host, m for the action menu, n to add a
 //! host) are dispatched by the event loop via `handlers::host::section_key`;
@@ -15,8 +16,11 @@ use crate::seg::{Line, Seg, seg};
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, d, f, fmt_secs, g, g2, hint_row, hue, list_detail,
-    rule, t,
+    rule, t, wrap_text,
 };
+
+/// Key column width of a detail row (`"  "` indent + 9-wide key).
+const KEY_W: usize = 11;
 
 /// A host's hued state glyph (● ready / ◐ provisioning / ✗ failed / ○ new).
 fn state_glyph(h: &HostSnapshot) -> Seg {
@@ -85,18 +89,18 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Hosts, i)),
         );
         if i == ctx.ui.cursor {
-            rows.extend(detail_rows(h, ctx));
+            rows.extend(detail_rows(h, ctx, ctx.cols));
         }
     }
     // Mirrors the statusbar strip (`section_keys::HOSTS`) — the two used to
     // advertise different key sets.
     rows.push(hint_row(&[
         ("n", "add host"),
-        ("p", "provision now"),
+        ("p", "provision"),
         ("r", "re-probe"),
         ("m", "more"),
-        ("c", "allow runtime install"),
-        ("x", "forget cached state"),
+        ("c", "allow install"),
+        ("x", "forget state"),
     ]));
     rows
 }
@@ -135,16 +139,15 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         })
         .collect();
     let host = &hosts[cursor];
-    let mut detail: Vec<Vec<Seg>> = Vec::new();
-    detail.extend(
-        detail_rows(host, ctx)
-            .into_iter()
-            .filter_map(|row| match row.line {
-                Line::Segs(segs) => Some(segs),
-                Line::Blank => Some(Vec::new()),
-                _ => None,
-            }),
-    );
+    let detail_w = ctx.cols.saturating_sub(list_w + 2);
+    let detail: Vec<Vec<Seg>> = detail_rows(host, ctx, detail_w)
+        .into_iter()
+        .filter_map(|row| match row.line {
+            Line::Segs(segs) => Some(segs),
+            Line::Blank => Some(Vec::new()),
+            _ => None,
+        })
+        .collect();
     let mut rows = vec![PanelRow::plain(Line::segs(vec![seg(d(), "HOSTS")])), rule()];
     rows.extend(list_detail(
         Section::Hosts,
@@ -156,23 +159,34 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     ));
     rows.push(hint_row(&[
         ("n", "add host"),
-        ("p", "provision now"),
+        ("p", "provision"),
         ("r", "re-probe"),
         ("m", "more"),
-        ("c", "allow runtime install"),
-        ("x", "forget cached state"),
+        ("c", "allow install"),
+        ("x", "forget state"),
     ]));
     rows
 }
 
-/// The cursor host's expanded detail block. Deep/full views add the recent
-/// event trail; the compact view keeps to identity + freshness + failure.
-fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
-    let kv = |k: &str, v: String| {
-        PanelRow::plain(Line::segs(vec![
-            seg(g(), format!("  {k:<9}")),
-            seg(f(), display_cell(&v)),
-        ]))
+/// The cursor host's expanded detail block, `width` columns wide: what it is,
+/// reachability, state with a reason and the next key, what uses it, image,
+/// consent and inventory. Values wrap under the key column so the plain-words
+/// lines are never clipped. Deep/full views add the recent event trail.
+fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx, width: usize) -> Vec<PanelRow> {
+    let val_w = width.saturating_sub(KEY_W);
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut kv = |k: &str, v: String| {
+        for (i, part) in wrap_text(&display_cell(&v), val_w).into_iter().enumerate() {
+            let key = if i == 0 {
+                format!("  {k:<9}")
+            } else {
+                " ".repeat(KEY_W)
+            };
+            rows.push(PanelRow::plain(Line::segs(vec![
+                seg(g(), key),
+                seg(f(), part),
+            ])));
+        }
     };
     let probe = match h.last_probe {
         Some(t) => {
@@ -208,23 +222,21 @@ fn detail_rows(h: &HostSnapshot, ctx: &SectionCtx) -> Vec<PanelRow> {
     } else {
         uses.join(" · ")
     };
-    let mut rows = vec![
-        kv("address", address),
-        kv("system", system),
-        kv("reach", format!("{} — {probe}", h.reach)),
-        kv("state", format!("{} — {}", h.short_status(), h.reason())),
-        kv("next", h.next_action().to_string()),
-        kv("used by", uses),
-        kv("image", h.image.clone()),
-        kv("consent", h.consent_plain()),
-    ];
+    kv("address", address);
+    kv("system", system);
+    kv("reach", format!("{} — {probe}", h.reach));
+    kv("state", format!("{} — {}", h.short_status(), h.reason()));
+    kv("next", h.next_action().to_string());
+    kv("used by", uses);
+    kv("image", h.image.clone());
+    kv("consent", h.consent_plain());
     for inv in &h.inventory {
-        rows.push(kv("have", inv.clone()));
+        kv("have", inv.clone());
     }
-    rows.push(PanelRow::plain(Line::segs(vec![
-        seg(g(), "  "),
-        seg(g2(), "help: panel ▸ hosts · thegn host status"),
-    ])));
+    kv(
+        "help",
+        "thegn help panel (hosts) · thegn host status".into(),
+    );
     if ctx.deep() && !h.events.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "  EVENTS")])));
         for ev in h.events.iter().take(5) {
@@ -246,6 +258,10 @@ mod tests {
     use crate::panel::sections::{Section, SectionCtx};
 
     fn render(hosts: Vec<HostSnapshot>) -> Vec<String> {
+        render_at(hosts, 80)
+    }
+
+    fn render_at(hosts: Vec<HostSnapshot>, cols: usize) -> Vec<String> {
         let model = FrameModel {
             panel: crate::panel::PanelData {
                 hosts,
@@ -261,7 +277,7 @@ mod tests {
         let ctx = SectionCtx {
             model: &model,
             ui: &ui,
-            cols: 80,
+            cols,
             rows: 30,
         };
         content(&ctx)
@@ -294,8 +310,8 @@ mod tests {
             "r probes the host, or p provisions it",
             "envs dev · job runner",
             "install_runtime = \"never\"",
-            "help: panel ▸ hosts",
-            "allow runtime install",
+            "thegn help panel",
+            "allow install",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
@@ -317,5 +333,31 @@ mod tests {
         assert!(text.contains("x86_64 linux · podman 5.0"), "{text}");
         assert!(text.contains("none needed"), "{text}");
         assert!(text.contains("nothing yet"), "{text}");
+    }
+
+    #[test]
+    fn narrow_panel_wraps_detail_values_instead_of_clipping() {
+        let cols = 40;
+        let lines = render_at(
+            vec![HostSnapshot {
+                name: "ws-mac-1".into(),
+                reach: "ssh".into(),
+                target: "ws-mac-1".into(),
+                consent: "never (config)".into(),
+                ..Default::default()
+            }],
+            cols,
+        );
+        let detail: Vec<&String> = lines.iter().filter(|l| l.starts_with("  ")).collect();
+        assert!(detail.len() > 8, "{lines:#?}");
+        for line in &detail {
+            assert!(line.chars().count() <= cols, "over {cols} cols: {line:?}");
+        }
+        // The consent explanation spans continuation rows under the key column.
+        let consent = detail.iter().position(|l| l.contains("consent")).unwrap();
+        assert!(
+            detail[consent + 1].starts_with(&" ".repeat(super::KEY_W)),
+            "{lines:#?}"
+        );
     }
 }

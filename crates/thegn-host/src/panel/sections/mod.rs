@@ -2141,11 +2141,11 @@ mod spec {
         // — the two surfaces used to advertise different key sets.
         for hint in [
             "n add host",
-            "p provision now",
+            "p provision",
             "r re-probe",
             "m more",
-            "c allow runtime install",
-            "x forget cached state",
+            "c allow install",
+            "x forget state",
         ] {
             assert!(rendered.contains(hint), "{hint}: {rendered}");
         }
