@@ -396,12 +396,12 @@ fn review_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
 /// The last step; `checks` is the Lead checks report once they have run.
 fn review_menu_with(f: &Facts, plan: &Plan, checks: Option<&[String]>) -> MenuOverlay {
     let mut body = format!(
-        "{} agent {}\n{} bubblewrap\n{} {}\n{} daemon enabled, Lead listener up\n{} agent login",
+        "{} agent {}\n{} bubblewrap\n{} pasta (isolated network)\n{} daemon enabled, Lead listener \
+         up\n{} agent login",
         mark(true),
         plan.agent,
         mark(f.bwrap),
         mark(f.pasta),
-        "pasta (isolated network)",
         mark(f.daemon_enabled && f.listener_up),
         mark(f.logged_in),
     );
