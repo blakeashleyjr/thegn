@@ -853,7 +853,7 @@ mod tests {
         );
         // `git_in` goes through `util::git_cmd`, which fences fsmonitor off
         // (THE-225), so the positive control must be a plain Git invocation.
-        let plain = Command::new("git")
+        let plain = Command::new("git") // plain-git-control: THE-225 positive control
             .arg("-C")
             .arg(&repo.dir)
             .args(["status", "--short"])

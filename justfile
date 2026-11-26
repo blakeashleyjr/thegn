@@ -828,7 +828,9 @@ ratchets:
     # Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
     # `build.rs` is exempt: a build script cannot depend on thegn-core, so it
     # scrubs GIT_ENV_VARS inline instead (see the comment at that call site).
-    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -v '/build.rs:' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+    # Lines tagged `plain-git-control:` are exempt: fsmonitor positive-control tests
+    # (THE-225) must run unfenced git to prove the fence matters.
+    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -v '/build.rs:' | grep -v 'plain-git-control:' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh
