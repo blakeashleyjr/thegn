@@ -178,6 +178,7 @@ fn watch_log_directory(
     let canonical_parent = parent
         .canonicalize()
         .unwrap_or_else(|_| parent.to_path_buf());
+    let watch_parent_buf = canonical_parent.clone();
     let reset_requested = Arc::new(AtomicBool::new(false));
     let callback_reset = Arc::clone(&reset_requested);
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -219,7 +220,7 @@ fn watch_log_directory(
     })?;
     // Watch the canonical spelling: FSEvents handed a symlinked path (`/var/..` ->
     // `/private/var/..`) can silently deliver nothing for it.
-    let watch_parent = canonical_parent.as_path();
+    let watch_parent = watch_parent_buf.as_path();
     watcher.watch(watch_parent, notify::RecursiveMode::NonRecursive)?;
     if let Some(grandparent) = watch_parent.parent()
         && grandparent.is_dir()
