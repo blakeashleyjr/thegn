@@ -1130,6 +1130,18 @@
       "summary": "autopilot.run rule action, synthesized autopilot:<repo> rule and budgets counting autopilot and Lead manual spawns; live verification open."
     },
     {
+      "change": "gate-devcontainer-privileges",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2144",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "Refuse devcontainer binds of container-engine sockets and thegn control/state directories outside generic mount approval."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

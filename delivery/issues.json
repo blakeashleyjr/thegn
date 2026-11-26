@@ -548,6 +548,13 @@
       ]
     },
     {
+      "issue": "THE-2144",
+      "project": "Sandbox & Remote 00: Shared contracts",
+      "changes": [
+        "gate-devcontainer-privileges"
+      ]
+    },
+    {
       "issue": "THE-2172",
       "project": "Agent & Workflow Platform",
       "changes": [

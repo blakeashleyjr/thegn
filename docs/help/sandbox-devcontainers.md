@@ -72,7 +72,11 @@ read at startup.
 
 Some repo requests are never eligible for approval. `privileged`, `capAdd`,
 `securityOpt`, `runArgs`, and `init` could weaken the trusted sandbox, so thegn
-always refuses them and names the reason. Recognized fields that thegn does not
+always refuses them and names the reason. Bind mounts that resolve to a
+container-engine socket, or contain one in an ancestor directory, are also
+privilege requests: they are omitted from the generic mounts approval and
+reported as `refused: engine-socket`. Binds of thegn's control or state
+directories are refused the same way. Recognized fields that thegn does not
 apply — such as `hostRequirements`, port attributes, `waitFor`,
 `workspaceMount`, `overrideCommand`, `secrets`, remote-user/UID settings, and
 compose overrides — are reported as reserved. Unknown top-level keys are also

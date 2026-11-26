@@ -315,9 +315,22 @@ impl ComposeGuard {
                 protected.push(path);
                 classes.push(class.to_owned());
             };
-            add(crate::util::xdg_state_home().join("thegn"), "thegn state");
-            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-                add(PathBuf::from(runtime).join("thegn"), "thegn runtime");
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            for (index, path) in crate::sandbox_runtime_escape::thegn_control_paths(
+                &crate::util::xdg_state_home(),
+                runtime.as_deref(),
+            )
+            .into_iter()
+            .enumerate()
+            {
+                add(
+                    path,
+                    if index == 0 {
+                        "thegn state"
+                    } else {
+                        "thegn runtime"
+                    },
+                );
             }
             if let Some(home) = std::env::var_os("HOME") {
                 let home = PathBuf::from(home);
@@ -333,21 +346,13 @@ impl ComposeGuard {
                 ] {
                     add(home.join(path), "credential");
                 }
-                add(home.join(".docker/run/docker.sock"), "engine socket");
             }
-            for path in [
-                "/var/run/docker.sock",
-                "/run/docker.sock",
-                "/run/podman/podman.sock",
-                "/run/containerd/containerd.sock",
-            ] {
-                add(PathBuf::from(path), "engine socket");
-            }
-            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-                add(
-                    PathBuf::from(runtime).join("podman/podman.sock"),
-                    "engine socket",
-                );
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            for path in crate::sandbox_runtime_escape::engine_socket_paths(
+                home.as_deref(),
+                runtime.as_deref(),
+            ) {
+                add(path, "engine socket");
             }
             for path in extra {
                 add(path.clone(), "control socket");
@@ -1638,6 +1643,65 @@ pub(crate) fn exec_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_guard_list_unchanged() {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let extra = PathBuf::from("/tmp/extra-control.sock");
+        let guard = ComposeGuard::for_host(std::slice::from_ref(&extra));
+
+        let mut expected = vec![(crate::util::xdg_state_home().join("thegn"), "thegn state")];
+        if let Some(runtime) = &runtime {
+            expected.push((runtime.join("thegn"), "thegn runtime"));
+        }
+        if let Some(home) = &home {
+            for path in [
+                ".ssh",
+                ".aws",
+                ".gnupg",
+                ".config/gh",
+                ".kube",
+                ".docker",
+                ".netrc",
+                ".git-credentials",
+            ] {
+                expected.push((home.join(path), "credential"));
+            }
+        }
+        // Snapshot of the engine-socket entries `for_host` listed inline before
+        // they moved to `engine_socket_paths`; do not derive this from it.
+        if let Some(home) = &home {
+            expected.push((home.join(".docker/run/docker.sock"), "engine socket"));
+        }
+        for path in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/run/podman/podman.sock",
+            "/run/containerd/containerd.sock",
+        ] {
+            expected.push((PathBuf::from(path), "engine socket"));
+        }
+        if let Some(runtime) = &runtime {
+            expected.push((runtime.join("podman/podman.sock"), "engine socket"));
+        }
+        expected.push((extra, "control socket"));
+
+        assert_eq!(
+            guard.protected,
+            expected
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            guard.classes,
+            expected
+                .iter()
+                .map(|(_, class)| (*class).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn compose_error_display_covers_every_variant() {
