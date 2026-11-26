@@ -2084,6 +2084,19 @@
         }
       ],
       "summary": "Continuously prove staged workers can commit without escaping configured containment."
+    },
+    {
+      "change": "worktree-delete-stops-programs",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2736",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Deleting a worktree stops its pane programs before the folder goes, and refuses the main checkout and Git-locked worktrees up front.",
+      "delivered_at": "2026-11-25"
     }
   ]
 }

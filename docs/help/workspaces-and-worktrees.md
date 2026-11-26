@@ -203,6 +203,19 @@ aliases; their chords do not change.
 - Deleting from disk is always an explicit second step in the [[sidebar]]
   delete menu — nothing destructive rides on a single keystroke.
 
+Deleting from disk stops the worktree's programs first. After the
+`pre_destroy` hook passes, thegn stops every pane in the worktree, including
+dev servers and agents and any daemon-backed session. Each one gets a terminate
+signal, then a kill after a short grace period. On Linux, thegn then waits up
+to 5 seconds for any other process using the folder to exit. Only then is the
+folder deleted. If another process is still there, the delete goes ahead and
+the status line names its pid.
+
+The repository's main checkout and a worktree locked with `git worktree lock`
+are refused before anything is stopped or closed. The status line gives the
+reason and, for a locked worktree, the `git worktree unlock` command to run.
+The same refusal applies to `thegn wt rm`.
+
 Closing a worktree keeps its checkout but records a suppression entry, so a
 later hydration does not immediately rediscover it. Use `thegn wt reopen
 <path>` to clear that record and re-register the worktree; reopening does not
