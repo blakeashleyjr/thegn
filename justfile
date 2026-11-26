@@ -1534,6 +1534,12 @@ test-the429:
 third-party-notices:
     python3 -B scripts/third_party_notices.py
 
+# Same output without cargo: licences come from Cargo.lock plus the extracted crate
+# manifests in the local cargo registry cache. Use it where `cargo metadata` cannot
+# run; the builder's `just third-party-notices` stays the authoritative run.
+third-party-notices-from-lock:
+    python3 -B scripts/third_party_notices.py --from-lock
+
 # Fail when THIRD_PARTY_NOTICES.md is stale against Cargo.lock (needs cargo and a warm
 # registry cache; not part of `just test`).
 third-party-notices-check:
