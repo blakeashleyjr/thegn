@@ -1739,15 +1739,46 @@ cwd=$2
 home=$3
 cache=$4
 shift 4
-rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
 command -v setsid >/dev/null 2>&1 || fail setsid
 [ -n "${PATH:-}" ] || fail path
 mkdir -p -- "${pidfile%/*}" "$home/tmp" "$cache/cargo/bin" "$cache/target" || fail dirs
-# The job's CARGO_HOME is a per-project cache with no toolchain; rustup-style
-# shims (`/.sprite/bin/cargo`) exec `$CARGO_HOME/bin/cargo`, so link the real
-# cargo home's binaries in.
-real_cargo=${CARGO_HOME:-${HOME:-}/.cargo}
-if [ "$real_cargo" != "$cache/cargo" ] && [ -d "$real_cargo/bin" ]; then
+# The job's CARGO_HOME is a per-project cache with no toolchain, and the sprite's
+# `/.sprite/bin/cargo` shim execs `$CARGO_HOME/bin/cargo` after defaulting
+# CARGO_HOME to /.sprite/languages/rust/cargo. Resolve the real toolchain home
+# (the caller's CARGO_HOME, the sprite default, ~/.cargo, then the directory of
+# the first real `cargo` on PATH), put its bin first on PATH so the shim is
+# bypassed, and link its binaries into the cache for anything that still execs
+# through `$CARGO_HOME/bin`.
+real_cargo=
+for c in "${CARGO_HOME:-}" /.sprite/languages/rust/cargo "${HOME:-}/.cargo"; do
+    if [ -n "$c" ] && [ "$c" != "$cache/cargo" ] && [ -x "$c/bin/cargo" ]; then
+        real_cargo=$c
+        break
+    fi
+done
+if [ -z "$real_cargo" ]; then
+    old_ifs=$IFS
+    IFS=:
+    for d in $PATH; do
+        [ -n "$d" ] && [ "$d" != "$cache/cargo/bin" ] && [ -x "$d/cargo" ] || continue
+        case $(head -c 2 "$d/cargo" 2>/dev/null) in '#!') continue ;; esac
+        real_cargo=${d%/bin}
+        break
+    done
+    IFS=$old_ifs
+fi
+rustup_home=${RUSTUP_HOME:-}
+if [ -z "$rustup_home" ]; then
+    for r in /.sprite/languages/rust/rustup "${HOME:-}/.rustup"; do
+        if [ -d "$r/toolchains" ]; then
+            rustup_home=$r
+            break
+        fi
+    done
+fi
+[ -n "$rustup_home" ] || rustup_home=${HOME:-}/.rustup
+if [ -n "$real_cargo" ] && [ -d "$real_cargo/bin" ]; then
+    PATH="$real_cargo/bin:$PATH"
     for b in "$real_cargo"/bin/*; do
         [ -e "$b" ] || continue
         ln -sf -- "$b" "$cache/cargo/bin/${b##*/}" 2>/dev/null
@@ -3651,6 +3682,28 @@ mod tests {
         assert!(LAUNCH_SCRIPT.contains("setsid"));
         assert!(LAUNCH_SCRIPT.contains(LAUNCH_FAILED_MARKER));
         assert!(!LAUNCH_SCRIPT.contains("$HOME/.claude"));
+    }
+
+    #[test]
+    fn the_launcher_resolves_the_real_toolchain_past_the_sprite_shim() {
+        assert!(LAUNCH_SCRIPT.contains("/.sprite/languages/rust/cargo"));
+        assert!(LAUNCH_SCRIPT.contains("/.sprite/languages/rust/rustup"));
+        assert!(LAUNCH_SCRIPT.contains("PATH=\"$real_cargo/bin:$PATH\""));
+        assert!(LAUNCH_SCRIPT.contains("RUSTUP_HOME=\"$rustup_home\""));
+    }
+
+    #[test]
+    fn the_launcher_script_parses_as_posix_sh() {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", LAUNCH_SCRIPT])
+            .output();
+        if let Ok(out) = out {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]
