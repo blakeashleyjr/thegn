@@ -1868,7 +1868,7 @@ fn widget_detail_inner(
                 footer: Some(footer),
                 series,
                 tone: Tok::Hue(Hue::Teal),
-                height: 5,
+                height: 3,
                 series2: None,
                 ..Default::default()
             })];
@@ -1895,7 +1895,7 @@ fn widget_detail_inner(
                     footer: Some(footer),
                     series,
                     tone: Tok::Hue(Hue::Purple),
-                    height: 5,
+                    height: 3,
                     series2: None,
                     ..Default::default()
                 }),
@@ -1906,8 +1906,11 @@ fn widget_detail_inner(
             ];
             if let Some((u, t)) = s.mem_gib {
                 let mut breakdown = vec![
-                    ("used".into(), format!("{u:.1}G"), Tok::Slot(S::Text)),
-                    ("total".into(), format!("{t:.0}G"), Tok::Slot(S::Dim)),
+                    (
+                        "used".into(),
+                        format!("{u:.1}G of {t:.0}G"),
+                        Tok::Slot(S::Text),
+                    ),
                     (
                         "available".into(),
                         format!("{:.1}G", (t - u).max(0.0)),
@@ -2181,7 +2184,7 @@ fn widget_detail_inner(
                 .collect();
             Some(sections(
                 "Disks",
-                60,
+                cpu_attrib::COLS,
                 vec![
                     Section::Graph(GraphSection {
                         label: "DISK IO".into(),
@@ -2189,7 +2192,7 @@ fn widget_detail_inner(
                         footer: Some("read + write, window-scaled".into()),
                         series,
                         tone: Tok::Hue(Hue::Blue),
-                        height: 5,
+                        height: 3,
                         series2: None,
                         ..Default::default()
                     }),
@@ -2210,7 +2213,7 @@ fn widget_detail_inner(
                         sel: None,
                     }),
                 ],
-                Placement::Center,
+                near,
                 ctx.screen,
             ))
         }

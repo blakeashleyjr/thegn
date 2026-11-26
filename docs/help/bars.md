@@ -44,7 +44,8 @@ and program) → the heaviest processes in that pane, then thegn itself (UI and
 daemon) and "outside thegn" — everything else. `cpu` orders the tree by CPU
 (percent of one core, like `top`, with each row's share of the masthead total
 beside it); `mem` orders it by resident memory. Panes of parked workspaces are
-included. A second click on the same stat still opens the full system monitor
+included. Only worktrees with live processes are listed (top eight), with an
+"N idle worktrees" line for the rest. A second click on the same stat still opens the full system monitor
 on that tab. Move the cursor through the breakdown with `j`/`k`: `↵` on a
 process opens the Processes tab filtered to it, where `k` kills it after a
 confirmation; `p` on a worktree or pane row shows that row's processes there.

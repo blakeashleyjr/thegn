@@ -7,6 +7,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The masthead `cpu`, `mem` and `disk` popovers are compact and consistent, all anchored under their
+  chip (Disks no longer opens mid-screen); CPU and Memory list only live worktrees (top eight) with an
+  "N idle worktrees" summary line.
+
 ## [0.1.0-alpha.137] — 2026-11-25
 
 Remote environments report their health, Sprite and Vercel jobs survive dropped
