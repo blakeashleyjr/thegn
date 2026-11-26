@@ -137,7 +137,7 @@ pub(crate) fn next_team_scope(
     }
 }
 
-/// [`sorted_filtered_issues`] narrowed to one team key (`None` = every team).
+/// `sorted_filtered_issues` narrowed to one team key (`None` = every team).
 pub(crate) fn sorted_filtered_issues_scoped<'a>(
     data: &'a crate::panel::PanelData,
     query: &str,
@@ -204,10 +204,13 @@ pub(super) fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
 // ---- main entry point -------------------------------------------------------
 
 pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
-    if let Some(id) = ctx.ui.issues_detail.as_deref()
-        && let Some(issue) = ctx.model.panel.tracker_issues.iter().find(|i| i.id == id)
-    {
-        return detail_page(ctx, issue);
+    if let Some(id) = ctx.ui.issues_detail.as_deref() {
+        let load = ctx.ui.issues_detail_loaded.as_ref().filter(|l| l.id == id);
+        let fetched = load.and_then(|l| l.detail.as_ref().ok());
+        let cached = ctx.model.panel.tracker_issues.iter().find(|i| i.id == id);
+        if let Some(issue) = fetched.map(|d| &d.issue).or(cached) {
+            return detail_page(ctx, issue, load);
+        }
     }
     if ctx.full() {
         full_view(ctx)
@@ -634,9 +637,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-/// The full-page detail view opened by `↵`: every field the tracker cache
-/// holds, with the description rendered as light markdown.
-fn detail_page(ctx: &SectionCtx, issue: &Issue) -> Vec<PanelRow> {
+/// The full-page detail view opened by `↵`: the tracker's full issue once the
+/// off-loop fetch lands (cached list fields until then), with the description
+/// and comments rendered as light markdown.
+fn detail_page(
+    ctx: &SectionCtx,
+    issue: &Issue,
+    load: Option<&crate::panel::IssueDetailLoad>,
+) -> Vec<PanelRow> {
     let w = ctx.cols.saturating_sub(2).max(10);
     let data = &ctx.model.panel;
     let mut rows = vec![
@@ -646,7 +654,7 @@ fn detail_page(ctx: &SectionCtx, issue: &Issue) -> Vec<PanelRow> {
         ])),
         rule(),
     ];
-    for segs in issue_detail_segs(issue, &data.tracker_links, w) {
+    for segs in issue_header_segs(issue, &data.tracker_links, w) {
         rows.push(PanelRow::plain(Line::segs(segs)));
     }
     if !issue.project_ids.is_empty() {
@@ -673,38 +681,46 @@ fn detail_page(ctx: &SectionCtx, issue: &Issue) -> Vec<PanelRow> {
     ])));
     if let Some(body) = issue.body.as_deref().filter(|b| !b.trim().is_empty()) {
         rows.push(rule());
-        let mut in_code = false;
-        for line in body.lines().take(200) {
-            let trimmed = line.trim_end();
-            if trimmed.trim_start().starts_with("```") {
-                in_code = !in_code;
-                continue;
+        rows.extend(markdown_rows(body, w, 200));
+    }
+    rows.push(rule());
+    match load.map(|l| &l.detail) {
+        None => rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g3(),
+            "loading the full issue…".to_string(),
+        )]))),
+        Some(Err(error)) => rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            display_clip(&format!("fetch failed: {error} — showing cached fields"), w),
+        )]))),
+        Some(Ok(detail)) => {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                format!("COMMENTS  {}", detail.comments.len()),
+            )])));
+            if detail.comments.is_empty() {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g3(),
+                    "no comments".to_string(),
+                )])));
             }
-            let segs = if in_code {
-                seg(f(), display_clip(&format!("  {trimmed}"), w))
-            } else if let Some(h) = trimmed.trim_start_matches('#').strip_prefix(' ')
-                && trimmed.starts_with('#')
-            {
-                seg(t(), display_clip(h, w)).bold()
-            } else if let Some(item) = trimmed
-                .trim_start()
-                .strip_prefix("- ")
-                .or_else(|| trimmed.trim_start().strip_prefix("* "))
-            {
-                seg(g(), display_clip(&format!("• {item}"), w))
-            } else {
-                seg(g(), display_clip(trimmed, w))
-            };
-            rows.push(PanelRow::plain(Line::segs(vec![segs])));
+            for comment in &detail.comments {
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    seg(g2(), display_clip(&comment.author, w)).bold(),
+                ])));
+                rows.extend(markdown_rows(&comment.body, w, 60));
+            }
+            if !detail.comments_complete {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g3(),
+                    "more comments in the browser (o)".to_string(),
+                )])));
+            }
         }
     }
-    rows.push(PanelRow::plain(Line::segs(vec![seg(
-        g3(),
-        "comments: open in browser (o)".to_string(),
-    )])));
     rows.push(rule());
     rows.push(hint_row(&[
-        ("↵", "details"),
+        ("↵", "close"),
         ("l", "link"),
         ("o", "browser"),
         ("b", "branch"),
@@ -712,7 +728,65 @@ fn detail_page(ctx: &SectionCtx, issue: &Issue) -> Vec<PanelRow> {
     rows
 }
 
+/// Light markdown for the detail page: fenced code dimmed, `#` headings bold,
+/// `-`/`*` bullets as `•`; at most `max_lines` source lines.
+fn markdown_rows(body: &str, w: usize, max_lines: usize) -> Vec<PanelRow> {
+    let mut rows = Vec::new();
+    let mut in_code = false;
+    for line in body.lines().take(max_lines) {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        let segs = if in_code {
+            seg(f(), display_clip(&format!("  {trimmed}"), w))
+        } else if let Some(h) = trimmed.trim_start_matches('#').strip_prefix(' ')
+            && trimmed.starts_with('#')
+        {
+            seg(t(), display_clip(h, w)).bold()
+        } else if let Some(item) = trimmed
+            .trim_start()
+            .strip_prefix("- ")
+            .or_else(|| trimmed.trim_start().strip_prefix("* "))
+        {
+            seg(g(), display_clip(&format!("• {item}"), w))
+        } else {
+            seg(g(), display_clip(trimmed, w))
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![segs])));
+    }
+    let remaining = body.lines().count().saturating_sub(max_lines);
+    if remaining > 0 {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            format!("… +{remaining} more lines (o opens the browser)"),
+        )])));
+    }
+    rows
+}
+
 fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>> {
+    let mut out = issue_header_segs(issue, links, w);
+
+    // Body (first 3 lines)
+    if let Some(body) = &issue.body {
+        out.push(vec![seg(g3(), "─".repeat(w.min(40)))]);
+        for line in body.lines().take(3) {
+            out.push(vec![seg(g(), display_clip(line, w))]);
+        }
+        let remaining = body.lines().count().saturating_sub(3);
+        if remaining > 0 {
+            out.push(vec![seg(g2(), format!("… +{remaining} more lines"))]);
+        }
+    }
+
+    out
+}
+
+/// Title, state/priority, assignees, labels, branch, account and link marker —
+/// the fields shared by the side detail pane and the `↵` detail page.
+fn issue_header_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>> {
     let mut out: Vec<Vec<Seg>> = Vec::new();
 
     // Title (bold)
@@ -771,18 +845,6 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
             hue(Hue::Green),
             "◈ linked to this worktree".to_string(),
         )]);
-    }
-
-    // Body (first 3 lines)
-    if let Some(body) = &issue.body {
-        out.push(vec![seg(g3(), "─".repeat(w.min(40)))]);
-        for line in body.lines().take(3) {
-            out.push(vec![seg(g(), display_clip(line, w))]);
-        }
-        let remaining = body.lines().count().saturating_sub(3);
-        if remaining > 0 {
-            out.push(vec![seg(g2(), format!("… +{remaining} more lines"))]);
-        }
     }
 
     out
@@ -1402,5 +1464,152 @@ mod tests {
         assert_eq!(effective_team(&data, &ui).as_deref(), Some("AGE"));
         assert_eq!(team_key("42"), None);
         assert_eq!(team_key("THE-2748"), Some("THE"));
+    }
+
+    fn rendered_text(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => {
+                    vec![segs.iter().map(|seg| seg.text.as_str()).collect::<String>()]
+                }
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => vec![
+                    l.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                    r.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                ],
+                Line::Blank | Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn detail_fixture() -> crate::chrome::FrameModel {
+        let mut open = issue("linear:THE-7", IssuePriority::High, IssueStatus::Todo, "");
+        open.number = "THE-7".into();
+        open.body = Some("## Steps\n- first step\n```\ncode line\n```\nplain tail".into());
+        open.labels = vec!["bug".into()];
+        open.assignees = vec!["sam".into()];
+        open.url = "https://linear.app/x/issue/THE-7".into();
+        crate::chrome::FrameModel {
+            panel: panel_with(vec![open]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enter_detail_page_renders_fields_and_markdown_once() {
+        let model = detail_fixture();
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            issues_detail: Some("linear:THE-7".into()),
+            ..Default::default()
+        };
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 40,
+        });
+        let text = rendered_text(&rows);
+        assert!(text.starts_with("ISSUE  THE-7"), "{text}");
+        assert!(text.contains("title linear:THE-7"), "{text}");
+        assert!(text.contains("by sam"), "{text}");
+        assert!(text.contains("bug"), "{text}");
+        assert!(
+            text.contains("link  https://linear.app/x/issue/THE-7"),
+            "{text}"
+        );
+        // Heading marker stripped, bullet drawn, fence lines dropped.
+        assert!(text.lines().any(|l| l == "Steps"), "{text}");
+        assert!(text.contains("• first step"), "{text}");
+        assert!(text.contains("  code line"), "{text}");
+        assert!(!text.contains("```"), "{text}");
+        // The description renders once, not as a preview plus the full body.
+        assert_eq!(text.matches("plain tail").count(), 1, "{text}");
+        assert!(!text.contains("more lines"), "{text}");
+        assert!(text.contains("loading the full issue…"), "{text}");
+        assert!(text.contains("close"), "{text}");
+    }
+
+    #[test]
+    fn fetched_detail_shows_comments_and_drops_stale_loads() {
+        let model = detail_fixture();
+        let mut ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            issues_detail: Some("linear:THE-7".into()),
+            ..Default::default()
+        };
+        let mut fetched = model.panel.tracker_issues[0].clone();
+        fetched.title = "fresh title".into();
+        let detail = thegn_core::issue::IssueDetail {
+            issue: fetched,
+            comments: vec![thegn_core::issue::IssueComment {
+                author: "alex".into(),
+                body: "- looks right".into(),
+                created_at_ms: 0,
+            }],
+            comments_complete: false,
+            labels_complete: true,
+        };
+        let stale = crate::panel::IssueDetailLoad {
+            id: "linear:THE-8".into(),
+            detail: Ok(detail.clone()),
+        };
+        assert!(!crate::handlers::tracker::apply_detail(&mut ui, stale));
+        assert!(ui.issues_detail_loaded.is_none());
+        let load = crate::panel::IssueDetailLoad {
+            id: "linear:THE-7".into(),
+            detail: Ok(detail),
+        };
+        assert!(crate::handlers::tracker::apply_detail(&mut ui, load));
+        let text = rendered_text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 40,
+        }));
+        assert!(text.contains("fresh title"), "{text}");
+        assert!(text.contains("COMMENTS  1"), "{text}");
+        assert!(text.contains("alex"), "{text}");
+        assert!(text.contains("• looks right"), "{text}");
+        assert!(text.contains("more comments in the browser (o)"), "{text}");
+        assert!(!text.contains("loading"), "{text}");
+
+        ui.issues_detail_loaded = Some(crate::panel::IssueDetailLoad {
+            id: "linear:THE-7".into(),
+            detail: Err("tracker http: 503".into()),
+        });
+        let text = rendered_text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 40,
+        }));
+        assert!(text.contains("fetch failed: tracker http: 503"), "{text}");
+        assert!(text.contains("title linear:THE-7"), "{text}");
+    }
+
+    #[test]
+    fn normal_view_shows_the_team_scope_row() {
+        let model = crate::chrome::FrameModel {
+            panel: panel_with(vec![
+                issue("THE-1", IssuePriority::High, IssueStatus::Todo, ""),
+                issue("THE-2", IssuePriority::High, IssueStatus::Todo, ""),
+                issue("AGE-1", IssuePriority::High, IssueStatus::Todo, ""),
+            ]),
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            ..Default::default()
+        };
+        let text = rendered_text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 39,
+            rows: 24,
+        }));
+        assert!(text.contains("scope [team THE] · T switches"), "{text}");
+        assert!(text.contains("THE-1"), "{text}");
+        assert!(!text.contains("AGE-1"), "{text}");
     }
 }

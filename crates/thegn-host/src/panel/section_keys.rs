@@ -132,8 +132,8 @@ const FILES: &[SectionKey] = &[
     k('O', "O", "editor"),
     k('y', "y", "yazi"),
 ];
-// The strip fits six: `j/k` and `D` (dispatch) still work and are listed in the
-// section body's hint row and the help page.
+// The strip fits six: `j/k`, `D` (dispatch) and `r` (refresh) still work; the
+// half and full views' hint rows list `D` and `r`.
 const ISSUES: &[SectionKey] = &[
     nav("↵", "details"),
     k('l', "l", "link"),

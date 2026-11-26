@@ -409,6 +409,10 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
+    /// The Issues detail page's full issue (description, comments), fetched
+    /// off-loop by `handlers::tracker::toggle_detail` and applied by
+    /// `handlers::tracker::apply_detail`.
+    IssueDetail(Box<crate::panel::IssueDetailLoad>),
     /// Periodic calendar sync: refresh every enabled `[[calendar.accounts]]`
     /// over the configured horizon. Runs on the shortest account interval
     /// (floored at 60s); no slot is emitted at all when nothing is configured.

@@ -15293,6 +15293,9 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::IssueDetail(p) => {
+                    dirty |= crate::handlers::tracker::apply_detail(&mut panel_ui, *p)
+                }
                 RefreshKind::Info(p) => {
                     dirty |= crate::detail::info::apply(
                         &mut bar_detail,

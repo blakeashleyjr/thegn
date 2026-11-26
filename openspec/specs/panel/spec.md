@@ -30,6 +30,20 @@ The panel SHALL aggregate issues from all active tracker providers (the `IssueRo
 - **THEN** the Issues section still shows the working provider's issues and logs
   the failure
 
+### Requirement: Issues list is team-scoped and opens a detail page
+
+When the loaded issues span more than one team key (`THE` in `THE-12`), the Issues section SHALL show one team by default (the team of the issue linked to the active worktree, else the team with the most issues), MUST show the scope in the list, and `T` SHALL cycle each team and then all teams. `↵` SHALL open a detail page for the cursor issue that fetches the full issue from the tracker off the loop and shows its state, assignee, labels, priority, project, link, description and comments; linking the issue to the worktree MUST be its own key (`l`).
+
+#### Scenario: Another team's issues are hidden by default
+
+- **WHEN** the tracker returns issues from teams `THE` and another team, with more `THE` issues and no linked issue
+- **THEN** the Issues section lists only the `THE` issues and labels the scope `[team THE]`
+
+#### Scenario: Enter opens the fetched issue
+
+- **WHEN** the user presses `↵` on an issue row
+- **THEN** the panel shows the issue's cached fields at once, fetches the full issue off-loop, and shows its comments when the fetch lands, or says the fetch failed and keeps the cached fields
+
 ### Requirement: Cross-repo "My Work" surface
 
 The panel SHALL provide a cross-repo `Mine` section listing actionable work (assigned issues, review-requested PRs, high-priority unread notifications); selecting a row MUST jump to its linked worktree, or offer to create one from the issue when none is linked.

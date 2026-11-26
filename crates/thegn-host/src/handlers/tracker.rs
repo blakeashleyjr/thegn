@@ -74,21 +74,87 @@ pub(crate) struct TrackerCtx<'a> {
 /// The issue under the Issues-section cursor, selected from the same
 /// sorted+filtered view the panel renders. Returned owned so the (immutable)
 /// borrow of `ctx` is released before the caller mutates `ctx.model`.
+/// While a detail page is open the keys act on that issue, not on whatever
+/// row the hidden list cursor has drifted to.
 fn cursor_issue(ctx: &TrackerCtx) -> Option<thegn_core::issue::Issue> {
+    if let Some(id) = ctx.panel_ui.issues_detail.as_deref()
+        && let Some(issue) = ctx.model.panel.tracker_issues.iter().find(|i| i.id == id)
+    {
+        return Some(issue.clone());
+    }
     crate::panel::sections::issues::issue_at_cursor(&ctx.model.panel, ctx.panel_ui).cloned()
 }
 
 /// Enter on the Issues section: open (or close) the detail page of the cursor
-/// issue.
+/// issue. Opening shows the cached fields at once and fetches the full issue
+/// (description, comments) from the tracker off-loop.
 pub(crate) fn toggle_detail(ctx: &mut TrackerCtx) {
     if ctx.panel_ui.issues_detail.take().is_some() {
+        ctx.panel_ui.issues_detail_loaded = None;
         ctx.model.status = "Closed issue details".into();
         return;
     }
     if let Some(issue) = cursor_issue(ctx) {
         ctx.model.status = format!("Details for {} — ↵ closes", issue.number);
-        ctx.panel_ui.issues_detail = Some(issue.id);
+        ctx.panel_ui.issues_detail = Some(issue.id.clone());
+        ctx.panel_ui.issues_detail_loaded = None;
+        spawn_detail_fetch(ctx, issue);
     }
+}
+
+/// Fetch the full issue behind the detail page on a blocking worker and post
+/// it back as `RefreshKind::IssueDetail`.
+fn spawn_detail_fetch(ctx: &TrackerCtx, issue: thegn_core::issue::Issue) {
+    let full_cfg = ctx.live_cfg.clone();
+    let tx = ctx.refresh_tx.clone();
+    let waker = ctx.waker.clone();
+    let cwd = active_tab_path(ctx.session);
+    tokio::task::spawn_blocking(move || {
+        let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        let router = panel_issue_router(&full_cfg, &repo_root, &cwd);
+        let detail = if !router.is_configured() {
+            Err("no issue tracker is configured".to_string())
+        } else {
+            let fetched = match thegn_core::issue::IssueRef::of(&issue) {
+                Some(issue_ref) => {
+                    thegn_svc::issue::block_on_tracker(router.get_issue_ref(&issue_ref))
+                }
+                None if issue.account.is_none() => {
+                    thegn_svc::issue::block_on_tracker(router.get_issue(&issue.id))
+                }
+                None => Ok(Err(thegn_svc::issue::IssueError::Policy(
+                    "issue row has an invalid account reference",
+                ))),
+            };
+            match fetched {
+                Ok(Ok(detail)) => Ok(detail),
+                Ok(Err(error)) | Err(error) => Err(thegn_core::ci_log::redact(&error.to_string())),
+            }
+        };
+        let load = crate::panel::IssueDetailLoad {
+            id: issue.id,
+            detail,
+        };
+        if let Err(error) = tx.send(crate::hydrate::RefreshKind::IssueDetail(Box::new(load))) {
+            tracing::debug!(%error, "failed to send issue detail");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(%error, "failed to wake after issue detail");
+        }
+    });
+}
+
+/// Apply a fetched issue to the open detail page. A load for a page that has
+/// since closed (or moved to another issue) is dropped. Returns "repaint".
+pub(crate) fn apply_detail(
+    panel_ui: &mut crate::panel::PanelUi,
+    load: crate::panel::IssueDetailLoad,
+) -> bool {
+    if panel_ui.issues_detail.as_deref() != Some(load.id.as_str()) {
+        return false;
+    }
+    panel_ui.issues_detail_loaded = Some(load);
+    true
 }
 
 /// `T` on the Issues section: switch the team scope (each team, then all).
