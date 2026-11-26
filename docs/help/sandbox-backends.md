@@ -249,6 +249,14 @@ accepted back from a sandbox. Set it globally or per `[env.<name>.sandbox.git]`;
 repository's `.thegn.toml` cannot set it. The keys are validated today; the
 sandbox mounts that enforce them arrive in a later release.
 
+`objects/info/alternates` and `objects/info/http-alternates` are always
+read-only inside the sandbox (created empty when missing), so a sandbox cannot
+redirect object lookups to a planted directory. A repository whose object store
+already borrows objects from elsewhere (a non-empty `alternates` file, a symlink
+under `objects/`, or a `commondir` outside the common dir) is judged at launch:
+`sealed` and `sealed-tunnel` refuse with "use a private copy", and other
+profiles warn and launch.
+
 Sandboxed and remote agents get no GitHub token by default: credentials stay
 with thegn. With the default `credential = "none"`, `GH_TOKEN` and
 `GITHUB_TOKEN` are not passed into sandboxes or provider provisioning even

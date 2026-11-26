@@ -7241,6 +7241,7 @@ fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
         target: target.map(str::to_string),
         default: Some("main".to_string()),
         identity: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -7315,6 +7316,68 @@ fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
             "{protected} is under a rw bind: {mounts:?}"
         );
     }
+}
+
+#[test]
+fn alternates_pinned_ro() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    std::fs::create_dir_all(fx.common.join("objects/info")).unwrap();
+    for mode in [
+        SandboxGitMode::CommitOnly,
+        SandboxGitMode::PushLane,
+        SandboxGitMode::Full,
+    ] {
+        let (mounts, _) = git_policy_mounts(
+            &git_cfg(mode),
+            &fx.wt,
+            &git_probe(&fx, "tg/lane", Some("main")),
+        );
+        let argv = bwrap_git_argv(&fx, mounts.clone());
+        let objects = triple_at(&argv, "--bind", &fx.common.join("objects")).expect("objects rw");
+        for name in ["alternates", "http-alternates"] {
+            let path = fx.common.join("objects/info").join(name);
+            // Created empty so the read-only bind has a target.
+            assert!(path.exists(), "{name}");
+            let pin = triple_at(&argv, "--ro-bind", &path).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                objects < pin,
+                "{name} pinned after the rw objects bind: {argv:?}"
+            );
+            // The mount list (lowered unchanged by OCI `:ro` and systemd
+            // `ReadOnlyPaths`/`BindReadOnlyPaths`) carries it read-only.
+            assert!(
+                mounts
+                    .iter()
+                    .any(|m| m.ro && std::path::Path::new(&m.dest) == path),
+                "{name}: {mounts:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_object_store_reads_alternates_symlinks_and_commondir() {
+    let fx = git_fixture();
+    let clean = probe_object_store(&fx.common, Some(&fx.admin));
+    assert_eq!(clean, (vec![], false, false));
+    std::fs::create_dir_all(fx.common.join("objects/info")).unwrap();
+    std::fs::write(
+        fx.common.join("objects/info/alternates"),
+        "# comment\n\n/shared/objects\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/tmp", fx.common.join("objects/aa")).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fx.admin.join("commondir"),
+        format!("{}\n", other.path().display()),
+    )
+    .unwrap();
+    let (alts, symlinks, outside) = probe_object_store(&fx.common, Some(&fx.admin));
+    assert_eq!(alts, vec!["/shared/objects".to_string()]);
+    assert!(symlinks && outside);
 }
 
 #[test]
@@ -7397,6 +7460,7 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         target: Some("main".into()),
         default: Some("main".into()),
         identity: Default::default(),
+        ..Default::default()
     };
     let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
     assert!(warning.expect("warns").contains("main checkout"));
