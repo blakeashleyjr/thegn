@@ -404,11 +404,9 @@ fn launch_spec_with(
             }
             Some(addr.port())
         }
-        LeadNetwork::Host => {
-            // Refused at the beginning of admission, before filesystem
-            // preparation. Keep this arm exhaustive if the config enum grows.
-            unreachable!("host network was refused before preparing the Lead")
-        }
+        // Refused at the top of admission, before any filesystem state;
+        // kept as an error (never a panic) so the arm stays exhaustive.
+        LeadNetwork::Host => bail!(HOST_NETWORK_REFUSED),
     };
 
     let plan = LeadMountPlan {
@@ -424,7 +422,7 @@ fn launch_spec_with(
         die_with_parent: matches!(mode, LeadMode::Headless { .. }) || !host.daemon_owned,
         // pasta starts bwrap as uid 0 of its user namespace: map back to the
         // caller's ids (claude refuses to skip permissions as root, and host
-        // files would read as root-owned). Host mode keeps today's argv.
+        // files would read as root-owned). Host mode is refused above.
         sandbox_ids: match network {
             LeadNetwork::Isolated => crate::platform::current_ids(),
             LeadNetwork::Host => None,
@@ -1247,7 +1245,8 @@ mod tests {
         // Every mount, mask and unset of the tab is present in the wake argv.
         let mounts = |argv: &[String]| -> Vec<String> {
             let b = argv.iter().position(|a| a == "bwrap").unwrap();
-            let sep = argv.iter().position(|a| a == "--").unwrap();
+            // bwrap's own `--`, not pasta's (which precedes bwrap).
+            let sep = b + argv[b..].iter().position(|a| a == "--").unwrap();
             argv[b + 1..sep]
                 .iter()
                 .filter(|a| *a != "--die-with-parent")
@@ -1392,7 +1391,7 @@ mod tests {
             "a daemon-owned pane drops --die-with-parent like the terminal path"
         );
         let bwrap = spec.argv.iter().position(|a| a == "bwrap").expect("bwrap");
-        let sep = spec.argv.iter().position(|a| a == "--").unwrap();
+        let sep = bwrap + spec.argv[bwrap..].iter().position(|a| a == "--").unwrap();
         assert!(bwrap < sep && spec.argv[sep + 1..].iter().any(|a| a.contains("true")));
         assert!(
             spec.env
