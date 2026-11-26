@@ -67,6 +67,7 @@ impl Engine {
         &self,
         samples: &[f32],
         language: &str,
+        trim: bool,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
     ) -> Result<String> {
@@ -77,10 +78,14 @@ impl Engine {
             return Ok(String::new());
         }
         Self::validate_language(language)?;
-        // Avoid Whisper's tendency to hallucinate on digital silence.
-        if samples.iter().map(|s| s * s).sum::<f32>() / (samples.len() as f32) < 0.000001 {
+        if !crate::level::has_speech(samples) {
             return Ok(String::new());
         }
+        let span = if trim {
+            crate::level::speech_span(samples).unwrap_or(0..samples.len())
+        } else {
+            0..samples.len()
+        };
         // Declare the callback context before `state`: ggml stores this
         // pointer in the state backend, so the context must outlive the state.
         let abort = Abort {
@@ -114,7 +119,7 @@ impl Engine {
             params.set_abort_callback(Some(should_abort));
             params.set_abort_callback_user_data(std::ptr::from_ref(&abort).cast_mut().cast());
         }
-        let result = state.full(params, samples);
+        let result = state.full(params, &samples[span]);
         if cancelled.load(Ordering::Acquire) || Instant::now() >= abort.deadline {
             bail!("Whisper transcription cancelled or timed out");
         }

@@ -2,6 +2,7 @@
 //! Native handles belong exclusively to the disposable voice worker process.
 #[cfg(feature = "native")]
 pub mod capture;
+pub mod level;
 #[cfg(feature = "native")]
 pub mod whisper;
 

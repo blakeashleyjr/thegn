@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
         let text = engine.transcribe(
             window,
             language,
+            false,
             Arc::new(AtomicBool::new(false)),
             Duration::from_secs(60),
         )?;
@@ -55,6 +56,7 @@ fn main() -> anyhow::Result<()> {
     let text = engine.transcribe(
         &samples,
         language,
+        true,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(60),
     )?;
@@ -70,6 +72,7 @@ fn main() -> anyhow::Result<()> {
             .transcribe(
                 window,
                 language,
+                false,
                 Arc::new(AtomicBool::new(true)),
                 Duration::from_secs(60)
             )
@@ -80,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     let silent = engine.transcribe(
         &vec![0.0; SAMPLE_RATE],
         language,
+        true,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(1),
     )?;

@@ -42,10 +42,13 @@ also a capture command. Native dictation is available in source builds with
 `voice-native` (or `voice-metal` on Apple silicon).
 
 Native embedded and HTTP providers show revisable text in the status line while
-recording. Only the final full-recording transcript reaches a pane. Stopping
-closes the device before finalization. Cancellation, config replacement, or pane
-closure during capture discards the current preview. A completed final transcript that loses
-focus is held for explicit insertion as described above.
+recording. Silence and low-level steady noise are skipped before transcription;
+the final embedded pass keeps 200 ms of context around detected speech. Previews
+use their full rolling windows so their offsets remain aligned. Only the final
+full-recording transcript reaches a pane. Stopping closes the device before
+finalization. Cancellation, config replacement, or pane closure during capture
+discards the current preview. A completed final transcript that loses focus is
+held for explicit insertion as described above.
 
 For an HTTP service compatible with multipart WAV transcription:
 
