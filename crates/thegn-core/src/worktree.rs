@@ -2600,7 +2600,7 @@ mod tests {
         match std::fs::create_dir(&path) {
             Ok(()) => std::fs::remove_dir(&path).unwrap(),
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
-                eprintln!("skipping: filesystem rejects non-UTF-8 names: {error}");
+                tracing::warn!(%error, "skipping: filesystem rejects non-UTF-8 names");
                 let _ = std::fs::remove_dir_all(&repo);
                 return;
             }

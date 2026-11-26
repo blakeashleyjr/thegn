@@ -73,8 +73,17 @@ fn plain_git_status_runs_the_fsmonitor_program() {
         return;
     }
     let fixture = Fixture::new("plain");
-    let status = util::git_cmd(&fixture.root)
+    // Not `util::git_cmd`: that helper fences fsmonitor off (THE-225), and this
+    // test is the positive control proving plain Git would have run it.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fixture.root)
         .args(["diff-index", "--quiet", "HEAD", "--"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .status()
         .unwrap();
     assert!(status.success(), "plain Git status failed: {status}");

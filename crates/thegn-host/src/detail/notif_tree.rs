@@ -396,7 +396,10 @@ impl NotifTree {
     fn entry_id(&self, e: &Entry) -> Option<String> {
         match e {
             Entry::Group { key, .. } => Some(format!("g:{key}")),
-            Entry::Leaf { idx, .. } => Some(format!("l:{}", self.leaves[*idx].key)),
+            // Callers that prune `leaves` take their anchor first (see
+            // `rebuild_notif_from`); an index past the end is still "no
+            // anchor" rather than a panic.
+            Entry::Leaf { idx, .. } => self.leaves.get(*idx).map(|l| format!("l:{}", l.key)),
             Entry::Static(j) => Some(format!("s:{j}")),
             _ => None,
         }
@@ -429,10 +432,22 @@ impl DetailOverlay {
     /// Regenerate the visible rows from the tree, keeping the cursor on the
     /// same entry when it still exists (else the nearest selectable row).
     fn rebuild_notif(&mut self) {
+        let anchor = self.notif_anchor();
+        self.rebuild_notif_from(anchor);
+    }
+
+    /// The stable id of the selected entry. Take it BEFORE pruning `leaves`:
+    /// `Entry::Leaf` holds an index into `leaves`, which shifts on removal.
+    fn notif_anchor(&self) -> Option<String> {
+        let t = self.notif.as_ref()?;
+        t.entries.get(self.sel).and_then(|e| t.entry_id(e))
+    }
+
+    /// `rebuild_notif` with an anchor captured before the tree changed.
+    fn rebuild_notif_from(&mut self, anchor: Option<String>) {
         let Some(t) = self.notif.as_mut() else {
             return;
         };
-        let anchor = t.entries.get(self.sel).and_then(|e| t.entry_id(e));
         let (rows, entries) = t.build();
         let found = anchor.and_then(|a| {
             entries
@@ -551,9 +566,10 @@ impl DetailOverlay {
 
     /// Drop the leaves with these keys (a batch dismissal) and rebuild.
     pub(crate) fn remove_notif_leaves(&mut self, keys: &[String]) {
+        let anchor = self.notif_anchor();
         if let Some(t) = self.notif.as_mut() {
             t.leaves.retain(|l| !keys.contains(&l.key));
-            self.rebuild_notif();
+            self.rebuild_notif_from(anchor);
         }
     }
 
@@ -564,6 +580,7 @@ impl DetailOverlay {
         if !matches!(self.content, DetailContent::List(_)) {
             return false;
         }
+        let anchor = self.notif_anchor();
         let Some(t) = self.notif.as_mut() else {
             return false;
         };
@@ -585,7 +602,7 @@ impl DetailOverlay {
             }
             _ => return true,
         }
-        self.rebuild_notif();
+        self.rebuild_notif_from(anchor);
         true
     }
 }

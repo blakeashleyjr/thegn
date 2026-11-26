@@ -592,7 +592,6 @@ voice.live_preview
 voice.max_seconds
 voice.model
 voice.model_path
-voice.replacements
 voice.timeout_seconds
 voice.vocabulary
 watch.pr_interval_secs
