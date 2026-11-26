@@ -74,8 +74,7 @@ fn speech_threshold(levels: &[f32]) -> Option<f32> {
 /// Detect speech from a fixed-level transient or a sustained level above the noise floor.
 pub fn has_speech(samples: &[f32]) -> bool {
     let levels: Vec<_> = window_levels_dbfs(samples).collect();
-    let peak = levels.iter().copied().fold(FLOOR_DBFS, f32::max);
-    peak >= FIXED_THRESHOLD_DBFS || longest_run(&levels, relative_threshold(&levels)) >= 6
+    speech_threshold(&levels).is_some()
 }
 
 /// Return the detected speech windows with 200 ms of context on either side.
@@ -94,78 +93,104 @@ pub fn speech_span(samples: &[f32]) -> Option<Range<usize>> {
 mod tests {
     use super::*;
 
-    fn tone(seconds: f32, dbfs: f32) -> Vec<f32> {
-        (0..(seconds * 16_000.0) as usize)
-            .map(|i| {
-                let t = i as f32 / 16_000.0;
-                10.0_f32.powf(dbfs / 20.0) * (std::f32::consts::TAU * 440.0 * t).sin()
+    const RATE: usize = 16_000;
+
+    /// A clip of deterministic uniform noise whose RMS level is `dbfs`.
+    fn noise(samples: usize, dbfs: f32) -> Vec<f32> {
+        let amplitude = 10.0_f32.powf(dbfs / 20.0) * 3.0_f32.sqrt();
+        let mut state = 0x1234_5678_u32;
+        (0..samples)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * amplitude
             })
             .collect()
     }
 
-    fn with_noise(signal: &mut [f32], dbfs: f32) {
-        let amplitude = 10.0_f32.powf(dbfs / 20.0) * 3.0_f32.sqrt();
-        let mut state = 0x1234_5678_u32;
-        for sample in signal {
-            // Deterministic uniform noise with the requested RMS level.
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let noise = (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * amplitude;
-            *sample += noise;
+    /// Add a 440 Hz tone whose RMS level is `dbfs` over `range`.
+    fn add_tone(clip: &mut [f32], range: Range<usize>, dbfs: f32) {
+        let amplitude = 10.0_f32.powf(dbfs / 20.0) * 2.0_f32.sqrt();
+        for (sample, i) in clip[range.clone()].iter_mut().zip(range) {
+            let t = i as f32 / RATE as f32;
+            *sample += amplitude * (std::f32::consts::TAU * 440.0 * t).sin();
         }
     }
 
     #[test]
-    fn detects_level_and_relative_speech_but_rejects_silence_and_noise() {
-        assert!(!has_speech(&vec![0.0; 16_000]));
-        let mut noise = vec![0.0; 16_000];
-        with_noise(&mut noise, -72.0);
-        assert!(!has_speech(&noise));
-        let mut quiet_tone = tone(0.3, -55.0);
-        with_noise(&mut quiet_tone, -80.0);
-        assert!(has_speech(&quiet_tone));
-        let short = tone(0.1, -58.0);
-        let mut short = short;
-        with_noise(&mut short, -80.0);
-        assert!(!has_speech(&short));
+    fn digital_zeros_are_not_speech() {
+        assert!(!has_speech(&vec![0.0; RATE]));
+        assert_eq!(speech_span(&vec![0.0; RATE]), None);
+    }
+
+    #[test]
+    fn steady_low_noise_is_not_speech() {
+        assert!(!has_speech(&noise(RATE, -72.0)));
+    }
+
+    #[test]
+    fn quiet_tone_over_noise_floor_is_speech_by_the_relative_path() {
+        let mut clip = noise(RATE, -80.0);
+        add_tone(&mut clip, 4_800..9_600, -55.0);
+        assert!(has_speech(&clip));
+    }
+
+    #[test]
+    fn short_quiet_tone_is_too_short() {
+        let mut clip = noise(RATE, -80.0);
+        add_tone(&mut clip, 4_800..6_400, -58.0);
+        assert!(!has_speech(&clip));
     }
 
     #[test]
     fn fixed_level_click_is_speech_even_without_a_sustained_run() {
-        // Match the fixed -50 dBFS fast path: a 10 ms click at -20 dBFS qualifies.
-        let mut click = vec![0.0; 16_000];
+        // Like Hex, any window at or above -50 dBFS passes the fixed gate, so a
+        // single 10 ms click at -20 dBFS counts as speech. This is deliberate:
+        // the gate only rejects clips that are certainly empty.
+        let mut click = vec![0.0; RATE];
         click[..160].fill(0.1);
         assert!(has_speech(&click));
     }
 
     #[test]
     fn one_quiet_window_bridges_but_two_break_the_run() {
-        let mut bridged = tone(0.24, -55.0);
-        let mut broken = bridged.clone();
-        bridged[1_440..1_920].fill(0.0);
-        broken[1_440..2_400].fill(0.0);
-        with_noise(&mut bridged, -80.0);
-        with_noise(&mut broken, -80.0);
+        // Six tone windows split 3 + 3 by one or two noise-only windows.
+        let w = WINDOW_SAMPLES;
+        let mut bridged = noise(RATE, -80.0);
+        add_tone(&mut bridged, 10 * w..13 * w, -55.0);
+        add_tone(&mut bridged, 14 * w..17 * w, -55.0);
         assert!(has_speech(&bridged));
+
+        let mut broken = noise(RATE, -80.0);
+        add_tone(&mut broken, 10 * w..13 * w, -55.0);
+        add_tone(&mut broken, 15 * w..18 * w, -55.0);
         assert!(!has_speech(&broken));
     }
 
     #[test]
-    fn span_pads_and_clamps_to_clip_edges() {
-        let speech = tone(0.3, -55.0);
-        let mut clip = vec![0.0; 16_000];
-        clip[4_800..9_600].copy_from_slice(&speech);
-        with_noise(&mut clip, -80.0);
-        let span = speech_span(&clip).unwrap();
-        assert_eq!(span, 16_000 / 10..8 * 16_000 / 10);
+    fn leading_quiet_windows_do_not_use_up_the_bridge() {
+        assert_eq!(longest_run(&[-80.0, -80.0, -50.0, -80.0, -50.0], -60.0), 2);
+        assert_eq!(longest_run(&[-50.0, -80.0, -80.0, -50.0], -60.0), 1);
+    }
 
-        let mut edge = tone(0.3, -55.0);
-        with_noise(&mut edge, -80.0);
-        assert_eq!(speech_span(&edge).unwrap().start, 0);
-        assert_eq!(speech_span(&edge).unwrap().end, edge.len());
+    #[test]
+    fn span_pads_by_200_ms_and_clamps_to_clip_edges() {
+        let mut clip = noise(RATE, -80.0);
+        add_tone(&mut clip, 4_800..9_600, -55.0);
+        assert_eq!(speech_span(&clip), Some(1_600..12_800));
+
+        // Speech touching both edges cannot be padded past the clip.
+        let len = 27 * WINDOW_SAMPLES;
+        let mut edge = noise(len, -80.0);
+        add_tone(&mut edge, 0..6 * WINDOW_SAMPLES, -55.0);
+        add_tone(&mut edge, len - 6 * WINDOW_SAMPLES..len, -55.0);
+        assert_eq!(speech_span(&edge), Some(0..len));
     }
 
     #[test]
     fn dc_offset_does_not_count_as_speech() {
-        assert!(!has_speech(&vec![0.3; 16_000]));
+        assert!(!has_speech(&vec![0.3; RATE]));
+        let mut offset = noise(RATE, -80.0);
+        offset.iter_mut().for_each(|sample| *sample += 0.3);
+        assert!(!has_speech(&offset));
     }
 }

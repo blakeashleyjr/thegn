@@ -68,7 +68,7 @@ external or native capture.
 
 Voice transcription SHALL use DC-removed RMS levels over 30 ms windows. It
 SHALL accept a window at or above -50 dBFS immediately, or accept a contiguous
-run of at least six windows above the greater of the 10th-percentile noise
+run of at least six windows at or above the greater of the 10th-percentile noise
 floor plus 12 dB and -66 dBFS. One quiet window MAY be bridged within a run;
 two consecutive quiet windows SHALL end it. The final embedded decode SHALL
 include 200 ms of context around detected speech, clamped to the recording;
