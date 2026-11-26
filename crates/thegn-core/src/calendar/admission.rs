@@ -288,7 +288,7 @@ impl AdmissionPool {
             return true;
         }
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 cur.checked_add(n).filter(|next| *next <= max)
             })
             .is_ok()
