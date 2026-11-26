@@ -29,7 +29,9 @@ THE-2753b: `src/input.rs` gains an opt-in `set_hold_partial_csi`/`has_pending_cs
 `flush_pending` trio and `src/terminal/unix.rs` enables it with a 40 ms flush. A short
 read that ended inside an SGR mouse report (`ESC [ <65;..`) used to be flushed with
 `maybe_more = false`, decoding `ESC [` as Alt+`[` (the previous-app chord). Default
-parser behaviour is unchanged; a lone ESC still resolves immediately.
+parser behaviour is unchanged; a lone ESC still resolves immediately. An expired hold
+polls the tty without blocking before flushing, so a late `poll_input` under load
+completes the report instead of emitting Alt+`[`.
 
 Upstream source, examples, benches, README, changelog and license are otherwise
 unchanged, and the manifest differs only by that table. Cargo registry

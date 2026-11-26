@@ -1020,8 +1020,11 @@ pub fn tab_chord(
 }
 
 /// How soon after a mouse-wheel report an `Alt+[`/`Alt+]` cycle chord is treated as
-/// the torn head of a split SGR report (THE-2753b), not a deliberate keypress.
-const WHEEL_CHORD_GUARD: std::time::Duration = std::time::Duration::from_millis(50);
+/// the torn head of a split SGR report (THE-2753b), not a deliberate keypress. A torn
+/// `ESC [` is held 40 ms by termwiz and another 40 ms by the host residue filter before
+/// it reaches the chord, plus event-loop latency under load, so the window must be
+/// well above those stacked holds.
+const WHEEL_CHORD_GUARD: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// True when `chord` is a tab-cycle chord arriving within [`WHEEL_CHORD_GUARD`] of a
 /// wheel event: trackpad scrolling must never flip the app tab. Direct `Alt+<digit>`
@@ -1044,11 +1047,18 @@ mod tests {
     fn cycle_chord_right_after_a_wheel_event_is_ignored() {
         let t0 = std::time::Instant::now();
         let soon = t0 + std::time::Duration::from_millis(10);
-        let later = t0 + std::time::Duration::from_millis(200);
+        let held = t0 + std::time::Duration::from_millis(90);
+        let later = t0 + std::time::Duration::from_millis(500);
         assert!(cycle_chord_is_wheel_residue(
             &TabChord::Cycle(-1),
             Some(t0),
             soon
+        ));
+        // Still caught after both 40 ms introducer holds have expired.
+        assert!(cycle_chord_is_wheel_residue(
+            &TabChord::Cycle(1),
+            Some(t0),
+            held
         ));
         assert!(!cycle_chord_is_wheel_residue(
             &TabChord::Cycle(-1),

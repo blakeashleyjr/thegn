@@ -17908,9 +17908,10 @@ async fn event_loop<T: Terminal>(
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
                 plugins_state.user_input();
-                if m.mouse_buttons
-                    .contains(termwiz::input::MouseButtons::VERT_WHEEL)
-                {
+                if m.mouse_buttons.intersects(
+                    termwiz::input::MouseButtons::VERT_WHEEL
+                        | termwiz::input::MouseButtons::HORZ_WHEEL,
+                ) {
                     last_wheel_at = Some(std::time::Instant::now());
                 }
                 crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
