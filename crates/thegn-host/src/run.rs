@@ -8473,6 +8473,10 @@ async fn event_loop<T: Terminal>(
     // Coalesce model hydrations: one main-loop `build_model` in flight, so a refresh
     // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
     let mut inflight_hydration_gen: Option<u64> = None;
+    // The Files self-heal (see the event-loop tail) fires at most once per
+    // hydration generation: a hydration that still lands Pending (a retained
+    // model after a failed build) must not respawn `build_model` on every wake.
+    let mut files_heal_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
     // A worktree/workspace switch may spawn ONE hydration that overlaps an
     // in-flight ticker hydration (generation checks discard the older result),
@@ -15611,12 +15615,15 @@ async fn event_loop<T: Terminal>(
         // Self-heal: the tracked-file listing is only fetched while Files is the
         // open section, so a model built under other hints (startup, restored
         // `open`, a prefetch) leaves it Pending — refresh once with the live hints.
-        want_model_refresh |= panel_ui.open == crate::panel::Section::Files
+        // Bounded to one heal per generation (`files_heal_gen`).
+        let files_heal = panel_ui.open == crate::panel::Section::Files
             && matches!(
                 model.panel.files_load,
                 crate::panel::gitui::DocLoad::Pending
             )
-            && inflight_hydration_gen.is_none();
+            && inflight_hydration_gen.is_none()
+            && files_heal_gen != Some(hydration_gen);
+        want_model_refresh |= files_heal;
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         // A switch's hydration may overlap ONE in-flight ticker hydration: the
         // generation checks at the arrival site make the older result inert
@@ -15677,6 +15684,9 @@ async fn event_loop<T: Terminal>(
                 switch_hydration_gen = Some(hydration_gen);
             }
             inflight_hydration_gen = Some(hydration_gen);
+            if files_heal {
+                files_heal_gen = Some(hydration_gen);
+            }
             model_refresh_pending = false;
             switch_refresh_pending = false;
         }
