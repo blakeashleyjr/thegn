@@ -178,6 +178,16 @@ fn clamp_cells(cells: &[(char, usize)]) -> Vec<(char, usize)> {
     out
 }
 
+/// Keep commit decorations from taking over a row when many refs point at it.
+fn compact_refs(refs: &str) -> String {
+    let refs: Vec<&str> = refs.split(", ").filter(|r| !r.is_empty()).collect();
+    match refs.as_slice() {
+        [] => String::new(),
+        [first] => (*first).to_string(),
+        [first, rest @ ..] => format!("{first} +{}", rest.len()),
+    }
+}
+
 /// Render commits + their graph rows into seg lines for the Full git frame:
 /// `[mark][graph cells][short sha] [subject] [(refs)] … [author initials] [age]`.
 /// Graph cells are lane-colored (`HUE_CYCLE[lane % 8]`), the gutter is padded
@@ -240,7 +250,7 @@ pub fn rows(
             l.push(subject);
             if !c.refs.is_empty() {
                 l.push(sp(1));
-                l.push(seg(hue(Hue::Amber), format!("({})", c.refs)));
+                l.push(seg(hue(Hue::Amber), format!("({})", compact_refs(&c.refs))));
             }
             let r = vec![
                 seg(hue(author_hue(&c.author)), initials(&c.author)),
@@ -266,6 +276,15 @@ mod tests {
             refs: refs.into(),
             parents: parents.iter().map(|p| p.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn refs_collapse_to_the_first_ref_and_remaining_count() {
+        assert_eq!(compact_refs("HEAD -> main"), "HEAD -> main");
+        assert_eq!(
+            compact_refs("HEAD -> main, origin/main, tag: v1.0"),
+            "HEAD -> main +2"
+        );
     }
 
     fn split(line: &Line) -> (&[Seg], &[Seg]) {

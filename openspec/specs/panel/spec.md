@@ -10,6 +10,26 @@ event loop so it never costs idle CPU.
 
 ## Requirements
 
+### Requirement: Half-width commit history stays readable
+
+The Git commits view at Half width SHALL use the full panel width for a
+single-line-per-commit list containing the short hash, truncated subject,
+author and age. The selected commit's changed files and line counts SHALL
+render inline beneath the list. At Full width, the existing history and detail
+columns SHALL remain available. Commit decorations with multiple refs SHALL
+show the first ref and a count of the remaining refs. An empty stash whose
+count is already known to be zero MUST NOT show a loading placeholder.
+
+#### Scenario: Read commits at Half width
+
+- **WHEN** the Git commits view is open at Half width
+- **THEN** each history row stays on one line with its hash, subject, author and age, and the selected commit's files and line counts appear below
+
+#### Scenario: Empty stash count is known
+
+- **WHEN** the stash list is empty and the known stash count is zero
+- **THEN** the view says `no stashes` instead of `loading stashes`
+
 ### Requirement: Tabbed panel with switchable sections
 
 The right panel SHALL present switchable tabs (e.g. Git / Work / System) each containing sections, and switching a tab or section MUST NOT recompute chrome geometry.
