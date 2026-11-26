@@ -11,6 +11,108 @@
 
 use std::path::{Path, PathBuf};
 
+/// Container-engine sockets that a devcontainer bind must not expose by default.
+pub fn engine_socket_paths(home: Option<&Path>, runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".docker/run/docker.sock"));
+    }
+    paths.extend([
+        PathBuf::from("/var/run/docker.sock"),
+        PathBuf::from("/run/docker.sock"),
+        PathBuf::from("/run/podman/podman.sock"),
+        PathBuf::from("/run/containerd/containerd.sock"),
+    ]);
+    if let Some(runtime_dir) = runtime_dir {
+        paths.push(runtime_dir.join("podman/podman.sock"));
+    }
+    paths
+}
+
+/// Thegn state and runtime directories protected from devcontainer binds.
+pub(crate) fn thegn_control_paths(state_home: &Path, runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![state_home.join("thegn")];
+    if let Some(runtime_dir) = runtime_dir {
+        paths.push(runtime_dir.join("thegn"));
+    }
+    paths
+}
+
+/// Canonicalize an existing path, or resolve its deepest existing ancestor and
+/// append the remaining components. This follows symlinks even when the leaf
+/// socket or directory has not been created yet.
+pub(crate) fn canonical_or_normalized(path: &Path) -> PathBuf {
+    canonical_or_normalized_inner(path, 0)
+}
+
+fn canonical_or_normalized_inner(path: &Path, depth: usize) -> PathBuf {
+    if depth < 40
+        && let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(path)
+    {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+        };
+        return canonical_or_normalized_inner(&target, depth + 1);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    if let Ok(path) = std::fs::canonicalize(&absolute) {
+        return path;
+    }
+    let mut missing = Vec::new();
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    let mut resolved =
+        std::fs::canonicalize(ancestor).unwrap_or_else(|_| lexical_normalize(&absolute));
+    if resolved != lexical_normalize(&absolute) {
+        for component in missing.iter().rev() {
+            resolved.push(component);
+        }
+    }
+    lexical_normalize(&resolved)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether a canonicalized source equals, or contains, one of the protected paths.
+pub(crate) fn reaches_protected_path(source: &Path, protected: &[PathBuf]) -> bool {
+    protected.iter().any(|path| {
+        let path = canonical_or_normalized(path);
+        source == path || path.starts_with(source)
+    })
+}
+
 /// What a runtime-dir entry is on the host, which decides how bwrap masks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscapeKind {
@@ -235,6 +337,24 @@ mod tests {
         plan_escape_masks, runtime_escape_masks,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn engine_socket_paths_preserve_compose_guard_order() {
+        assert_eq!(
+            super::engine_socket_paths(
+                Some(Path::new("/home/u")),
+                Some(Path::new("/run/user/1000"))
+            ),
+            vec![
+                PathBuf::from("/home/u/.docker/run/docker.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+                PathBuf::from("/run/docker.sock"),
+                PathBuf::from("/run/podman/podman.sock"),
+                PathBuf::from("/run/containerd/containerd.sock"),
+                PathBuf::from("/run/user/1000/podman/podman.sock"),
+            ]
+        );
+    }
 
     fn rt() -> PathBuf {
         PathBuf::from("/run/user/1000")

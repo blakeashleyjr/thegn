@@ -31,6 +31,7 @@ use crate::config_resolve::{Approvals, GatedRequest};
 use crate::devcontainer::{
     self, Command, DevContainer, ImageSource, Mount, MountKind, SubstCtx, SubstitutionReport,
 };
+use crate::devcontainer_privilege::{PrivilegeRequest, RequestOrigin};
 use crate::envplan::{ProvisionStep, StepKind};
 use crate::sandbox::{Backend, BackendFamily};
 use crate::sandbox_build::{self, SandboxBuild};
@@ -156,6 +157,12 @@ pub fn apply_gated_with_policy(
     };
 
     o.warnings = devcontainer::recognized_unapplied(dc).warnings();
+    o.warnings.extend(refused_engine_socket_mounts(
+        dc,
+        ctx,
+        local_env_allowed,
+        &mut o.substitution,
+    ));
 
     // image / build / compose
     if let Some(req) = source_request(dc)
@@ -168,13 +175,11 @@ pub fn apply_gated_with_policy(
     if let Some(req) = mounts_request(dc)
         && ok(&req, &mut o)
     {
-        o.warnings.extend(fold_mounts(
-            dc,
-            sb,
-            ctx,
-            local_env_allowed,
-            &mut o.substitution,
-        ));
+        for warning in fold_mounts(dc, sb, ctx, local_env_allowed, &mut o.substitution) {
+            if !o.warnings.contains(&warning) {
+                o.warnings.push(warning);
+            }
+        }
     }
 
     // ports
@@ -543,6 +548,9 @@ fn fold_mounts(
                 }
             }
             MountOutcome::Unsupported(why) => warnings.push(why),
+            MountOutcome::Privilege(request, origin) => {
+                warnings.push(privilege_refusal(&request, &origin));
+            }
         }
     }
     warnings
@@ -710,11 +718,15 @@ fn source_request(dc: &DevContainer) -> Option<GatedRequest> {
 }
 
 fn mounts_request(dc: &DevContainer) -> Option<GatedRequest> {
-    if dc.mounts.is_empty() {
+    let mounts: Vec<&Mount> = dc
+        .mounts
+        .iter()
+        .filter(|mount| !mount_request_is_engine_socket(dc, mount))
+        .collect();
+    if mounts.is_empty() {
         return None;
     }
-    let raw: Vec<serde_json::Value> = dc
-        .mounts
+    let raw: Vec<serde_json::Value> = mounts
         .iter()
         .map(|m| {
             json!({
@@ -725,8 +737,7 @@ fn mounts_request(dc: &DevContainer) -> Option<GatedRequest> {
             })
         })
         .collect();
-    let summary = dc
-        .mounts
+    let summary = mounts
         .iter()
         .map(|m| match &m.source {
             Some(s) => format!("{s} → {}", m.target),
@@ -826,6 +837,7 @@ fn command_display(cmd: &Command) -> String {
 
 enum MountOutcome {
     Bind(String),
+    Privilege(PrivilegeRequest, RequestOrigin),
     Volume {
         name: String,
         dest: String,
@@ -846,6 +858,9 @@ fn mount_to_sandbox(
         MountKind::Bind => match &m.source {
             Some(src) => {
                 let src = ctx_subst(dc, src, ctx, local_env_allowed, report);
+                if let Some(request) = engine_socket_request(&src) {
+                    return MountOutcome::Privilege(request, RequestOrigin::RepoFile);
+                }
                 let mut spec = format!("{src}:{target}");
                 if m.readonly {
                     spec.push_str(":ro");
@@ -870,6 +885,84 @@ fn mount_to_sandbox(
             MountOutcome::Unsupported(format!("devcontainer: tmpfs mount at '{target}' (skipped)"))
         }
     }
+}
+
+fn mount_request_is_engine_socket(dc: &DevContainer, mount: &Mount) -> bool {
+    if mount.kind != MountKind::Bind {
+        return false;
+    }
+    let Some(source) = mount.source.as_deref() else {
+        return false;
+    };
+    let local_env = |name: &str| std::env::var(name).ok();
+    let container_env = |_| None;
+    let ctx = SubstCtx {
+        local_workspace_folder: String::new(),
+        container_workspace_folder: String::new(),
+        local_env: &local_env,
+        container_env: &container_env,
+    };
+    let mut report = SubstitutionReport::default();
+    let source = ctx_subst(dc, source, &ctx, &|_| true, &mut report);
+    source_is_engine_socket(&source)
+}
+
+fn source_is_engine_socket(source: &str) -> bool {
+    engine_socket_request(source).is_some()
+}
+
+fn engine_socket_request(source: &str) -> Option<PrivilegeRequest> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut protected =
+        crate::sandbox_runtime_escape::engine_socket_paths(home.as_deref(), runtime.as_deref());
+    protected.extend(crate::sandbox_runtime_escape::thegn_control_paths(
+        &crate::util::xdg_state_home(),
+        runtime.as_deref(),
+    ));
+    engine_socket_request_with_protected(source, &protected)
+}
+
+fn engine_socket_request_with_protected(
+    source: &str,
+    protected: &[PathBuf],
+) -> Option<PrivilegeRequest> {
+    let source = crate::sandbox_runtime_escape::canonical_or_normalized(Path::new(source));
+    crate::sandbox_runtime_escape::reaches_protected_path(&source, protected)
+        .then_some(PrivilegeRequest::EngineSocket(source))
+}
+
+fn source_reaches_engine_socket(source: &Path, protected: &[PathBuf]) -> bool {
+    engine_socket_request_with_protected(&source.to_string_lossy(), protected).is_some()
+}
+
+fn privilege_refusal(request: &PrivilegeRequest, origin: &RequestOrigin) -> String {
+    match (request, origin) {
+        (PrivilegeRequest::EngineSocket(_), RequestOrigin::RepoFile) => {
+            "refused: engine-socket bind reaches a protected host path".into()
+        }
+        _ => "refused: devcontainer privilege request".into(),
+    }
+}
+
+fn refused_engine_socket_mounts(
+    dc: &DevContainer,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> Vec<String> {
+    dc.mounts
+        .iter()
+        .filter(|mount| mount.kind == MountKind::Bind)
+        .filter_map(
+            |mount| match mount_to_sandbox(mount, ctx, local_env_allowed, report, dc) {
+                MountOutcome::Privilege(request, origin) => {
+                    Some(privilege_refusal(&request, &origin))
+                }
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// Render a lifecycle [`Command`] to a single shell line with `${...}`
@@ -1410,6 +1503,73 @@ mod tests {
         // env + variable substitution landed in init_script exports.
         assert!(sb.init_script.contains("export TZ=UTC"));
         assert!(sb.init_script.contains("export API=/home/u/proj/x"));
+    }
+
+    #[test]
+    fn docker_sock_mount_is_privilege_request() {
+        let dc = parse(
+            r#"{"mounts":[{"source":"/var/run/docker.sock","target":"/run/docker.sock","type":"bind"}]}"#,
+        )
+        .unwrap();
+        assert!(mounts_request(&dc).is_none());
+        assert!(source_is_engine_socket("/var/run/docker.sock"));
+    }
+
+    #[test]
+    fn run_user_dir_mount_detected() {
+        let protected = vec![PathBuf::from("/run/user/1234/podman/podman.sock")];
+        assert!(source_reaches_engine_socket(
+            Path::new("/run/user/1234"),
+            &protected
+        ));
+        assert!(source_reaches_engine_socket(Path::new("/run"), &protected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_socket_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("engine.sock");
+        std::os::unix::fs::symlink("/run/docker.sock", &link).unwrap();
+        assert!(source_reaches_engine_socket(
+            &link,
+            &[PathBuf::from("/run/docker.sock")]
+        ));
+    }
+
+    #[test]
+    fn control_dir_mount_detected() {
+        let state = PathBuf::from("/tmp/test-state/thegn");
+        let runtime = PathBuf::from("/run/user/1234/thegn");
+        let protected = vec![state.clone(), runtime.clone()];
+        assert!(source_reaches_engine_socket(
+            Path::new("/tmp/test-state"),
+            &protected
+        ));
+        assert!(source_reaches_engine_socket(&runtime, &protected));
+    }
+
+    #[test]
+    fn approved_mounts_request_still_refuses_engine_socket() {
+        let dc = parse(
+            r#"{"mounts":[{"source":"/run/docker.sock","target":"/run/docker.sock","type":"bind"},{"source":"/workspace/cache","target":"/cache","type":"bind"}]}"#,
+        )
+        .unwrap();
+        let approvals = approvals_for(&dc);
+        let mut sb = SandboxConfig::default();
+        let outcome = apply_gated(&dc, &mut sb, &ctx(), "/w", &approvals);
+        assert!(!sb.mounts.iter().any(|mount| mount.contains("docker.sock")));
+        assert!(
+            sb.mounts
+                .iter()
+                .any(|mount| mount == "/workspace/cache:/cache")
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| { warning.starts_with("refused: engine-socket") })
+        );
     }
 
     #[test]

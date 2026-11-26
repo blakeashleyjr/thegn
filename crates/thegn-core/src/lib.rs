@@ -168,6 +168,7 @@ pub mod devcontainer;
 pub mod devcontainer_features;
 pub mod devcontainer_inventory;
 pub mod devcontainer_overlay;
+pub mod devcontainer_privilege;
 pub mod devcontainer_select;
 pub mod devenv;
 pub mod diff_highlight;
