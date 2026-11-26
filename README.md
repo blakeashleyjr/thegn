@@ -639,11 +639,12 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - the other cloud execution providers (Fly, DigitalOcean, Hetzner, Machine0,
   Daytona) and the managed pool (`thegn fleet` covers Sprites and Vercel
   only),
-- the placement engine,
-- voice mode.
+- the placement engine.
 
-Observe dashboards (off until you set `[observe] enabled = true`) and plugin
-app tabs are part of the stable channel.
+Observe dashboards (off until you set `[observe] enabled = true`), plugin
+app tabs, and voice dictation (off until you run `thegn voice setup` or set
+`[voice] enabled = true`; native engine in the Nix package and the macOS Apple
+silicon release, not in the Linux/musl tarballs) are part of the stable channel.
 
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
 (`nix run github:blakeashleyjr/thegn#dev` / `nix profile install

@@ -105,7 +105,7 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
 
 ## Experimental subsystems
 
-- **Kubernetes placement, other providers, placement, and voice are
+- **Kubernetes placement, other providers, and placement are
   dev-channel only.** Treat them as experimental rather than product promises;
   see [[release-channels]]. Sprites and Vercel environments (and `thegn job
 run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
@@ -115,5 +115,10 @@ run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
   mosh needs `mosh-server` on the remote host. Neither has a recorded
   paid live run on this release yet; see [[environments]] and
   [[vercel-sandbox]].
+- **Voice dictation is stable but opt-in and build-dependent.** Native
+  capture + Whisper ship in the Nix package and the macOS Apple silicon release
+  (14.2+); the Linux glibc 2.28 tarball and musl build omit them and report
+  "not built into this binary". The model (about 141 MiB) downloads on first
+  setup; see [[voice]].
 - **Observe and plugin app tabs are stable.** Use the stable channel for these
   features; see [[release-channels]].

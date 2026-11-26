@@ -1,11 +1,11 @@
 //! Private, version-local worker protocol. Credentials travel over a pipe,
 //! never argv, environment overrides, logs, or a recording on disk.
-#[cfg(feature = "voice-native")]
+#[cfg(voice_native)]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
-#[cfg(feature = "voice-native")]
+#[cfg(voice_native)]
 use std::io::Write;
 use thegn_core::config::VoiceConfig;
 
@@ -47,7 +47,7 @@ pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<String>> {
 }
 
 pub(crate) fn run() -> Result<()> {
-    #[cfg(feature = "voice-native")]
+    #[cfg(voice_native)]
     {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut input = std::io::BufReader::new(std::io::stdin());
@@ -62,13 +62,11 @@ pub(crate) fn run() -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(feature = "voice-native"))]
-    bail!(
-        "native voice is not compiled; rebuild with --features voice-native (voice-metal on Apple silicon)"
-    )
+    #[cfg(not(voice_native))]
+    bail!("native voice is not built into this binary (musl/Windows builds omit it)")
 }
 
-#[cfg(feature = "voice-native")]
+#[cfg(voice_native)]
 fn emit(event: Event) -> Result<()> {
     let encoded = serde_json::to_vec(&event)?;
     if encoded.len() as u64 >= MAX_EVENT {
@@ -81,7 +79,7 @@ fn emit(event: Event) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "voice-native")]
+#[cfg(voice_native)]
 fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result<()> {
     use std::sync::{
         Arc,
@@ -253,7 +251,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
 
 /// Every check that must pass before the microphone opens. Returns the model
 /// path to load for the embedded kind. Never touches capture or the engine.
-#[cfg(feature = "voice-native")]
+#[cfg(voice_native)]
 fn preflight(
     cfg: &VoiceConfig,
     cancel: &std::sync::atomic::AtomicBool,
@@ -294,7 +292,7 @@ fn preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "voice-native")]
+    #[cfg(voice_native)]
     #[test]
     fn preflight_fails_on_missing_model_before_capture_or_load() {
         use thegn_core::config::VoiceKind;

@@ -9,13 +9,19 @@ actions: [voice-toggle, voice-cancel]
 
 ## Quick start
 
-1. Voice is experimental: launch with `THEGN_CHANNEL=dev`. On the stable
-   channel it is forced off, and `Alt v` says so.
-2. Use a build with native dictation (`voice-native`, or `voice-metal` on
-   Apple silicon macOS 14.2+). Release tarball and flake builds omit it; with
-   those, use an HTTP provider or `capture_command` instead.
-3. Run `thegn voice setup --language en`. It offers to download the Whisper
-   model (about 141 MiB for `base.en`) and enables voice.
+1. Voice is a stable, opt-in feature: nothing records or loads a model until
+   you turn it on. The one step is `thegn voice setup --language en`, which
+   writes `[voice] enabled = true` for you (or set it by hand).
+2. Use a build with native dictation. The Nix package (`.#default`, Home
+   Manager) on Linux and the macOS Apple silicon release (Homebrew or tarball;
+   macOS 14.2+, Metal with CPU fallback) include it. The Linux release tarball
+   (glibc 2.28 build) and the musl build do not, because they cannot link ALSA;
+   `thegn voice status` then says native voice is not built into this binary.
+   With those, use an HTTP provider or `capture_command`, or install via Nix.
+3. Setup offers to download the Whisper model (about 141 MiB for `base.en`),
+   with progress, in that shell (never inside the UI), and verifies its
+   checksum. The model is not bundled. Pressing `Alt v` before setup tells you
+   to run it. The command palette lists `Voice: toggle recording`.
 4. Run `thegn voice status`. The `Ready:` line names the next missing step;
    `thegn doctor` shows the same line. Readiness never opens the microphone.
 5. Press `Alt v` in a pane. On macOS, allow Microphone for your terminal app
@@ -29,7 +35,7 @@ records silence instead, so the status line shows `Voice: no speech detected`;
 check the Microphone privacy setting for your terminal app. Disabled voice starts no
 worker and opens no audio device.
 
-Voice mode is an experimental, opt-in toggle-to-talk feature. Press `Alt v` to
+Voice mode is an opt-in toggle-to-talk feature. Press `Alt v` to
 start recording from the focused pane, press it again to stop and transcribe,
 or press `Esc`/`Alt V` to cancel and discard the utterance. If focus moved or
 the pane died before transcription finished, the transcript is held in memory
@@ -69,18 +75,22 @@ Use `--model-path /path/to/model.bin` for a local GGML model. Downloads finish
 before capture; recordings remain in memory. On first use, Alt v reports setup
 or build requirements if the provider is unavailable.
 
-Native dictation requires a build with `voice-native` (Linux CPU) or `voice-metal`
-(Apple silicon macOS 14.2+, Metal with CPU fallback). It runs in a disposable
-worker process. Check microphone permission for the hosting terminal on macOS;
-check the default input and ALSA/PipeWire routing on Linux. Native distribution
-enablement remains gated on real-device verification. Disabled voice creates no
-worker or audio device.
-Release tarball and flake builds omit `voice-native`. In those builds, default
-embedded setup stops with a native-voice build requirement; HTTP setup requires
-`[voice] capture_command`, while command setup requires `[voice] command` and
-also a capture command. Hex setup requires `[voice] capture_command`. Native
-dictation is available in source builds with `voice-native` (or `voice-metal`
-on Apple silicon).
+Native dictation is the default `voice-native` Cargo feature on Linux glibc
+(CPU Whisper, ALSA via cpal; needs `libasound.so.2` at runtime, which the Nix
+package carries) and macOS (CoreAudio, Metal with CPU fallback, 14.2+). It runs
+in a disposable worker process, so a machine with no audio device or no model
+still starts normally: voice reports unavailable and nothing else changes. On
+macOS the microphone permission belongs to the hosting terminal app; allow it
+in System Settings > Privacy & Security > Microphone. On Linux check the default
+input and ALSA/PipeWire routing. Disabled voice creates no worker or audio
+device.
+musl-static and Windows builds, and the glibc 2.28 Linux release tarball, are
+built with `--no-default-features` and omit native voice. There, default
+embedded setup stops with a "not built into this binary" message; HTTP setup
+requires `[voice] capture_command`, while command setup requires `[voice]
+command` and also a capture command. Source builds on Linux glibc and macOS
+include it by default; `--no-default-features` opts out. Hex setup requires
+`[voice] capture_command` in builds without native voice.
 
 Native embedded and HTTP providers show revisable text in the status line while
 recording. Silence and low-level steady noise are skipped before transcription;
@@ -173,5 +183,4 @@ terms), it is discarded.
 All `[voice]` settings are in `config/config.toml.example`: `enabled`, `kind`,
 `capture_command`, `command`, `max_seconds`, `language`, `model`, `model_path`,
 `endpoint`, `credential`, `live_preview`, `timeout_seconds`, `replacements`, and
-`vocabulary`. Voice remains experimental and disabled on the stable channel; use
-`THEGN_CHANNEL=dev`.
+`vocabulary`. Voice is available on the stable channel and stays off until you enable it.

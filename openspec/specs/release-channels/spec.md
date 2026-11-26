@@ -34,8 +34,8 @@ In the `stable` channel thegn SHALL neutralise every experimental subsystem at
 config load so an experimental key left in a user's config is inert rather than
 half-active. The gated set is: remote worktrees (`[sandbox.remote]`), execution
 providers (`[host.*]`), the LLM proxy (`[llm_proxy]`), the Observe dashboards
-(`[observe]`), the placement engine (`[placement]`), and voice mode (`[voice]`).
-Issue trackers (`[issues]`: Linear/Jira/Kaneo/GitHub) and GitHub PR/issue
+(`[observe]`), and the placement engine (`[placement]`). Voice mode (`[voice]`) is stable and
+opt-in: it MUST NOT be clamped, and defaults to disabled. Issue trackers (`[issues]`: Linear/Jira/Kaneo/GitHub) and GitHub PR/issue
 viewing MUST remain available in both channels, and the `[[agents]]` launcher
 list (which includes the plain-shell entry) MUST NOT be cleared. In the `dev`
 channel the clamp MUST be a no-op.

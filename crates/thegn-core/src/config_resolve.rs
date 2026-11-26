@@ -3441,7 +3441,8 @@ mod tests {
         let source = include_str!("../tests/fixtures/release-channel-compat.toml");
         let mut stable: Config = toml::from_str(source).expect("legacy channel config parses");
         let clamped = stable.clamp_to_channel(Channel::Stable);
-        assert_eq!(clamped, [Feature::Placement, Feature::Voice]);
+        assert_eq!(clamped, [Feature::Placement]);
+        assert!(stable.voice.enabled, "Voice is stable and keeps its opt-in");
         assert!(
             Feature::PROGRAMME
                 .iter()
@@ -3450,7 +3451,6 @@ mod tests {
         assert!(stable.observe.enabled, "Observe remains stable");
         assert_eq!(stable.apps.default_tab, "plugin:legacy");
         assert!(!stable.placement.enabled);
-        assert!(!stable.voice.enabled);
 
         let mut dev: Config = toml::from_str(source).expect("legacy channel config parses");
         assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
@@ -3458,6 +3458,18 @@ mod tests {
         assert!(dev.placement.enabled);
         assert!(dev.voice.enabled);
         assert_eq!(dev.apps.default_tab, "plugin:legacy");
+    }
+
+    #[test]
+    fn stable_config_with_voice_enabled_keeps_voice() {
+        use crate::channel::{Channel, Feature};
+
+        let mut cfg: Config = toml::from_str("[voice]\nenabled = true\n").expect("voice config");
+        let clamped = cfg.clamp_to_channel(Channel::Stable);
+        assert!(!clamped.contains(&Feature::Voice));
+        assert!(cfg.voice.enabled, "stable keeps an opted-in [voice] block");
+        let off: Config = toml::from_str("").expect("empty config");
+        assert!(!off.voice.enabled, "voice stays opt-in by default");
     }
 
     #[test]

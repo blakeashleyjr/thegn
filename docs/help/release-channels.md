@@ -27,8 +27,12 @@ this is why:
 | `remote`    | Kubernetes placement and the direct-iroh control listener (SSH/mosh remote workspaces and the `thegn serve` / `attach` / `pair` client/server mode are stable) | `[env.*] placement = "k8s"`, `serve --iroh-direct`, `pair direct` |
 | `providers` | cloud execution other than Sprites and Vercel (Fly / DO / Hetzner / Machine0 / Daytona / custom), the managed pool, `thegn fleet` for those providers          | `[host.*]`, other `[env.*]` provider envs                         |
 | `placement` | the multi-host placement engine                                                                                                                                | `[placement]`                                                     |
-| `voice`     | command-backed voice mode                                                                                                                                      | `[voice]`                                                         |
 | `lead`      | the Lead meta agent: a hosted agent CLI in a global tab                                                                                                        | `[lead]`                                                          |
+
+Voice dictation (`[voice]`, [[voice]]) graduated and is **stable**: it is
+never clamped, and stays off until you set `[voice] enabled = true` (or run
+`thegn voice setup`). Whether a binary can record also depends on the build:
+see [[voice]] for which release builds include native dictation.
 
 ### Sandbox and remote programme features (not yet implemented)
 
@@ -114,7 +118,7 @@ refuse on the stable channel with a pointer to the dev channel. Sprites and Verc
 Enforcement happens at the edges, never by compiling code out:
 
 - Config toggles for a disallowed feature are **neutralised at load**, so
-  a stray `[placement]` or `[voice]` block in a stable run is inert rather
+  a stray `[placement]` block in a stable run is inert rather
   than an error.
 - Dev-only verbs and UI surfaces are hidden. Tracker commands remain available
   in both channels when an issue provider is configured.

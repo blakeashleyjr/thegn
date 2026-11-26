@@ -92,7 +92,7 @@ reproducible problems that are not listed here.
   accepted by config, not implemented, never selected.
 - Provider placements without an enforceable isolation request are reported as
   `provider-managed (unverified)`; their isolation is not verified by thegn.
-- Kubernetes placement, direct Iroh, the `providers`, `placement`, and `voice`
+- Kubernetes placement, direct Iroh, the `providers`, and `placement`
   subsystems are dev-channel only (experimental); their hardening and behavior
   are not public-alpha promises. Sprites and Vercel environments (and `thegn
 job run` on them), SSH/mosh remote workspaces and `thegn serve`/`attach`/

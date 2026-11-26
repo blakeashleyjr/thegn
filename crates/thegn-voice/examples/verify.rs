@@ -1,6 +1,9 @@
 //! Opt-in inference measurements on supplied PCM16 mono/16 kHz audio.
 //! Never opens a microphone. See docs/voice-verification.md.
-#[cfg(feature = "native")]
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 fn main() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use std::io::{Read, Write};
@@ -100,7 +103,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(not(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+)))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("build the verify example with --features native (metal on Apple silicon)")
 }
