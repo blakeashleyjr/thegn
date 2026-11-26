@@ -42,7 +42,12 @@ exit 23
         }
         assert_eq!(
             std::fs::read_to_string(&report).unwrap(),
-            format!("{}\ncaptured-value\n", dir.path().display())
+            // The fixture shell derives `$PWD` from getcwd(), which reports the
+            // physical path (`/private/tmp/...` under a macOS `/tmp` symlink).
+            format!(
+                "{}\ncaptured-value\n",
+                std::fs::canonicalize(dir.path()).unwrap().display()
+            )
         );
         drop(cache);
         dir.close().unwrap();

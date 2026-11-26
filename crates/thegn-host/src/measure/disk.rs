@@ -1847,9 +1847,12 @@ mod generation_tests {
             &profile.join(format!("deps/libpkg-{YOUNG_HASH}.rlib")),
             young_at,
         );
-        // Uppercase hex is not Cargo's suffix: ignored, never removed.
+        // Uppercase hex is not Cargo's suffix: ignored, never removed. Its
+        // digits differ from every lowercase hash above: on a case-insensitive
+        // filesystem (macOS APFS by default) a same-letters name would
+        // overwrite that file instead of sitting beside it.
         write_file(
-            &profile.join("deps/libpkg-0123456789ABCDEF.rlib"),
+            &profile.join("deps/libpkg-0123456789ABCDEE.rlib"),
             b"not-hex",
         );
         write_file(
@@ -1908,7 +1911,7 @@ mod generation_tests {
             format!("deps/libpkg-{LIVE_HASH}.rlib"),
             format!("deps/pkg-{LIVE_HASH}.d"),
             format!("deps/libpkg-{YOUNG_HASH}.rlib"),
-            "deps/libpkg-0123456789ABCDEF.rlib".to_string(),
+            "deps/libpkg-0123456789ABCDEE.rlib".to_string(),
             format!("incremental/pkg-{LIVE_HASH}/s-y/work.bin"),
             format!("build/pkg-{LIVE_HASH}/output"),
         ] {

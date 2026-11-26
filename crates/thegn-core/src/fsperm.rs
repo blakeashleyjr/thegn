@@ -1218,10 +1218,13 @@ impl PrivateDir {
             if append {
                 flags |= OFlag::O_APPEND;
             }
-            // An `O_CREAT` open in a directory this handle still pins cannot
-            // legitimately see ENOENT; macOS reports it transiently while another
-            // thread mutates the directory, so retry briefly before reporting.
-            let mut attempts = 0u32;
+            // APFS can fail one of two racing O_CREAT opens of the same new
+            // name with ENOENT (macOS: two threads creating one lock or log
+            // file). The parent stays open and the name is a single
+            // component, so ENOENT here is transient; retry it a few times.
+            // Sleep rather than yield: on a loaded host the racing creator can
+            // be preempted mid-create for longer than a handful of yields.
+            let mut enoent_retries: u64 = 0;
             let fd = loop {
                 match openat(
                     &self.fd,
@@ -1229,9 +1232,9 @@ impl PrivateDir {
                     flags,
                     nix::sys::stat::Mode::from_bits_truncate(0o600),
                 ) {
-                    Err(nix::errno::Errno::ENOENT) if attempts < 5 => {
-                        attempts += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    Err(nix::errno::Errno::ENOENT) if enoent_retries < 8 => {
+                        enoent_retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(enoent_retries));
                     }
                     other => break other,
                 }

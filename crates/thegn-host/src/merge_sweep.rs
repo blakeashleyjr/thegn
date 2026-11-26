@@ -2263,7 +2263,9 @@ mod tests {
                     util::sh_quote(&release.to_string_lossy()),
                 ),
                 wait: Some(true),
-                timeout_secs: Some(10),
+                // Generous bounds: on a loaded macOS host the sweep can take
+                // well over ten seconds to reach the hook. A pass returns early.
+                timeout_secs: Some(60),
                 on_failure: Some(thegn_core::hooks::HookFailure::Warn),
             },
         )];
@@ -2288,7 +2290,7 @@ mod tests {
                     }
                     let _release = Release(writer_release);
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                     while !writer_started.exists() && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }

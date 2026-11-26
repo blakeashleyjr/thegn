@@ -206,7 +206,12 @@ mod tests {
     fn sandbox_profile_cli_set_persists_the_worktree_override() {
         let _state = crate::testenv::IsolatedState::new();
         let worktree = tempfile::tempdir().unwrap();
-        let path = worktree.path().to_string_lossy().into_owned();
+        // Registered worktree paths are canonical; macOS temp roots are not
+        // (`/var` and `/tmp` are symlinks into `/private`).
+        let path = std::fs::canonicalize(worktree.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let db = Db::open().unwrap();
         db.put_worktree("repo/main", &path, &path, "main", None, None)
             .unwrap();

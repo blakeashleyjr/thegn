@@ -69,6 +69,13 @@ git-subprocess = { max-threads = 6 }
 filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::tests::/) | test(e2e_cargo_real_repo)'
 test-group = 'git-subprocess'
 
+[[profile.default.overrides]]
+# Twenty full fixture-repo + landed-sweep rounds in one test. Native macOS runs
+# of the whole suite pushed it past the 5-minute bound while still progressing;
+# allow it twice that before nextest kills it.
+filter = 'test(merge_sweep::tests::landed_worktree_status_matrix_respects_expiry_and_force_without_discarding_edits)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 # `just test-windows-wine`: the workspace tests cross-compiled for
 # x86_64-pc-windows-gnu and run under Wine (test/wine-runner.sh). Inherits
 # everything above from `default` (state isolation, timeouts, groups).

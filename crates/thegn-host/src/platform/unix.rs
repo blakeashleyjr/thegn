@@ -1182,8 +1182,12 @@ impl DesktopChild {
                 return Err(error);
             }
         }
+        // macOS and the BSDs report EPERM, not ESRCH, when the group holds only
+        // zombies (the exited, still-unreaped leader keeps the group alive), so
+        // after an observed exit EPERM means nothing was left to signal.
         if let Some(error) = group_error
             && error.raw_os_error() != Some(libc::ESRCH)
+            && !(exited && error.raw_os_error() == Some(libc::EPERM))
         {
             return Err(error);
         }
