@@ -1038,6 +1038,9 @@ pub fn detached(program: &str) -> Command {
 pub fn git_cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
+    // THE-225: host-side Git never runs a repository-configured fsmonitor
+    // program (a sandboxed worker can write the shared or per-worktree config).
+    c.args(["-c", "core.fsmonitor=false"]);
     for var in GIT_ENV_VARS {
         c.env_remove(var);
     }
@@ -3374,6 +3377,18 @@ mod tests {
                 "git_cmd must scrub {var} from the child environment"
             );
         }
+    }
+
+    #[test]
+    fn git_cmd_disables_fsmonitor_before_the_subcommand() {
+        // THE-225: `git_cmd` pins `core.fsmonitor=false` right after `-C <dir>`,
+        // so no host-side invocation runs a fsmonitor program from repo config.
+        let dir = std::path::Path::new("/tmp");
+        let args: Vec<_> = git_cmd(dir)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-C", "/tmp", "-c", "core.fsmonitor=false"]);
     }
 
     #[test]

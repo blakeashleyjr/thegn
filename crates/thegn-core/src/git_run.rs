@@ -464,6 +464,7 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = ["-C", dir.path().to_str().unwrap()]
             .into_iter()
+            .chain(["-c", "core.fsmonitor=false"])
             .chain(HOST_MUTATION_FENCE)
             .map(std::ffi::OsString::from)
             .collect::<Vec<_>>();
