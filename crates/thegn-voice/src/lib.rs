@@ -1,9 +1,25 @@
 //! Native audio/inference leaf. No core, host, terminal, or database dependency.
 //! Native handles belong exclusively to the disposable voice worker process.
-#[cfg(feature = "native")]
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 pub mod capture;
-#[cfg(feature = "native")]
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 pub mod whisper;
+
+/// Whether this build links native capture and Whisper (feature `native` on a
+/// supported target: Linux glibc or macOS). False on musl/Windows builds.
+pub const NATIVE_COMPILED: bool = cfg!(all(
+    feature = "native",
+    any(
+        target_os = "macos",
+        all(target_os = "linux", target_env = "gnu")
+    )
+));
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const WINDOW_SAMPLES: usize = 8 * SAMPLE_RATE;

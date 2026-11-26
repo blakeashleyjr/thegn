@@ -843,8 +843,10 @@ fn native_session(
     waker: &TerminalWaker,
 ) -> Result<(), String> {
     use crate::voice_worker::{Event, Request};
-    if !cfg!(feature = "voice-native") {
-        return Err("native capture is not compiled; use a voice-native/voice-metal build or configure capture_command".into());
+    if !cfg!(voice_native) {
+        return Err(
+            "native voice is not built into this binary; configure [voice] capture_command".into(),
+        );
     }
     if cancel.load(Ordering::Acquire) {
         return Ok(());

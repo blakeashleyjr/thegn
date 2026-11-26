@@ -23,6 +23,12 @@
   # builds its C via the `cc` crate (stdenv compiler, no extra input).
   pkg-config,
   zlib,
+  # Native dictation (default feature): whisper.cpp builds with cmake, bindgen
+  # needs libclang, and cpal links ALSA on Linux (CoreAudio/Metal on darwin come
+  # from the SDK). Must match `cargoCommonArgs` in flake.nix.
+  cmake,
+  rustPlatform,
+  alsa-lib,
   # runtime tools thegn shells out to
   git,
   fzf,
@@ -110,8 +116,9 @@ in
       "-p thegn-host --bin thegn --features iroh"
       + lib.optionalString isDev " --features dev";
 
-    nativeBuildInputs = [makeWrapper pkg-config installShellFiles];
-    buildInputs = [zlib];
+    nativeBuildInputs = [makeWrapper pkg-config installShellFiles cmake rustPlatform.bindgenHook];
+    buildInputs = [zlib] ++ lib.optionals stdenv.hostPlatform.isLinux [alsa-lib];
+    dontUseCmakeConfigure = true;
 
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
     # fff-search links vendored libgit2 + LMDB (built from source in-sandbox).

@@ -54,6 +54,20 @@ fn watch_git_identity() {
 }
 
 fn main() {
+    // `voice_native`: the `voice-native` feature AND a target that can link the
+    // native engine (Linux glibc, macOS). On musl static and Windows builds the
+    // feature is a no-op and voice reports "not built into this binary". Keep
+    // the predicate in sync with crates/thegn-voice.
+    #[allow(clippy::disallowed_macros)]
+    {
+        println!("cargo:rustc-check-cfg=cfg(voice_native)");
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let supported = os == "macos" || (os == "linux" && env == "gnu");
+        if std::env::var_os("CARGO_FEATURE_VOICE_NATIVE").is_some() && supported {
+            println!("cargo:rustc-cfg=voice_native");
+        }
+    }
     // These are cargo build script directives - they MUST use println!; the git
     // sha probe runs at build time (not on the event loop), so the disallowed
     // `Command::output` lint does not apply here.

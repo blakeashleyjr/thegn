@@ -66,7 +66,7 @@ supervision; it has no core dependency. This is one of the sanctioned
 core-to-leaf edges — `thegn-media` and the serde-only `thegn-sandbox-proto` are
 the others — pinned in `crate_boundaries.rs`.
 
-Native dictation is an optional host edge (`voice-native`, `voice-metal`), never
+Native dictation is a default-on host edge (`voice-native`; `voice-metal` is implied on macOS), never
 a core dependency. The same binary's private worker owns microphone/Whisper;
 the host supervises cancellation/deadlines off-loop and wakes the UI for scoped
 partial/final events. HTTP and pinned atomic model acquisition live in services.

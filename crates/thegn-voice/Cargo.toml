@@ -17,12 +17,21 @@ metal = ["native"]
 
 [dependencies]
 anyhow.workspace = true
+
+# Native capture + Whisper link only where a system audio stack and a C++
+# toolchain are available to the release matrix: Linux glibc (ALSA via cpal,
+# CPU Whisper) and macOS (CoreAudio, Metal). Elsewhere (musl static, Windows)
+# the `native` feature is accepted but compiles to nothing, and the host reports
+# voice as "not built into this binary". Keep the predicate in sync with
+# `src/lib.rs` and `crates/thegn-host/build.rs`.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 whisper-rs = { version = "=0.16.0", default-features = false, optional = true }
 
 # Compile Metal only for Apple builds, including `--all-features` on Linux.
 # The `metal` feature selects GPU use at runtime; CPU fallback stays available.
 [target.'cfg(target_os = "macos")'.dependencies]
+cpal = { version = "=0.18.2", optional = true }
 whisper-rs = { version = "=0.16.0", default-features = false, features = [
   "metal",
 ], optional = true }

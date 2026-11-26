@@ -81,7 +81,7 @@ fn readiness(cfg: &VoiceConfig, facts: &Facts) -> Option<String> {
     let native_capture = cfg.capture_command.is_empty() || cfg.kind == VoiceKind::Embedded;
     if native_capture && !facts.native_compiled {
         return Some(
-            "this build has no native capture; use a voice-native/voice-metal build or set [voice] capture_command"
+            "native voice is not built into this binary (musl/Windows builds omit it); set [voice] capture_command or use a glibc Linux or macOS build"
                 .into(),
         );
     }
@@ -126,7 +126,7 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
         cfg,
         &Facts {
             channel_allowed,
-            native_compiled: cfg!(feature = "voice-native"),
+            native_compiled: cfg!(voice_native),
             model_present,
             model_error: model_error.as_deref(),
         },
@@ -138,8 +138,8 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
         "enabled": cfg.enabled, "kind": cfg.kind.as_str(), "language": cfg.language,
         "model": cfg.model, "model_path": path.as_ref().map(|p|p.display().to_string()),
         "model_error": model_error,
-        "model_present": model_present, "native_compiled": cfg!(feature="voice-native"),
-        "metal_compiled": cfg!(feature="voice-metal"), "live_preview": cfg.live_preview && cfg.kind != VoiceKind::Command && native_capture && cfg!(feature="voice-native"),
+        "model_present": model_present, "native_compiled": cfg!(voice_native),
+        "metal_compiled": cfg!(feature="voice-metal"), "live_preview": cfg.live_preview && cfg.kind != VoiceKind::Command && native_capture && cfg!(voice_native),
         "credential_configured": cfg.credential.is_some(), "timeout_seconds": cfg.request_timeout().as_secs(),
         "setup": "thegn voice setup; experimental channel required; ready means configuration is complete, not that the microphone works (macOS: allow Microphone for your terminal)"
     })
@@ -278,10 +278,10 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             match provider {
                 VoiceKind::Embedded => {
                     anyhow::ensure!(
-                        cfg!(feature = "voice-native"),
-                        "this build has no native voice; rebuild with voice-native (voice-metal on Apple silicon)"
+                        cfg!(voice_native),
+                        "native voice is not built into this binary (musl/Windows builds omit it); use a glibc Linux or macOS build"
                     );
-                    #[cfg(feature = "voice-native")]
+                    #[cfg(voice_native)]
                     thegn_voice::whisper::Engine::validate_language(&voice.language)?;
                     let path = models::resolve(&voice)?;
                     if voice.model_path.is_some() {
@@ -312,7 +312,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                             "Live HTTP previews repeatedly send overlapping audio and may incur repeated billing. Use --final-only to send just the final recording.",
                         );
                     }
-                    if !cfg!(feature = "voice-native") && voice.capture_command.is_empty() {
+                    if !cfg!(voice_native) && voice.capture_command.is_empty() {
                         bail!("HTTP needs native capture or [voice] capture_command");
                     }
                 }
@@ -322,14 +322,14 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                         "configure [voice] command before setup --kind command"
                     );
                     anyhow::ensure!(
-                        cfg!(feature = "voice-native") || !voice.capture_command.is_empty(),
+                        cfg!(voice_native) || !voice.capture_command.is_empty(),
                         "command transcription needs native capture or [voice] capture_command"
                     );
                 }
             }
             thegn_core::config_write::set_voice(&config_path, &voice)?;
             outln!(
-                "Voice configured. Alt v records/stops; Esc cancels. Use the experimental channel (THEGN_CHANNEL=dev). Audio is pasted without submission."
+                "Voice configured. Alt v records/stops; Esc cancels. Audio is pasted without submission."
             );
             Ok(())
         }

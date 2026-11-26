@@ -17,9 +17,13 @@ tracker reconciliation below. No release dates are asserted.
 The native leaf pins CPAL 0.18.2 and whisper-rs 0.16.0. Linux builds require ALSA
 development files/pkg-config, CMake, a C++ toolchain, and libclang for bindings.
 Apple builds require Xcode tools, CMake, the 14.2+ SDK/deployment target, and Metal
-frameworks for `voice-metal`. Do not enable these features in desktop releases
-until the matrix below has actual evidence. Current release/bridge flags stay
-unchanged. The stable channel continues to clamp `[voice] enabled` off.
+frameworks for `voice-metal`. `voice-native` is a default feature of
+`thegn-host` since the stable graduation (2026-11-25), compiled only on Linux
+glibc and macOS (musl and Windows omit it automatically). Release legs: macOS
+Apple silicon ships it; the glibc 2.28 zigbuild tarball, musl tarball, bridge
+and completions builds use `--no-default-features`. Real-device evidence below
+is still required before announcing a platform. Voice is not channel-clamped;
+`[voice] enabled` stays off until the user opts in.
 
 ## Required evidence
 

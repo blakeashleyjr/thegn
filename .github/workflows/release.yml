@@ -216,8 +216,8 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release --locked --target x86_64-unknown-linux-musl \
-            -p thegn-host --bin thegn
+          cargo build --release --locked --no-default-features \
+            --target x86_64-unknown-linux-musl -p thegn-host --bin thegn
           mkdir -p "$RUNNER_TEMP/bridge"
           install -m755 target/x86_64-unknown-linux-musl/release/thegn \
             "$RUNNER_TEMP/bridge/thegn-musl"
@@ -252,8 +252,13 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           # Apple silicon is a native build; darwin cannot be cross-compiled from Linux.
+          # Only this leg ships native voice (CoreAudio + Metal Whisper): both Linux
+          # legs build `--no-default-features` because a zigbuild/musl binary cannot
+          # link ALSA and would otherwise gain a hard libasound.so.2 dependency that
+          # breaks start-up on headless hosts. They report voice as not built in.
           - target: aarch64-apple-darwin
             os: macos-15
+            voice: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -292,6 +297,12 @@ jobs:
           path: ${{ github.workspace }}/bridge
       - name: Mark the bridge executable
         run: chmod 755 "$GITHUB_WORKSPACE/bridge/thegn-musl"
+      - name: Set the macOS floor for native voice
+        if: matrix.voice
+        run: |
+          set -euo pipefail
+          # Metal's Whisper needs macOS 14.2 APIs; set for the build below.
+          echo "MACOSX_DEPLOYMENT_TARGET=14.2" >> "$GITHUB_ENV"
       - id: upload
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
@@ -304,6 +315,8 @@ jobs:
           manifest-path: crates/thegn-host/Cargo.toml
           # Release binaries include the optional call-home transport (THE-672).
           features: iroh
+          # Native voice (default feature) ships on darwin only; see the matrix.
+          no-default-features: ${{ !matrix.voice }}
           archive: thegn-$tag-${{ matrix.target }}
           # Both licenses and the README are included, plus the resident bridge as
           # `thegn-musl` (include copies by basename). Keep both binaries at the
@@ -527,7 +540,7 @@ jobs:
         with:
           toolchain: stable
       - name: Build thegn
-        run: cargo build --release --locked -p thegn-host --bin thegn
+        run: cargo build --release --locked --no-default-features -p thegn-host --bin thegn
       - name: Generate completions
         env:
           TAG: ${{ needs.admit.outputs.tag }}
