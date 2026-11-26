@@ -548,6 +548,13 @@
       ]
     },
     {
+      "issue": "THE-2148",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "pin-git-alternates-read-only"
+      ]
+    },
+    {
       "issue": "THE-2172",
       "project": "Agent & Workflow Platform",
       "changes": [

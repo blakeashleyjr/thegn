@@ -633,7 +633,7 @@ pub struct SandboxSpec {
     /// fingerprints it, policy fingerprint v3, when it first does).
     pub egress: Option<crate::egress::plan::EgressPlan>,
     /// A sealed launch's object-store refusal from
-    /// [`crate::sandbox_floor::git_integrity_gate`] (alternates, symlinks in
+    /// `sandbox_floor::git_integrity_gate` (alternates, symlinks in
     /// `objects/`, or an outside `commondir`); surfaced by `home_gate` so the
     /// existing refusal channel stops the launch before any host spawn.
     pub git_integrity_refusal: Option<String>,
@@ -1803,9 +1803,10 @@ pub(crate) struct GitProbe {
     pub(crate) identity: crate::git_identity::GitIdentity,
 }
 
-/// Object-store integrity facts for [`probe_git`]: the borrowed alternates
-/// paths, whether `objects/` holds a symlink, and whether `commondir` points
-/// outside the common dir. A few `read`/`stat` calls, no git subprocess.
+/// Object-store integrity facts for `probe_git`: the borrowed alternates
+/// paths, whether `objects/` is or holds a symlink, and whether `commondir`
+/// points outside the common dir. A few `read`/`stat` calls, no git
+/// subprocess.
 fn probe_object_store(
     common: &std::path::Path,
     admin: Option<&std::path::Path>,
@@ -1819,21 +1820,28 @@ fn probe_object_store(
                 .collect()
         })
         .unwrap_or_default();
-    let objects_symlinks = std::fs::read_dir(common.join("objects")).is_ok_and(|rd| {
-        rd.flatten()
-            .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
-    });
+    let objects = common.join("objects");
+    let objects_symlinks = std::fs::symlink_metadata(&objects).is_ok_and(|m| m.is_symlink())
+        || std::fs::read_dir(&objects).is_ok_and(|rd| {
+            rd.flatten()
+                .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        });
+    // `common` is what git itself resolved from this very `commondir`, so it
+    // cannot tell a redirected file apart. The anchor is where the admin dir
+    // lives: a linked worktree's admin dir is `<common>/worktrees/<name>`.
     let commondir_outside = admin.is_some_and(|admin| {
         let Ok(text) = std::fs::read_to_string(admin.join("commondir")) else {
             return false;
         };
-        match (
-            admin.join(text.trim()).canonicalize(),
-            common.canonicalize(),
-        ) {
-            (Ok(t), Ok(c)) => t != c,
-            _ => false,
-        }
+        let Ok(target) = admin.join(text.trim()).canonicalize() else {
+            return false;
+        };
+        let own = admin
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+            .and_then(std::path::Path::parent)
+            .and_then(|p| p.canonicalize().ok());
+        own.is_none_or(|own| own != target) || common.canonicalize().is_ok_and(|c| c != target)
     });
     (alternates, objects_symlinks, commondir_outside)
 }
@@ -2065,11 +2073,20 @@ fn git_policy_mounts(
         mounts.push(path_mount(&config, true));
     }
     for path in &plan.ro_after {
+        // The parent too: a repo without `objects/info/` would otherwise skip
+        // the alternates pin and leave the sandbox free to create the file
+        // under the writable `objects/` (THE-2148).
         if !path.exists()
-            && let Err(error) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            && let Err(error) = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .map(drop)
+                })
         {
             tracing::warn!(
                 target: "thegn::sandbox",

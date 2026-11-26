@@ -7322,7 +7322,8 @@ fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
 fn alternates_pinned_ro() {
     use crate::config::SandboxGitMode;
     let fx = git_fixture();
-    std::fs::create_dir_all(fx.common.join("objects/info")).unwrap();
+    // No `objects/info/`: the pin must create it rather than skip the bind.
+    assert!(!fx.common.join("objects/info").exists());
     for mode in [
         SandboxGitMode::CommitOnly,
         SandboxGitMode::PushLane,
@@ -7378,6 +7379,25 @@ fn probe_object_store_reads_alternates_symlinks_and_commondir() {
     let (alts, symlinks, outside) = probe_object_store(&fx.common, Some(&fx.admin));
     assert_eq!(alts, vec!["/shared/objects".to_string()]);
     assert!(symlinks && outside);
+    // git resolves `--git-common-dir` FROM `commondir`, so the launch path
+    // probes with the planted dir as `common`; the admin dir's own location
+    // still exposes the redirect.
+    let (_, _, outside) = probe_object_store(other.path(), Some(&fx.admin));
+    assert!(
+        outside,
+        "a redirected commondir is outside the admin dir's repo"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_object_store_flags_a_symlinked_objects_dir() {
+    let fx = git_fixture();
+    let real = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(fx.common.join("objects")).unwrap();
+    std::os::unix::fs::symlink(real.path(), fx.common.join("objects")).unwrap();
+    let (alts, symlinks, outside) = probe_object_store(&fx.common, Some(&fx.admin));
+    assert!(alts.is_empty() && symlinks && !outside);
 }
 
 #[test]
