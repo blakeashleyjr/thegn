@@ -43,6 +43,30 @@ entered, never what was requested.
   the opt-outs named: `isolation_floor = "off"`, `enabled = false`,
   `backend = "none"`, or run on host
 
+#### Scenario: Clean host with no backend names the fix and offers run on host
+
+- **WHEN** a local launch halts because no backend is ready on the host (for
+  example a fresh Mac without Apple `container`, podman or docker), under any
+  `failover` mode
+- **THEN** the halt names the backends thegn can use and the install/start
+  command for each (on macOS `brew install podman && podman machine init &&
+podman machine start`, or Apple `container`), the modal offers `[h] run on
+host` with the caveat that the pane runs with no sandbox, the choice pins
+  only that worktree for the current session, and nothing is persisted
+- **AND** `thegn doctor` reports the same missing-backend fix on its
+  containment row
+
+#### Scenario: SSH env host without a container runtime names backend none
+
+- **WHEN** an `[env.<name>] placement = "ssh"` launch halts because no
+  container runtime was found on the remote host
+- **THEN** the halt names `[env.<name>.sandbox] backend = "none"` with the
+  caveat that the pane runs with no sandbox, the modal offers `[h] run on host`,
+  and that choice runs the pane bare on the ssh host (never as a local shell)
+  for the current session only, with nothing persisted
+- **AND** `thegn doctor` lists each such ssh env with bounded probes for
+  reachability, `mosh-server` (mosh transport), `dtach` and a container runtime
+
 #### Scenario: Chain without host refuses
 
 - **WHEN** no backend is runnable and the configured `backend_chain` does not name `host`
@@ -1165,6 +1189,30 @@ The control plane MUST remain ssh (mosh cannot pipe non-interactive commands).
 - **WHEN** a machine0 pane opens with the default `transport = "mosh"`
 - **THEN** it attaches over mosh if the VM has `mosh-server` (and the host has
   `mosh`), otherwise it transparently falls back to ssh — never failing the pane
+
+### Requirement: SSH-placement mosh panes fall back to ssh when mosh cannot start
+
+thegn SHALL wrap an ssh-placement interactive pane whose transport is mosh in a
+local fallback that captures mosh's stderr. When mosh exits non-zero and its
+output shows the remote `mosh-server` is missing (`mosh-server: command not
+found` and the other shells' wordings) or that no server startup message
+arrived, the pane SHALL replay that diagnostic, print one notice line (for a
+missing server: how to install mosh, or set `transport = "ssh"`), and continue
+as the plain-ssh pane for the same remote command. Any other mosh failure SHALL
+keep mosh's exit status. A pane's last-error status SHALL skip sshd login
+banners and thegn's fallback notice, showing the last real diagnostic line.
+
+#### Scenario: A host without mosh-server still gets a shell
+
+- **WHEN** a pane opens with `transport = "mosh"` on a host lacking
+  `mosh-server`
+- **THEN** the pane shows mosh's diagnostic and a one-line install notice, then
+  runs the same remote shell over `ssh -t` instead of crash-looping
+
+#### Scenario: Last error skips the login banner
+
+- **WHEN** a remote pane keeps crashing and its output ends with `Last login:`
+- **THEN** the status names the last diagnostic line before the banner
 
 ### Requirement: Tailnet host discovery is a provider seam
 

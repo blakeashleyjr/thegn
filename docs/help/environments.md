@@ -36,7 +36,13 @@ provider) appear in the panel's **system → environments** section — `↵`
 token (the outcome pops as a toast and is logged), `n` opens the add
 wizard (on the stable channel it offers `local`, `ssh`, `sprites` and `vercel`;
 the other kinds appear on the dev channel), and `x`
-removes it after a confirm (removal also forgets the stored token). On a
+removes it after a confirm (removal also forgets the stored token). The
+selected env expands into labelled rows: placement and provider, health and
+last check, what it is used for (this worktree and its jobs), target, data
+mode, sandbox overlay, failover, and the token state in words (`present` or
+`missing`, with the variable it resolves from). Sprites and Vercel envs also
+show how model credentials are handled. The footer names each action
+(`use for this worktree`, `test token`, `remove env`, `new env…`). On a
 [[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
 the sandbox) and the row shows `results not pulled` until a pull succeeds. An
 environment can keep a **warm spare pool** so new worktrees start
@@ -920,6 +926,29 @@ Not confirmed against a live provider:
 work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
+
+**Persistence needs dtach or mosh-server on the remote.** A pane survives a
+detach only if the remote has `dtach` (plain ssh panes) or `mosh-server` (mosh
+panes). Without either, the remote shell ends when the client detaches or is
+killed, and relaunching opens a fresh shell. thegn prints a one-line warning
+in the pane at launch when `dtach` is missing (or unusable) over ssh,
+and `thegn doctor` reports it (below). Fix: `brew install
+dtach` (macOS) or `apt install dtach` (Debian/Ubuntu), or install mosh.
+
+`thegn doctor` preflights each `[env.<name>] placement = "ssh"` with its own
+ssh target over a short, bounded ssh probe: whether the host is reachable, and
+whether `mosh-server` (mosh transport only), `dtach`, `podman` and `docker` are
+present. If no container runtime is found, the launch halts and names the fix:
+install podman or docker there, or set `[env.<name>.sandbox] backend = "none"`
+to run bare on that host with no sandbox. The halt also offers
+`[h] run on host`, which runs that worktree bare on the ssh host (never on your
+machine) for this session only; nothing is remembered.
+
+If the remote host has no `mosh-server`, the pane prints mosh's error and a
+one-line notice saying how to install mosh (or set `transport = "ssh"`), then
+continues over plain ssh. The same happens when mosh cannot start a server for
+another reason. A pane that keeps crashing reports its last real error line,
+not the ssh login banner.
 
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —

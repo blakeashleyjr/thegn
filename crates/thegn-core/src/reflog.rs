@@ -164,7 +164,7 @@ fn parse_reflog_with_limits(
     );
 
     let mut entries = Vec::with_capacity(fields.len() / 4);
-    for (record_index, record) in fields.chunks_exact(4).enumerate() {
+    for (record_index, record) in fields.as_chunks::<4>().0.iter().enumerate() {
         let sha = record[0];
         let selector = record[1];
         let timestamp = record[2];

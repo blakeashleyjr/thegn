@@ -45,6 +45,18 @@ pub enum AttrError {
     Expired,
 }
 
+impl std::fmt::Display for AttrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => f.write_str("malformed attribution token"),
+            Self::BadSignature => f.write_str("attribution token signature is invalid"),
+            Self::Expired => f.write_str("attribution token has expired"),
+        }
+    }
+}
+
+impl std::error::Error for AttrError {}
+
 /// The caller scope a virtual key carries. The proxy rolls spend up `scope →
 /// agent → workspace → zone → global`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,6 +18,7 @@
 //! | `other_open:<slug>`  | `"1"` open / `"0"` collapsed (absent=`[ui] sidebar_other_group_collapsed`) | toggle_collapse on the "Other" group |
 //! | `batch_open:<key>`   | `"1"` (absent=collapsed) | toggle_collapse on a batch row (`batch:{slug}/{token}`) |
 //! | `more_open:<key>`    | `"1"` (absent=truncated to the row limit) | toggle_show_more ("show more"/"show fewer") |
+//! | `finished_cleared:<slug>` | epoch ms cut-off | "Clear finished" on a `Finished` pipelines row |
 //!
 //! `<key>` is the row's stable identity: a workspace slug, `{slug}/{branch}`
 //! for worktrees, `{slug}/folder:{id}` for folders, `terminals/host:{key}` for
@@ -134,6 +135,11 @@ pub(crate) struct SidebarState {
     pub(crate) recently_deleted: std::collections::HashMap<String, Option<u64>>,
     /// THE-2463 Q1: the preview project row a pending create added: (seq, repo path).
     pub(crate) create_preview: Option<(u64, String)>,
+    /// THE-2737: the focused tab the user just marked unread. The loop's
+    /// focus-ack skips it so the filled dot is not re-read on the very next
+    /// frame; cleared once focus leaves the tab or its dot leaves `Waiting`,
+    /// so focusing it again reads it as normal. Loop-side only, never persisted.
+    pub(crate) unread_hold: Option<String>,
 }
 
 impl SidebarState {
@@ -210,6 +216,16 @@ impl SidebarState {
                     // best-effort: lazy sweep of a legacy tombstone row
                     let _ = db.del_ui_state(scope, &key);
                 }
+            } else if let Some(slug) = key.strip_prefix("finished_cleared:") {
+                match value.parse::<i64>() {
+                    Ok(cut) => {
+                        self.view.finished_cleared.insert(slug.to_string(), cut);
+                    }
+                    Err(_) => {
+                        // best-effort: lazy sweep of an unreadable row
+                        let _ = db.del_ui_state(scope, &key);
+                    }
+                }
             } else if let Some(batch) = key.strip_prefix("batch_open:") {
                 if value == "1" {
                     self.view.batch_open.insert(batch.to_string());
@@ -243,6 +259,14 @@ impl SidebarState {
     pub(crate) fn set_other_open(&mut self, slug: &str, open: bool) {
         self.view.other_open.insert(slug.to_string(), open);
         self.persist(&format!("other_open:{slug}"), if open { "1" } else { "0" });
+    }
+
+    /// "Clear finished": hide every pipeline lane of workspace `slug` that has
+    /// finished by `now_ms` (persisted as `finished_cleared:<slug>`). Lanes
+    /// that finish later still show; worktrees are never touched.
+    pub(crate) fn clear_finished(&mut self, slug: &str, now_ms: i64) {
+        self.view.finished_cleared.insert(slug.to_string(), now_ms);
+        self.persist(&format!("finished_cleared:{slug}"), &now_ms.to_string());
     }
 
     /// Record (and persist) whether a batch row is open. Collapsed is the
@@ -532,6 +556,41 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(key, _)| key == "more_open:stale")
+        );
+    }
+
+    /// "Clear finished" persists its per-workspace cut-off and `load` restores
+    /// it; an unparseable value is swept.
+    #[test]
+    fn finished_cleared_round_trips_through_ui_state() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+
+        let mut sidebar = SidebarState::default();
+        sidebar.clear_finished("app", 1_234);
+        assert_eq!(sidebar.view.finished_cleared.get("app"), Some(&1_234));
+        let rows = read_sidebar_state_from_writer().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "finished_cleared:app" && value == "1234")
+        );
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for (key, value) in rows {
+            db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+        }
+        db.set_ui_state(SIDEBAR_SCOPE, "finished_cleared:junk", "soon")
+            .unwrap();
+        let mut loaded = SidebarState::default();
+        loaded.load(&db, SIDEBAR_SCOPE);
+        assert_eq!(loaded.view.finished_cleared.get("app"), Some(&1_234));
+        assert_eq!(loaded.view.finished_cleared.get("junk"), None);
+        assert!(
+            !db.ui_state_in_scope(SIDEBAR_SCOPE)
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key == "finished_cleared:junk")
         );
     }
 

@@ -42,6 +42,16 @@ be recallable with `Ctrl+r`.
 - **THEN** the overlay shows an inline regex error instead of an empty-results
   state
 
+#### Scenario: Opening the overlay lists recent lines
+
+- **WHEN** the overlay opens over a pane that has printed output
+- **THEN** its most recent lines are listed before the user types anything
+
+#### Scenario: Scope cycle has no profile step
+
+- **WHEN** the user presses `Tab` repeatedly
+- **THEN** the scope cycles pane, tab, worktree, workspace, then back to pane, with no `profile` scope
+
 #### Scenario: Recent query is recalled
 
 - **WHEN** the user reopens terminal search and presses `Ctrl+r`

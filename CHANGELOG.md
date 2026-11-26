@@ -7,6 +7,32 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.139] — 2026-11-26
+
+Voice dictation ships on the stable channel, and the side panel's Work, Issues, Hosts and Environments views have been reworked.
+
+### Added
+
+- Voice dictation is on the stable channel, with the native engine in default builds. It adds vocabulary prompts, replacement rules for the final text, and a readiness verdict in `voice status` and `voice doctor`.
+- A search field in the docked help view.
+- An Acknowledgments page and complete third-party licence notices.
+- A one-time warning when an ssh host has systemd lingering off.
+
+### Changed
+
+- Issues in the panel are scoped to one team. Enter opens an issue's details.
+- The Hosts and Environments sections show per-host and per-environment health, usage and labelled actions.
+- One Pipelines section in the sidebar, with one-row lanes. Finished lanes age out.
+- The CPU, memory and disk popovers in the masthead are reworked. The Keys view shows chords as keycaps.
+
+### Fixed
+
+- A worktree's programs are stopped before it is deleted, and locked or main worktrees are refused.
+- The notification cursor stays in place when a leaf is removed.
+- Sandbox installer prefixes match under a symlinked home.
+- A transient ENOENT from racing file creates is retried.
+- macOS file watching and process tests behave correctly.
+
 ## [0.1.0-alpha.138] — 2026-11-25
 
 Cloud spend in the top bar now includes Sprites, and Lead can be set up from inside thegn.

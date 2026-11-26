@@ -256,6 +256,17 @@ pub enum SecretFileError {
     Refused(String),
 }
 
+impl std::fmt::Display for SecretFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("secret file not found"),
+            Self::Refused(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SecretFileError {}
+
 /// Read a `file:` SecretRef after checking its resolved target's owner, mode, link, size and UTF-8.
 ///
 /// Final-component symlinks are followed. Group access is allowed with a one-time warning; world
@@ -1207,12 +1218,27 @@ impl PrivateDir {
             if append {
                 flags |= OFlag::O_APPEND;
             }
-            let fd = openat(
-                &self.fd,
-                name_path,
-                flags,
-                nix::sys::stat::Mode::from_bits_truncate(0o600),
-            )
+            // APFS can fail one of two racing O_CREAT opens of the same new
+            // name with ENOENT (macOS: two threads creating one lock or log
+            // file). The parent stays open and the name is a single
+            // component, so ENOENT here is transient; retry it a few times.
+            // Sleep rather than yield: on a loaded host the racing creator can
+            // be preempted mid-create for longer than a handful of yields.
+            let mut enoent_retries: u64 = 0;
+            let fd = loop {
+                match openat(
+                    &self.fd,
+                    name_path,
+                    flags,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                ) {
+                    Err(nix::errno::Errno::ENOENT) if enoent_retries < 8 => {
+                        enoent_retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(enoent_retries));
+                    }
+                    other => break other,
+                }
+            }
             .map_err(|error| {
                 if error == nix::errno::Errno::EISDIR {
                     std::io::Error::new(
@@ -2517,6 +2543,15 @@ fn restrict(path: &Path, unix_mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Skip a redundant chmod: concurrent writers all re-assert the same mode on
+        // a shared registry root, and on macOS a chmod racing an `openat(O_CREAT)`
+        // in that directory can make the open fail spuriously with ENOENT.
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.is_dir()
+            && meta.permissions().mode() & 0o7777 == unix_mode
+        {
+            return Ok(());
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(unix_mode))
     }
     #[cfg(windows)]

@@ -851,7 +851,20 @@ mod tests {
                 ),
             ],
         );
-        git_in(&repo.dir, &["status", "--short"]);
+        // `git_in` goes through `util::git_cmd`, which fences fsmonitor off
+        // (THE-225), so the positive control must be a plain Git invocation.
+        let plain = Command::new("git") // plain-git-control: THE-225 positive control
+            .arg("-C")
+            .arg(&repo.dir)
+            .args(["status", "--short"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(plain.success(), "plain git status failed: {plain}");
         assert!(
             fsmonitor_marker.exists(),
             "plain status is the fsmonitor positive control"

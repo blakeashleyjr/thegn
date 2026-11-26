@@ -201,6 +201,18 @@ impl From<io::Error> for CollectError {
     }
 }
 
+impl std::fmt::Display for CollectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(kind) => write!(f, "metrics source i/o error: {kind}"),
+            Self::Parse(what) => write!(f, "metrics source parse error: {what}"),
+            Self::Gone => f.write_str("metrics source is gone"),
+        }
+    }
+}
+
+impl std::error::Error for CollectError {}
+
 pub trait Collector: Send {
     fn id(&self) -> CollectorId;
     fn cadence(&self) -> Cadence;

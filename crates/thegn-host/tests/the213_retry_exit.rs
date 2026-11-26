@@ -213,6 +213,10 @@ fn serve_health(listener: UnixListener) {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // BSD/macOS accept() hands back a socket that inherits the
+                // listener's O_NONBLOCK (Linux does not), so a read would see
+                // WouldBlock before the client's request arrives.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

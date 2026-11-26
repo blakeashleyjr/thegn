@@ -409,6 +409,10 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
+    /// The Issues detail page's full issue (description, comments), fetched
+    /// off-loop by `handlers::tracker::toggle_detail` and applied by
+    /// `handlers::tracker::apply_detail`.
+    IssueDetail(Box<crate::panel::IssueDetailLoad>),
     /// Periodic calendar sync: refresh every enabled `[[calendar.accounts]]`
     /// over the configured horizon. Runs on the shortest account interval
     /// (floored at 60s); no slot is emitted at all when nothing is configured.
@@ -6082,7 +6086,7 @@ pub(crate) fn toggle_system_scope(
     }
 }
 
-/// Toggle the Across section between the active workspace (default) and every
+/// Toggle the Attention (Across) section between the active workspace (default) and every
 /// workspace, rehydrate so the aggregation rebuilds under the new scope, and
 /// return the status line. Same shape as [`toggle_system_scope`].
 pub(crate) fn toggle_across_scope(
@@ -6107,9 +6111,9 @@ pub(crate) fn toggle_across_scope(
         None,
     );
     if all {
-        "Across: all projects".into()
+        "Attention: all projects".into()
     } else {
-        "Across: this project".into()
+        "Attention: this project".into()
     }
 }
 

@@ -398,6 +398,7 @@ self: {
     ui.confirm_delete_project = cfg.uiConfirmDeleteProject;
     ui.confirm_quit = cfg.uiConfirmQuit;
     ui.full_mode_chip = cfg.uiFullModeChip;
+    ui.tab_title_from_terminal = cfg.uiTabTitleFromTerminal;
     ui.dismiss_overlay_on_click_outside = cfg.uiDismissOverlayOnClickOutside;
     ui.sidebar_freeze_sort = cfg.uiSidebarFreezeSort;
     ui.sidebar_nav_skips_collapsed = cfg.uiSidebarNavSkipsCollapsed;
@@ -432,6 +433,7 @@ self: {
     ui.sidebar_group_row_limit = cfg.uiSidebarGroupRowLimit;
     ui.sidebar_group_row_limits = cfg.uiSidebarGroupRowLimits;
     ui.sidebar_batch_group_min = cfg.uiSidebarBatchGroupMin;
+    ui.sidebar_finished_pipeline_days = cfg.uiSidebarFinishedPipelineDays;
     search.max_results = cfg.searchMaxResults;
     search.respect_gitignore = cfg.searchRespectGitignore;
     search.include_hidden = cfg.searchIncludeHidden;
@@ -876,6 +878,12 @@ in {
       description = "Whether to display the full word for the mode chip. Unset (null) = the binary's default.";
     };
 
+    uiTabTitleFromTerminal = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Label tabs with the focused pane's terminal title instead of a number. Unset (null) = the binary's default (true).";
+    };
+
     uiDismissOverlayOnClickOutside = lib.mkOption {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
@@ -1080,6 +1088,12 @@ in {
       type = lib.types.nullOr (lib.types.ints.unsigned);
       default = null;
       description = "Loose worktrees sharing a batch token fold into one sidebar row once this many share it; 0 = off. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarFinishedPipelineDays = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Days a finished pipeline stays in the sidebar Pipelines section before it ages out; 0 = never. The worktree is never deleted. Unset (null) = the binary's default.";
     };
 
     searchMaxResults = lib.mkOption {

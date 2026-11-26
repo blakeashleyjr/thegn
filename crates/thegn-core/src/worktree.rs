@@ -870,6 +870,14 @@ pub struct AddError {
     pub branch_probe_failed: bool,
 }
 
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AddError {}
+
 /// [`add`] with the failure reason returned instead of warned, for callers
 /// that surface errors in their own UI (the new-worktree progress overlay).
 pub fn add_checked(
@@ -1025,8 +1033,8 @@ pub fn add_checked_with_state(
 /// warm volumes stay. The caller resolves `loc` before the DB row is forgotten
 /// and before local removal; a location read after removal can no longer
 /// refuse anything.
-pub fn purge_worktree_files(loc: &crate::remote::GitLoc) {
-    loc.remove_remote_dir();
+pub fn purge_worktree_files(loc: &crate::remote::GitLoc) -> Result<(), String> {
+    loc.remove_remote_dir()
 }
 
 /// Remove a worktree and optionally delete its branch. Returns whether the
@@ -1237,6 +1245,39 @@ fn worktree_paths_equal(left: &Path, right: &Path) -> bool {
         || (left.exists()
             && right.exists()
             && std::fs::canonicalize(left).ok() == std::fs::canonicalize(right).ok())
+}
+
+/// Why `worktree` (of the repository at `root`) must not be removed, checked
+/// before anything is stopped or closed (THE-2736): the primary checkout and a
+/// linked worktree locked with `git worktree lock` are refused with a plain
+/// reason. Reads the `.git` file and Git's `locked` marker only, no
+/// subprocess. `None` means removal may go ahead; an unreadable `.git` is left
+/// to the later steps, which fail closed on their own.
+pub fn removal_refusal(root: &Path, worktree: &Path) -> Option<String> {
+    if worktree_paths_equal(root, worktree) {
+        return Some(format!(
+            "{} is the repository's main checkout; it cannot be removed. Nothing was closed",
+            worktree.display()
+        ));
+    }
+    let marker = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    // `join` keeps an absolute gitdir as is and resolves a relative one.
+    let reason = std::fs::read_to_string(worktree.join(gitdir).join("locked")).ok()?;
+    let reason = reason.trim();
+    let why = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+    Some(format!(
+        "{} is locked{why}; run `git worktree unlock {}` first. Nothing was closed",
+        worktree.display(),
+        worktree.display()
+    ))
 }
 
 /// Reclaim a worktree's build artifacts (`target/`) while keeping the checkout
@@ -1633,6 +1674,45 @@ mod tests {
         ] {
             assert!(util::git_cmd(dir).args(args).status().unwrap().success());
         }
+    }
+
+    #[test]
+    fn removal_refusal_names_the_main_checkout_and_a_locked_worktree() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = scratch.path().join("feature");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &path.to_string_lossy()
+            ]
+        ));
+
+        let main = removal_refusal(&repo, &repo).expect("the main checkout is refused");
+        assert!(main.contains("main checkout"), "{main}");
+        assert_eq!(removal_refusal(&repo, &path), None);
+
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "on a usb disk",
+                &path.to_string_lossy()
+            ]
+        ));
+        let locked = removal_refusal(&repo, &path).expect("a locked worktree is refused");
+        assert!(locked.contains("is locked (on a usb disk)"), "{locked}");
+        assert!(locked.contains("git worktree unlock"), "{locked}");
+        assert!(path.exists() && branch_exists(&repo, "feature"));
     }
 
     #[test]
@@ -2481,7 +2561,11 @@ mod tests {
         let path = allocate_worktree_path(&repo, "feat/a", &cfg).unwrap();
         add_checked(&repo, "feat/a", "main", &path, &cfg).unwrap();
         let inspected = inspect_registered(&repo, &path).unwrap();
-        assert_eq!(inspected.registered_path().as_path(), path);
+        // Git records the realpath (macOS `/tmp` is `/private/tmp`).
+        assert_eq!(
+            inspected.registered_path().as_path(),
+            std::fs::canonicalize(&path).unwrap()
+        );
         assert_eq!(inspected.branch().unwrap().raw(), b"feat/a");
         assert!(inspected.common_dir().as_path().is_absolute());
         assert!(inspected.admin_dir().as_path().is_absolute());
@@ -2511,6 +2595,17 @@ mod tests {
         raw.extend_from_slice(b"/thegn-raw-\n");
         raw.push(0xff);
         let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        // APFS and HFS+ reject names that are not valid UTF-8 (EILSEQ), so
+        // there is no such worktree path to preserve on macOS: skip there.
+        match std::fs::create_dir(&path) {
+            Ok(()) => std::fs::remove_dir(&path).unwrap(),
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                tracing::warn!(%error, "skipping: filesystem rejects non-UTF-8 names");
+                let _ = std::fs::remove_dir_all(&repo);
+                return;
+            }
+            Err(error) => panic!("unexpected scratch collision: {error}"),
+        }
         assert!(
             util::git_cmd(&repo)
                 .args(["worktree", "add", "-q", "--detach"])
@@ -2523,7 +2618,7 @@ mod tests {
         let inspected = inspect_registered(&repo, &path).unwrap();
         assert_eq!(
             inspected.registered_path().as_bytes(),
-            path.as_os_str().as_bytes()
+            std::fs::canonicalize(&path).unwrap().as_os_str().as_bytes()
         );
         assert!(inspected.branch().is_none());
         let _ = util::git_cmd(&repo)

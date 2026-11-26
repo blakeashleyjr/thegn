@@ -1,13 +1,41 @@
 //! Native audio/inference leaf. No core, host, terminal, or database dependency.
 //! Native handles belong exclusively to the disposable voice worker process.
-#[cfg(feature = "native")]
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 pub mod capture;
-#[cfg(feature = "native")]
+pub mod level;
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 pub mod whisper;
+
+/// Whether this build links native capture and Whisper (feature `native` on a
+/// supported target: Linux glibc or macOS). False on musl/Windows builds.
+pub const NATIVE_COMPILED: bool = cfg!(all(
+    feature = "native",
+    any(
+        target_os = "macos",
+        all(target_os = "linux", target_env = "gnu")
+    )
+));
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const WINDOW_SAMPLES: usize = 8 * SAMPLE_RATE;
 pub const PREVIEW_STEP: usize = SAMPLE_RATE;
+/// How long capture keeps recording after stop, so the last syllable is kept.
+pub const STOP_TAIL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// True once the post-stop tail has elapsed. `None` means stop was not seen.
+pub fn tail_done(
+    stop_seen: Option<std::time::Instant>,
+    now: std::time::Instant,
+    tail: std::time::Duration,
+) -> bool {
+    stop_seen.is_some_and(|seen| now.saturating_duration_since(seen) >= tail)
+}
 
 /// Keep the newest words visible during long utterances. The host applies its
 /// cell-width/control filtering after this UTF-8-safe byte bound.
@@ -160,6 +188,16 @@ fn preview_tail(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tail_done_waits_for_the_tail_after_stop() {
+        let t0 = std::time::Instant::now();
+        let tail = STOP_TAIL;
+        assert!(!tail_done(None, t0 + tail * 2, tail));
+        assert!(!tail_done(Some(t0), t0, tail));
+        assert!(!tail_done(Some(t0), t0 + tail / 2, tail));
+        assert!(tail_done(Some(t0), t0 + tail, tail));
+        assert!(tail_done(Some(t0), t0 + tail * 2, tail));
+    }
     #[test]
     fn long_previews_keep_new_speech_visible_without_splitting_unicode() {
         let text = format!("{} latest spoken words", "界".repeat(200));

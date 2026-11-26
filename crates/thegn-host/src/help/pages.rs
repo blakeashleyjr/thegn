@@ -68,6 +68,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/automations.md"),
     include_str!("../../../../docs/help/terminal-compatibility.md"),
     include_str!("../../../../docs/help/best-practices.md"),
+    include_str!("../../../../docs/help/acknowledgments.md"),
     include_str!("../../../../docs/help/help.md"),
 ];
 

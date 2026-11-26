@@ -2291,7 +2291,11 @@ mod tests {
     /// both the workspace and the feat worktree in `db` so folder filing has a
     /// row to update. Returns (repo_root, feat_worktree_path).
     fn repo_with_feat(db: &Db, tag: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
+        // Cleanup refuses noncanonical worktree paths by design; the macOS temp
+        // root (`/var/folders`, or `/tmp`, both under `/private`) is a symlink.
+        let temp = std::env::temp_dir();
+        let temp = std::fs::canonicalize(&temp).unwrap_or(temp);
+        let root = temp.join(format!(
             "tg-mlife-{tag}-{}-{}",
             std::process::id(),
             util::now()

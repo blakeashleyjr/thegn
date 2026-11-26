@@ -12,6 +12,17 @@ pub struct Engine {
     context: WhisperContext,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Pass {
+    Preview,
+    Final,
+}
+
+/// Return a Whisper encoder context sized to an audio window, plus a small margin.
+pub fn audio_ctx_for(n: usize) -> i32 {
+    (n.saturating_add(319) / 320).saturating_add(64).min(1500) as i32
+}
+
 struct Abort {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
@@ -40,10 +51,10 @@ impl Engine {
     pub fn load(path: &Path) -> Result<Self> {
         let path = path.to_str().context("model path must be UTF-8")?;
         let mut params = WhisperContextParameters::default();
-        params.use_gpu(cfg!(all(target_os = "macos", feature = "metal")));
+        params.use_gpu(cfg!(target_os = "macos"));
         let context = WhisperContext::new_with_params(path, params)
             .and_then(|context| {
-                if cfg!(all(target_os = "macos", feature = "metal")) {
+                if cfg!(target_os = "macos") {
                     // The no-state loader can succeed before Metal compute
                     // buffers are allocated. Preflight that allocation too so
                     // startup can fall back to CPU before opening the mic.
@@ -52,7 +63,7 @@ impl Engine {
                 Ok(context)
             })
             .or_else(|error| {
-                if cfg!(all(target_os = "macos", feature = "metal")) {
+                if cfg!(target_os = "macos") {
                     let mut cpu = WhisperContextParameters::default();
                     cpu.use_gpu(false);
                     WhisperContext::new_with_params(path, cpu)
@@ -63,12 +74,16 @@ impl Engine {
             .context("load Whisper model (Metal with CPU fallback on macOS; CPU on Linux)")?;
         Ok(Self { context })
     }
+    /// `prompt` is the Whisper initial prompt (final pass only); the caller
+    /// drops a transcript that merely echoes it.
     pub fn transcribe(
         &self,
         samples: &[f32],
         language: &str,
+        pass: Pass,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
+        prompt: Option<&str>,
     ) -> Result<String> {
         if cancelled.load(Ordering::Acquire) {
             bail!("Whisper transcription cancelled");
@@ -77,10 +92,14 @@ impl Engine {
             return Ok(String::new());
         }
         Self::validate_language(language)?;
-        // Avoid Whisper's tendency to hallucinate on digital silence.
-        if samples.iter().map(|s| s * s).sum::<f32>() / (samples.len() as f32) < 0.000001 {
+        if !crate::level::has_speech(samples) {
             return Ok(String::new());
         }
+        let span = if pass == Pass::Final {
+            crate::level::speech_span(samples).unwrap_or(0..samples.len())
+        } else {
+            0..samples.len()
+        };
         // Declare the callback context before `state`: ggml stores this
         // pointer in the state backend, so the context must outlive the state.
         let abort = Abort {
@@ -90,19 +109,30 @@ impl Engine {
         let mut state = self.context.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(
-            std::thread::available_parallelism().map_or(2, |n| n.get().min(4)) as i32,
+            std::thread::available_parallelism().map_or(2, |n| n.get().min(8)) as i32,
         );
         params.set_language(if language == "auto" || language.is_empty() {
             None
         } else {
             Some(language)
         });
+        if let Some(prompt) = prompt {
+            params.set_initial_prompt(prompt);
+        }
         params.set_translate(false);
         params.set_no_context(true);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_special(false);
         params.set_print_timestamps(false);
+        params.set_suppress_nst(true);
+        params.set_suppress_blank(true);
+        if pass == Pass::Preview {
+            params.set_temperature_inc(0.0);
+            params.set_single_segment(true);
+            params.set_no_timestamps(true);
+            params.set_audio_ctx(audio_ctx_for(samples.len()));
+        }
         // whisper-rs 0.16.0's safe helper double-boxes a trait object, then
         // casts that allocation to the original closure type in its trampoline.
         // Use a concrete, owned callback context instead (and avoid its leak).
@@ -114,7 +144,7 @@ impl Engine {
             params.set_abort_callback(Some(should_abort));
             params.set_abort_callback_user_data(std::ptr::from_ref(&abort).cast_mut().cast());
         }
-        let result = state.full(params, samples);
+        let result = state.full(params, &samples[span]);
         if cancelled.load(Ordering::Acquire) || Instant::now() >= abort.deadline {
             bail!("Whisper transcription cancelled or timed out");
         }
@@ -124,6 +154,20 @@ impl Engine {
             .map(|s| s.to_str_lossy().map(|text| text.into_owned()))
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join(""))
+    }
+}
+
+#[cfg(test)]
+mod audio_context_tests {
+    use super::audio_ctx_for;
+
+    #[test]
+    fn audio_context_scales_to_window_and_clamps() {
+        assert_eq!(audio_ctx_for(0), 64);
+        assert_eq!(audio_ctx_for(16_000), 114);
+        assert_eq!(audio_ctx_for(8 * 16_000), 464);
+        assert_eq!(audio_ctx_for(30 * 16_000), 1500);
+        assert_eq!(audio_ctx_for(60 * 16_000), 1500);
     }
 }
 

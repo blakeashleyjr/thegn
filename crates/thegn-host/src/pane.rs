@@ -665,6 +665,21 @@ impl PtyPane {
         }
     }
 
+    /// What a worktree delete must stop before the folder goes (THE-2736): the
+    /// PTY child's owner, or a daemon session's local child. `None` for a
+    /// remote/provider stream, whose process isn't on this host.
+    pub(crate) fn delete_stop(&self) -> Option<crate::worktree_lifecycle::PaneStop> {
+        if let Some(owner) = &self.child_process {
+            return Some(crate::worktree_lifecycle::PaneStop::Owned(owner.clone()));
+        }
+        if self.is_daemon_backed() {
+            return self
+                .live_pid()
+                .map(crate::worktree_lifecycle::PaneStop::Group);
+        }
+        None
+    }
+
     /// Whether this pane is backed by the pane daemon (survives UI exit).
     pub fn is_daemon_backed(&self) -> bool {
         matches!(&self.io, PaneIo::Stream { provider, .. } if provider == "daemon")

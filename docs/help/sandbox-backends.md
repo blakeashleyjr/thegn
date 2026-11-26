@@ -172,6 +172,15 @@ resulting isolation class. When an unprobed engine still rejects the runtime at
 create, the failure names the runtime and the placement instead of a generic
 container error.
 
+## Agents dying on ssh disconnect
+
+On the first connect to an ssh host, thegn checks `loginctl show-user $USER -p
+Linger`. If systemd lingering is off, it shows a one-time notice, because
+systemd may kill the host's processes (your agents) when the session ends, for
+example when the laptop sleeps. Fix it on the host with
+`sudo loginctl enable-linger $USER`. Hosts without systemd, or where the probe
+fails or times out, show nothing and never block the connect.
+
 ## Isolation floor
 
 `backend_chain` expresses a _preference_; the isolation floor is a _demand_.
@@ -246,8 +255,27 @@ read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
 with a trailing `/*` (one level) or `/**` (any depth), and the merge target
 and default branches are always denied. Only `refs/heads/` branches are
 accepted back from a sandbox. Set it globally or per `[env.<name>.sandbox.git]`; a
-repository's `.thegn.toml` cannot set it. The keys are validated today; the
-sandbox mounts that enforce them arrive in a later release.
+repository's `.thegn.toml` cannot set it. `mode = "full"` still lets a sandbox
+move refs.
+
+In every mode, in the `mode = "full"` fallback (main checkout, top-level or
+detached branch) and for remote placements, the git control files are read-only
+inside the sandbox on bwrap, OCI and systemd: `hooks/`, `config`, `info/`, the
+worktree's `.git` file, and its `commondir`, `gitdir` and `config.worktree`. On
+systemd a repository outside `$HOME` gets a read-only git directory with only the
+write policy's carve-outs writable. For profile `standard` and above, a local
+worktree's existing `.claude/`, `.mcp.json`, `.envrc` and `.vscode/tasks.json`
+are read-only too, because the host later runs them. `standard` is an accident
+guard, not a boundary against a hostile agent: files the sandbox creates fresh
+are not pinned, and Landlock-only cannot pin.
+
+`objects/info/alternates` and `objects/info/http-alternates` are always
+read-only inside the sandbox (created empty when missing), so a sandbox cannot
+redirect object lookups to a planted directory. A repository whose object store
+already borrows objects from elsewhere (a non-empty `alternates` file, a symlink
+under `objects/`, or a `commondir` outside the common dir) is judged at launch:
+`sealed` and `sealed-tunnel` refuse with "use a private copy", and other
+profiles warn and launch.
 
 Sandboxed and remote agents get no GitHub token by default: credentials stay
 with thegn. With the default `credential = "none"`, `GH_TOKEN` and

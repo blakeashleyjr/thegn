@@ -5791,6 +5791,17 @@ mod tests {
     }
 
     #[test]
+    fn reserved_host_value_verb_is_refused_with_a_reserved_reason() {
+        // Nothing seeds host values, so the verb must not answer `null` as if
+        // it had looked something up.
+        let refusal = host_verb_check(&seg_spec("p"), HostVerb::HostValue)
+            .expect_err("reserved host.value must be refused before dispatch");
+        assert_eq!(refusal.code, RpcErrorCode::Unsupported);
+        assert!(refusal.message.contains("host.value"));
+        assert!(refusal.message.contains("reserved"));
+    }
+
+    #[test]
     fn io_request_is_refused_at_dispatch_without_an_audit_entry() {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();

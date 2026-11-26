@@ -1071,11 +1071,17 @@ impl SessionActor {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let db = self.db.clone();
         let session = self.meta.id.clone();
+        let worktree = self.meta.worktree.clone().unwrap_or_default();
         tokio::task::spawn_blocking(move || {
             use thegn_core::store::NotificationStore;
             let db = db.lock().expect("daemon db lock");
             if let Err(e) = db.clear_session_attention(&session) {
                 tracing::warn!(target: "thegn::daemon", "attention state clear failed: {e}");
+            }
+            if let Err(e) =
+                db.mark_notification_read_by_source("agent_attention", &session, &worktree)
+            {
+                tracing::warn!(target: "thegn::daemon", "attention notification resolve failed: {e}");
             }
         });
     }

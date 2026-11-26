@@ -1628,7 +1628,10 @@ fn mosh_wraps_backend_over_ssh() {
         TransportKind::Mosh,
     ));
     let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh");
+    assert_eq!(
+        argv[4], "mosh",
+        "mosh argv rides the fallback wrapper: {argv:?}"
+    );
     assert!(argv.iter().any(|a| a.starts_with("--ssh=")));
     assert!(argv.iter().any(|a| a.contains("-p 2222")));
     assert!(argv.contains(&"user@box".to_string()));
@@ -2977,7 +2980,10 @@ fn remote_none_bare_shell_cds_and_moshes() {
         TransportKind::Mosh,
     ));
     let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh");
+    assert_eq!(
+        argv[4], "mosh",
+        "mosh argv rides the fallback wrapper: {argv:?}"
+    );
     let body = argv.last().unwrap();
     assert!(body.contains("cd /wt/feat"));
     assert!(body.contains("exec ${SHELL:-/bin/sh} -l"));
@@ -3340,7 +3346,8 @@ fn remote_enter_argv_wraps_with_mosh() {
     // With a real image + OCI backend on a remote, enter_argv should
     // produce a mosh wrapper.
     let argv = enter_argv(&s, "bash -l").expect("valid volume names");
-    assert_eq!(argv[0], "mosh", "outer command must be mosh: {argv:?}");
+    assert_eq!(argv[0], "/bin/sh", "local fallback wrapper: {argv:?}");
+    assert_eq!(argv[4], "mosh", "mosh argv rides the wrapper: {argv:?}");
     // The remote host must appear in the argv.
     assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
 }
@@ -4597,6 +4604,59 @@ fn stderr_with_timeout_stdin_redacts_payload_and_reports_child_failure() {
     assert!(
         !stderr.contains("canary"),
         "secret leaked in stderr: {stderr}"
+    );
+}
+
+/// Spawn a live process whose command line carries the REAL remote OCI create
+/// argv (as `sh` positional parameters) while the real secret payload goes to
+/// its stdin, then read that command line back from `ps`: the canary must be
+/// absent from the live argv, and the argv must still be what `ps` printed.
+#[cfg(unix)]
+#[test]
+fn remote_oci_create_keeps_canary_out_of_live_process_argv() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("live-process-canary")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Podman);
+    s.env = vec![("GH_TOKEN".into(), "live-process-canary".into())];
+    s.placement = Placement::Ssh(SshPlacement::plain(
+        "box".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let secret_env = remote_stdin_oci_secret_env(&s);
+    let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
+    let (create, input) = oci_create_argv_and_stdin(&s, opts, &secret_env).unwrap();
+    let input = input.expect("SSH host secret stdin");
+    assert!(
+        String::from_utf8_lossy(&input).contains("live-process-canary"),
+        "precondition: the payload carries the canary"
+    );
+    // `; :` keeps `sh` from exec-ing `ps` in place, so `$$` still names the
+    // process whose argv holds the create command.
+    let mut argv: Vec<String> = vec![
+        "sh".into(),
+        "-c".into(),
+        "ps -ww -o command= -p $$ >&2; :".into(),
+        "sh".into(),
+    ];
+    argv.extend(create);
+    let (success, stderr) = stderr_with_timeout_stdin(&argv, Duration::from_secs(5), input)
+        .expect("process listing completes");
+
+    assert!(success, "process listing failed: {stderr}");
+    assert!(
+        stderr.contains("/dev/stdin"),
+        "ps must print the live create argv: {stderr}"
+    );
+    assert!(
+        !stderr.contains("live-process-canary") && !stderr.contains("[REDACTED]"),
+        "secret appeared in live process argv: {stderr}"
     );
 }
 
@@ -7241,6 +7301,7 @@ fn git_probe(fx: &GitFixture, branch: &str, target: Option<&str>) -> GitProbe {
         target: target.map(str::to_string),
         default: Some("main".to_string()),
         identity: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -7318,6 +7379,88 @@ fn git_policy_commit_only_binds_common_ro_then_lane_carve_outs() {
 }
 
 #[test]
+fn alternates_pinned_ro() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    // No `objects/info/`: the pin must create it rather than skip the bind.
+    assert!(!fx.common.join("objects/info").exists());
+    for mode in [
+        SandboxGitMode::CommitOnly,
+        SandboxGitMode::PushLane,
+        SandboxGitMode::Full,
+    ] {
+        let (mounts, _) = git_policy_mounts(
+            &git_cfg(mode),
+            &fx.wt,
+            &git_probe(&fx, "tg/lane", Some("main")),
+        );
+        let argv = bwrap_git_argv(&fx, mounts.clone());
+        let objects = triple_at(&argv, "--bind", &fx.common.join("objects")).expect("objects rw");
+        for name in ["alternates", "http-alternates"] {
+            let path = fx.common.join("objects/info").join(name);
+            // Created empty so the read-only bind has a target.
+            assert!(path.exists(), "{name}");
+            let pin = triple_at(&argv, "--ro-bind", &path).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                objects < pin,
+                "{name} pinned after the rw objects bind: {argv:?}"
+            );
+            // The mount list (lowered unchanged by OCI `:ro` and systemd
+            // `ReadOnlyPaths`/`BindReadOnlyPaths`) carries it read-only.
+            assert!(
+                mounts
+                    .iter()
+                    .any(|m| m.ro && std::path::Path::new(&m.dest) == path),
+                "{name}: {mounts:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_object_store_reads_alternates_symlinks_and_commondir() {
+    let fx = git_fixture();
+    let clean = probe_object_store(&fx.common, Some(&fx.admin));
+    assert_eq!(clean, (vec![], false, false));
+    std::fs::create_dir_all(fx.common.join("objects/info")).unwrap();
+    std::fs::write(
+        fx.common.join("objects/info/alternates"),
+        "# comment\n\n/shared/objects\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/tmp", fx.common.join("objects/aa")).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fx.admin.join("commondir"),
+        format!("{}\n", other.path().display()),
+    )
+    .unwrap();
+    let (alts, symlinks, outside) = probe_object_store(&fx.common, Some(&fx.admin));
+    assert_eq!(alts, vec!["/shared/objects".to_string()]);
+    assert!(symlinks && outside);
+    // git resolves `--git-common-dir` FROM `commondir`, so the launch path
+    // probes with the planted dir as `common`; the admin dir's own location
+    // still exposes the redirect.
+    let (_, _, outside) = probe_object_store(other.path(), Some(&fx.admin));
+    assert!(
+        outside,
+        "a redirected commondir is outside the admin dir's repo"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_object_store_flags_a_symlinked_objects_dir() {
+    let fx = git_fixture();
+    let real = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(fx.common.join("objects")).unwrap();
+    std::os::unix::fs::symlink(real.path(), fx.common.join("objects")).unwrap();
+    let (alts, symlinks, outside) = probe_object_store(&fx.common, Some(&fx.admin));
+    assert!(alts.is_empty() && symlinks && !outside);
+}
+
+#[test]
 fn git_policy_read_only_makes_the_worktree_ro() {
     use crate::config::SandboxGitMode;
     let fx = git_fixture();
@@ -7332,6 +7475,15 @@ fn git_policy_read_only_makes_the_worktree_ro() {
     assert!(triple_at(&argv, "--ro-bind", &fx.wt).is_some(), "{argv:?}");
     assert!(
         triple_at(&argv, "--ro-bind", &fx.common).is_some(),
+        "{argv:?}"
+    );
+    // Planting pin targets in the main git dir would break host git (an
+    // empty `commondir` is fatal); a missing `info` must not become a file.
+    for planted in ["commondir", "gitdir", "config.worktree", "info"] {
+        assert!(!fx.common.join(planted).exists(), "{planted} was created");
+    }
+    assert!(
+        triple_at(&argv, "--ro-bind", &fx.common.join("hooks")).is_some(),
         "{argv:?}"
     );
 }
@@ -7397,6 +7549,7 @@ fn git_policy_main_checkout_gets_a_read_only_git_dir() {
         target: Some("main".into()),
         default: Some("main".into()),
         identity: Default::default(),
+        ..Default::default()
     };
     let (mounts, warning) = git_policy_mounts(&git_cfg(SandboxGitMode::CommitOnly), &main, &probe);
     assert!(warning.expect("warns").contains("main checkout"));
@@ -7911,5 +8064,336 @@ fn hidden_paths_systemd_are_inaccessible_unless_they_hold_the_worktree() {
     assert!(
         !argv.iter().any(|arg| arg == "InaccessiblePaths=-/wt"),
         "{argv:?}"
+    );
+}
+
+/// The seven control pins of `fx` as a linked worktree, in every backend argv.
+fn seven_pins(fx: &GitFixture) -> Vec<std::path::PathBuf> {
+    vec![
+        fx.common.join("hooks"),
+        fx.common.join("config"),
+        fx.common.join("info"),
+        fx.admin.join("config.worktree"),
+        fx.admin.join("commondir"),
+        fx.admin.join("gitdir"),
+        fx.wt.join(".git"),
+    ]
+}
+
+fn pin_fixture_files(fx: &GitFixture) {
+    std::fs::create_dir_all(fx.common.join("info")).unwrap();
+    std::fs::write(fx.admin.join("config.worktree"), "").unwrap();
+}
+
+fn argv_for(backend: Backend, fx: &GitFixture, mounts: Vec<Mount>) -> Vec<String> {
+    let mut s = spec(backend);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    backend_enter_argv_with_env(&s, "true", SandboxArgvEnv::default())
+        .unwrap_or_else(|e| panic!("{backend:?}: {e:?}"))
+}
+
+#[test]
+fn every_git_pin_is_read_only_on_every_backend() {
+    use crate::config::SandboxGitMode;
+    for mode in [
+        SandboxGitMode::ReadOnly,
+        SandboxGitMode::CommitOnly,
+        SandboxGitMode::PushLane,
+        SandboxGitMode::Full,
+    ] {
+        let fx = git_fixture();
+        pin_fixture_files(&fx);
+        let (mounts, _) = git_policy_mounts(
+            &git_cfg(mode),
+            &fx.wt,
+            &git_probe(&fx, "tg/lane", Some("main")),
+        );
+        let legacy = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+        for (label, mounts) in [("policy", mounts), ("legacy", legacy)] {
+            let bwrap = argv_for(Backend::Bwrap, &fx, mounts.clone());
+            let oci = {
+                let mut s = spec(Backend::Podman);
+                s.worktree = fx.wt.clone();
+                s.mounts = mounts.clone();
+                oci_create_opts(&s).expect("oci opts")
+            };
+            let props = {
+                let mut s = spec(Backend::Systemd);
+                s.worktree = fx.wt.clone();
+                s.mounts = mounts;
+                systemd_mount_props(&s).unwrap()
+            };
+            for pin in seven_pins(&fx) {
+                // `read-only` has no per-worktree admin dir (the plan treats the
+                // common dir as its own admin dir).
+                if mode == SandboxGitMode::ReadOnly
+                    && label == "policy"
+                    && pin.starts_with(&fx.admin)
+                {
+                    continue;
+                }
+                let p = pin.display().to_string();
+                assert!(
+                    triple_at(&bwrap, "--ro-bind", &pin).is_some(),
+                    "{mode:?}/{label}: bwrap {p}"
+                );
+                assert!(
+                    oci.iter().any(|a| a == &format!("{p}:{p}:ro")),
+                    "{mode:?}/{label}: oci {p}: {oci:?}"
+                );
+                assert!(
+                    props.contains(&format!("ReadOnlyPaths={p}")),
+                    "{mode:?}/{label}: systemd {p}: {props:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn systemd_common_outside_home_is_readonly() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    let (mounts, _) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    let mut s = spec(Backend::Systemd);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    s.read_only_root = false;
+    let props = systemd_mount_props(&s).unwrap();
+    let common = fx.common.display().to_string();
+    assert!(
+        props.contains(&format!("ReadOnlyPaths={common}")),
+        "{props:?}"
+    );
+    for rw in [
+        "objects",
+        "worktrees/lane",
+        "refs/heads/tg",
+        "logs/refs/heads/tg",
+    ] {
+        assert!(
+            props.contains(&format!("ReadWritePaths={common}/{rw}")),
+            "{rw}: {props:?}"
+        );
+    }
+}
+
+/// `fx`'s worktree with `.claude/`, `.envrc` and `.mcp.json` present (no
+/// `.vscode/tasks.json`), bound writable and then host-exec pinned.
+fn host_exec_fixture_mounts(fx: &GitFixture, profile: SandboxProfile) -> Vec<Mount> {
+    std::fs::create_dir_all(fx.wt.join(".claude")).unwrap();
+    std::fs::write(fx.wt.join(".claude/settings.json"), "{}").unwrap();
+    std::fs::write(fx.wt.join(".envrc"), "").unwrap();
+    std::fs::write(fx.wt.join(".mcp.json"), "{}").unwrap();
+    let mut mounts = vec![path_mount(&fx.wt, false)];
+    mounts.extend(host_exec_mounts(&fx.wt, profile));
+    mounts
+}
+
+#[test]
+fn bwrap_host_exec_files_ro_after_worktree() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Hardened);
+    assert!(mounts[1..].iter().all(|m| m.ro), "{mounts:?}");
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    let wt = triple_at(&argv, "--bind", &fx.wt).expect("worktree");
+    for name in [".claude", ".envrc", ".mcp.json"] {
+        let at =
+            triple_at(&argv, "--ro-bind", &fx.wt.join(name)).unwrap_or_else(|| panic!("{name}"));
+        assert!(wt < at, "{name} after worktree: {argv:?}");
+    }
+    assert!(
+        triple_at(&argv, "--ro-bind", &fx.wt.join(".vscode/tasks.json")).is_none(),
+        "missing entries are not pinned"
+    );
+}
+
+#[test]
+fn open_profile_does_not_pin_host_exec_files() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Open);
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    assert!(triple_at(&argv, "--ro-bind", &fx.wt.join(".envrc")).is_none());
+    // Sealed is above standard: pinned too.
+    let sealed = host_exec_mounts(&fx.wt, SandboxProfile::Sealed);
+    assert!(
+        sealed.iter().any(|m| m.ro && m.dest.ends_with("/.envrc")),
+        "{sealed:?}"
+    );
+}
+
+#[test]
+fn claude_dir_pinned_as_directory() {
+    let fx = git_fixture();
+    let mounts = host_exec_fixture_mounts(&fx, SandboxProfile::Hardened);
+    let claude = fx.wt.join(".claude").display().to_string();
+    let settings = fx.wt.join(".claude/settings.json").display().to_string();
+    assert!(
+        mounts.iter().any(|m| m.ro && m.dest == claude),
+        "{mounts:?}"
+    );
+    assert!(!mounts.iter().any(|m| m.dest == settings), "{mounts:?}");
+}
+
+#[test]
+fn systemd_emits_readonlypaths_for_every_ro_pin() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    std::fs::create_dir_all(fx.wt.join(".claude")).unwrap();
+    std::fs::write(fx.wt.join(".envrc"), "").unwrap();
+    let (mut mounts, _) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    mounts.extend(host_exec_mounts(&fx.wt, SandboxProfile::Hardened));
+    let mut s = spec(Backend::Systemd);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    let props = systemd_mount_props(&s).unwrap();
+    for pin in seven_pins(&fx)
+        .into_iter()
+        .chain([fx.wt.join(".claude"), fx.wt.join(".envrc")])
+    {
+        let p = pin.display().to_string();
+        assert!(
+            props.contains(&format!("ReadOnlyPaths={p}")),
+            "{p}: {props:?}"
+        );
+    }
+}
+
+#[test]
+fn oci_pins_are_ro_volumes() {
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    let mut mounts = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+    std::fs::write(fx.wt.join(".envrc"), "").unwrap();
+    mounts.extend(host_exec_mounts(&fx.wt, SandboxProfile::Hardened));
+    let mut s = spec(Backend::Podman);
+    s.worktree = fx.wt.clone();
+    s.mounts = mounts;
+    let oci = oci_create_opts(&s).expect("oci opts");
+    for pin in seven_pins(&fx).into_iter().chain([fx.wt.join(".envrc")]) {
+        let p = pin.display().to_string();
+        assert!(
+            oci.iter().any(|a| a == &format!("{p}:{p}:ro")),
+            "{p}: {oci:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_guard_hook_visible_ro() {
+    // thegn's `pre-merge-commit` guard lives in the shared hooks dir on the
+    // host; the sandbox sees it (no hide) but read-only, so it still fires
+    // and cannot be removed or rewritten.
+    let fx = git_fixture();
+    std::fs::write(fx.common.join("hooks/pre-merge-commit"), "#!/bin/sh\n").unwrap();
+    let (mounts, _) = git_policy_mounts(
+        &git_cfg(crate::config::SandboxGitMode::CommitOnly),
+        &fx.wt,
+        &git_probe(&fx, "tg/lane", Some("main")),
+    );
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    let hooks = triple_at(&argv, "--ro-bind", &fx.common.join("hooks")).expect("hooks ro");
+    let common = triple_at(&argv, "--ro-bind", &fx.common).expect("common ro");
+    assert!(common < hooks, "{argv:?}");
+    let hooks_dest = fx.common.join("hooks").display().to_string();
+    assert!(
+        !argv
+            .windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == hooks_dest),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn legacy_mounts_pin_hooks_and_config_worktree() {
+    let fx = git_fixture();
+    // No `config.worktree` yet: the writable common dir would let the sandbox
+    // plant one, so the legacy path creates it empty and pins it.
+    let cw = fx.admin.join("config.worktree");
+    assert!(!cw.exists());
+    let mounts = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+    assert!(cw.is_file());
+    let common = fx.common.display().to_string();
+    let at = |dest: &std::path::Path| {
+        let dest = dest.display().to_string();
+        mounts.iter().position(|m| m.ro && m.dest == dest)
+    };
+    let common_at = mounts
+        .iter()
+        .position(|m| !m.ro && m.dest == common)
+        .expect("common rw");
+    for pin in seven_pins(&fx) {
+        let pin_at = at(&pin).unwrap_or_else(|| panic!("{}: {mounts:?}", pin.display()));
+        assert!(common_at < pin_at, "{} after common", pin.display());
+    }
+}
+
+#[test]
+fn full_fallback_pins_hooks() {
+    use crate::config::SandboxGitMode;
+    let fx = git_fixture();
+    // A top-level branch cannot be confined: `full` falls back to the legacy
+    // read-write common dir, which still pins every control file.
+    let (mounts, warning) = git_policy_mounts(
+        &git_cfg(SandboxGitMode::Full),
+        &fx.wt,
+        &git_probe(&fx, "lane", Some("main")),
+    );
+    assert!(warning.is_some_and(|w| w.contains("read-write")));
+    let argv = argv_for(Backend::Bwrap, &fx, mounts);
+    assert!(triple_at(&argv, "--bind", &fx.common).is_some(), "{argv:?}");
+    for pin in seven_pins(&fx) {
+        assert!(
+            triple_at(&argv, "--ro-bind", &pin).is_some(),
+            "{}: {argv:?}",
+            pin.display()
+        );
+    }
+}
+
+#[test]
+fn remote_placement_pins_hooks() {
+    let common = std::path::Path::new("/remote/repo/.git");
+    let admin = common.join("worktrees/lane");
+    let wt = std::path::Path::new("/remote/wt");
+    let mounts = legacy_git_mounts(wt, Some(common), Some(&admin), false);
+    for pin in [
+        common.join("hooks"),
+        common.join("config"),
+        common.join("info"),
+        admin.join("config.worktree"),
+        admin.join("commondir"),
+        admin.join("gitdir"),
+        wt.join(".git"),
+    ] {
+        let dest = pin.display().to_string();
+        assert!(mounts.iter().any(|m| m.ro && m.dest == dest), "{dest}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_symlinked_hooks_fail_closed_to_a_read_only_common_dir() {
+    let fx = git_fixture();
+    pin_fixture_files(&fx);
+    std::fs::remove_dir_all(fx.common.join("hooks")).unwrap();
+    std::os::unix::fs::symlink(&fx.wt, fx.common.join("hooks")).unwrap();
+    let mounts = legacy_git_mounts(&fx.wt, Some(&fx.common), Some(&fx.admin), true);
+    let common = fx.common.display().to_string();
+    assert!(
+        mounts.iter().any(|m| m.dest == common && m.ro),
+        "{mounts:?}"
     );
 }

@@ -1649,7 +1649,7 @@ class AttestationVerificationTests(unittest.TestCase):
             tag_object="a" * 40,
             commit=self.SHA,
             target="homebrew",
-            target_repository="owner/homebrew-tap",
+            target_repository="owner/homebrew-thegn",
             branch="main",
             outcome="committed",
             old_oid="c" * 40,
@@ -1676,7 +1676,7 @@ class AttestationVerificationTests(unittest.TestCase):
             [{"path": "Formula/thegn.rb", "sha256": "e" * 64}],
             receipt["published_blobs"],
         )
-        self.assertEqual("owner/homebrew-tap", receipt["target_repository"])
+        self.assertEqual("owner/homebrew-thegn", receipt["target_repository"])
         self.assertEqual(self.RUN, receipt["release"]["run_id"])
         self.assertEqual(1, receipt["release"]["run_attempt"])
         self.assertEqual(self.SHA, receipt["release"]["source_commit"])
@@ -1963,7 +1963,7 @@ class PublicationSagaTests(unittest.TestCase):
         return {
             "schema_version": 1,
             "target": target,
-            "target_repository": "owner/homebrew-tap" if homebrew else "thegn-bin",
+            "target_repository": "owner/homebrew-thegn" if homebrew else "thegn-bin",
             "branch": "main" if homebrew else "master",
             "outcome": "committed",
             "old_oid": "c" * 40,

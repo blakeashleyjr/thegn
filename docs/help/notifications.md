@@ -23,6 +23,13 @@ still-failing process from producing a new failure. An agent failure clears when
 agent run in that worktree finishes cleanly, and a test failure clears when a test runner
 (`pytest`, `nextest`, `jest`, `vitest`, `rspec`) later exits cleanly there.
 
+An "agent needs input" notification clears itself when its cause is gone: the
+agent session ends, the worktree is removed, or the pipeline lane that raised it
+finishes. On startup thegn also clears the ones left behind by sessions that are
+no longer running or by worktrees that no longer exist. Pipeline lane rows carry
+their lane, so the inbox can group them, and they count as stale after 24 hours,
+as does any informational notification.
+
 ### `agent_error_signatures`
 
 A list of case-insensitive substrings. When any line of live agent output
@@ -79,6 +86,15 @@ bounded retry failures are dropped or dead-lettered without affecting the
 durable inbox row. Notification text can include branch names, issue titles,
 and log fragments, so route chat sinks with care. `thegn doctor` performs an
 offline configuration/request-shape probe and never posts a test message.
+
+## The notifications overlay
+
+The overlay opened by the `✋`/`✉` chip groups items by kind (needs input,
+failed, finished, info) under a count line, and folds several items from one
+pipeline batch or project into a single row with a count. `↵`/`→` expands a
+group, `←` collapses it, `x` dismisses the row or group under the cursor, `D`
+dismisses everything older than 24 hours, and `/` filters by text. Older items
+sit in a collapsed **Older (N)** group and are not counted on the chip.
 
 ## Approvals
 

@@ -32,15 +32,15 @@ worktrees, cloud providers, placement, and voice stay off in stable even when
 configured. Observe dashboards and plugin app tabs are stable. The stable/dev
 matrix is shown by `thegn doctor` and [release channels](help/release-channels.md).
 
-`voice setup [--language en|auto] [--model NAME] [--kind embedded|http|command]`
+`voice setup [--language en|auto] [--model NAME] [--kind embedded|http|command|hex]`
 configures experimental dictation. Setup confirms model size before download;
 `--yes` accepts it in scripts, and `--model-path PATH` uses a local GGML file.
 HTTP setup accepts a full `--endpoint` and optional `--credential` secret reference;
 `--final-only` avoids repeated audio billing for live previews. `voice status
 --json` reports readiness without microphone access. `voice model list --json`,
 `voice model pull NAME [--yes]`, and `voice model rm NAME` manage pinned artifacts.
-Native capture requires `voice-native` (`voice-metal` on Apple silicon) and the
-experimental channel. See [voice help](help/voice.md) and
+Native capture needs a build with native voice (default on Linux glibc and
+macOS; absent from musl and the Linux release tarball). See [voice help](help/voice.md) and
 [release verification](voice-verification.md).
 
 `session open --resume-work <row>` resumes an eligible unfinished pipeline row

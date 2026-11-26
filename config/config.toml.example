@@ -158,6 +158,10 @@ sidebar_dividers = true  # alternate the background tint per project block, so t
 # more immersive (or fully borderless) fullscreen.
 fullscreen_keep_masthead = true
 fullscreen_keep_statusbar = true
+# Tab chips show the focused pane's terminal title (spinner glyphs stripped,
+# bare folder paths ignored) while the tab keeps its default numeric name; a
+# custom tab name always wins. Set false to keep numeric labels.
+tab_title_from_terminal = true
 # Worktree-row display in the sidebar. The main line is the dynamic name (the
 # OSC window title a running agent/shell sets), falling back to the branch name.
 # The right cluster carries, in order: the dirty status icon, the uncommitted
@@ -228,6 +232,9 @@ sidebar_group_row_limit = 7
 # sidebar_group_row_limits = { Other = 5 }
 # Loose worktrees sharing a batch token fold into one row once this many share it; 0 = off.
 sidebar_batch_group_min = 2
+# Days a finished pipeline stays in the sidebar's Pipelines section; 0 = never age out.
+# The worktree is never deleted (`wt prune` does that).
+sidebar_finished_pipeline_days = 7
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -2551,15 +2558,16 @@ visible = true
 # `sections` reorders sections across all tabs — any section left out is hidden;
 # an empty/absent list shows every section in the built-in order:
 #   Git tab:    changes · commits · branches · stash · files
-#   Work tab:   mine · across · pr · ci · merge · issues · problems · jobs
+#   Work tab:   mine · attention · pr · ci · merge · issues · problems · jobs
 #               · tests · symbols
 #   System tab: notifications · logs · sandbox · hosts · environments · share
 #               · forward · telemetry · media · keys
 # "mine" is the "My Work" feed (assigned issues across all trackers +
 # review-requested/authored PRs + high-priority notifications), scoped to the
-# active repo by default ("a" widens to all repos). "across" aggregates other
+# active repo by default ("a" widens to all repos). "attention" lists other
 # worktrees' failing CI, scoped to the active workspace ("a" widens).
-# The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
+# The old "across" key still works for "attention", and "prs" / "tasks" work
+# as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]
 # sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]
@@ -5133,18 +5141,20 @@ poll_interval_secs = 3
 # mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
 # skill = "lead"                    # skill seeded into the notes dir
 # notes_dir = "~/.local/state/thegn/lead"  # the Lead's only writable directory (default $XDG_STATE_HOME/thegn/lead)
-# network = "isolated"             # "isolated" (own netns via pasta; no pasta = no Lead) or "host" (warns on every launch)
+# network = "isolated"             # own netns via pasta; no pasta = no Lead
+# Legacy network = "host" is refused because it exposes host loopback and abstract sockets.
 # token_ttl_secs = 43200            # Lead token lifetime (300..604800); slides on use, capped at 7 days from minting
 # outward_allow = []                # outward caps ("issues.comment", "issues.update") allowed without a per-call owner approval
 # preview = false                   # written by the in-app setup flow: keeps [lead] active on the stable channel (preview)
 
-# ── Experimental voice mode ─────────────────────────────────────────────────
+# ── Voice mode (stable, opt-in) ─────────────────────────────────────────────
 # Alt v records/stops; Esc cancels. Final text is pasted without submission.
 # Run `thegn voice setup --language en` before native capture. Downloads require
-# size confirmation and finish before the microphone opens. Stable clamps off.
+# size confirmation and finish before the microphone opens. Stable keeps it.
 [voice]
 enabled = false
-# command (legacy WAV-in/text-out), embedded (Whisper), or http (multipart JSON).
+# command (legacy WAV-in/text-out), embedded (Whisper), http (multipart JSON), or
+# hex (`hex transcribe <temporary WAV>`; needs the Hex CLI on PATH).
 kind = "command"
 # Empty selects native capture (voice-native build); command arrays are argv,
 # never shell strings. External capture is final-only. Embedded uses native capture.
@@ -5167,6 +5177,13 @@ endpoint = ""
 live_preview = true
 # Separate total deadline for each inference/HTTP request, clamped 1..=300.
 timeout_seconds = 60
+# Ordered find/replace rules for each final transcript (at most 200). Matching is
+# case-insensitive, on whole words; an empty `to` deletes the phrase.
+# replacements = [{ from = "open code", to = "OpenCode" }]
+replacements = []
+# Names Whisper should spell: repos, tools, people. Embedded and HTTP only.
+# Trimmed; entries over 64 characters are dropped; at most 200 are used.
+vocabulary = []
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,

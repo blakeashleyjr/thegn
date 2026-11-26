@@ -96,10 +96,16 @@ detail; if the two differ, `KNOWN_ISSUES.md` is newer.
   and [[sandbox-profiles]].
 - **Native plugins run unsandboxed as your user.** Enable only plugins you
   trust; see [[plugins]].
+- **On bwrap, mount sources are re-resolved by path at launch.** If you add a
+  writable mount that contains another mount's source (for example all of
+  `~/.claude-profiles`), a sandboxed process can swap that source for a symlink
+  before the next pane starts and see the file it points to. The default plan
+  has no such overlap. podman and docker re-check bind identities after
+  creation and refuse a changed source. See [[sandbox-security-model]].
 
 ## Experimental subsystems
 
-- **Kubernetes placement, other providers, placement, and voice are
+- **Kubernetes placement, other providers, and placement are
   dev-channel only.** Treat them as experimental rather than product promises;
   see [[release-channels]]. Sprites and Vercel environments (and `thegn job
 run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
@@ -109,5 +115,10 @@ run` on them), SSH/mosh remote workspaces and the `thegn serve`/`attach`/
   mosh needs `mosh-server` on the remote host. Neither has a recorded
   paid live run on this release yet; see [[environments]] and
   [[vercel-sandbox]].
+- **Voice dictation is stable but opt-in and build-dependent.** Native
+  capture + Whisper ship in the Nix package and the macOS Apple silicon release
+  (14.2+); the Linux glibc 2.28 tarball and musl build omit them and report
+  "not built into this binary". The model (about 141 MiB) downloads on first
+  setup; see [[voice]].
 - **Observe and plugin app tabs are stable.** Use the stable channel for these
   features; see [[release-channels]].

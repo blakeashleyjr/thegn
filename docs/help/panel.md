@@ -29,8 +29,8 @@ rightmost pane) focuses it; `Ctrl-Alt-p` hides it. It is a tabbed
 accordion — four tabs, one open section at a time:
 
 - **git** — changes (diff), commits, branches, stash, files
-- **work** — mine (your unified work feed), across (cross-worktree
-  attention), the branch's PR + the repo's open PRs, CI runs, the merge
+- **work** — mine (your unified work feed), attention (failing CI in your
+  other worktrees), the branch's PR + the repo's open PRs, CI runs, the merge
   queue, the PR queue, issues, problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
   port forwards, telemetry, keys, media, usage
@@ -100,21 +100,25 @@ off banner when its feature is unavailable.
 | `stash`    | stash entries                  |
 | `files`    | the worktree tree              |
 
+The `files` body reads `loading files…` until the tracked-file listing
+arrives (it is fetched only while `files` is open), and `no tracked files` only
+when git lists none.
+
 **work**
 
-| Section    | Shows                                                                |
-| ---------- | -------------------------------------------------------------------- |
-| `mine`     | one feed of everything assigned to you: issues, review requests, PRs |
-| `across`   | failing CI for the active project (`a` widens), grouped by worktree  |
-| `pr`       | PR state, CI check rollup, review decision for this branch           |
-| `ci`       | run history and per-run state across providers                       |
-| `merge`    | the local merge queue — per-branch land/defer status                 |
-| `prq`      | PR queue (hidden until `[pr_queue] enabled = true`)                  |
-| `issues`   | tracker issues                                                       |
-| `problems` | compiler, linter, and test diagnostics                               |
-| `jobs`     | configured shell jobs (build, test, run)                             |
-| `tests`    | test results and the pass/fail rollup                                |
-| `symbols`  | the LSP / tree-sitter outline for the file you edit or pick          |
+| Section     | Shows                                                                                |
+| ----------- | ------------------------------------------------------------------------------------ |
+| `mine`      | one feed of everything assigned to you: issues, review requests, PRs                 |
+| `attention` | failing CI in your worktrees, grouped by worktree (this project; `a` = all projects) |
+| `pr`        | PR state, CI check rollup, review decision for this branch                           |
+| `ci`        | run history and per-run state across providers                                       |
+| `merge`     | the local merge queue — per-branch land/defer status                                 |
+| `prq`       | PR queue (hidden until `[pr_queue] enabled = true`)                                  |
+| `issues`    | tracker issues                                                                       |
+| `problems`  | compiler, linter, and test diagnostics                                               |
+| `jobs`      | configured shell jobs (build, test, run)                                             |
+| `tests`     | test results and the pass/fail rollup                                                |
+| `symbols`   | the LSP / tree-sitter outline for the file you edit or pick                          |
 
 **system**
 
@@ -274,13 +278,18 @@ scope.
 If the repo has no `origin` remote the repo-scoped PR search cannot run;
 the section says so rather than silently searching every repo.
 
-### across — cross-worktree attention
+### attention — failing CI in your worktrees
 
-A read-mostly stream of things needing attention in your _other_
-worktrees — currently each worktree's failing CI (latest run per
-workflow), grouped by worktree. Scoped to the active project by
-default; `a` widens to every project. `↵` jumps to that worktree's tab,
+A read-only list of what needs you across your worktrees. Right now that
+is each worktree's failing CI (the latest run per workflow), grouped by
+worktree. The hint line reads `(this project · a = all projects)`: the
+list covers the active project by default, and `a` switches it to every
+project. Press `a` again to go back. `↵` jumps to that worktree's tab,
 or opens the registered worktree if it has no open tab.
+
+The section was called `across` before; that name still works as the
+`[panel] sections` key, and keybindings and help contexts still use
+`across`.
 
 {{keys:across}}
 
@@ -355,7 +364,7 @@ Sidebar attention follows the same provider-context rule: a cached CI
 failure from another context does not mark a worktree for attention, while an
 unknown current context keeps the cached failure.
 It also skips runs cached for another branch, or with no recorded branch, in
-the sidebar and **across**; when the current branch is unknown, cached runs
+the sidebar and **attention**; when the current branch is unknown, cached runs
 still count.
 Background log ingestion reuses a cached job log as evidence only when it
 was fetched for the worktree's current provider context
@@ -439,6 +448,18 @@ for two accounts stay separate. With
 `[issues] move_on_merge` enabled, a linked issue that cannot move to Done when
 its PR merges raises an `automation_failed` inbox notification with the error
 redacted; the same issue and error are reported once.
+
+The list is scoped to one team by default: the team of the issue linked to
+the active worktree, else the team with the most issues. The scope shows in
+the header (`[team THE]`) and `T` cycles each team, then all teams. A
+configured Linear `team_id` already limits what is fetched. `↵` opens a
+detail page for the issue: state, assignee, labels, priority, project,
+blockers and link, with the description and comments rendered as light
+markdown. The page shows the cached fields at once and fetches the full
+issue from the tracker; a failed fetch says so and keeps the cached fields.
+`↵` again returns to the list, and while the page is open `l`, `o` and `b`
+act on that issue. `l` links or unlinks the issue to the active worktree (a
+`◈` marks linked rows); `o` opens it in the browser.
 
 {{keys:issues}}
 
@@ -563,8 +584,16 @@ while `l` still opens their logs. Actions on owned containers ask first.
 `g` scopes the full table too; Half-width `g` rows are selectable.
 When sandboxing is off, a one-line banner says so. See [[sandboxing]]. **hosts** manages `[host.*]`
 machines: `n` adds one, `p` provisions, `r` re-probes, `m` opens the
-action menu (which holds removal), `c` grants install consent, `x`
-forgets cached state. **environments** lists `[env.*]`: `↵` (re)binds the
+action menu (which holds removal), `c` allows thegn to install a container
+runtime, `x` forgets cached state. The selected host expands to show its
+address (and jump host), OS, architecture and runtime once probed, whether
+it was reached and when it was last probed, its provisioning state with a
+one-line reason and the next key to press, what uses it (envs bound with
+`host = "<name>"` and the `[jobs]` runner), its base image, and install
+consent in plain words. Consent `never (config)` means the host's config
+sets `install_runtime = "never"`: thegn will never install a runtime there,
+and `c` cannot override it; install one yourself or change the setting to
+`"ask"`. Long values wrap under their label. See also `thegn host status`. **environments** lists `[env.*]`: `↵` (re)binds the
 env to this worktree. If placement changes, it asks first; new panes move
 to the new placement while running panes stay where they are. A same-placement
 bind is immediate. `t` tests provider env tokens only, `n` adds, `x` removes

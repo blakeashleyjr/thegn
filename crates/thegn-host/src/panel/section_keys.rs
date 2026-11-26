@@ -132,13 +132,15 @@ const FILES: &[SectionKey] = &[
     k('O', "O", "editor"),
     k('y', "y", "yazi"),
 ];
+// The strip fits six: `j/k`, `D` (dispatch) and `r` (refresh) still work; the
+// half and full views' hint rows list `D` and `r`.
 const ISSUES: &[SectionKey] = &[
-    nav("j/k", "row"),
-    nav("↵", "link"),
+    nav("↵", "details"),
+    k('l', "l", "link"),
+    k('T', "T", "team"),
     k('o', "o", "browser"),
     k('a', "a", "assign me"),
     k('b', "b", "branch"),
-    k('D', "D", "dispatch"),
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
@@ -195,14 +197,14 @@ const FORWARD: &[SectionKey] = &[
     k('x', "x", "remove"),
 ];
 const HOSTS: &[SectionKey] = &[
-    k('n', "n", "new"),
+    k('n', "n", "add host"),
     k('p', "p", "provision"),
-    k('r', "r", "probe"),
-    k('m', "m", "menu"),
-    k('c', "c", "grant"),
+    k('r', "r", "re-probe"),
+    k('m', "m", "more"),
+    k('c', "c", "allow install"),
     // `x` forgets the cached host state (confirmed) — actual host REMOVAL
     // lives behind `m`; labelling this "remove" made users expect deletion.
-    danger('x', "x", "forget cache"),
+    danger('x', "x", "forget state"),
 ];
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),

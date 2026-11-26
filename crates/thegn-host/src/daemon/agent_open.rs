@@ -135,7 +135,8 @@ fn configured_tool_command<'a>(cfg: &'a Config, name: &str) -> Result<&'a str> {
 pub(crate) fn ensure_configured_agent(cfg: &Config, name: &str) -> Result<()> {
     anyhow::ensure!(
         cfg.agent_command(name).is_some(),
-        "unknown configured agent `{name}`"
+        "unknown configured agent `{name}` (if it was added to config.toml after the daemon \
+         started, restart the daemon to load it)"
     );
     Ok(())
 }
@@ -1473,7 +1474,8 @@ mod tests {
         let error = resolve(&config, &db, &spec, &launch, None).expect_err("unknown agent refuses");
         assert_eq!(
             error.to_string(),
-            "unknown configured agent `pipeline-smoke-agent-that-is-not-configured`"
+            "unknown configured agent `pipeline-smoke-agent-that-is-not-configured` (if it was \
+             added to config.toml after the daemon started, restart the daemon to load it)"
         );
     }
 

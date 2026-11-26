@@ -14,6 +14,7 @@ actions:
     sidebar-narrower,
     sidebar-wider,
     open-info,
+    mark-unread,
   ]
 ---
 
@@ -105,6 +106,12 @@ checkout in it is not a live worktree, so it gets no row.
 - `f` — move to a folder (or create one)
 - `r` / `F2` — rename
 - `p` — pin to top
+- `u` — mark unread: turn a hollow (seen) dot back to its filled amber/red
+  state until you focus the tab again. Acts on every marked row, else the
+  cursor row (on a batch row, every member of the batch); a row with no dot
+  is left alone. Also in the row menu and the palette ("Mark worktree
+  unread"); from a pane the palette action marks the focused tab, which
+  stays filled until you leave it and come back.
 - `s` — sort menu: manual / name / recent / attention / live (live orders
   worktrees by most-recent process/agent activity, newest first). The
   active mode is always on screen: it is the quiet word at the right of
@@ -327,8 +334,23 @@ tree — holding one folder per pipeline, named from the roster's issue id:
     ▾ THE-74 (2)
         tg-the-74
         tg-the-74-review
-    ▸ THE-9 (1)
+      THE-9
+    ▸ Finished (3)
 ```
+
+A lane is named for its issue (or lane name) without a `local:` prefix. A lane
+with a single worktree is one row, not a header plus a repeated child. Lanes
+whose roster rows have all finished (merged, done, failed or abandoned) fold
+into one `Finished (N)` group. After `sidebar_finished_pipeline_days` days
+(default `7`; `0` = never) a finished lane leaves the sidebar; its worktree is
+never deleted — `wt prune` does that. The open worktree's lane always stays.
+**Clear finished** in the `Finished` row's menu hides every lane finished so
+far in that project at once; a lane that finishes later shows up again. A
+folder you made yourself named `Pipelines` does not become a second Pipelines
+group: pipeline worktrees filed there show in the one `Pipelines` group.
+Integration and release worktrees (`tg/bNNN-integration`, `tg/bNNN-release`)
+are not pipelines: they sit with the ordinary worktrees. Worktrees filed under
+`Merged` show their age and size, not the last commit subject.
 
 Every worktree the pipeline's roster rows reference hangs inside its lane
 folder. `↵` (or a double-click, or a click on the caret) folds and unfolds a
@@ -384,6 +406,8 @@ Two things the dots deliberately do **not** do:
 
 A red or amber dot is sticky: focusing the tab makes it hollow (seen) but
 does not clear it. It only goes back to white when work genuinely resumes.
+Press `u` on a hollow row to flag it again (filled, and ranked up by the
+attention sort) until you next focus it.
 Thresholds are tunable — see [[config-reference]] `[activity]`, and
 `[theme.colors]` for the three dot colours.
 

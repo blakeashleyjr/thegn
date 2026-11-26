@@ -160,7 +160,10 @@ fn symlink_outside_approved_roots_is_rejected_but_home_dotfile_repo_is_not() {
 #[test]
 fn bwrap_sealed_hides_home_behind_a_tmpfs_before_any_bind() {
     let td = fixture();
-    let h = td.path();
+    // Canonical: local mount sources are canonicalised before emission
+    // (`/tmp` is `/private/tmp` on macOS).
+    let canonical = td.path().canonicalize().unwrap();
+    let h = canonical.as_path();
     let mut mounts = sealed_home_allowlist(h);
     mounts.push(rw(&h.join("wt")));
     let argv = enter_argv(&spec(Backend::Bwrap, h, mounts, true), "true").unwrap();
@@ -186,7 +189,10 @@ fn bwrap_sealed_hides_home_behind_a_tmpfs_before_any_bind() {
 #[test]
 fn bwrap_hardened_is_unchanged_no_tmpfs_home() {
     let td = fixture();
-    let h = td.path();
+    // Canonical: local mount sources are canonicalised before emission
+    // (`/tmp` is `/private/tmp` on macOS).
+    let canonical = td.path().canonicalize().unwrap();
+    let h = canonical.as_path();
     let mut ro_home = rw(h);
     ro_home.ro = true;
     let argv = enter_argv(
@@ -284,9 +290,26 @@ fn planned_view_separates_confidentiality_from_integrity() {
         planned_home_view(SealedTunnel, Backend::Podman),
         HomeView::Hidden
     );
+    // `ProtectHome=tmpfs` only reaches /home, /root and /run/user, so a systemd
+    // launch from a `$HOME` elsewhere (macOS `/Users/..`) fails closed.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let systemd_covers = ["/home", "/root", "/run/user"]
+        .iter()
+        .any(|r| Path::new(&home).starts_with(r))
+        && std::fs::canonicalize(&home)
+            .map(|c| {
+                ["/home", "/root", "/run/user"]
+                    .iter()
+                    .any(|r| c.starts_with(r))
+            })
+            .unwrap_or(true);
     assert_eq!(
         planned_home_view(Sealed, Backend::Systemd),
-        HomeView::Hidden
+        if systemd_covers {
+            HomeView::Hidden
+        } else {
+            HomeView::ReadOnly
+        }
     );
     assert_eq!(
         planned_home_view(Hardened, Backend::Bwrap),

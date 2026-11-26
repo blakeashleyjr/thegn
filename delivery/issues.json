@@ -548,10 +548,24 @@
       ]
     },
     {
-      "issue": "THE-2172",
-      "project": "Agent & Workflow Platform",
+      "issue": "THE-2144",
+      "project": "Sandbox & Remote 00: Shared contracts",
       "changes": [
-        "add-lead-tool-surface"
+        "gate-devcontainer-privileges"
+      ]
+    },
+    {
+      "issue": "THE-2147",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "harden-git-control-pins"
+      ]
+    },
+    {
+      "issue": "THE-2148",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "pin-git-alternates-read-only"
       ]
     },
     {
@@ -778,6 +792,20 @@
       "project": "Agent & Workflow Platform",
       "changes": [
         "lead-in-app-setup"
+      ]
+    },
+    {
+      "issue": "THE-2736",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "worktree-delete-stops-programs"
+      ]
+    },
+    {
+      "issue": "THE-2741",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "sidebar-finished-pipelines-age-out"
       ]
     }
   ]

@@ -6,6 +6,58 @@ The aggregated notification and event bus: user-defined routing rules, DND / qui
 
 ## Requirements
 
+### Requirement: Notification age classification
+
+The notification model SHALL expose `is_stale(now)` using Unix seconds. Info
+notifications older than 24 hours SHALL be stale. `agent_attention`
+notifications older than 24 hours SHALL be stale only when a non-interactive
+pipeline lane raised them (source `escalation:{row}@…`); interactive agent
+attention SHALL not age out by time alone.
+
+#### Scenario: Old informational notification
+
+- **WHEN** an Info notification is more than 24 hours old
+- **THEN** `is_stale(now)` returns true
+
+#### Scenario: Old lane attention and interactive attention
+
+- **WHEN** pipeline lane attention is more than 24 hours old
+- **THEN** `is_stale(now)` returns true, while an equally old interactive
+  agent attention returns false
+
+### Requirement: Lane attention carries its group
+
+A pipeline lane escalation SHALL carry its dispatch row in its source ref, and
+the model SHALL expose it as a group key (`pipeline:{row}`) so the inbox can
+fold a lane's rows into one group.
+
+#### Scenario: Escalation row
+
+- **WHEN** a lane escalation has source `escalation:42@abcdefg:awaiting-approval`
+- **THEN** its group key is `pipeline:42`
+
+### Requirement: Attention notifications resolve with their cause
+
+An unread `agent_attention` notification SHALL be marked read, on the existing
+state-change event and without polling, when the session that raised it ends,
+when its worktree is removed, or when the pipeline lane that raised it reaches a
+terminal status. On daemon boot (and on host boot with the daemon route off)
+thegn SHALL resolve, off the render loop, every unread `agent_attention` row
+whose session is not live or whose worktree is unregistered and missing.
+
+#### Scenario: Lane reaches a terminal status
+
+- **WHEN** a dispatch row becomes failed, done, merged or abandoned
+- **THEN** its `escalation:{row}@…` rows and its worker's agent-hook rows in
+  the lane worktree are marked read, and other lanes' rows are untouched
+
+#### Scenario: Boot clears the backlog
+
+- **WHEN** thegn starts with unread attention rows from dead sessions or
+  removed worktrees
+- **THEN** those rows are marked read, while rows for a registered remote
+  worktree or a lane on a live worktree stay
+
 ### Requirement: User-defined action rules route notifications
 
 Notification delivery SHALL be governed by an ordered list of user rules
@@ -161,12 +213,21 @@ The red attention flag SHALL count only unread Alert notifications, the neutral 
 
 ### Requirement: One statusbar attention chip
 
-The statusbar SHALL carry a single attention chip: `✋ N` where N is the number of needs-you worktrees plus unread Alert notifications not attributed to one of those worktrees (red when anything is blocked/failing or an alert is unread, amber otherwise); when N is zero and unread Notice rows exist, a quiet `✉ N` inbox count instead; nothing when only Info rows are unread. The chip's count MUST equal the number of rows in the unified surface's "Needs you" and "Alerts" groups.
+The statusbar SHALL carry a single attention chip: `✋ N` where N is the number of needs-you worktrees plus unread Alert notifications not attributed to one of those worktrees (red when anything is blocked/failing or an alert is unread, amber otherwise); when N is zero and unread Notice rows exist, a quiet `✉ N` inbox count instead; nothing when only Info rows are unread. The chip's count MUST equal the number of live (non-stale) items in the unified surface's grouped list; an item first raised more than 24 hours ago is stale and MUST NOT be counted.
 
 #### Scenario: A failed pane lights one chip, not two
 
 - **WHEN** a `process_failed` notification for worktree W is unread and W scores as a needs-you worktree
-- **THEN** the statusbar shows `✋ 1` (not a separate `⚑ 1`) and the unified surface lists W once under Needs you
+- **THEN** the statusbar shows `✋ 1` (not a separate `⚑ 1`) and the unified surface lists W once, under its kind group
+
+### Requirement: The unified surface groups, folds and ages items
+
+The unified surface SHALL open with a count line per kind (needs input, failed, finished, info) and list items grouped by kind, most urgent first. Within a kind, two or more items from one source (a pipeline batch, or the project a worktree lives in) SHALL fold into one collapsed row carrying the count (for example "Pipeline b313 — 23 need input"); `Enter` or `Right` SHALL expand it and `Left` SHALL collapse it. Items first raised more than 24 hours ago SHALL appear only in a collapsed "Older (N)" group at the bottom. `x` SHALL dismiss the item or the whole group under the cursor, `D` SHALL dismiss every stale item, and `/` SHALL filter by text; these keys SHALL be shown in the footer.
+
+#### Scenario: A hundred stale lane rows no longer bury live ones
+
+- **WHEN** 100 needs-input items from old pipeline batches are older than 24 hours and one item is fresh
+- **THEN** the fresh item is listed under its kind, the 100 are folded under "Older (100)", and the chip counts 1
 
 ### Requirement: The unified surface shows live items and acts in place
 
@@ -448,3 +509,35 @@ completion slot, capability-catalog row, or SQLite state.
 - **THEN** doctor reports the unavailable provider or pack fallback while the
   command remains successful and no control, capability, or database surface is
   added
+
+### Requirement: Approval requests are attention notifications
+
+An approval request SHALL be stored as an `agent_attention` notification row
+without a schema change. The Lead MUST NOT be able to resolve it.
+
+#### Scenario: Lead requests approval
+
+- **WHEN** the Lead calls `approvals.request`
+- **THEN** a pending `agent_attention` notification exists and `approvals.list`
+  shows it
+
+### Requirement: Notice frames are opt-in
+
+The event stream SHALL deliver `Notice` frames only to subscribers whose
+`FeedFilter.kinds` names `notification`, `dispatch` or `automation_run`.
+
+#### Scenario: Legacy subscriber
+
+- **WHEN** a subscriber sets no kinds filter
+- **THEN** it receives no `Notice` frame
+
+### Requirement: Caller attribution is sanitized and audit-only
+
+`THEGN_CALLER` SHALL be accepted only with characters `[A-Za-z0-9._:/@-]` and at
+most 64 bytes, otherwise recorded as `invalid`, and MUST NOT influence
+authorization.
+
+#### Scenario: Hostile caller value
+
+- **WHEN** `THEGN_CALLER` contains a space
+- **THEN** the audit records `invalid`

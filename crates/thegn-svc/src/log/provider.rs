@@ -173,6 +173,12 @@ fn watch_log_directory(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().map(std::ffi::OsStr::to_os_string);
     let parent_path = parent.to_path_buf();
+    // FSEvents (macOS) reports canonical paths (`/private/var/..` for `/var/..`), so
+    // the parent-reset comparison must also accept the canonical spelling.
+    let canonical_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    let watch_parent_buf = canonical_parent.clone();
     let reset_requested = Arc::new(AtomicBool::new(false));
     let callback_reset = Arc::clone(&reset_requested);
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -185,10 +191,9 @@ fn watch_log_directory(
             );
             let is_metadata = matches!(kind, EventKind::Modify(ModifyKind::Metadata(_)));
             let is_parent_reset = matches!(kind, EventKind::Create(_) | EventKind::Remove(_))
-                && event
-                    .paths
-                    .iter()
-                    .any(|event_path| event_path == &parent_path);
+                && event.paths.iter().any(|event_path| {
+                    event_path == &parent_path || event_path == &canonical_parent
+                });
             let is_file_change = is_change
                 && !is_metadata
                 && file_name.as_deref().is_some_and(|name| {
@@ -197,11 +202,15 @@ fn watch_log_directory(
                         .iter()
                         .any(|event_path| event_path.file_name() == Some(name))
                 });
+            // Dropped events (FSEvents `MustScanSubDirs` on a loaded Mac, inotify queue
+            // overflow) arrive as an `EventKind::Other` rescan notice that names no
+            // file: the append may be among them, so re-read. A read never drops events.
+            let is_rescan = event.need_rescan();
             let signal = if is_parent_reset {
                 callback_reset.store(true, Ordering::Release);
                 true
             } else {
-                is_file_change
+                is_file_change || is_rescan
             };
             if signal {
                 // best-effort: a full queue records a pending read; a disconnected
@@ -213,8 +222,11 @@ fn watch_log_directory(
             }
         }
     })?;
-    watcher.watch(parent, notify::RecursiveMode::NonRecursive)?;
-    if let Some(grandparent) = parent.parent()
+    // Watch the canonical spelling: FSEvents handed a symlinked path (`/var/..` ->
+    // `/private/var/..`) can silently deliver nothing for it.
+    let watch_parent = watch_parent_buf.as_path();
+    watcher.watch(watch_parent, notify::RecursiveMode::NonRecursive)?;
+    if let Some(grandparent) = watch_parent.parent()
         && grandparent.is_dir()
     {
         watcher.watch(grandparent, notify::RecursiveMode::NonRecursive)?;
@@ -538,8 +550,17 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        file.write_all(b"appended\n").unwrap();
-        events.recv_timeout(Duration::from_secs(5)).unwrap();
+        // FSEvents coalesces and delays delivery on a loaded Mac; keep appending until
+        // one lands (any one append must nudge) instead of betting on a single write.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            file.write_all(b"appended\n").unwrap();
+            file.flush().unwrap();
+            if events.recv_timeout(Duration::from_millis(500)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "append never nudged the watcher");
+        }
     }
 
     #[test]

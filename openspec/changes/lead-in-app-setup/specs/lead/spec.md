@@ -6,10 +6,10 @@
 
 When the Lead jump key is pressed and `[lead]` is absent, or the Lead is not logged in, or the
 daemon's Lead listener is not up, thegn SHALL open a guided setup instead of opening the Lead. The
-setup SHALL check bubblewrap and pasta (offering the host network when pasta is missing), preview
-the `[lead]` and `[daemon] enabled` lines before writing them with the config writer, confirm before
-restarting the daemon, run the agent and MCP logins by running `thegn lead login` in a thegn pane,
-and offer a reset that removes `[lead]`. Only claude SHALL be offered as the Lead's agent.
+setup SHALL check bubblewrap and pasta (both required; a missing pasta shows install hints and never
+a host-network option), preview the `[lead]` and `[daemon] enabled` lines before writing them with
+the config writer, confirm before restarting the daemon, run the agent and MCP logins by running
+`thegn lead login` in a thegn pane, and offer a reset that removes `[lead]`. Only claude SHALL be offered as the Lead's agent.
 
 #### Scenario: Unconfigured jump
 

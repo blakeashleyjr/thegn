@@ -209,8 +209,21 @@ mod tests {
     fn lanes_run_concurrently_and_every_row_ends_done() {
         let (steps, window) = window();
         let per_step = Duration::from_millis(150);
+        // Overlap is proven by counting steps in flight, not by an upper bound
+        // on wall-clock time, which a loaded host (macOS CI) overran. Each step
+        // waits (bounded) for the other lane before sleeping, so a serial
+        // runner never reaches two in flight.
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
         let exec = |_: &ProvisionStep| -> anyhow::Result<()> {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            let rendezvous = Instant::now() + Duration::from_secs(2);
+            while peak.load(Ordering::SeqCst) < 2 && Instant::now() < rendezvous {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             std::thread::sleep(per_step);
+            in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         };
         let mut finals = vec![None; steps.len()];
@@ -220,11 +233,11 @@ mod tests {
         })
         .expect("window");
         let elapsed = started.elapsed();
-        // Serial would be 5 × 150 ms; the longer lane is 3 × 150 ms.
         assert!(
-            elapsed < per_step * 5,
-            "lanes did not overlap: {elapsed:?} for 5 steps of {per_step:?}"
+            peak.load(Ordering::SeqCst) >= 2,
+            "lanes did not overlap: at most one of 5 steps was ever in flight"
         );
+        // The longer lane alone is 3 × 150 ms.
         assert!(elapsed >= per_step * 3, "{elapsed:?}");
         assert!(
             finals.iter().all(|s| *s == Some(ProvisionState::Done)),

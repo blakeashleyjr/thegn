@@ -1630,6 +1630,7 @@ mod spec {
                 reg: Some(std::sync::Arc::new(crate::help::pages::registry_logged(
                     &thegn_core::config::Config::default(),
                 ))),
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -2140,12 +2141,12 @@ mod spec {
         // …and the action hints mirror the statusbar strip (`section_keys::HOSTS`)
         // — the two surfaces used to advertise different key sets.
         for hint in [
-            "n new",
+            "n add host",
             "p provision",
-            "r probe",
-            "m menu",
-            "c grant",
-            "x forget cache",
+            "r re-probe",
+            "m more",
+            "c allow install",
+            "x forget state",
         ] {
             assert!(rendered.contains(hint), "{hint}: {rendered}");
         }
@@ -2824,10 +2825,7 @@ mod spec {
         let rendered = text(&rows);
         assert!(rendered.contains("host connect: timeout"), "{rendered}");
         assert!(rendered.contains("ghcr.io/x/base:v1"), "{rendered}");
-        assert!(
-            rendered.contains("reach target  flaky.example"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("address  flaky.example"), "{rendered}");
         assert_eq!(
             rows.iter()
                 .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Hosts, _))))

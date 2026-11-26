@@ -38,7 +38,7 @@ pub(crate) const TITLE: &str = "CPU";
 /// Title of the `mem` popup (unchanged from before the breakdown existed).
 pub(crate) const MEM_TITLE: &str = "Memory";
 /// Requested popup width; `sections` clamps it to the screen.
-pub(crate) const COLS: usize = 68;
+pub(crate) const COLS: usize = 60;
 /// Label of the heading the attribution sections start at. `refresh_open`
 /// replaces everything from here down and leaves the graphs above alone.
 const HEADING: &str = "by workspace";
@@ -140,7 +140,7 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
             .map(|(used, _)| (f64::from(used.max(0.0)) * GIB) as u64),
     );
     let scopes = summary.map(|s| scope_usage(&s.scopes)).unwrap_or_default();
-    cpu_attrib::build(
+    cpu_attrib::build_compact(
         &AttribInputs {
             owners: &model.pane_owners,
             panes: panes.as_deref(),
@@ -152,6 +152,7 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
         },
         sort,
         cpu_attrib::TOP_PER_PANE,
+        cpu_attrib::TOP_WORKTREES,
     )
 }
 
@@ -765,6 +766,40 @@ mod tests {
                 filter: None,
             })
         );
+    }
+
+    #[test]
+    fn monitor_popovers_anchor_to_their_chip_at_small_and_large_sizes() {
+        let hist = TelemetryHistory::default();
+        for screen in [(60usize, 20usize), (200, 60)] {
+            let ctx = StatusCtx::new_for_test_on(&hist, Rect::full(screen.0, screen.1));
+            let item = Rect {
+                x: 30,
+                y: 0,
+                cols: 8,
+                rows: 1,
+            };
+            let mut m = model();
+            m.stats.disks = vec![thegn_metrics::DiskInfo {
+                name: "sda".into(),
+                mount: "/".into(),
+                free_pct: 20,
+                read_bps: 0,
+                write_bps: 0,
+                kind: thegn_metrics::DiskKind::Ssd,
+                extra_mounts: 0,
+            }]
+            .into();
+            for widget in ["cpu", "mem", "disk"] {
+                let ov = open_detail_for(&BarItemId::Widget(widget.into()), item, &m, &ctx)
+                    .unwrap_or_else(|| panic!("{widget} opens a popup"));
+                assert!(
+                    matches!(ov.placement, Placement::NearBelow(_)),
+                    "{widget} at {screen:?}"
+                );
+                assert!(ov.rows <= screen.1, "{widget} fits {screen:?}: {}", ov.rows);
+            }
+        }
     }
 
     #[test]

@@ -790,6 +790,134 @@ fn diff_text_rows(text: &str, scroll: usize, body: usize) -> Vec<PanelRow> {
         .collect()
 }
 
+/// Compact the selected commit's patch into one file/stat row per changed path.
+fn commit_stat_rows(text: &str, avail: usize) -> Vec<PanelRow> {
+    let mut files: Vec<(String, u32, u32)> = Vec::new();
+    let mut current: Option<(String, u32, u32)> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, path)| path)
+                .unwrap_or(rest)
+                .to_string();
+            current = Some((path, 0, 0));
+        } else if let Some((_, added, deleted)) = current.as_mut() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                *added = added.saturating_add(1);
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                *deleted = deleted.saturating_add(1);
+            }
+        }
+    }
+    if let Some(file) = current {
+        files.push(file);
+    }
+    let mut rows = vec![PanelRow::plain(Line::segs(vec![seg(
+        g2(),
+        format!("FILES · {}", files.len()),
+    )]))];
+    for (path, added, deleted) in files.into_iter().take(avail.saturating_sub(1)) {
+        rows.push(PanelRow::plain(Line::split(
+            vec![seg(d(), path)],
+            vec![
+                seg(hue(Hue::Green), format!("+{added}")),
+                sp(1),
+                seg(hue(Hue::Red), format!("−{deleted}")),
+            ],
+        )));
+    }
+    rows.truncate(avail);
+    rows
+}
+
+/// Half-width commit view: full-width single-line history followed by the
+/// selected commit's compact file statistics. Each row is `hash subject
+/// (refs)` on the left and `author age` on the right; draw-time `Line::Split`
+/// fitting trims the subject with an ellipsis instead of wrapping it.
+fn half_commits_rows(data: &PanelData, ui: &PanelUi, focused: bool, body: usize) -> Vec<PanelRow> {
+    let indices = list_indices(ui, data, GitView::Commits);
+    let selected_display = ui.git.cur.commits.min(indices.len().saturating_sub(1));
+    let selected = indices
+        .get(selected_display)
+        .and_then(|&i| data.commits.get(i));
+    let mut rows = Vec::with_capacity(body);
+    if let Some(fr) = filter_row(ui, GitView::Commits, indices.len()) {
+        rows.push(fr);
+    }
+    let body_left = body.saturating_sub(rows.len());
+    if indices.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "no commits")])));
+        rows.truncate(body);
+        return rows;
+    }
+    // The detail block takes at most a third of the body (and never more than
+    // a header plus seven files), so the history stays the primary content.
+    let detail_cap = (body_left / 3).clamp(2, 8);
+    let mut detail = Vec::new();
+    if let Some(commit) = selected {
+        let key = ui.git.selected_commit_detail_key(&commit.sha);
+        match ui.git.commit_show.as_ref().filter(|entry| entry.0 == key) {
+            Some((_, Ok(text))) => detail = commit_stat_rows(text, detail_cap),
+            Some((_, Err(error))) => detail.push(PanelRow::plain(Line::segs(vec![seg(
+                hue(Hue::Red),
+                format!("commit detail unavailable: {error}"),
+            )]))),
+            None => detail.push(spinner(ui.docs.tick, "commit detail")),
+        }
+    }
+    let detail_rows = detail.len().min(body_left.saturating_sub(2));
+    let separator = usize::from(detail_rows > 0);
+    let list_budget = body_left.saturating_sub(detail_rows + separator);
+    let selection = ui.git.selection();
+    for display in window(indices.len(), list_budget, selected_display) {
+        let Some(commit) = indices.get(display).and_then(|&i| data.commits.get(i)) else {
+            continue;
+        };
+        let mut left = vec![
+            seg(ac(), commit.short.clone()),
+            sp(1),
+            seg(d(), commit.subject.clone()),
+        ];
+        if !commit.refs.is_empty() {
+            left.push(sp(1));
+            left.push(seg(
+                hue(Hue::Amber),
+                format!("({})", graph::compact_refs(&commit.refs)),
+            ));
+        }
+        let right = vec![
+            seg(
+                hue(crate::panel::sections::commits::author_hue(&commit.author)),
+                seg::clip_end(&commit.author, 14),
+            ),
+            sp(1),
+            seg(g2(), age(commit.date)),
+        ];
+        let mut row = PanelRow::plain(Line::split(left, right))
+            .with_hit(PanelHit::Row(Section::Commits, display));
+        if display == selected_display {
+            row = row.with_bg(if focused {
+                Tok::SelAccent
+            } else {
+                range_tint()
+            });
+        } else if ui.git.sel_anchor.is_some() && selection.contains(&display) {
+            row = row.with_bg(range_tint());
+        }
+        rows.push(row);
+    }
+    if detail_rows > 0 {
+        rows.push(PanelRow::blank());
+        rows.extend(detail.into_iter().take(detail_rows));
+    }
+    rows.truncate(body);
+    rows
+}
+
 /// The selected stash's display index and stable SHA (filter-aware) — this
 /// MUST mirror [`stash_region`]'s selection exactly.
 pub(crate) fn selected_stash(ui: &PanelUi, data: &PanelData) -> Option<(usize, String)> {
@@ -888,6 +1016,9 @@ fn stash_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
         .get(GitView::Stash)
         .min(ix.len().saturating_sub(1));
     let Some(s) = ix.get(cur).map(|&s| &data.stashes[s]) else {
+        if data.stash_count == 0 && !data.stash_unknown {
+            return vec![PanelRow::plain(Line::segs(vec![seg(g2(), "no stashes")]))];
+        }
         let message = match &data.stashes_load {
             crate::panel::gitui::DocLoad::Pending => "loading stashes…".to_string(),
             crate::panel::gitui::DocLoad::Ready => "no stashes".to_string(),
@@ -1441,6 +1572,19 @@ pub(super) fn build_git_full(
     }
     let body = rows.saturating_sub(out.len() + 1);
     if body > 0 {
+        if ui.width == crate::layout::PanelWidth::Half && ui.git.focus == GitView::Commits {
+            out.extend(half_commits_rows(&model.panel, ui, focused, body));
+            let (help, chip) = help_row_with_chip(ui, cols, out.len());
+            out.push(help);
+            out.truncate(rows);
+            return PanelFrame {
+                rows: out,
+                rail: Vec::new(),
+                col_hits: chip.into_iter().collect(),
+                col_zone: None,
+                tab_spans: Vec::new(),
+            };
+        }
         if ui.width == crate::layout::PanelWidth::Half && cols < SIDE_W + 40 {
             let side_rows_count = (body / 3).max(4).min(body.saturating_sub(1));
             out.extend(side_rows(model, ui, focused, side_rows_count, cols));
@@ -1766,16 +1910,76 @@ mod tests {
 
     #[test]
     fn half_commits_routes_to_the_git_frame() {
-        let m = model();
+        let mut m = model();
         let mut u = ui(GitView::Commits);
         u.width = PanelWidth::Half;
         u.git.focus = GitView::Commits;
+        m.panel.commits[0].refs = "HEAD -> main, origin/main, tag: v1.0".into();
         let key = u.git.selected_commit_detail_key(&m.panel.commits[0].sha);
         u.git.commit_show_key = Some(key.clone());
-        u.git.commit_show = Some((key, Ok("half width commit detail".into())));
+        u.git.commit_show = Some((
+            key,
+            Ok(concat!(
+                "commit detail header\n",
+                "diff --git a/src/a.rs b/src/a.rs\n",
+                "--- a/src/a.rs\n",
+                "+++ b/src/a.rs\n",
+                "@@ -1 +1 @@\n",
+                "-old\n",
+                "+new\n",
+            )
+            .into()),
+        ));
         let frame = crate::panel::frame::build_panel(&m, &u, 60, 30, true);
         let all = all_text(&frame);
-        assert!(all.contains("half width commit detail"), "{all}");
+        assert!(all.contains("feat: change 0"), "{all}");
+        assert!(all.contains("Blake Ashley"), "{all}");
+        assert!(all.contains("src/a.rs"), "{all}");
+        assert!(all.contains("+1"), "{all}");
+        assert!(all.contains("−1"), "{all}");
+        assert!(!all.contains("loading stashes"), "{all}");
+        assert!(all.contains("(HEAD -> main +2)"), "{all}");
+        assert!(!all.contains("tag: v1.0"), "{all}");
+        assert!(
+            frame
+                .rows
+                .iter()
+                .filter(|row| matches!(&row.hit, Some(PanelHit::Row(Section::Commits, _))))
+                .all(|row| matches!(&row.line, Line::Split { .. })),
+            "commit rows should be one physical line each"
+        );
+    }
+
+    #[test]
+    fn full_width_commits_keep_the_split_list_and_compact_refs() {
+        let mut m = model();
+        m.panel.commits[0].refs = "HEAD -> main, origin/main, tag: v1.0".into();
+        let mut u = ui(GitView::Commits);
+        let key = u.git.selected_commit_detail_key(&m.panel.commits[0].sha);
+        u.git.commit_show_key = Some(key.clone());
+        u.git.commit_show = Some((key, Ok("commit detail header\n+change".into())));
+        let frame = build_git_full(&m, &u, 120, 40, true);
+        let all = all_text(&frame);
+        // The side column wraps long items, so pin the collapsed tail and the
+        // absence of the hidden refs rather than one contiguous string.
+        assert!(all.contains("+2)"), "{all}");
+        assert!(!all.contains("tag: v1.0"), "{all}");
+        assert!(all.contains("commit detail header"), "{all}");
+        assert!(frame.col_zone.is_some(), "full width retains split columns");
+    }
+
+    #[test]
+    fn empty_stash_count_does_not_render_a_loading_placeholder() {
+        let mut m = model();
+        m.panel.stashes.clear();
+        m.panel.stash_count = 0;
+        m.panel.stash_unknown = false;
+        m.panel.stashes_load = crate::panel::gitui::DocLoad::Pending;
+        let mut u = ui(GitView::Stash);
+        u.width = PanelWidth::Half;
+        let all = all_text(&build_git_full(&m, &u, 60, 30, true));
+        assert!(all.contains("no stashes"), "{all}");
+        assert!(!all.contains("loading stashes"), "{all}");
     }
 
     // Regression: with both the hydrated header banner and the UI merge flow

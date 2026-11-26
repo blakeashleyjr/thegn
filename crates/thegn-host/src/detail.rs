@@ -198,6 +198,14 @@ pub enum DetailAction {
     /// loop, then refresh. Keeps the overlay open: the loop removes the row in
     /// place so the dismissal is visible where it was asked for.
     DismissNotification { id: i64 },
+    /// Dismiss a whole group (or every stale item): mark each inbox id read,
+    /// ack each needs-you target, and drop the leaves keyed `keys` from the
+    /// grouped overlay in place. Keeps the overlay open.
+    DismissBatch {
+        ids: Vec<i64>,
+        acks: Vec<notif_tree::AckTarget>,
+        keys: Vec<String>,
+    },
     /// Open the raw thegn.log in a pager pane (fuller scrollback than the tail).
     OpenLogPager,
     /// Copy a single log line's raw text to the system clipboard.
@@ -242,6 +250,7 @@ impl DetailAction {
             DetailAction::DrillCiRun { .. }
                 | DetailAction::AckAttention { .. }
                 | DetailAction::DismissNotification { .. }
+                | DetailAction::DismissBatch { .. }
                 | DetailAction::FetchCalendar { .. }
         )
     }
@@ -257,6 +266,8 @@ pub use ci_drill::{CiDetailPayload, apply_ci_detail};
 /// child-module arrangement as `ci_drill` — it reaches `DetailOverlay`'s
 /// private fields, and lives outside `detail.rs` to keep it under the cap.
 pub(crate) mod calendar;
+/// The unified notifications overlay's grouping model (fold by kind/source).
+pub(crate) mod notif_tree;
 pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 /// The `cpu`/`mem` popups' workspace → worktree → pane attribution tree.
 pub(crate) mod cpu_attrib;
@@ -276,6 +287,7 @@ pub use status_modal::DaemonSessions;
 /// `enter` action (fired by Enter/Return) and extra char-keyed `actions`; a list
 /// with any actionable row becomes navigable (a selection cursor, not just
 /// scroll).
+#[derive(Clone)]
 pub struct DetailRow {
     pub marker: Tok,
     pub glyph: String,
@@ -506,6 +518,8 @@ pub struct DetailOverlay {
     /// A human-authorized CI autofix action, populated only after a bounded
     /// redacted log entry has landed in the in-place CI drill.
     ci_autofix: Option<CiAutofixAvailability>,
+    /// The grouped/foldable model when this is the unified notifications list.
+    notif: Option<notif_tree::NotifTree>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +811,9 @@ impl DetailOverlay {
         if mods.intersects(Modifiers::ALT | Modifiers::SUPER) {
             return DetailOutcome::Pending;
         }
+        if let Some(out) = self.notif_key(key) {
+            return out;
+        }
         if crate::input::is_escape_key(key) {
             return DetailOutcome::Close;
         }
@@ -924,6 +941,9 @@ impl DetailOverlay {
     /// previous one at the end). Navigation never acks: a row only leaves the
     /// list when the user explicitly asks.
     pub fn remove_selected(&mut self) {
+        if self.notif_remove_selected() {
+            return;
+        }
         let DetailContent::List(l) = &mut self.content else {
             return;
         };
@@ -1109,6 +1129,7 @@ impl DetailOverlay {
         self.cols = 72;
         self.rows = 18;
         self.hint = None;
+        self.notif = None;
         self.scroll = 0;
         self.sel = self.content_len().saturating_sub(1);
         self.scroll_to_sel();
@@ -1142,6 +1163,7 @@ impl DetailOverlay {
         self.cols = 72;
         self.rows = (n + 2).clamp(5, 22);
         self.hint = None;
+        self.notif = None;
         self.scroll = 0;
         self.sel = 0;
     }
@@ -1676,6 +1698,7 @@ fn graph(
         monitor_tab: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     }
 }
 
@@ -1699,6 +1722,7 @@ fn keyval(
         monitor_tab: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     }
 }
 
@@ -1716,6 +1740,7 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
         monitor_tab: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     }
 }
 
@@ -1765,6 +1790,7 @@ fn sections_detail(
         monitor_tab: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     };
     fit_to_screen(&mut ov, screen);
     ov.set_sections(detail);
@@ -1797,6 +1823,7 @@ fn list(
         monitor_tab: None,
         live_ci: None,
         ci_autofix: None,
+        notif: None,
     }
 }
 
@@ -1841,7 +1868,7 @@ fn widget_detail_inner(
                 footer: Some(footer),
                 series,
                 tone: Tok::Hue(Hue::Teal),
-                height: 5,
+                height: 3,
                 series2: None,
                 ..Default::default()
             })];
@@ -1868,7 +1895,7 @@ fn widget_detail_inner(
                     footer: Some(footer),
                     series,
                     tone: Tok::Hue(Hue::Purple),
-                    height: 5,
+                    height: 3,
                     series2: None,
                     ..Default::default()
                 }),
@@ -1879,8 +1906,11 @@ fn widget_detail_inner(
             ];
             if let Some((u, t)) = s.mem_gib {
                 let mut breakdown = vec![
-                    ("used".into(), format!("{u:.1}G"), Tok::Slot(S::Text)),
-                    ("total".into(), format!("{t:.0}G"), Tok::Slot(S::Dim)),
+                    (
+                        "used".into(),
+                        format!("{u:.1}G of {t:.0}G"),
+                        Tok::Slot(S::Text),
+                    ),
                     (
                         "available".into(),
                         format!("{:.1}G", (t - u).max(0.0)),
@@ -2154,7 +2184,7 @@ fn widget_detail_inner(
                 .collect();
             Some(sections(
                 "Disks",
-                60,
+                cpu_attrib::COLS,
                 vec![
                     Section::Graph(GraphSection {
                         label: "DISK IO".into(),
@@ -2162,7 +2192,7 @@ fn widget_detail_inner(
                         footer: Some("read + write, window-scaled".into()),
                         series,
                         tone: Tok::Hue(Hue::Blue),
-                        height: 5,
+                        height: 3,
                         series2: None,
                         ..Default::default()
                     }),
@@ -2183,7 +2213,7 @@ fn widget_detail_inner(
                         sel: None,
                     }),
                 ],
-                Placement::Center,
+                near,
                 ctx.screen,
             ))
         }
@@ -2557,24 +2587,21 @@ fn badge_detail(
 /// - **Logs** — one quiet entry point into thegn.log (never a red alert;
 ///   self-diagnostics are gated off by default, see `surface_self_log_errors`).
 fn unified_detail(model: &FrameModel, screen: Rect) -> Option<DetailOverlay> {
+    use notif_tree::{Leaf, is_stale};
     use thegn_core::notification::Priority;
-    let mut rows: Vec<DetailRow> = Vec::new();
+    let now = thegn_core::util::now();
 
     // 1. Needs you — the actionable per-worktree rollup. Its paths drive the
     //    de-dup: a worktree failure surfaced here is suppressed in Alerts + MQ.
-    let (needs_rows, needs_paths) = needs_you_rows(model);
-    if !needs_rows.is_empty() {
-        rows.push(DetailRow::header("Needs you"));
-        rows.extend(needs_rows);
-    }
+    let (mut leaves, needs_paths) = needs_you_leaves(model, now);
 
     // The inbox, newest-first, UNREAD only: this surface is what still needs
     // you, not history (read rows live in the panel's System ▸ Notifications
     // section behind its show-read toggle). Listing read rows here — dimmed —
     // is what made `x`/`a` look inert: nothing ever left the list. `log:thegn`
-    // rows are pulled into the Logs group; everything else splits by
-    // *effective* priority (config overrides included, the same priority the
-    // chip counts by) into Alerts vs Notifications.
+    // rows are pulled into the Logs entry; everything else becomes a leaf of
+    // the grouped list, classified by kind (and *effective* priority, config
+    // overrides included — the same priority the chip counts by).
     let mut notes: Vec<_> = model
         .panel
         .notifications
@@ -2583,25 +2610,43 @@ fn unified_detail(model: &FrameModel, screen: Rect) -> Option<DetailOverlay> {
         .cloned()
         .collect();
     notes.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
-
-    // 2. Alerts — alert-priority, not a log row, and not already a Needs-you
-    //    worktree (dedup).
-    let alerts: Vec<DetailRow> = notes
-        .iter()
-        .filter(|n| {
-            n.source_ref != "log:thegn"
-                && model.panel.priority_of(n.kind) == Priority::Alert
-                && (n.worktree_path.is_empty() || !needs_paths.contains(&n.worktree_path))
-        })
-        .map(notification_row)
-        .collect();
-    if !alerts.is_empty() {
-        rows.push(DetailRow::header("Alerts"));
-        rows.extend(alerts);
+    for (i, n) in notes.iter().enumerate() {
+        if n.source_ref == "log:thegn" {
+            continue;
+        }
+        let prio = model.panel.priority_of(n.kind);
+        // An alert for a worktree already listed under Needs you is the same
+        // item seen from the other side: show it once.
+        if prio == Priority::Alert
+            && !n.worktree_path.is_empty()
+            && needs_paths.contains(&n.worktree_path)
+        {
+            continue;
+        }
+        let row = notification_row(n);
+        let source = notif_tree::source_key(&n.worktree_path);
+        let key = if n.id != 0 {
+            format!("n:{}", n.id)
+        } else {
+            format!("n0:{i}")
+        };
+        leaves.push(Leaf {
+            search: format!("{} {source}", row.text).to_lowercase(),
+            key,
+            kind: notif_kind(n.kind, prio),
+            source,
+            ts: Some(n.created_at_ms),
+            stale: is_stale(Some(n.created_at_ms), now),
+            row,
+            id: (n.id != 0).then_some(n.id),
+            ack: None,
+        });
     }
 
-    // 3. Merge queue — the active queue entries, dedup'd against Needs-you
-    //    worktrees (a queued branch already surfaced there is not repeated).
+    // Fixed rows after the grouped list.
+    let mut tail: Vec<DetailRow> = Vec::new();
+    // Merge queue — the active queue entries, dedup'd against Needs-you
+    // worktrees (a queued branch already surfaced there is not repeated).
     let gl = crate::caps::active_glyphs();
     let mq: Vec<DetailRow> = model
         .panel
@@ -2611,50 +2656,59 @@ fn unified_detail(model: &FrameModel, screen: Rect) -> Option<DetailOverlay> {
         .map(|r| mq_row(r, gl))
         .collect();
     if !mq.is_empty() {
-        rows.push(DetailRow::header("Merge queue"));
-        rows.extend(mq);
+        tail.push(DetailRow::header("Merge queue"));
+        tail.extend(mq);
     }
-
-    // 4. Notifications — unread Notice/Info rows (never log rows).
-    let inbox: Vec<DetailRow> = notes
-        .iter()
-        .filter(|n| {
-            n.source_ref != "log:thegn" && model.panel.priority_of(n.kind) < Priority::Alert
-        })
-        .map(notification_row)
-        .collect();
-    if !inbox.is_empty() {
-        rows.push(DetailRow::header("Notifications"));
-        rows.extend(inbox);
-    }
-
-    // 5. Other repos — needs-you worktrees the active-repo scope held back. Kept
-    //    below the local groups (it is context, not this repo's alarm) but still
-    //    actionable: Enter switches workspace, `x` quiets that episode.
+    // Other repos — needs-you worktrees the active-repo scope held back. Kept
+    // below the local groups (it is context, not this repo's alarm) but still
+    // actionable: Enter switches workspace, `x` quiets that episode.
     let others = other_repo_rows(model);
     if !others.is_empty() {
-        rows.push(DetailRow::header(format!("Other repos ({})", others.len())));
-        rows.extend(others);
+        tail.push(DetailRow::header(format!("Other repos ({})", others.len())));
+        tail.extend(others);
     }
+    // Logs — always one dim entry point into thegn.log.
+    tail.push(DetailRow::header("Logs"));
+    tail.push(logs_row(model, &notes));
 
-    // 6. Logs — always one dim entry point into thegn.log.
-    rows.push(DetailRow::header("Logs"));
-    rows.push(logs_row(model, &notes));
-
+    let mut ov = DetailOverlay::notif_overlay("Notifications", leaves, tail, UNIFIED_MIN_COLS, 1);
     // Sized to the terminal, not a fixed 62×18: wide enough for the longest
     // row (messages were being truncated into a box a quarter of the screen),
     // tall enough to show everything it can — scrolling only once the content
     // outgrows what `layer::box_dims` will actually draw.
-    let widest = rows.iter().map(row_width).max().unwrap_or(0);
+    let (widest, count) = match &ov.content {
+        DetailContent::List(l) => (
+            l.rows.iter().map(row_width).max().unwrap_or(0),
+            l.rows.len(),
+        ),
+        _ => (0, 0),
+    };
     // Up to ¾ of the screen, but never below the floor (a narrow terminal
     // keeps the 62-col box; `fit_to_screen` still bounds it to what draws).
     let cap = (screen.cols.saturating_mul(3) / 4).max(UNIFIED_MIN_COLS);
-    let cols = widest.max(UNIFIED_MIN_COLS).min(cap);
-    let height = (rows.len() + 1).max(UNIFIED_MIN_ROWS); // +1 hint footer
-    let mut ov = list("Notifications", rows, "all clear", cols, height);
+    ov.cols = widest.max(UNIFIED_MIN_COLS).min(cap);
+    ov.rows = (count + 1).max(UNIFIED_MIN_ROWS); // +1 hint footer
     fit_to_screen(&mut ov, screen);
-    ov.hint = Some("↵ open · x dismiss · a clear all · l land · r retry · o log".into());
+    // The tree was laid out in a 1-row box; re-anchor the window now that the
+    // real height is known.
+    ov.scroll = 0;
+    ov.scroll_to_sel();
     Some(ov)
+}
+
+/// Which grouped-list kind an inbox row belongs to.
+fn notif_kind(
+    kind: thegn_core::notification::NotificationKind,
+    prio: thegn_core::notification::Priority,
+) -> notif_tree::NKind {
+    use notif_tree::NKind;
+    use thegn_core::notification::NotificationKind as K;
+    match kind {
+        K::AgentAttention | K::QueueNeedsHuman => NKind::NeedsInput,
+        K::AgentDone | K::QueueLanded | K::QueueReady | K::ProcessExited => NKind::Finished,
+        _ if prio == thegn_core::notification::Priority::Alert => NKind::Failed,
+        _ => NKind::Info,
+    }
 }
 
 /// Floor for the unified surface's box; it grows from here with its content
@@ -2827,19 +2881,45 @@ fn attention_row(
     row
 }
 
-/// The "Needs you" rows (live attention rollup, scoped to the active repo) plus
-/// the set of worktree paths they cover — the caller uses the set to suppress
-/// duplicate Alert rows.
-fn needs_you_rows(model: &FrameModel) -> (Vec<DetailRow>, std::collections::HashSet<String>) {
+/// The in-scope needs-you worktrees as grouped-list leaves, plus the set of
+/// worktree paths they cover — the caller uses the set to suppress duplicate
+/// Alert rows. Blocked → needs input, failing → failed, anything else finished.
+fn needs_you_leaves(
+    model: &FrameModel,
+    now: i64,
+) -> (Vec<notif_tree::Leaf>, std::collections::HashSet<String>) {
+    use notif_tree::{AckTarget, Leaf, NKind};
+    use thegn_core::attention::AttentionTier;
     let mut paths = std::collections::HashSet::new();
-    let rows = crate::handlers::attention::needs_user_ordered(model)
+    let leaves = crate::handlers::attention::needs_user_ordered(model)
         .into_iter()
         .map(|(path, score)| {
             paths.insert(path.clone());
-            attention_row(model, &path, score)
+            let row = attention_row(model, &path, score);
+            let source = notif_tree::source_key(&path);
+            Leaf {
+                search: format!("{} {source}", row.text).to_lowercase(),
+                key: format!("a:{path}"),
+                kind: match score.tier {
+                    AttentionTier::Blocked => NKind::NeedsInput,
+                    AttentionTier::Failure => NKind::Failed,
+                    _ => NKind::Finished,
+                },
+                source,
+                ts: score.since,
+                stale: notif_tree::is_stale(score.since, now),
+                row,
+                id: None,
+                ack: Some(AckTarget {
+                    path,
+                    reason: score.reason,
+                    since: score.since,
+                    episode: score.episode,
+                }),
+            }
         })
         .collect();
-    (rows, paths)
+    (leaves, paths)
 }
 
 /// The needs-you rows for worktrees in *other* repos — what the default scope

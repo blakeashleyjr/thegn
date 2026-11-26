@@ -44,10 +44,12 @@ and program) → the heaviest processes in that pane, then thegn itself (UI and
 daemon) and "outside thegn" — everything else. `cpu` orders the tree by CPU
 (percent of one core, like `top`, with each row's share of the masthead total
 beside it); `mem` orders it by resident memory. Panes of parked workspaces are
-included. A second click on the same stat still opens the full system monitor
-on that tab. Move the cursor through the breakdown with `j`/`k`: `↵` on a
-process opens the Processes tab filtered to it, where `k` kills it after a
-confirmation; `p` on a worktree or pane row shows that row's processes there.
+included. Only worktrees with live processes are listed (the heaviest eight),
+with one "N idle worktrees" line for the rest. A second click on the same stat
+still opens the full system monitor on that tab. Move the cursor through the
+breakdown with `j`/`k`: `↵` on a process opens the Processes tab filtered to
+it, where `k` kills it after a confirmation; `p` on a worktree or pane row
+shows that row's processes there.
 See [[system-monitor]] for how the attribution works.
 
 The app-tab chips are buttons: the active app sits on the focus pill and the
@@ -304,15 +306,22 @@ the notification list only if you turn on
 `[notifications] agent_attention_inbox`.
 
 The `✋`/`✉` chip, the opt-in `mq` widget, and the PR-queue chip all open the
-**one unified surface** — a single grouped list of _Needs you · Alerts · Merge
-queue · Notifications · Other repos · Logs_, sized to the terminal and
-showing **only unread** rows (read history lives in the panel's System ▸
-Notifications section behind its show-read toggle). Moving the cursor never
-marks anything read. One clear/dismiss convention holds throughout: `x`
-dismisses the row under the cursor and it leaves the list in place, the
-popup staying open (on a needs-you row that quiets the worktree **and**
-retires its inbox rows); `a` clears all — the same total clear from every
-row — and closes the popup. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
+**one unified surface**: a count line (_N need input · N failed · N finished ·
+N info_), then the items grouped by kind, then _Merge queue · Other repos ·
+Logs_. It is sized to the terminal and shows **only unread** rows (read
+history lives in the panel's System ▸ Notifications section behind its
+show-read toggle). Several items from one pipeline batch or project fold into
+one row with a count ("Pipeline b313 — 23 need input"): `↵` or `→` expands
+it, `←` collapses it. Anything first raised more than 24 hours ago is stale:
+it sits in a collapsed **Older (N)** group at the bottom and is not counted on
+the `✋` chip. `/` filters by text (`Esc` clears the filter), `D` dismisses
+everything stale, and `x` dismisses the row **or the whole group** under the
+cursor. Moving the cursor never marks anything read. One clear/dismiss
+convention holds throughout: `x` dismisses the row under the cursor and it
+leaves the list in place, the popup staying open (on a needs-you row that
+quiets the worktree **and** retires its inbox rows); `a` clears all — the same
+total clear from every row — and closes the popup.
+Merge-queue rows act in place — `l` lands a gated-green branch, `r`
 retries a blocked one, `x` removes it, `m` jumps to the full Work ▸ Merge
 queue section. (In the panel's System ▸ Notifications section and in this
 popup, `a` asks for confirmation before clearing. In the panel it ignores an

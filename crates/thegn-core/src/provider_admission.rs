@@ -1263,7 +1263,7 @@ pub(crate) fn decode_base64(raw: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let chunks = bytes.len() / 4;
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == chunks;
         let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
         if padding > 2 || (padding > 0 && !last) {

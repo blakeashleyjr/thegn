@@ -82,6 +82,13 @@ fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
             }
             vec![report]
         }
+        VoiceKind::Hex => {
+            let mut report = crate::voice::CommandVoiceProvider::new(v.clone()).probe();
+            if !v.enabled {
+                report = report.note("[voice] enabled = false; explicit consent is off");
+            }
+            vec![report]
+        }
         VoiceKind::Embedded => {
             let available = {
                 crate::voice_models::resolve(v)

@@ -856,9 +856,17 @@ pub fn prepare_sandbox_env_with_selection(
                     }
                     .into());
                 }
+                // The session `[h]` pin from the no-runtime halt (THE-2729) counts
+                // as an explicit `backend = "none"` here: the placement stays ssh,
+                // so the pane runs bare on that host, never as a local shell.
+                let configured_backend = if force_host_requested(worktree) {
+                    thegn_core::config::SandboxBackend::None
+                } else {
+                    sb.backend
+                };
                 ssh_none_guard(
                     &spec,
-                    sb.backend,
+                    configured_backend,
                     degrade_allowed,
                     ask,
                     &env_name,
@@ -1231,11 +1239,23 @@ pub fn prepare_sandbox_env_with_selection(
     // a fallback preference; the floor admission below still applies.
     if !degrade_allowed && !(placement.is_local() && auto_chain_names_host(&sb)) {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
+        let mut reason = crate::remote_sync::no_backend_reason(reachable, &warnings);
+        // THE-2644: a local host with no ready backend (a clean Mac) names the
+        // backends and their install/start fix, and always offers the explicit,
+        // session-only `[h] run on host` choice — the same doctrine as the
+        // dormant-runtime modal. Nothing is degraded until the user picks it.
+        let local_no_backend = placement.is_local() && reachable;
+        if local_no_backend {
+            reason = format!(
+                "{reason}; {}",
+                thegn_core::sandbox_floor::no_backend_fix_here()
+            );
+        }
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
-            ask,
+            reason,
+            ask: ask || local_no_backend,
             dormant: None,
             sealed_home: false,
         }

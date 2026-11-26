@@ -17,9 +17,13 @@ tracker reconciliation below. No release dates are asserted.
 The native leaf pins CPAL 0.18.2 and whisper-rs 0.16.0. Linux builds require ALSA
 development files/pkg-config, CMake, a C++ toolchain, and libclang for bindings.
 Apple builds require Xcode tools, CMake, the 14.2+ SDK/deployment target, and Metal
-frameworks for `voice-metal`. Do not enable these features in desktop releases
-until the matrix below has actual evidence. Current release/bridge flags stay
-unchanged. The stable channel continues to clamp `[voice] enabled` off.
+frameworks for `voice-metal`. `voice-native` is a default feature of
+`thegn-host` since the stable graduation (2026-11-25), compiled only on Linux
+glibc and macOS (musl and Windows omit it automatically). Release legs: macOS
+Apple silicon ships it; the glibc 2.28 zigbuild tarball, musl tarball, bridge
+and completions builds use `--no-default-features`. Real-device evidence below
+is still required before announcing a platform. Voice is not channel-clamped;
+`[voice] enabled` stays off until the user opts in.
 
 ## Required evidence
 
@@ -89,6 +93,18 @@ are checked in. Machine: Ryzen AI 9 HX 370, Linux 7.2.9, about 94 GiB RAM;
 | Full 11-second recording final decode                           | 2,378 ms                              |
 | Peak inference process RSS                                      | 349,820 KiB (about 342 MiB)           |
 | Pre-cancel / digital silence                                    | Passed; pre-cancel returned in < 1 ms |
+
+### Whisper preview parameter change (VOICE-L3)
+
+| Measurement                                      | Before                                                                                     | After                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| Preview parameters                               | 4-thread cap; default temperature fallback; full/default audio context; timestamps enabled | Up to 8 threads; no temperature fallback; single segment, no timestamps; window-scaled audio context |
+| Preview decode, 20 calls, nearest-rank p50 / p95 | 2,375 / 2,914 ms on the Linux reference machine above                                      | Pending supplied-audio rerun with the command below                                                  |
+
+The after latency and transcript still need measurement on the reference machine;
+the <1.2 s preview p50 target is not claimed by this code change alone. Final pass
+keeps default temperature fallback and full audio context. Both passes suppress
+non-speech and blank tokens.
 
 These are decoder measurements, not capture-to-display acceptance or a broad
 corpus. The tail is close to (and individual calls exceed) the 3-second target.
@@ -181,8 +197,10 @@ in its trampoline. The leaf uses a documented concrete FFI callback context
 owned across the synchronous native call instead, with a regression test for
 cancellation/deadline/ownership. The supplied-audio `verify` example exercises
 real inference without opening a microphone. Metal startup also preflights
-compute-state allocation before capture so a state-allocation failure can use
-the CPU fallback. Apple behavior is unverified.
+compute-state allocation during model load so a state-allocation failure can
+use the CPU fallback. The worker opens the microphone first and loads the model
+while capture runs, so the first words are kept; capture also keeps a 250 ms
+tail after stop (cancel skips it). Apple behavior is unverified.
 
 Native release acceptance remains open: broader ALSA/PipeWire routing, device
 removal, macOS TCC/Metal/CPU fallback and packaging, broader speech/noise corpus,

@@ -63,9 +63,13 @@ removing a file refreshes the relevant views.
 
 ### commits — branch history
 
-At Half and Full width, the detail region follows the cursor and shows the
-commit through `git show`, read-only. `↵` opens the commit's files with the
-selected file's diff shown read-only. Mark lines with `space` to start a
+At Half width, the history uses the full panel width with one line per commit:
+short hash, subject (trimmed with an ellipsis), author and age. The selected
+commit's changed files and line counts appear beneath the list. At Full width,
+the detail region follows the cursor and shows the commit through `git show`,
+read-only. `↵` opens the commit's files with the selected file's diff shown
+read-only. Long ref decorations collapse to the first ref and a count of the
+remaining refs. Mark lines with `space` to start a
 custom patch; `W` diffs the selection against the mark. Merge commits show
 their diff against the first parent. If there are no changed files, the view
 says so; if commit files cannot be read, it reports that state. `E` edits

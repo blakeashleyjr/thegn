@@ -120,3 +120,16 @@ response for work that did not occur.
 - **WHEN** a plugin sends an `io` request (network or command)
 - **THEN** it receives an `unsupported` RPC error that names the verb as
   reserved and the request performs no operation
+
+### Requirement: Unseeded host values fail explicitly
+
+The `host.value` host verb SHALL be advertised as `reserved` in the host verb
+support matrix and SHALL be refused with an `unsupported` RPC error naming it as
+reserved before dispatch, until the host seeds the values it answers. A request
+MUST NOT receive a success-shaped `null` for a value the host never provides.
+
+#### Scenario: A plugin reads a host value
+
+- **WHEN** a resident plugin sends a `host.value` request for any key
+- **THEN** it receives an `unsupported` RPC error that names the verb as
+  reserved

@@ -272,7 +272,7 @@ impl Section {
             Section::Branches => "branches",
             Section::Stash => "stash",
             Section::Mine => "mine",
-            Section::Across => "across",
+            Section::Across => "attention",
             Section::Pr => "pr",
             Section::Ci => "ci",
             Section::MergeQueue => "merge",
@@ -351,9 +351,15 @@ impl Section {
         }
     }
 
-    /// Stable id for ui_state persistence and `[panel] sections` config keys.
+    /// Stable id for ui_state persistence, keybinding ids and help contexts
+    /// (`panel:<key>`). Differs from the label for `Across`: its label is
+    /// "attention", but its id stays "across" so saved state and bindings
+    /// keep working.
     pub fn as_key(self) -> &'static str {
-        self.label()
+        match self {
+            Section::Across => "across",
+            _ => self.label(),
+        }
     }
 
     pub fn from_key(key: &str) -> Option<Section> {
@@ -361,6 +367,7 @@ impl Section {
         let key = match key {
             "prs" | "git" => "pr",
             "tasks" => "jobs",
+            "attention" => "across",
             k => k,
         };
         SECTION_ORDER.iter().copied().find(|s| s.as_key() == key)
@@ -373,6 +380,12 @@ impl Section {
 pub struct HelpPanelState {
     pub page: String,
     pub reg: Option<std::sync::Arc<thegn_core::help::HelpRegistry>>,
+    /// Query shown in the docked Help header. `searching` keeps the field
+    /// focused while the user types and browses matches.
+    pub query: String,
+    pub searching: bool,
+    pub hits: Vec<thegn_core::help::SearchHit>,
+    pub selected: usize,
 }
 
 /// Resolve `[panel] sections` into the live accordion order: config keys map
@@ -1252,6 +1265,15 @@ impl FilePreview {
     }
 }
 
+/// The tracker's full record for the open Issues detail page, fetched off-loop
+/// when `↵` opens it (`handlers::tracker::toggle_detail`). `detail` is
+/// `Err(message)` when the fetch failed.
+#[derive(Debug, Clone)]
+pub struct IssueDetailLoad {
+    pub id: String,
+    pub detail: Result<thegn_core::issue::IssueDetail, String>,
+}
+
 /// The panel's interactive state, owned by the event loop.
 ///
 /// Not `Clone`: `docs` carries an hour of telemetry history (~620 KiB), and this
@@ -1336,6 +1358,16 @@ pub struct PanelUi {
     pub issues_filter: String,
     /// Optional project/sprint ID filter for the Issues section (`f` key cycles).
     pub issues_project_filter: Option<String>,
+    /// Team-key scope for the Issues section (`T` key cycles). `None` = the
+    /// default scope (the active worktree's team, else the commonest team);
+    /// `Some("")` = every team; `Some(key)` = that team only.
+    pub issues_team: Option<String>,
+    /// Id of the issue whose detail page is open in the Issues section (`↵`
+    /// toggles). `None` = the list.
+    pub issues_detail: Option<String>,
+    /// The API fetch for `issues_detail` (description + comments). `None`
+    /// while it is in flight; a load for another id is ignored.
+    pub issues_detail_loaded: Option<IssueDetailLoad>,
     /// Row cursor within the Notifications section's list.
     pub notifications_cursor: usize,
     /// Expanded notification id in the compact inbox views.
@@ -1398,6 +1430,9 @@ impl Default for PanelUi {
             tasks_cursor: 0,
             issues_filter: String::new(),
             issues_project_filter: None,
+            issues_team: None,
+            issues_detail: None,
+            issues_detail_loaded: None,
             notifications_cursor: 0,
             notifications_expanded: None,
             notifications_show_read: false,
@@ -1902,6 +1937,12 @@ mod tests {
         assert_eq!(Section::from_key("prs"), Some(Section::Pr));
         assert_eq!(Section::from_key("git"), Some(Section::Pr));
         assert_eq!(Section::from_key("tasks"), Some(Section::Jobs));
+        // The Across section is labelled "attention"; its old "across" key
+        // still resolves, and so does the new name.
+        assert_eq!(Section::Across.label(), "attention");
+        assert_eq!(Section::Across.as_key(), "across");
+        assert_eq!(Section::from_key("attention"), Some(Section::Across));
+        assert_eq!(Section::from_key("across"), Some(Section::Across));
         assert_eq!(Section::from_key("nope"), None);
     }
 

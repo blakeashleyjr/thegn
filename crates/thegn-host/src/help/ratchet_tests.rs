@@ -574,8 +574,9 @@ fn body_mentions(body: &str, id: &str) -> bool {
 
 /// Whole-word mention of a panel section key in a page body. Not the prose
 /// ratchet's substring rule — keys like `pr`/`ci`/`db` would match inside
-/// unrelated words. `Section::as_key()` is the section's own label, so there
-/// is no chord/label fallback to add.
+/// unrelated words. `Section::as_key()` is the section's stable id (equal to its
+/// label except `Across`, labelled "attention"), so the page keeps naming the
+/// id (the compat note in `panel.md`) and there is no label fallback to add.
 fn body_mentions_panel_section(body: &str, key: &str) -> bool {
     let hay = body.to_ascii_lowercase();
     let needle = key.to_ascii_lowercase();

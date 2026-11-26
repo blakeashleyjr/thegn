@@ -41,6 +41,14 @@ Bindings SHALL layer in order — preset (IDE/vim/emacs) → user `[keybinds]` �
 - **WHEN** a workspace defines a keybind that differs from the user default
 - **THEN** the workspace binding takes effect in that workspace
 
+#### Scenario: IDE presets map file keys to palette modes
+
+- **WHEN** the `vscode` keymap preset is active
+- **THEN** `Ctrl-p` opens the command palette in file-path mode and `Ctrl-Shift-f` opens it in file-contents mode
+
+- **WHEN** the `jetbrains` keymap preset is active
+- **THEN** `Ctrl-Shift-f` opens the command palette in file-contents mode and `Ctrl-e` opens it showing recent files
+
 #### Scenario: Which-key hint for a pending sequence
 
 - **WHEN** a partial sequence has been typed

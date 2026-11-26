@@ -113,7 +113,7 @@ pub fn parse_capability_token(text: &str) -> std::result::Result<[u8; 32], Capab
         return Err(CapabilityRefusal::Malformed);
     }
     let mut secret = [0_u8; 32];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]).ok_or(CapabilityRefusal::Malformed)?;
         let low = hex_nibble(pair[1]).ok_or(CapabilityRefusal::Malformed)?;
         secret[index] = (high << 4) | low;

@@ -100,6 +100,13 @@ A worktree with no agent MUST NOT show any awaiting state (see the
 - **THEN** the row's indication changes to the seen form while keeping the same
   finished-versus-blocked distinction, and is not cleared
 
+#### Scenario: Mark unread
+
+- **WHEN** the user marks a worktree row whose indication is the seen form as unread
+- **THEN** the row returns to its filled awaiting form, ranks up in the attention
+  sort, and stays so until the tab is focused again; a row with no awaiting
+  indication is unchanged, and every marked row is flipped together
+
 #### Scenario: A plain terminal never demands attention
 
 - **WHEN** a worktree with no agent goes busy and then quiet

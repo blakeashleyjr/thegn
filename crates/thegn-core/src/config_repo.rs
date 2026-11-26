@@ -385,6 +385,19 @@ pub struct RepoOverlayParseError {
     pub selected_env: String,
 }
 
+impl std::fmt::Display for RepoOverlayParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "repo overlay {} failed to parse: {}",
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for RepoOverlayParseError {}
+
 /// Return a parse error for the selected candidate, if any.  This mirrors the
 /// tolerant loader's precedence: a malformed winner does not fall through.
 pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseError> {

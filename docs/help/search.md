@@ -2,19 +2,19 @@
 id: search
 title: Search
 order: 9
-actions: [search-pane, search-global]
+actions: [search-pane, search-global, palette-files, palette-content]
 ---
 
 # Search
 
 Four search surfaces, one habit: type, arrow, `↵`.
 
-| Key               | Searches                                      |
-| ----------------- | --------------------------------------------- |
-| `Ctrl-Alt-/`      | the **focused pane's** scrollback and history |
-| `Ctrl-/`          | **every pane** at once                        |
-| palette, `/` mode | **file contents** in the focused worktree     |
-| palette, `>` mode | **file names** — fuzzy-open a file            |
+| Key               | Searches                                  |
+| ----------------- | ----------------------------------------- |
+| `Ctrl-Alt-/`      | the **focused pane's** printed output     |
+| `Ctrl-/`          | every pane in the **active worktree**     |
+| palette, `/` mode | **file contents** in the focused worktree |
+| palette, `>` mode | **file names** — fuzzy-open a file        |
 
 ## Terminal search
 
@@ -63,13 +63,14 @@ Recent queries are kept in memory only, so they are gone after a restart.
 The active controls show as `Aa`, `ab`, `.*` and `~` chips beside the scope
 in the overlay header.
 
-`Tab` widens the scope and `Shift-Tab` narrows it, through pane, tab, worktree
-and workspace. The `profile` scope is no longer in the cycle. These scopes are
-the presets for how far a search reaches.
+`Ctrl-/` starts at the active worktree. `Tab` widens the scope and `Shift-Tab`
+narrows it, through pane, tab, worktree and workspace. Workspace covers every
+worktree in the active workspace; there is no wider scope. These scopes are the
+presets for how far a search reaches.
 
-"History" means the scrollback thegn keeps for each pane (a bounded in-memory
-ring of the lines the pane printed), not your shell history. A pane with no
-output yet shows "no history yet".
+The source is the output buffer thegn keeps for each pane: a bounded in-memory
+ring of the lines the pane printed. It is not your shell history, and it is not
+the terminal's own scrollback. A pane with no output yet shows "no output yet".
 
 `[search] max_results` caps how many hits are collected — raise it for a
 big scrollback, lower it if searching feels heavy. When the cap is reached
@@ -82,12 +83,18 @@ The [[command-palette]] handles files. `/` greps **contents** in the
 focused worktree; `>` fuzzy-matches **paths**. Both open what you pick in
 the drawer or an editor pane.
 
+The IDE presets map their file keys onto those modes. With `keymap_preset =
+"vscode"`, `Ctrl-P` opens the palette in `>` mode (go to file), and
+`Ctrl-Shift-F` opens it in `/` mode (find in path). With `"jetbrains"`,
+`Ctrl-Shift-F` is the same find in path, and `Ctrl-E` opens the palette's
+recent files. The file picker only lists paths once you type a query.
+
 Content search matches the query as literal text, ignoring case unless the
 query contains an uppercase letter. It honours `.gitignore`, includes dotfiles,
 and skips `.git`, symlinks, binary files, and files over 2 MiB.
 
-This is the one people mix up: `Ctrl-/` searches what your terminals
-_printed_, the palette's `/` searches what is _on disk_.
+This is the one people mix up: `Ctrl-/` searches what the active worktree's
+terminals _printed_, the palette's `/` searches what is _on disk_.
 
 ## Searching this help
 
@@ -99,5 +106,5 @@ you one result per mention, so you land on the right one. See [[help]].
 ## Related
 
 - [[copy-and-select]] — scrollback, selections, and registers
-- [[panel]]'s **work → across** section is search-adjacent: it surfaces
+- [[panel]]'s **work → attention** section is search-adjacent: it surfaces
   failing CI across every worktree without you asking

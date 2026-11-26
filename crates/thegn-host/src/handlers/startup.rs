@@ -188,6 +188,11 @@ fn clear_stale_raised_hands() {
                 // best-effort: the table is disposable derived state; a
                 // failed clear costs one stale hand until the next boot.
                 let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&db);
+                // Same empty registry: retire the inbox rows dead sessions or
+                // removed worktrees left behind (THE-2732).
+                if let Err(error) = db.resolve_orphan_attention(|_| false) {
+                    tracing::debug!(%error, "attention backlog sweep failed");
+                }
             }
             // best-effort: spawn: a failed spawn costs one stale hand until the next boot (cost described above)
         })

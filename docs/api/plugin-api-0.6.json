@@ -2779,9 +2779,9 @@
       "modes": [
         "resident"
       ],
-      "owner": "host value projection",
+      "owner": "THE-162 (the host seeds no host values)",
       "since": "0.2.0",
-      "state": "wired",
+      "state": "reserved",
       "verb": "host.value"
     },
     {

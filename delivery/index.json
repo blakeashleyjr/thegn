@@ -231,7 +231,7 @@
     },
     {
       "change": "add-lead-tool-surface",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -240,7 +240,7 @@
         }
       ],
       "summary": "Bird's-eye capabilities for the Lead: overview, notifications, automation authoring, approvals and merge drain.",
-      "delivered_at": "2026-11-18"
+      "archive_path": "openspec/changes/archive/2026-11-26-add-lead-tool-surface/"
     },
     {
       "change": "add-localization",
@@ -1130,6 +1130,30 @@
       "summary": "autopilot.run rule action, synthesized autopilot:<repo> rule and budgets counting autopilot and Lead manual spawns; live verification open."
     },
     {
+      "change": "gate-devcontainer-privileges",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2144",
+          "project": "Sandbox & Remote 00: Shared contracts"
+        }
+      ],
+      "summary": "Refuse devcontainer binds of container-engine sockets and thegn control/state directories outside generic mount approval."
+    },
+    {
+      "change": "harden-git-control-pins",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2147",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2147 (WS11-P3-01) pins the git control files and host-executed worktree files read-only on bwrap, OCI and systemd, in every git mode, the full fallback and remote placements; remote build and tests remain unchecked."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",
@@ -1433,6 +1457,18 @@
         }
       ],
       "summary": "Per-tab zoom renders as a pane stack with one-row bars; keyboard, mouse and narrow-width geometry share one drawn layout."
+    },
+    {
+      "change": "pin-git-alternates-read-only",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2148",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2148 (WS11-P3-02) pins objects/info/alternates and http-alternates read-only under [sandbox.git] and probes the object store at launch (alternates, symlinks in objects/, an outside commondir): sealed and sealed-tunnel refuse, other profiles warn; remote build and tests remain unchecked."
     },
     {
       "change": "preserve-config-validation-severity",
@@ -1869,6 +1905,19 @@
       "summary": "Make SSH/mosh remote workspaces and client/server mode available on the stable channel; Kubernetes placement and direct iroh stay dev-only."
     },
     {
+      "change": "sidebar-finished-pipelines-age-out",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2741",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "One Pipelines section per project, one-row lanes without the local: prefix, and finished pipelines that fold into Finished and age out of the sidebar.",
+      "delivered_at": "2026-11-25"
+    },
+    {
       "change": "sidebar-short-worktree-list",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -2048,6 +2097,19 @@
         }
       ],
       "summary": "Continuously prove staged workers can commit without escaping configured containment."
+    },
+    {
+      "change": "worktree-delete-stops-programs",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2736",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Deleting a worktree stops its pane programs before the folder goes, and refuses the main checkout and Git-locked worktrees up front.",
+      "delivered_at": "2026-11-25"
     }
   ]
 }

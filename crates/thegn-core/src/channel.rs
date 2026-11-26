@@ -96,7 +96,7 @@ pub enum Feature {
     Observe,
     /// The multi-host placement / host-as-resource engine (`[placement]`).
     Placement,
-    /// Experimental command-backed voice mode (`[voice]`).
+    /// Voice dictation (`[voice]`): stable, opt-in by config.
     Voice,
     /// Resident plugin app tabs (`AppTab` contributions, plugin ids in `[apps]`).
     PluginApps,
@@ -193,11 +193,9 @@ impl Feature {
     pub const fn stability(self) -> Stability {
         match self {
             // The confirmed experimental set for the pre-alpha.
-            Feature::Remote
-            | Feature::Providers
-            | Feature::Placement
-            | Feature::Voice
-            | Feature::Lead => Stability::Experimental,
+            Feature::Remote | Feature::Providers | Feature::Placement | Feature::Lead => {
+                Stability::Experimental
+            }
             // The sandbox + remote programme (WS00-P1-01): experimental until each
             // owner item graduates its feature.
             Feature::SandboxBackends
@@ -209,7 +207,9 @@ impl Feature {
             | Feature::AgentPresets
             | Feature::PrivateCopy
             | Feature::Escalation => Stability::Experimental,
-            Feature::Observe | Feature::PluginApps => Stability::Stable,
+            // Voice graduated (2026-11-25): shippable on stable, still opt-in
+            // via `[voice] enabled = true` and a model pull.
+            Feature::Observe | Feature::PluginApps | Feature::Voice => Stability::Stable,
         }
     }
 
@@ -257,6 +257,13 @@ mod tests {
             );
             assert!(f.allowed_in(Channel::Dev), "{f} must be allowed in dev");
         }
+    }
+
+    #[test]
+    fn voice_is_stable_but_opt_in() {
+        assert_eq!(Feature::Voice.stability(), Stability::Stable);
+        assert!(Feature::Voice.allowed_in(Channel::Stable));
+        assert!(!crate::config::Config::default().voice.enabled);
     }
 
     #[test]

@@ -31,6 +31,62 @@ pub struct Notification {
     pub worktree_path: String,
 }
 
+/// Source-ref prefix of a pipeline lane escalation: `escalation:{row}@{head7}:{token}`.
+pub const LANE_ESCALATION_PREFIX: &str = "escalation:";
+
+/// Age past which an Info row, or a non-interactive lane's attention row, is stale.
+pub const STALE_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// Whether `source_ref` names a daemon session: the raised-hand rows a session
+/// writes carry its 16-hex-digit session id as their source.
+pub fn is_session_source(source_ref: &str) -> bool {
+    source_ref.len() == 16
+        && source_ref
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl Notification {
+    /// The dispatch row of a pipeline lane escalation, parsed from its source
+    /// ref. The UI folds rows sharing a lane source into one group; `None` for
+    /// every row that a non-interactive lane did not write.
+    pub fn lane_row(&self) -> Option<i64> {
+        if self.kind != NotificationKind::AgentAttention {
+            return None;
+        }
+        let rest = self.source_ref.strip_prefix(LANE_ESCALATION_PREFIX)?;
+        let row = rest.split_once('@').map_or(rest, |(row, _)| row);
+        row.parse().ok()
+    }
+
+    /// The group key a lane row folds under (`pipeline:{row}`), or `None`.
+    pub fn group_key(&self) -> Option<String> {
+        self.lane_row().map(|row| format!("pipeline:{row}"))
+    }
+
+    /// Whether this inbox row has aged out of the active notification surface.
+    /// `now` and `created_at_ms` are Unix seconds despite the legacy field name.
+    /// Info rows age out after a day; an attention row ages out only when a
+    /// non-interactive lane wrote it, since a person's agent may still wait.
+    pub fn is_stale(&self, now: i64) -> bool {
+        if now.saturating_sub(self.created_at_ms) <= STALE_AFTER_SECS {
+            return false;
+        }
+        self.kind.default_priority() == Priority::Info || self.lane_row().is_some()
+    }
+
+    /// Whether an unread attention row lost its cause while thegn was down: its
+    /// worktree is gone, or the session that raised it is not live. The boot
+    /// sweep resolves these so an old backlog clears on upgrade.
+    pub fn orphaned(&self, worktree_gone: bool, session_live: impl Fn(&str) -> bool) -> bool {
+        if self.read || self.kind != NotificationKind::AgentAttention {
+            return false;
+        }
+        (!self.worktree_path.is_empty() && worktree_gone)
+            || (is_session_source(&self.source_ref) && !session_live(&self.source_ref))
+    }
+}
+
 /// What triggered the notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -628,6 +684,129 @@ mod tests {
         assert!(Priority::Notice.rank() > Priority::Info.rank());
         // Ord matches rank (used for >= threshold comparisons).
         assert!(Priority::Alert > Priority::Notice && Priority::Notice > Priority::Info);
+    }
+
+    fn stale_test_row(
+        kind: NotificationKind,
+        source_ref: &str,
+        message: &str,
+        at: i64,
+    ) -> Notification {
+        Notification {
+            id: 1,
+            kind,
+            source_ref: source_ref.into(),
+            message: message.into(),
+            created_at_ms: at,
+            read: false,
+            worktree_path: "/repo/wt".into(),
+        }
+    }
+
+    #[test]
+    fn info_notifications_age_out_after_one_day() {
+        let now = 200_000;
+        let row = stale_test_row(NotificationKind::WorktreeCreated, "", "ready", now - 86_400);
+        assert!(!row.is_stale(now));
+        let old = stale_test_row(NotificationKind::WorktreeCreated, "", "ready", now - 86_401);
+        assert!(old.is_stale(now));
+    }
+
+    #[test]
+    fn only_noninteractive_agent_attention_ages_out() {
+        let now = 200_000;
+        let old_interactive = stale_test_row(
+            NotificationKind::AgentAttention,
+            "0123456789abcdef",
+            "needs input",
+            now - 90_000,
+        );
+        assert!(!old_interactive.is_stale(now));
+        let old_hook = stale_test_row(
+            NotificationKind::AgentAttention,
+            "agent-hook:claude@/repo/wt",
+            "needs input",
+            now - 90_000,
+        );
+        assert!(!old_hook.is_stale(now));
+        let old_pipeline = stale_test_row(
+            NotificationKind::AgentAttention,
+            "escalation:42@abcdefg:awaiting-approval",
+            "Pipeline lane needs you: THE-1 stage plan",
+            now - 90_000,
+        );
+        assert!(old_pipeline.is_stale(now));
+        let recent_pipeline = stale_test_row(
+            NotificationKind::AgentAttention,
+            "escalation:9@abcdefg:validation-failed",
+            "Pipeline lane needs you",
+            now - 10,
+        );
+        assert!(!recent_pipeline.is_stale(now));
+    }
+
+    #[test]
+    fn other_old_notifications_are_not_stale() {
+        let old = stale_test_row(NotificationKind::AgentFailed, "run-1", "failed", 1);
+        assert!(!old.is_stale(200_000));
+    }
+
+    #[test]
+    fn lane_escalations_carry_their_group() {
+        let row = stale_test_row(
+            NotificationKind::AgentAttention,
+            "escalation:42@abcdefg:awaiting-approval",
+            "Pipeline lane needs you",
+            1,
+        );
+        assert_eq!(row.lane_row(), Some(42));
+        assert_eq!(row.group_key().as_deref(), Some("pipeline:42"));
+        let session = stale_test_row(NotificationKind::AgentAttention, "0123456789abcdef", "", 1);
+        assert_eq!(session.group_key(), None);
+        let other_kind = stale_test_row(
+            NotificationKind::AgentDone,
+            "escalation:42@abcdefg:x",
+            "",
+            1,
+        );
+        assert_eq!(other_kind.lane_row(), None);
+        let garbage = stale_test_row(NotificationKind::AgentAttention, "escalation:x@y", "", 1);
+        assert_eq!(garbage.lane_row(), None);
+    }
+
+    #[test]
+    fn session_sources_are_sixteen_hex_digits() {
+        assert!(is_session_source("0123456789abcdef"));
+        assert!(!is_session_source("0123456789ABCDEF"));
+        assert!(!is_session_source("api"));
+        assert!(!is_session_source("escalation:42@abcdefg:x"));
+    }
+
+    #[test]
+    fn orphaned_attention_is_the_rows_whose_cause_is_gone() {
+        let hand = stale_test_row(NotificationKind::AgentAttention, "0123456789abcdef", "", 1);
+        assert!(hand.orphaned(false, |_| false), "dead session");
+        assert!(!hand.orphaned(false, |_| true), "live session");
+        assert!(hand.orphaned(true, |_| true), "worktree gone");
+        let lane = stale_test_row(
+            NotificationKind::AgentAttention,
+            "escalation:4@abc:x",
+            "",
+            1,
+        );
+        assert!(
+            !lane.orphaned(false, |_| false),
+            "lane rows have no session"
+        );
+        assert!(lane.orphaned(true, |_| false));
+        let mut read = hand.clone();
+        read.read = true;
+        assert!(!read.orphaned(true, |_| false), "already resolved");
+        let done = stale_test_row(NotificationKind::AgentDone, "0123456789abcdef", "", 1);
+        assert!(!done.orphaned(true, |_| false), "only attention rows");
+        let mut global = hand.clone();
+        global.worktree_path.clear();
+        assert!(!global.orphaned(true, |_| true), "no worktree to be gone");
     }
 
     #[test]

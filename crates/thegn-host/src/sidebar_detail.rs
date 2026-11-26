@@ -300,7 +300,7 @@ fn requested_fields(
             .branch_meta
             .as_ref()
             .and_then(|meta| meta.last_subject.as_deref())
-            .filter(|subject| !subject.is_empty())
+            .filter(|subject| !subject.is_empty() && !row.hide_subject)
             .map(|subject| Field::new(id, vec![seg(Tok::Slot(S::Dim), display_cell(subject))], 8))
             .into_iter()
             .collect(),

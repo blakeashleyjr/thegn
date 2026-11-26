@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.138`). **x86_64 Linux and macOS on
+> **Status: public alpha** (`0.1.0-alpha.139`). **x86_64 Linux and macOS on
 > Apple silicon are supported;** on macOS install with `brew install blakeashleyjr/thegn/thegn`,
 > the release tarball (see [Install](#install)), the flake, or a source build. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and
@@ -639,11 +639,12 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - the other cloud execution providers (Fly, DigitalOcean, Hetzner, Machine0,
   Daytona) and the managed pool (`thegn fleet` covers Sprites and Vercel
   only),
-- the placement engine,
-- voice mode.
+- the placement engine.
 
-Observe dashboards (off until you set `[observe] enabled = true`) and plugin
-app tabs are part of the stable channel.
+Observe dashboards (off until you set `[observe] enabled = true`), plugin
+app tabs, and voice dictation (off until you run `thegn voice setup` or set
+`[voice] enabled = true`; native engine in the Nix package and the macOS Apple
+silicon release, not in the Linux/musl tarballs) are part of the stable channel.
 
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
 (`nix run github:blakeashleyjr/thegn#dev` / `nix profile install
@@ -704,6 +705,15 @@ Please report vulnerabilities **privately** — see
 [`SECURITY.md`](SECURITY.md) for the process. Reports about sandbox escape,
 credential leakage between worktrees, or command injection through untrusted
 repo content are especially valued.
+
+## Acknowledgments
+
+thegn stands on a lot of other people's work: termwiz and wezterm,
+alacritty_terminal, tokio, gix, SQLite, tree-sitter, whisper.cpp and many more,
+with ideas borrowed from zellij, tmux, Zed, Jujutsu and others. The
+[acknowledgments help page](docs/help/acknowledgments.md) (press `F1`) says
+who and why; [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists every
+dependency and its licence.
 
 ## License
 

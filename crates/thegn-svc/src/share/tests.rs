@@ -591,7 +591,13 @@ fn share_state_identity_preserves_non_utf8_path_bytes() {
     let base = temp.path().join("state");
     let non_utf8 = temp.path().join(std::ffi::OsStr::from_bytes(b"wt-\xff"));
     let replacement = temp.path().join("wt--");
-    std::fs::create_dir(&non_utf8).expect("non-UTF-8 worktree");
+    match std::fs::create_dir(&non_utf8) {
+        Ok(()) => {}
+        // APFS (macOS) only stores valid UTF-8 names and rejects these bytes with
+        // EILSEQ; there is no such path to preserve there, so the case cannot arise.
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+        Err(error) => panic!("non-UTF-8 worktree: {error}"),
+    }
     std::fs::create_dir(&replacement).expect("replacement worktree");
     let actual =
         share_state_dir_at(&base, &non_utf8, "bore", 3000, 1).expect("non-UTF-8 share identity");

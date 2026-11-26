@@ -134,9 +134,11 @@ fn oci_parsers_reject_blank_records_as_malformed() {
 #[test]
 fn mount_source_matching_is_canonical_and_path_component_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("worktree");
+    // The caller passes a canonical target; a macOS temp root is not one.
+    let base = dir.path().canonicalize().unwrap();
+    let target = base.join("worktree");
     let nested = target.join("nested");
-    let sibling = dir.path().join("worktree-copy");
+    let sibling = base.join("worktree-copy");
     std::fs::create_dir(&target).unwrap();
     std::fs::create_dir(&nested).unwrap();
     std::fs::create_dir(&sibling).unwrap();
@@ -153,7 +155,7 @@ fn mount_source_matching_is_canonical_and_path_component_bounded() {
     ));
     #[cfg(unix)]
     {
-        let link = dir.path().join("nested-link");
+        let link = base.join("nested-link");
         std::os::unix::fs::symlink(&nested, &link).unwrap();
         assert!(mount_source_may_own(&link, &target));
     }

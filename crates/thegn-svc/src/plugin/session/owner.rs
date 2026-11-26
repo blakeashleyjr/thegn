@@ -351,11 +351,14 @@ async fn cleanup(
     let deadline = shared.closing().expect("closing latch").1;
     // EOF frequently precedes the kernel's exit notification by a few cycles.
     // A short closing-only grace preserves the child's actual status; it cannot
-    // turn an inherited-pipe hang into an unbounded wait.
+    // turn an inherited-pipe hang into an unbounded wait. The grace is sized
+    // for a loaded host: on macOS the exit notice is a SIGCHLD delivered
+    // through the signal driver, and 20 ms there regularly lost a crashing
+    // plugin's exit code to our own termination signal.
     if reason == CloseReason::StdoutClosed {
         drop(
             tokio::time::timeout_at(
-                (Instant::now() + Duration::from_millis(20)).min(deadline),
+                (Instant::now() + Duration::from_millis(250)).min(deadline),
                 process.leader.wait_ready(),
             )
             .await,

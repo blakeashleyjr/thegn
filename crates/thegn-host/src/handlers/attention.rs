@@ -110,9 +110,10 @@ pub(crate) fn needs_user_out_of_scope(model: &FrameModel) -> Vec<(String, Attent
     )
 }
 
-/// Everything the single `✋` statusbar chip and the unified popup's top groups
-/// are built from — **one** rollup so the chip's count is exactly the number
-/// of rows the popup's "Needs you" + "Alerts" groups show, and the two can't
+/// Everything the single `✋` statusbar chip and the unified popup's live groups
+/// are built from — **one** rollup so the chip's count is exactly the number of
+/// live needs-you + alert items the popup shows (anything older than a day
+/// folds into its "Older" group and is not counted), and the two can't
 /// drift (they used to be two badges fed by two predicates: a failed pane lit
 /// both a `⚑` inbox flag and the `✋` hand for the same event).
 #[derive(Debug, Default)]
@@ -148,19 +149,29 @@ impl AttentionRollup<'_> {
 
 /// Build the [`AttentionRollup`] over the hydrated model. Pure.
 pub(crate) fn rollup(model: &FrameModel) -> AttentionRollup<'_> {
+    use crate::detail::notif_tree::is_stale;
     use thegn_core::notification::Priority;
-    let needs = needs_user_ordered(model);
-    let out_of_scope = needs_user_out_of_scope(model);
-    let covered: std::collections::HashSet<&str> = needs
+    let now = thegn_core::util::now();
+    let mut needs = needs_user_ordered(model);
+    let mut out_of_scope = needs_user_out_of_scope(model);
+    // Stale items still cover their worktree (so a raw alert is not
+    // double-listed) but never count: the chip is for what needs you *now*,
+    // and the overlay folds anything older than a day into "Older".
+    let covered: std::collections::HashSet<String> = needs
         .iter()
         .chain(out_of_scope.iter())
-        .map(|(p, _)| p.as_str())
+        .map(|(p, _)| p.clone())
         .collect();
+    needs.retain(|(_, s)| !is_stale(s.since, now));
+    out_of_scope.retain(|(_, s)| !is_stale(s.since, now));
     let mut alerts = Vec::new();
     let mut notices = 0;
     for n in model.panel.notifications.iter().filter(|n| !n.read) {
         if n.source_ref == "log:thegn" {
             continue; // self-diagnostics: the Logs group, never the chip
+        }
+        if is_stale(Some(n.created_at_ms), now) {
+            continue;
         }
         match model.panel.priority_of(n.kind) {
             Priority::Alert => {
@@ -503,7 +514,7 @@ mod tests {
                 kind: thegn_core::notification::NotificationKind::Assigned,
                 source_ref: "THE-1".into(),
                 message: "assigned".into(),
-                created_at_ms: 1,
+                created_at_ms: thegn_core::util::now(),
                 read: false,
                 worktree_path: String::new(),
             });

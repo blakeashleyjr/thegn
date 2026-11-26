@@ -632,6 +632,11 @@ pub struct SandboxSpec {
     /// Added by WS00-P1-03 and always `None` until WS04-P2-08 sets it (and
     /// fingerprints it, policy fingerprint v3, when it first does).
     pub egress: Option<crate::egress::plan::EgressPlan>,
+    /// A sealed launch's object-store refusal from
+    /// `sandbox_floor::git_integrity_gate` (alternates, symlinks in
+    /// `objects/`, or an outside `commondir`); surfaced by `home_gate` so the
+    /// existing refusal channel stops the launch before any host spawn.
+    pub git_integrity_refusal: Option<String>,
 }
 
 /// An inert spec for tests and struct-update syntax (WS00-P1-02; the spec's
@@ -683,6 +688,7 @@ impl Default for SandboxSpec {
             hidden_paths: Vec::new(),
             volume_owners: Vec::new(),
             egress: None,
+            git_integrity_refusal: None,
         }
     }
 }
@@ -1770,22 +1776,74 @@ pub fn set_merge_target_lookup(lookup: MergeTargetLookup) {
 
 /// What the git mount plan needs to know about a local linked worktree.
 #[derive(Debug, Clone, Default)]
-struct GitProbe {
+pub(crate) struct GitProbe {
     /// The git common dir (`<repo>/.git`).
-    common: PathBuf,
+    pub(crate) common: PathBuf,
     /// The worktree's own git dir (`<common>/worktrees/<name>`), when linked.
-    admin: Option<PathBuf>,
+    pub(crate) admin: Option<PathBuf>,
     /// The checked-out branch (`None` when detached).
-    branch: Option<String>,
+    pub(crate) branch: Option<String>,
     /// The merge target (`auto` resolved to the default branch), when known.
-    target: Option<String>,
+    pub(crate) target: Option<String>,
     /// The repository's default branch, when known (never `HEAD`).
-    default: Option<String>,
+    pub(crate) default: Option<String>,
+    /// `objects/info/alternates` lists at least one non-comment path (read
+    /// before the read-only pin creates the file empty).
+    pub(crate) alternates_nonempty: bool,
+    /// The borrowed object directories named by `objects/info/alternates`.
+    pub(crate) alternates: Vec<String>,
+    /// An entry directly under `<common>/objects` is a symlink.
+    pub(crate) objects_symlinks: bool,
+    /// `<admin>/commondir` resolves outside the common dir.
+    pub(crate) commondir_outside: bool,
     /// The host's effective commit identity for this repo (validated), handed
     /// to the sandbox as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`: the shared
     /// `.git/config` is read-only under `[sandbox.git]` and the global
     /// gitconfig may be unreachable from the sandbox `$HOME`.
-    identity: crate::git_identity::GitIdentity,
+    pub(crate) identity: crate::git_identity::GitIdentity,
+}
+
+/// Object-store integrity facts for `probe_git`: the borrowed alternates
+/// paths, whether `objects/` is or holds a symlink, and whether `commondir`
+/// points outside the common dir. A few `read`/`stat` calls, no git
+/// subprocess.
+fn probe_object_store(
+    common: &std::path::Path,
+    admin: Option<&std::path::Path>,
+) -> (Vec<String>, bool, bool) {
+    let alternates: Vec<String> = std::fs::read_to_string(common.join("objects/info/alternates"))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let objects = common.join("objects");
+    let objects_symlinks = std::fs::symlink_metadata(&objects).is_ok_and(|m| m.is_symlink())
+        || std::fs::read_dir(&objects).is_ok_and(|rd| {
+            rd.flatten()
+                .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        });
+    // `common` is what git itself resolved from this very `commondir`, so it
+    // cannot tell a redirected file apart. The anchor is where the admin dir
+    // lives: a linked worktree's admin dir is `<common>/worktrees/<name>`.
+    let commondir_outside = admin.is_some_and(|admin| {
+        let Ok(text) = std::fs::read_to_string(admin.join("commondir")) else {
+            return false;
+        };
+        let Ok(target) = admin.join(text.trim()).canonicalize() else {
+            return false;
+        };
+        let own = admin
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+            .and_then(std::path::Path::parent)
+            .and_then(|p| p.canonicalize().ok());
+        own.is_none_or(|own| own != target) || common.canonicalize().is_ok_and(|c| c != target)
+    });
+    (alternates, objects_symlinks, commondir_outside)
 }
 
 /// How long a resolved per-repo identity is reused before git is asked again.
@@ -1843,12 +1901,18 @@ fn probe_git(loc: &GitLoc, worktree: &std::path::Path, common: &std::path::Path)
         .filter(|t| !t.is_empty() && t != "auto")
         .or_else(|| default.clone());
     let identity = cached_git_identity(repo_root, &|args| loc.git_out(args));
+    let (alternates, objects_symlinks, commondir_outside) =
+        probe_object_store(common, admin.as_deref());
     GitProbe {
         common: common.to_path_buf(),
         admin,
         branch,
         target,
         default,
+        alternates_nonempty: !alternates.is_empty(),
+        alternates,
+        objects_symlinks,
+        commondir_outside,
         identity,
     }
 }
@@ -1877,18 +1941,131 @@ fn path_mount(path: &std::path::Path, ro: bool) -> Mount {
     }
 }
 
+/// Filesystem facts for one git control pin target (never following
+/// symlinks); `None` when the path does not exist.
+fn pin_target_facts(
+    path: &std::path::Path,
+    common: &std::path::Path,
+) -> Option<crate::config_sandbox::git_policy::PinTargetFacts> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let inside_common = match (std::fs::canonicalize(path), std::fs::canonicalize(common)) {
+        (Ok(p), Ok(c)) => p.starts_with(c),
+        _ => false,
+    };
+    Some(crate::config_sandbox::git_policy::PinTargetFacts {
+        directory: meta.file_type().is_dir(),
+        regular_file: meta.file_type().is_file(),
+        symlink: meta.file_type().is_symlink(),
+        inside_common,
+    })
+}
+
 /// Today's (pre-THE-2009) binds: the worktree and the common dir read-write,
-/// with the shared `.git/config` pinned read-only on top.
-fn legacy_git_mounts(worktree: &std::path::Path, common: Option<&std::path::Path>) -> Vec<Mount> {
+/// with the git control files (`hooks`, `config`, `info`, the gitfile, and the
+/// per-worktree `commondir`, `gitdir`, `config.worktree`) pinned read-only on
+/// top, so no mode or placement leaves them writable (THE-2147).
+///
+/// `verify` is true for a local worktree: pin targets are checked without
+/// following symlinks and a missing `hooks`/`info` directory or linked-worktree
+/// `config.worktree` is created; an unsafe or uncreatable target fails closed
+/// by binding the whole common dir read-only. For a remote placement the paths
+/// are the remote's and cannot be checked here, so every pin is emitted as is
+/// (the caller drops the ones the remote reports absent).
+fn legacy_git_mounts(
+    worktree: &std::path::Path,
+    common: Option<&std::path::Path>,
+    admin: Option<&std::path::Path>,
+    verify: bool,
+) -> Vec<Mount> {
     let mut mounts = vec![path_mount(worktree, false)];
-    if let Some(gc) = common {
-        mounts.push(path_mount(gc, false));
-        let config = gc.join("config");
-        if config.exists() {
-            mounts.push(path_mount(&config, true));
+    let Some(gc) = common else {
+        return mounts;
+    };
+    let common_index = mounts.len();
+    mounts.push(path_mount(gc, false));
+    let admin = admin.unwrap_or(gc);
+    for pin in crate::config_sandbox::git_policy::control_pins(gc, admin, worktree) {
+        if !verify {
+            mounts.push(path_mount(&pin, true));
+            continue;
+        }
+        let mut facts = pin_target_facts(&pin, gc);
+        let name = pin.file_name().and_then(|n| n.to_str());
+        // Under the writable common dir a missing `hooks`/`info` or
+        // `config.worktree` could be planted by the sandbox, so create it
+        // (`config.worktree` only in a real linked-worktree admin dir, never
+        // in the main git dir); if that fails, fail closed below.
+        let creatable = match name {
+            Some("hooks" | "info") => pin.parent() == Some(gc),
+            Some("config.worktree") => {
+                pin.parent() == Some(admin)
+                    && admin != gc
+                    && std::fs::symlink_metadata(admin.join("commondir"))
+                        .is_ok_and(|m| m.file_type().is_file())
+            }
+            _ => false,
+        };
+        if facts.is_none() && creatable {
+            let created = if name == Some("config.worktree") {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&pin)
+                    .map(drop)
+            } else {
+                std::fs::create_dir(&pin)
+            };
+            if created.is_ok() {
+                facts = pin_target_facts(&pin, gc);
+            }
+            if facts.is_none() {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    path = %pin.display(),
+                    "git control path could not be created; shared .git mounted read-only"
+                );
+                mounts[common_index].ro = true;
+                continue;
+            }
+        }
+        let Some(facts) = facts else { continue };
+        if crate::config_sandbox::git_policy::pin_target_ok(&pin, gc, facts) {
+            mounts.push(path_mount(&pin, true));
+        } else {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                path = %pin.display(),
+                "git control path is not a real file or directory; shared .git mounted read-only"
+            );
+            mounts[common_index].ro = true;
         }
     }
     mounts
+}
+
+/// Read-only pins for the worktree files the host later executes (`.claude/`,
+/// `.mcp.json`, `.envrc`, `.vscode/tasks.json`), for profile `standard` and
+/// above. Only entries that exist at launch are pinned. Emit these AFTER the
+/// worktree bind so the sub-path override wins.
+fn host_exec_mounts(worktree: &std::path::Path, profile: SandboxProfile) -> Vec<Mount> {
+    if profile == SandboxProfile::Open {
+        return Vec::new();
+    }
+    crate::host_exec_paths::existing_host_exec_pins(
+        worktree,
+        |path| match std::fs::symlink_metadata(path) {
+            Ok(meta) => crate::host_exec_paths::HostExecPathFacts {
+                exists: true,
+                directory: meta.file_type().is_dir(),
+                regular_file: meta.file_type().is_file(),
+                symlink: meta.file_type().is_symlink(),
+            },
+            Err(_) => crate::host_exec_paths::HostExecPathFacts::default(),
+        },
+    )
+    .iter()
+    .map(|path| path_mount(path, true))
+    .collect()
 }
 
 /// Empty directory kept inside each writable `refs/heads/<parent>/` and
@@ -1899,8 +2076,8 @@ pub(crate) const GIT_CARVE_KEEP_DIR: &str = ".thegn-keep";
 /// The worktree + git common-dir binds for a LOCAL worktree under `git`
 /// (THE-2009/THE-2021), plus the warning to log when the plan fell back.
 ///
-/// Order: the worktree, the common dir read-only, the writable carve-outs, the
-/// shared `config` pin, then the `ro_after` re-pins (bwrap applies binds in
+/// Order: the worktree, the common dir read-only, the writable carve-outs,
+/// then the `ro_after` re-pins (git control files, alternates; bwrap applies binds in
 /// argument order). Missing carve-out dirs are created first (best-effort);
 /// a carve-out or re-pin whose source still does not exist is dropped (a
 /// dropped carve-out only removes write access). When the branch cannot be
@@ -1952,7 +2129,7 @@ fn git_policy_mounts(
         Ok(plan) => (plan, None),
         Err(reason) if structural.is_some() && git.mode == SandboxGitMode::Full => {
             return (
-                legacy_git_mounts(worktree, Some(common)),
+                legacy_git_mounts(worktree, Some(common), probe.admin.as_deref(), true),
                 Some(format!(
                     "{reason}; mode = \"full\" keeps the shared .git read-write"
                 )),
@@ -2004,16 +2181,27 @@ fn git_policy_mounts(
             .filter(|p| p.exists())
             .map(|p| path_mount(p, false)),
     );
-    let config = common.join("config");
-    if config.exists() {
-        mounts.push(path_mount(&config, true));
-    }
+    let mut unsafe_admin = false;
     for path in &plan.ro_after {
+        // Pins directly in the common dir (`hooks`, `config`, `info`) sit
+        // under its read-only bind, so a missing one cannot be planted from
+        // the sandbox; never create them (a `hooks`/`info` FILE would break
+        // host git). Other pins are created so their pin applies; the
+        // alternates parent too: a repo without `objects/info/` would
+        // otherwise leave the sandbox free to create the file under the
+        // writable `objects/` (THE-2148).
         if !path.exists()
-            && let Err(error) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            && path.parent() != Some(common)
+            && let Err(error) = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .map(drop)
+                })
         {
             tracing::warn!(
                 target: "thegn::sandbox",
@@ -2024,9 +2212,40 @@ fn git_policy_mounts(
         }
         // A main checkout's `<worktree>/.git` IS the common dir, already
         // bound read-only above.
-        if path.exists() && path.as_path() != common {
+        if path.as_path() == common {
+            continue;
+        }
+        if let Some(facts) = pin_target_facts(path, common) {
+            let control = matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(
+                    "hooks"
+                        | "info"
+                        | "config"
+                        | "config.worktree"
+                        | "commondir"
+                        | "gitdir"
+                        | ".git"
+                )
+            );
+            if control && !crate::config_sandbox::git_policy::pin_target_ok(path, common, facts) {
+                // Fail closed: a symlinked control file could redirect the pin
+                // elsewhere. Everything under the read-only common dir is safe;
+                // the writable admin dir is not, so drop its carve-out.
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    path = %path.display(),
+                    "git control path is not a real file or directory; git dir read-only for this launch"
+                );
+                unsafe_admin = true;
+                continue;
+            }
             mounts.push(path_mount(path, true));
         }
+    }
+    if unsafe_admin && let Some(admin) = &probe.admin {
+        let admin = admin.to_string_lossy();
+        mounts.retain(|m| m.ro || m.dest != admin);
     }
     (mounts, warning)
 }
@@ -2240,17 +2459,56 @@ fn resolve_placed_with(
     // The probe's host commit identity, carried to the env assembly below.
     let probed_identity: std::cell::RefCell<Option<crate::git_identity::GitIdentity>> =
         std::cell::RefCell::new(None);
-    let add_worktree_mounts = |mounts: &mut Vec<Mount>| match &git_common {
-        Some(gc) if git_policy_applies => {
-            let probe = probe_git(loc, &worktree, gc);
-            probed_identity.replace(Some(probe.identity.clone()));
-            let (git_mounts, warning) = git_policy_mounts(&cfg.git, &worktree, &probe);
-            if let Some(reason) = warning {
-                warn_git_fallback_once(&loc.path(), &reason);
+    let probed_git: std::cell::RefCell<Option<GitProbe>> = std::cell::RefCell::new(None);
+    let add_worktree_mounts = |mounts: &mut Vec<Mount>| {
+        match &git_common {
+            Some(gc) if git_policy_applies => {
+                let probe = probe_git(loc, &worktree, gc);
+                probed_identity.replace(Some(probe.identity.clone()));
+                probed_git.replace(Some(probe.clone()));
+                let (git_mounts, warning) = git_policy_mounts(&cfg.git, &worktree, &probe);
+                if let Some(reason) = warning {
+                    warn_git_fallback_once(&loc.path(), &reason);
+                }
+                mounts.extend(git_mounts);
             }
-            mounts.extend(git_mounts);
+            gc => {
+                let admin = gc.as_deref().and_then(|common| {
+                    loc.git_out_path(&["rev-parse", "--path-format=absolute", "--git-dir"])
+                        .ok()
+                        .filter(|p| p.as_path() != common)
+                });
+                let mut git_mounts =
+                    legacy_git_mounts(&worktree, gc.as_deref(), admin.as_deref(), !loc.is_remote());
+                // A bind of a missing source aborts the remote launch, and
+                // `info/` and `config.worktree` are often absent: drop a pin
+                // the remote reports absent (a read error keeps it, failing
+                // closed). `hooks` is not probed: `--git-path hooks` follows
+                // `core.hooksPath`, and git's templates create it.
+                if loc.is_remote()
+                    && let Some(common) = gc.as_deref()
+                {
+                    let mut absent = Vec::new();
+                    if matches!(loc.read_git_path_checked("info"), Ok(None)) {
+                        absent.push(common.join("info"));
+                    }
+                    if let Some(admin) = &admin
+                        && matches!(loc.read_git_path_checked("config.worktree"), Ok(None))
+                    {
+                        absent.push(admin.join("config.worktree"));
+                    }
+                    git_mounts.retain(|m| {
+                        !m.ro || !absent.iter().any(|p| p.as_os_str() == m.dest.as_str())
+                    });
+                }
+                mounts.extend(git_mounts);
+            }
         }
-        gc => mounts.extend(legacy_git_mounts(&worktree, gc.as_deref())),
+        // THE-2147: files the host later executes from the worktree, pinned
+        // after the worktree bind (local worktrees, profile standard and up).
+        if !loc.is_remote() {
+            mounts.extend(host_exec_mounts(&worktree, profile));
+        }
     };
     // Inject host toolchain paths (dotfiles, $HOME, /nix/store, etc.) so the
     // user's real shell, starship, and configs work identically in the sandbox.
@@ -2636,7 +2894,17 @@ fn resolve_placed_with(
         hidden_paths,
         // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
         egress: None,
+        git_integrity_refusal: None,
     };
+    if let Some(probe) = probed_git.take()
+        && let Some(miss) = crate::sandbox_floor::git_integrity_gate(&spec, &probe)
+    {
+        if spec.seal_home.is_some() {
+            spec.git_integrity_refusal = Some(miss);
+        } else {
+            warn_git_fallback_once(&loc.path(), &miss);
+        }
+    }
     if abi_ok && nix_daemon && !add_nix_daemon_access(&mut spec) {
         // Only nag when explicitly requested; the auto backstop stays silent.
         msg::warn(
@@ -4295,17 +4563,71 @@ fn systemd_mount_props_with_carveouts(
             )?);
         }
     }
-    // systemd does not consume read-only mounts generally; preserve the
-    // special shared .git/config protection used by this backend.
-    for m in &spec.mounts {
-        if m.ro && m.dest.ends_with("/config") {
-            props.push(crate::sandbox_mounts::systemd_path_property(
-                "ReadOnlyPaths",
-                &m.dest,
-            )?);
+    // systemd does not consume read-only mounts generally. Emit
+    // `ReadOnlyPaths=` for every git control pin and host-executed worktree
+    // pin, and, for a read-only common dir (e.g. a repo outside `$HOME`, which
+    // `ProtectHome=` never covers), `ReadOnlyPaths=<common>` plus
+    // `ReadWritePaths=` for exactly the policy's writable carve-outs below it
+    // (the more specific path wins). THE-2147.
+    let ro_dest = |dest: &str| spec.mounts.iter().any(|m| m.ro && m.dest == dest);
+    for m in spec.mounts.iter().filter(|m| m.ro) {
+        let is_common =
+            ro_dest(&format!("{}/hooks", m.dest)) || ro_dest(&format!("{}/config", m.dest));
+        if is_git_control_pin(&m.dest) || is_host_exec_pin(&spec.worktree, &m.dest) || is_common {
+            push_unique(
+                &mut props,
+                crate::sandbox_mounts::systemd_path_property("ReadOnlyPaths", &m.dest)?,
+            );
+        }
+        if is_common {
+            let prefix = format!("{}/", m.dest);
+            for rw in spec
+                .mounts
+                .iter()
+                .filter(|r| !r.ro && r.dest.starts_with(&prefix))
+            {
+                push_unique(
+                    &mut props,
+                    crate::sandbox_mounts::systemd_path_property("ReadWritePaths", &rw.dest)?,
+                );
+            }
         }
     }
     Ok(props)
+}
+
+fn push_unique(props: &mut Vec<String>, prop: String) {
+    if !props.contains(&prop) {
+        props.push(prop);
+    }
+}
+
+/// A mount destination whose last component is a git control path pinned
+/// read-only by the git write policy.
+fn is_git_control_pin(dest: &str) -> bool {
+    matches!(
+        std::path::Path::new(dest)
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some(
+            "hooks"
+                | "config"
+                | "info"
+                | "config.worktree"
+                | "commondir"
+                | "gitdir"
+                | ".git"
+                | "alternates"
+                | "http-alternates"
+        )
+    )
+}
+
+/// A mount destination that is one of the host-executed worktree files.
+fn is_host_exec_pin(worktree: &std::path::Path, dest: &str) -> bool {
+    crate::host_exec_paths::HOST_EXECUTED_WORKTREE_PATHS
+        .iter()
+        .any(|rel| worktree.join(rel.trim_end_matches('/')) == std::path::Path::new(dest))
 }
 
 fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {

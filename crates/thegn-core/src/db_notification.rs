@@ -1164,6 +1164,33 @@ impl Db {
             &transition.worktree_path,
         )
     }
+
+    /// One-time boot sweep (THE-2732): mark read every unread `agent_attention`
+    /// row whose cause went away while thegn was down, so an old backlog clears
+    /// on upgrade. A row's worktree counts as gone only when no worktree row
+    /// is registered for the path and the directory is missing, so a remote
+    /// worktree with no local tree keeps its rows. `session_live` decides the
+    /// session-raised rows; a boot with an empty session map passes `|_| false`.
+    /// Blocking: call it off the render loop. Returns how many rows resolved.
+    pub fn resolve_orphan_attention(&self, session_live: impl Fn(&str) -> bool) -> Result<usize> {
+        use crate::store::WorkspaceStore;
+        let registered: std::collections::HashSet<String> =
+            self.worktrees()?.into_iter().map(|w| w.worktree).collect();
+        let mut resolved = 0;
+        for n in self.get_unread_notifications()? {
+            if n.kind != crate::notification::NotificationKind::AgentAttention {
+                continue;
+            }
+            let gone = !n.worktree_path.is_empty()
+                && !registered.contains(&n.worktree_path)
+                && !std::path::Path::new(&n.worktree_path).exists();
+            if n.orphaned(gone, &session_live) {
+                self.mark_notification_read(n.id)?;
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
 }
 
 /// The explicit column list every `AgentDispatch` read selects, paired with

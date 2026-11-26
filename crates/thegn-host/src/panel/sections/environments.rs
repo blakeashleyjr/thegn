@@ -143,8 +143,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let env = &envs[cursor];
         let detail_w = ctx.cols.saturating_sub(list_w + 2);
         let mut detail = Vec::new();
+        let label_w = label_width(env);
         for (label, value) in &env.detail {
-            let prefix = format!("  {label:<9}");
+            let prefix = format!("  {label:<label_w$}");
             let value_width = detail_w.saturating_sub(prefix.chars().count()).max(1);
             let wrapped = wrap_text(&display_cell(value), value_width);
             for (line_index, line) in wrapped.iter().enumerate() {
@@ -154,7 +155,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                         if line_index == 0 {
                             prefix.clone()
                         } else {
-                            "           ".to_string()
+                            " ".repeat(label_w + 2)
                         },
                     ),
                     seg(g(), display_clip(line, value_width)),
@@ -175,12 +176,6 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             cursor,
             ctx.model.panel.environments_error.is_some(),
         ));
-        if let Some(toolchain) = &ctx.model.panel.toolchain {
-            rows.push(PanelRow::plain(Line::segs(vec![seg(
-                d(),
-                format!("WORKTREE TOOLCHAIN  {}", toolchain_label(toolchain)),
-            )])));
-        }
         return rows;
     }
     // Each env row carries a `Row` hit so the enumerate index lines up with
@@ -225,12 +220,6 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ctx.ui.cursor,
         ctx.model.panel.environments_error.is_some(),
     ));
-    if let Some(toolchain) = &ctx.model.panel.toolchain {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(
-            d(),
-            format!("WORKTREE TOOLCHAIN  {}", toolchain_label(toolchain)),
-        )])));
-    }
     rows
 }
 
@@ -240,27 +229,48 @@ fn environment_hints(envs: &[EnvSnapshot], cursor: usize, unreadable: bool) -> P
         "bind unavailable"
     } else {
         selected
-            .map(|env| if env.bound { "bound" } else { "rebind here" })
-            .unwrap_or("rebind here")
+            .map(|env| {
+                if env.bound {
+                    "bound here"
+                } else {
+                    "use for this worktree"
+                }
+            })
+            .unwrap_or("use for this worktree")
     };
     let mut hints = vec![("enter", enter_hint)];
     if selected.is_some_and(|env| env.placement == "provider") {
-        hints.push(("t", "test"));
+        hints.push(("t", "test token"));
     }
     if crate::env_ui::pull_available(envs, cursor) {
-        hints.push(("p", "pull"));
+        hints.push(("p", "pull results"));
     }
-    hints.extend([("x", "remove"), ("n", "new…")]);
+    hints.extend([("x", "remove env"), ("n", "new env…")]);
     hint_row(&hints)
 }
 
+/// Label column width: the longest label plus a two-space gutter, so values
+/// never butt against their label.
+fn label_width(env: &EnvSnapshot) -> usize {
+    env.detail
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2
+}
+
 fn detail_rows(env: &EnvSnapshot, width: usize) -> Vec<PanelRow> {
+    let label_w = label_width(env);
     env.detail
         .iter()
         .map(|(label, value)| {
             PanelRow::plain(Line::segs(vec![
-                seg(g(), format!("  {label:<9}")),
-                seg(g(), display_clip(value, width.saturating_sub(13).max(1))),
+                seg(g(), format!("  {label:<label_w$}")),
+                seg(
+                    g(),
+                    display_clip(value, width.saturating_sub(label_w + 4).max(1)),
+                ),
             ]))
         })
         .collect()
@@ -509,6 +519,42 @@ mod tests {
                 assert!(row.hit.is_none());
             }
         }
+    }
+
+    #[test]
+    fn detail_labels_are_separated_from_values_and_no_toolchain_line() {
+        let mut e = env("sp", "x");
+        e.detail = vec![
+            ("placement".into(), "provider".into()),
+            ("provider".into(), "sprites".into()),
+            ("last check".into(), "not recorded".into()),
+        ];
+        let mut model = frame(vec![e]);
+        model.panel.toolchain = Some(Default::default());
+        let ui = PanelUi {
+            open: Section::Environments,
+            width: PanelWidth::Half,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 20,
+        };
+        let text: Vec<String> = content(&ctx).iter().map(row_text).collect();
+        assert!(
+            text.iter().any(|t| t == "  placement   provider"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t == "  last check  not recorded"),
+            "{text:?}"
+        );
+        assert!(
+            !text.iter().any(|t| t.contains("WORKTREE TOOLCHAIN")),
+            "{text:?}"
+        );
     }
 
     #[test]

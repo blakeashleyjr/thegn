@@ -377,19 +377,32 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test reaps the sleep child it parked inside the fixture repo"
+    )]
     fn a_process_cwd_inside_the_worktree_is_reported() {
-        // This test process's own cwd is inside the tree being probed.
-        let cwd = std::env::current_dir().unwrap();
+        // A child parked inside a private repository stands in for a shell left
+        // open in the worktree. The ambient checkout is not used: a test host's
+        // copy of the source may have no `.git` or no `main` ref.
+        let main = repo();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(main.path())
+            .spawn()
+            .unwrap();
         let f = facts_for(
-            cwd.to_str().unwrap(),
+            main.path().to_str().unwrap(),
             "",
             "main",
             Path::new("/nonexistent"),
             false,
-        )
-        .unwrap();
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let f = f.unwrap();
         if cfg!(target_os = "linux") {
-            assert!(f.live_cwd_pids.contains(&std::process::id()));
+            assert!(f.live_cwd_pids.contains(&child.id()));
         }
         assert!(f.branch.is_none());
     }

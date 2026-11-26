@@ -67,7 +67,8 @@ pub(crate) struct Facts {
     pub agents: Vec<AgentOption>,
     /// `[lead] agent` as written in the user config file.
     pub file_agent: Option<String>,
-    /// `[lead] network = "host"` as written in the user config file.
+    /// `[lead] network = "host"` as written in the user config file. The Lead
+    /// refuses it, so the flow rewrites it to `isolated`.
     pub file_host_network: bool,
     /// `[daemon] enabled = true` as written in the user config file.
     pub daemon_enabled: bool,
@@ -88,8 +89,6 @@ pub(crate) struct Facts {
 pub(crate) struct Plan {
     /// The chosen `[lead] agent` (empty until picked).
     pub agent: String,
-    /// Use `[lead] network = "host"` (no pasta).
-    pub host_network: bool,
     /// The daemon stop was already issued in this run.
     pub restarted: bool,
 }
@@ -99,28 +98,18 @@ impl Plan {
     pub(crate) fn from_facts(f: &Facts) -> Self {
         Plan {
             agent: f.file_agent.clone().unwrap_or_default(),
-            host_network: f.file_host_network,
             restarted: false,
         }
     }
 
     fn encode(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.agent,
-            u8::from(self.host_network),
-            u8::from(self.restarted)
-        )
+        format!("{}|{}", self.agent, u8::from(self.restarted))
     }
 
     fn decode(s: &str) -> Option<Plan> {
-        let mut it = s.rsplitn(3, '|');
-        let restarted = it.next()?;
-        let host = it.next()?;
-        let agent = it.next()?;
+        let (agent, restarted) = s.rsplit_once('|')?;
         Some(Plan {
             agent: agent.to_string(),
-            host_network: host == "1",
             restarted: restarted == "1",
         })
     }
@@ -132,9 +121,7 @@ impl Plan {
             format!("agent = \"{}\"", self.agent),
             "preview = true".to_string(),
         ];
-        if self.host_network {
-            lines.push("network = \"host\"".into());
-        } else if f.file_host_network {
+        if f.file_host_network {
             lines.push("network = \"isolated\"".into());
         }
         lines.push("[daemon]".into());
@@ -150,7 +137,7 @@ pub(crate) enum Step {
     ChooseAgent,
     /// bubblewrap is missing: nothing can proceed.
     NeedBwrap,
-    /// pasta is missing and the network is isolated: choose the fallback.
+    /// pasta is missing: nothing can proceed until it is installed.
     NeedNetwork,
     /// Write `[lead]` and `[daemon] enabled` (with a preview).
     WriteConfig,
@@ -170,11 +157,11 @@ pub(crate) fn next_step(f: &Facts, plan: &Plan) -> Step {
     if !f.bwrap {
         return Step::NeedBwrap;
     }
-    if !plan.host_network && !f.pasta {
+    if !f.pasta {
         return Step::NeedNetwork;
     }
     let written = f.file_agent.as_deref() == Some(plan.agent.as_str())
-        && f.file_host_network == plan.host_network
+        && !f.file_host_network
         && f.daemon_enabled
         && (f.dev_channel || f.file_preview);
     if !written {
@@ -310,12 +297,10 @@ pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
             "Lead: pasta is missing",
             format!(
                 "The Lead's sandbox gets an isolated network through pasta, which is not \
-                 installed. {PASTA_HINT} Or run the Lead on the host network: simpler, but its \
-                 sandbox then shares your network."
+                 installed and the Lead refuses to open without it. {PASTA_HINT}"
             ),
             TAG,
             vec![
-                row('h', "use the host network", arg("host", plan, "")),
                 row(
                     'r',
                     "check again (after installing pasta)",
@@ -409,16 +394,12 @@ fn review_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
 /// The last step; `checks` is the Lead checks report once they have run.
 fn review_menu_with(f: &Facts, plan: &Plan, checks: Option<&[String]>) -> MenuOverlay {
     let mut body = format!(
-        "{} agent {}\n{} bubblewrap\n{} {}\n{} daemon enabled, Lead listener up\n{} agent login",
+        "{} agent {}\n{} bubblewrap\n{} pasta (isolated network)\n{} daemon enabled, Lead listener \
+         up\n{} agent login",
         mark(true),
         plan.agent,
         mark(f.bwrap),
-        mark(plan.host_network || f.pasta),
-        if plan.host_network {
-            "host network"
-        } else {
-            "pasta (isolated network)"
-        },
+        mark(f.pasta),
         mark(f.daemon_enabled && f.listener_up),
         mark(f.logged_in),
     );
@@ -561,16 +542,6 @@ pub(crate) fn apply(host: &mut dyn Host, arg_str: &str) -> Applied {
             };
             Applied {
                 menu: Some(step_menu(&facts, &plan)),
-                ..Applied::default()
-            }
-        }
-        "host" => {
-            let plan = Plan {
-                host_network: true,
-                ..plan
-            };
-            Applied {
-                menu: menu_now(host, &plan),
                 ..Applied::default()
             }
         }
@@ -785,9 +756,7 @@ impl Host for RealHost<'_> {
             set_key(&path, "lead.agent", &plan.agent)?;
             // The marker the stable-channel clamp honours (preview).
             set_key(&path, "lead.preview", "true")?;
-            if plan.host_network {
-                set_key(&path, "lead.network", "host")?;
-            } else if f.file_host_network {
+            if f.file_host_network {
                 set_key(&path, "lead.network", "isolated")?;
             }
             set_key(&path, "daemon.enabled", "true")
@@ -859,7 +828,7 @@ mod tests {
             }
             self.wrote.push((plan.clone(), f.clone()));
             self.facts.file_agent = Some(plan.agent.clone());
-            self.facts.file_host_network = plan.host_network;
+            self.facts.file_host_network = false;
             self.facts.daemon_enabled = true;
             Ok(())
         }
@@ -923,7 +892,6 @@ mod tests {
     fn plan_round_trips_and_rejects_garbage() {
         let p = Plan {
             agent: "my-claude".into(),
-            host_network: true,
             restarted: true,
         };
         assert_eq!(Plan::decode(&p.encode()), Some(p));
@@ -943,10 +911,9 @@ mod tests {
         assert_eq!(next_step(&f, &p), Step::NeedBwrap);
         f.bwrap = true;
         assert_eq!(next_step(&f, &p), Step::NeedNetwork);
-        p.host_network = true;
+        f.pasta = true;
         assert_eq!(next_step(&f, &p), Step::WriteConfig);
         f.file_agent = Some("claude".into());
-        f.file_host_network = true;
         f.daemon_enabled = true;
         assert_eq!(next_step(&f, &p), Step::Restart);
         p.restarted = true;
@@ -975,11 +942,9 @@ mod tests {
             ..plan(&f)
         };
         assert_eq!(next_step(&f, &p), Step::WriteConfig);
-        let p = Plan {
-            host_network: true,
-            ..plan(&f)
-        };
-        assert_eq!(next_step(&f, &p), Step::WriteConfig);
+        let mut f = f;
+        f.file_host_network = true;
+        assert_eq!(next_step(&f, &plan(&f)), Step::WriteConfig);
     }
 
     #[test]
@@ -1194,7 +1159,6 @@ mod tests {
         };
         let p = Plan {
             agent: "claude".into(),
-            host_network: true,
             ..Plan::default()
         };
         let out = apply(&mut host, &arg("write", &p, ""));
@@ -1226,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_pasta_offers_the_host_network_fallback() {
+    fn missing_pasta_blocks_without_a_host_network_option() {
         let mut host = Fake {
             facts: Facts {
                 dev_channel: true,
@@ -1242,8 +1206,15 @@ mod tests {
         };
         let m = step_menu(&host.facts, &p);
         assert_eq!(m.title, "Lead: pasta is missing");
-        let host_arg = args(&m).into_iter().flatten().next().unwrap();
-        let out = apply(&mut host, &host_arg);
+        assert_eq!(args(&m).len(), 2, "check again and cancel only");
+        let retry = args(&m).into_iter().flatten().next().unwrap();
+        let out = apply(&mut host, &retry);
+        assert_eq!(
+            out.menu.expect("still blocked").title,
+            "Lead: pasta is missing"
+        );
+        host.facts.pasta = true;
+        let out = apply(&mut host, &retry);
         assert_eq!(out.menu.expect("write").title, "Write the Lead config?");
     }
 
@@ -1374,11 +1345,6 @@ mod tests {
                 "enabled = true"
             ]
         );
-        let h = Plan {
-            host_network: true,
-            ..p.clone()
-        };
-        assert!(h.preview(&f).contains(&"network = \"host\"".to_string()));
         f.file_host_network = true;
         assert!(
             p.preview(&f)

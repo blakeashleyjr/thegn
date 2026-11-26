@@ -54,6 +54,7 @@ pub enum SidebarKeyId {
     CycleDetail,
     Info,
     TogglePin,
+    MarkUnread,
     Mark,
     RowMenu,
     Delete,
@@ -93,6 +94,7 @@ impl SidebarKeyId {
                 | I::Expand
                 | I::Collapse
                 | I::TogglePin
+                | I::MarkUnread
                 | I::Mark
                 | I::RowMenu
                 | I::Delete
@@ -285,6 +287,13 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         &[KeyCode::Char('p')],
         "p",
         "pin / unpin",
+        HintTier::Full,
+    ),
+    k(
+        SidebarKeyId::MarkUnread,
+        &[KeyCode::Char('u')],
+        "u",
+        "mark unread",
         HintTier::Full,
     ),
     k(

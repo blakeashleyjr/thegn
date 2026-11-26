@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const LIMIT: u64 = 8 * 1024 * 1024;
-const DEADLINE: Duration = Duration::from_secs(10);
+/// macOS scans a freshly written executable (the copied `tg` alias, or a new
+/// build) on its first exec, which under parallel test load can take longer
+/// than the whole Linux budget.
+const DEADLINE: Duration = Duration::from_secs(if cfg!(target_os = "macos") { 60 } else { 10 });
 
 #[path = "../../../../test/support/owned_test_child.rs"]
 mod owned_test_child;

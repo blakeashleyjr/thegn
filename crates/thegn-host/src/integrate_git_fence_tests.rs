@@ -238,6 +238,7 @@ fn fence_args_precede_the_subcommand() {
         .collect::<Vec<_>>();
     let expected = ["-C", fixture.repo.to_str().unwrap()]
         .into_iter()
+        .chain(["-c", "core.fsmonitor=false"])
         .chain(HOST_GIT_FENCE)
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();

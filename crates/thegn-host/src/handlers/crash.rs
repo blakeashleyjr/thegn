@@ -98,8 +98,20 @@ pub(crate) fn prep_leaf_for_respawn(
 pub(crate) fn crash_reason(tail: &str) -> Option<String> {
     tail.lines()
         .rev()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| {
+            let line = l.trim();
+            !line.is_empty() && !is_login_banner_or_notice(line)
+        })
         .map(|l| l.trim().chars().take(200).collect())
+}
+
+/// Lines that are never the crash cause: an sshd login banner, or thegn's own
+/// mosh-to-ssh fallback notice (the real diagnostic precedes it).
+fn is_login_banner_or_notice(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("last login:")
+        || lower.starts_with("welcome to ")
+        || line.starts_with(thegn_core::placement::MOSH_NOTICE_PREFIX)
 }
 
 /// Inbox text for a failed non-agent pane. When the exiting program is only a
@@ -201,6 +213,26 @@ mod tests {
         assert_eq!(
             crash_reason(tail).as_deref(),
             Some("Error: crun: readlink: No such file or directory")
+        );
+    }
+
+    #[test]
+    fn reason_skips_ssh_login_banner_and_mosh_fallback_notice() {
+        let tail = format!(
+            "bash: mosh-server: command not found\n\
+             {}\n\
+             Last login: Tue Nov 25 08:00:00 2026 from 192.0.2.1\n\
+             Welcome to Ubuntu 24.04 LTS\n\n",
+            thegn_core::placement::MOSH_SERVER_MISSING_NOTICE
+        );
+        assert_eq!(
+            crash_reason(&tail).as_deref(),
+            Some("bash: mosh-server: command not found")
+        );
+        // A tail of nothing but banners has no usable reason.
+        assert_eq!(
+            crash_reason("Last login: Tue Nov 25 from 192.0.2.1\n"),
+            None
         );
     }
 

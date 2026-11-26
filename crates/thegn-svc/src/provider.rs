@@ -2303,6 +2303,14 @@ fn reconcile_action(
     }
 }
 
+/// Whether a provider-listed name is the repository's `.git`, compared
+/// ASCII-case-insensitively (THE-155): on a case-insensitive volume (macOS
+/// default) a remote `.GIT` would otherwise land on the worktree's own `.git`
+/// pointer or directory and redirect the next host `git` at planted config.
+fn is_dotgit_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(".git")
+}
+
 fn valid_remote_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -2454,7 +2462,7 @@ pub trait ProviderFiles: Send + Sync {
                 let listing = self.list_dir(id, &join_remote(remote, &rel)).await?;
                 let mut siblings = std::collections::HashSet::new();
                 for e in &listing {
-                    if e.name == ".git" {
+                    if is_dotgit_name(&e.name) {
                         continue;
                     }
                     anyhow::ensure!(
@@ -2481,7 +2489,7 @@ pub trait ProviderFiles: Send + Sync {
                     );
                 }
                 for e in listing {
-                    if e.name == ".git" {
+                    if is_dotgit_name(&e.name) {
                         continue;
                     }
                     let child = if rel.is_empty() {
@@ -2605,7 +2613,7 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
         let listing = files.list_dir(id, &join_remote(remote, &rel)).await?;
         let mut siblings = std::collections::HashSet::new();
         for entry in &listing {
-            if entry.name == ".git" {
+            if is_dotgit_name(&entry.name) {
                 continue;
             }
             anyhow::ensure!(
@@ -2632,7 +2640,7 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
             );
         }
         for entry in listing {
-            if entry.name == ".git" {
+            if is_dotgit_name(&entry.name) {
                 continue;
             }
             let child = if rel.is_empty() {
@@ -8872,6 +8880,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drive_exec_tty_preserves_line_endings_across_text_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (first, second) in [("/dev/pts/0\n", "ok\n"), ("/dev/pts/0\r\n", "ok\r\n")] {
+            let expected = [first.as_bytes(), second.as_bytes()].concat();
+            let (frames, fault, _) = drive_exec_messages(
+                true,
+                vec![
+                    Message::Text(first.into()),
+                    Message::Text(second.into()),
+                    Message::Text(r#"{"type":"exit","exit_code":0}"#.into()),
+                ],
+                false,
+            )
+            .await;
+            let output: Vec<u8> = frames
+                .iter()
+                .filter_map(|frame| match frame {
+                    ExecFrame::Stdout(bytes) => Some(bytes.as_slice()),
+                    ExecFrame::Exit(_) => None,
+                })
+                .flatten()
+                .copied()
+                .collect();
+
+            assert_eq!(output, expected);
+            assert_eq!(frames.last(), Some(&ExecFrame::Exit(0)));
+            assert_eq!(fault, None);
+        }
+    }
+
+    #[tokio::test]
     async fn drive_exec_non_tty_refuses_non_json_text_frames() {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, protocol::Role};
@@ -10021,6 +10061,60 @@ mod tests {
             assert!(provider.download_dir("id", "/", temp.path()).await.is_err());
             assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
         }
+    }
+
+    /// THE-155: a case variant of `.git` is never pulled back, so a remote cannot
+    /// overwrite the worktree's gitdir pointer on a case-insensitive volume.
+    #[tokio::test]
+    async fn download_dir_skips_case_variants_of_dot_git() {
+        assert!(is_dotgit_name(".git"));
+        assert!(is_dotgit_name(".GIT"));
+        assert!(is_dotgit_name(".Git"));
+        assert!(!is_dotgit_name(".gitignore"));
+        assert!(!is_dotgit_name("git"));
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ListingProvider::new(
+            vec![
+                FileEntry {
+                    name: ".GIT".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+                FileEntry {
+                    name: "keep".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+            ],
+            Vec::new(),
+        );
+        provider.download_dir("id", "/", temp.path()).await.unwrap();
+        assert!(temp.path().join("keep").exists());
+        let names: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keep".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_skips_case_variants_of_dot_git() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/.GIT", b"gitdir: /planted");
+        files.set("/w/keep.txt", b"k");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(temp.path().join("keep.txt")).unwrap(), b"k");
+        let names: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["keep.txt".to_string()]);
     }
 
     #[tokio::test]

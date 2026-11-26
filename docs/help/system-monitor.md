@@ -365,6 +365,12 @@ says so. CPU is percent of one core, like `top`, so a busy pane can read above
 100%; the share column is that row's fraction of the masthead total. Missing
 readings show `—`, never a made-up `0`.
 
+The popups list only worktrees with live processes, heaviest first, at most
+eight. Idle worktrees fold into one summary line ("N idle worktrees", with
+"+N more" when live ones were cut), so hundreds of worktrees never push the
+useful rows off screen. The `cpu`, `mem` and `disk` popups share one width and
+a compact three-line graph, and each opens directly under its masthead chip.
+
 Attribution uses the same ancestry walk as the `owner` column: a process
 belongs to the pane whose shell it descends from. The per-pane totals come
 from the complete native process pass, which exists on Linux; elsewhere the

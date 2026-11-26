@@ -239,7 +239,7 @@ pub fn assemble(inputs: OverviewInputs, req: &OverviewRequest, now: i64) -> Over
 
     let queue = |rows: Vec<QueueView>| -> Vec<QueueView> {
         rows.into_iter()
-            .filter(|q| q.worktree.as_deref().is_none_or(&in_scope))
+            .filter(|q| q.worktree.as_deref().is_none_or(in_scope))
             .take(limit)
             .map(clip_queue)
             .collect()

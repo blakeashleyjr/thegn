@@ -319,6 +319,9 @@ pub struct UiConfig {
     pub sidebar_show_ahead_behind: bool,
     /// Show the compact open-PR chip (`⬡N`) in a worktree row's right cluster.
     pub sidebar_show_pr_chip: bool,
+    /// Use a focused pane's terminal title as a tab chip label when the stored
+    /// tab title is still its default ordinal.
+    pub tab_title_from_terminal: bool,
     /// Show the jujutsu-colocation marker (`ĵ`) in a worktree row's right cluster
     /// when the repo has a `.jj/` beside `.git/`.
     pub sidebar_show_jj: bool,
@@ -383,6 +386,10 @@ pub struct UiConfig {
     /// Loose worktrees sharing a batch token (`tg/b158-…` → `b158`) fold into one
     /// collapsible row per batch once at least this many share it; `0` = off.
     pub sidebar_batch_group_min: usize,
+    /// Days a finished pipeline (every dispatch merged, done, failed or
+    /// abandoned) stays in the sidebar's `Pipelines` section before it ages out;
+    /// `0` = never. The worktree is never deleted — `wt prune` does that.
+    pub sidebar_finished_pipeline_days: u32,
 }
 
 impl Default for UiConfig {
@@ -404,6 +411,7 @@ impl Default for UiConfig {
             sidebar_show_diff_stat: true,
             sidebar_show_ahead_behind: true,
             sidebar_show_pr_chip: true,
+            tab_title_from_terminal: true,
             sidebar_show_jj: true,
             sidebar_show_submodules: true,
             sidebar_focus_detail: FocusDetail::default(),
@@ -430,6 +438,7 @@ impl Default for UiConfig {
             sidebar_group_row_limit: 7,
             sidebar_group_row_limits: std::collections::BTreeMap::new(),
             sidebar_batch_group_min: 2,
+            sidebar_finished_pipeline_days: 7,
         }
     }
 }
@@ -703,6 +712,7 @@ mod tests {
     #[test]
     fn sidebar_row_display_defaults_on_and_toggle() {
         let cfg = UiConfig::default();
+        assert!(cfg.tab_title_from_terminal);
         assert!(cfg.sidebar_show_status_icon);
         assert!(cfg.sidebar_show_diff_stat);
         assert!(cfg.sidebar_show_ahead_behind);
@@ -720,6 +730,8 @@ mod tests {
         assert!(!cfg.sidebar_show_diff_stat);
         assert!(cfg.sidebar_show_ahead_behind);
         assert_eq!(cfg.sidebar_icon_ahead, "»");
+        let cfg: UiConfig = toml::from_str("tab_title_from_terminal = false").unwrap();
+        assert!(!cfg.tab_title_from_terminal);
     }
 
     #[test]
@@ -854,5 +866,6 @@ sidebar_group_row_limits={Other=5,"agents wip"=0}"#;
         let cfg: UiConfig = toml::from_str("sidebar_group_row_limit = 15").unwrap();
         assert_eq!(cfg.sidebar_group_row_limit, 15);
         assert_eq!(cfg.sidebar_batch_group_min, 2);
+        assert_eq!(cfg.sidebar_finished_pipeline_days, 7);
     }
 }

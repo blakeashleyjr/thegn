@@ -33,9 +33,8 @@ agents chapter (`l`) open the same flow.
 2. **Agent.** Choose the Lead's agent from the detected agents. Only claude is
    supported today; others are listed as not offered.
 3. **Prerequisites.** bubblewrap is required (the flow shows install hints and
-   a "check again" row). If `pasta` is missing you can install it or choose the
-   host network (`[lead] network = "host"`), where the Lead's sandbox shares
-   your network.
+   a "check again" row). `pasta` is required too: if it is missing the flow
+   shows install hints and a "check again" row, with no host-network option.
 4. **Config.** A preview shows the exact `[lead]` (including `preview = true`)
    and `[daemon] enabled = true` lines; confirming writes them to your config
    file, keeping the rest of it.
@@ -67,7 +66,7 @@ the Lead's agent. Without `[lead]` there is no Lead section in the sidebar and
 On stable, `[lead]` is clamped off unless it carries `preview = true`. Not yet
 verified live.
 
-1. Install bubblewrap and `pasta` (or set `[lead] network = "host"`).
+1. Install bubblewrap and `pasta`; the Lead refuses to launch without both.
 2. Set `[daemon] enabled = true`, `[lead] agent = "claude"` and, on stable,
    `[lead] preview = true`.
 3. Run `thegn daemon stop`, then open thegn. Lead tabs end when the daemon

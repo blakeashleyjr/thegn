@@ -557,19 +557,24 @@ fn unified_surface_lists_only_unread_rows() {
     );
 }
 
-/// Grouping follows the *effective* priority (config overrides), the same one
-/// the chip counts by — a kind promoted to `alert` lands under Alerts.
+/// Inbox rows are grouped by kind: a finished agent lands under "Finished",
+/// an alert-priority failure under "Failed", the rest under "Info".
 #[test]
-fn unified_surface_groups_by_effective_priority() {
-    let mut model = notif_model(
-        vec![notif(NotificationKind::AgentDone, "wt", "finished", 5)],
+fn unified_surface_groups_by_kind() {
+    let model = notif_model(
+        vec![
+            notif(NotificationKind::AgentDone, "wt", "finished", 5),
+            notif(NotificationKind::AgentFailed, "wt2", "failed", 6),
+            notif(NotificationKind::Mentioned, "pr:1", "mentioned", 7),
+        ],
         vec![],
     );
-    let under = |ov: &DetailOverlay| -> String {
-        let DetailContent::List(l) = &ov.content else {
-            panic!("expected a list");
-        };
-        let i = l.rows.iter().position(|r| r.text == "finished").unwrap();
+    let ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let under = |text: &str| -> String {
+        let i = l.rows.iter().position(|r| r.text == text).unwrap();
         l.rows[..i]
             .iter()
             .rev()
@@ -577,12 +582,10 @@ fn unified_surface_groups_by_effective_priority() {
             .map(|r| r.text.clone())
             .unwrap()
     };
-    assert_eq!(under(&open_notifications(&model)), "Notifications");
-    model.panel.notification_priority.insert(
-        NotificationKind::AgentDone.as_str(),
-        thegn_core::notification::Priority::Alert,
-    );
-    assert_eq!(under(&open_notifications(&model)), "Alerts");
+    assert_eq!(under("finished"), "Finished (1)");
+    assert_eq!(under("failed"), "Failed (1)");
+    assert_eq!(under("mentioned"), "Info (1)");
+    assert_eq!(l.rows[0].text, "1 failed \u{b7} 1 finished \u{b7} 1 info");
 }
 
 /// Navigating must never acknowledge: moving the cursor over an unread row
@@ -891,7 +894,7 @@ fn needs_you(model: &mut FrameModel, path: &str) {
             tier: AttentionTier::Failure,
             sub: 2,
             reason: AttentionReason::ProcessFailed,
-            since: Some(60),
+            since: Some(thegn_core::util::now() - 60),
             episode: 0,
         },
     );
@@ -960,7 +963,10 @@ fn unified_surface_groups_by_section_and_dedups_worktree_alerts() {
         .filter(|r| r.header)
         .map(|r| r.text.as_str())
         .collect();
-    assert_eq!(headers, ["Needs you", "Alerts", "Notifications", "Logs"]);
+    assert_eq!(
+        headers,
+        ["2 failed \u{b7} 1 info", "Failed (2)", "Info (1)", "Logs"]
+    );
     let body: Vec<&str> = l
         .rows
         .iter()
@@ -1010,7 +1016,11 @@ fn needs_you_rows_group_other_repos_separately() {
             .collect::<Vec<_>>()
     };
     let h = headers(&model);
-    assert_eq!(h, ["Needs you", "Other repos (1)", "Logs"], "{h:?}");
+    assert_eq!(
+        h,
+        ["1 failed", "Failed (1)", "Other repos (1)", "Logs"],
+        "{h:?}"
+    );
 
     // Each group holds exactly one row, and the out-of-scope one keeps its `x`
     // ack action — scoping quiets the nag, it doesn't remove the affordance.
@@ -1030,7 +1040,7 @@ fn needs_you_rows_group_other_repos_separately() {
     // Widened (`repo_scope: None`, what the `g` toggle hydrates): one group.
     model.sidebar_status.repo_scope = None;
     let h = headers(&model);
-    assert_eq!(h, ["Needs you", "Logs"], "{h:?}");
+    assert_eq!(h, ["2 failed", "Failed (2)", "Logs"], "{h:?}");
 }
 
 #[test]
@@ -2409,7 +2419,8 @@ fn memory_popup_breakdown_has_available_then_optional_free() {
         })
         .expect("memory breakdown");
     let keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
-    assert_eq!(keys, ["used", "total", "available", "free"]);
+    assert_eq!(keys, ["used", "available", "free"]);
+    assert_eq!(rows[0].1, "8.0G of 32G");
 }
 
 fn mq_test_row(status: &str) -> thegn_core::db::MergeQueueRow {
@@ -2522,4 +2533,188 @@ fn wrap_full_text_keeps_every_word_and_breaks_long_tokens() {
     let wrapped = super::wrap_full_text(&long, 8);
     assert_eq!(wrapped.concat(), long);
     assert!(wrapped.iter().all(|l| l.len() <= 8));
+}
+
+// --- grouped overlay: folding, stale, filter ---------------------------
+
+/// A blocked "agent needs input" worktree raised `age` seconds ago.
+fn needs_input_at(model: &mut FrameModel, path: &str, age: i64) {
+    use thegn_core::attention::{AttentionReason, AttentionScore, AttentionTier};
+    model.sidebar_status.attention.insert(
+        path.into(),
+        AttentionScore {
+            tier: AttentionTier::Blocked,
+            sub: 0,
+            reason: AttentionReason::AgentNeedsInput,
+            since: Some(thegn_core::util::now() - age),
+            episode: 0,
+        },
+    );
+}
+
+fn list_texts(ov: &DetailOverlay) -> Vec<String> {
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    l.rows.iter().map(|r| r.text.clone()).collect()
+}
+
+#[test]
+fn same_batch_rows_fold_and_arrows_expand_and_collapse() {
+    let mut model = FrameModel::default();
+    for i in 0..3 {
+        needs_input_at(&mut model, &format!("/wt/thegn/b313-the-{i}"), 60 + i);
+    }
+    let mut ov = open_notifications(&model);
+    let members = |ov: &DetailOverlay| {
+        list_texts(ov)
+            .iter()
+            .filter(|t| t.contains("agent needs input"))
+            .count()
+    };
+    let t = list_texts(&ov);
+    assert_eq!(t[0], "3 need input");
+    assert_eq!(t[1], "Needs input (3)");
+    assert_eq!(t[2], "Pipeline b313 \u{2014} 3 need input");
+    assert_eq!(members(&ov), 0, "collapsed by default: {t:?}");
+    // Right expands; the cursor stays on the group.
+    assert_eq!(
+        ov.handle_key(&KeyCode::RightArrow, Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    assert_eq!(members(&ov), 3);
+    // Left on a member collapses its group and lands on the group row.
+    ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+    assert_eq!(
+        ov.handle_key(&KeyCode::LeftArrow, Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    assert_eq!(members(&ov), 0);
+    // Enter toggles it open again.
+    ov.handle_key(&KeyCode::Enter, Modifiers::NONE);
+    assert_eq!(members(&ov), 3);
+}
+
+#[test]
+fn x_on_a_group_dismisses_every_member() {
+    let mut model = FrameModel::default();
+    for i in 0..2 {
+        needs_input_at(&mut model, &format!("/wt/thegn/b313-the-{i}"), 60);
+    }
+    let mut ov = open_notifications(&model);
+    let DetailOutcome::Act(DetailAction::DismissBatch { acks, keys, .. }) =
+        ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE)
+    else {
+        panic!("x on a group is a batch dismissal");
+    };
+    assert_eq!(acks.len(), 2);
+    assert!(
+        DetailAction::DismissBatch {
+            ids: vec![],
+            acks: vec![],
+            keys: keys.clone()
+        }
+        .keeps_overlay()
+    );
+    ov.remove_notif_leaves(&keys);
+    assert_eq!(
+        list_texts(&ov),
+        vec!["Logs".to_string(), "open thegn.log".into()]
+    );
+}
+
+#[test]
+fn stale_rows_fold_into_older_and_do_not_count_on_the_badge() {
+    let mut model = FrameModel::default();
+    needs_input_at(&mut model, "/wt/thegn/b200-old", 3 * 24 * 3600);
+    needs_input_at(&mut model, "/wt/thegn/b313-new", 60);
+    assert_eq!(
+        crate::handlers::attention::rollup(&model).count(),
+        1,
+        "only the live item counts"
+    );
+    let mut ov = open_notifications(&model);
+    let t = list_texts(&ov);
+    assert_eq!(t[0], "1 need input \u{b7} 1 older");
+    let older = t
+        .iter()
+        .position(|x| x == "Older (1)")
+        .expect("older group");
+    let logs = t.iter().position(|x| x == "Logs").unwrap();
+    assert!(older < logs && t[..older].iter().any(|x| x.contains("b313-new")));
+    assert!(
+        !t.iter().any(|x| x.contains("b200-old")),
+        "collapsed: {t:?}"
+    );
+    // `D` dismisses exactly the stale item.
+    let DetailOutcome::Act(DetailAction::DismissBatch { keys, .. }) =
+        ov.handle_key(&KeyCode::Char('D'), Modifiers::NONE)
+    else {
+        panic!("D dismisses stale");
+    };
+    assert_eq!(keys, vec!["a:/wt/thegn/b200-old".to_string()]);
+    ov.remove_notif_leaves(&keys);
+    assert!(!list_texts(&ov).iter().any(|x| x.starts_with("Older")));
+    // Nothing stale left: D does nothing.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('D'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+}
+
+#[test]
+fn slash_filters_rows_and_escape_clears_before_closing() {
+    let mut model = FrameModel::default();
+    needs_input_at(&mut model, "/wt/thegn/b313-alpha", 60);
+    needs_input_at(&mut model, "/wt/other/zzz", 70);
+    let mut ov = open_notifications(&model);
+    ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+    for c in "zzz".chars() {
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char(c), Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+    }
+    // Typing is text, never an action (`x` would otherwise dismiss).
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    ov.handle_key(&KeyCode::Backspace, Modifiers::NONE);
+    let t = list_texts(&ov);
+    assert!(t.iter().any(|x| x.contains("zzz")), "{t:?}");
+    assert!(!t.iter().any(|x| x.contains("alpha")), "{t:?}");
+    ov.handle_key(&KeyCode::Enter, Modifiers::NONE);
+    // First Esc clears the filter, the next one closes.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Escape, Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    assert!(list_texts(&ov).iter().any(|x| x.contains("alpha")));
+    assert_eq!(
+        ov.handle_key(&KeyCode::Escape, Modifiers::NONE),
+        DetailOutcome::Close
+    );
+}
+
+#[test]
+fn grouped_overlay_renders_counts_groups_older_and_key_footer() {
+    let mut model = FrameModel::default();
+    for i in 0..3 {
+        needs_input_at(&mut model, &format!("/wt/thegn/b313-the-{i}"), 60);
+    }
+    needs_input_at(&mut model, "/wt/thegn/b200-old", 3 * 24 * 3600);
+    let ov = open_notifications(&model);
+    let text = rendered_text(&ov, screen());
+    for want in [
+        "3 need input",
+        "Needs input (3)",
+        "Pipeline b313",
+        "Older (1)",
+        "x dismiss",
+        "D stale",
+        "/ filter",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
 }

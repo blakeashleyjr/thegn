@@ -1961,6 +1961,19 @@ impl Span {
     }
 }
 
+/// Theme-slot names a [`Span::slot`] may carry. The host maps each name to one
+/// of its own foreground palette colors; a name outside this list falls back to
+/// the span's [`StyleRole`]. Background and border slots are deliberately absent.
+pub const SPAN_SLOTS: [&str; 7] = [
+    "text",
+    "dim",
+    "faint",
+    "accent",
+    "activity_active",
+    "activity_waiting",
+    "activity_done",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct View {
     /// The single-line content — the v0.2 compat path an older plugin keeps
@@ -2599,10 +2612,10 @@ pub static HOST_VERB_SUPPORT: &[HostVerbSupport] = &[
     HostVerbSupport {
         verb: HostVerb::HostValue,
         since: ApiVersion::new(0, 2, 0),
-        state: SupportState::Wired,
+        state: SupportState::Reserved,
         authority: "none",
         modes: RESIDENT_MODE,
-        owner: "host value projection",
+        owner: "THE-162 (the host seeds no host values)",
     },
     HostVerbSupport {
         verb: HostVerb::HostCall,
@@ -4507,6 +4520,19 @@ timeout_secs = 5
             .iter()
             .find(|row| row.verb == HostVerb::Io)
             .expect("io has a host support row");
+
+        assert_eq!(row.state, SupportState::Reserved);
+        assert!(row.owner.contains("THE-162"));
+    }
+
+    #[test]
+    fn host_value_verb_is_reserved_in_the_support_matrix() {
+        // No production path seeds `PluginRuntime::with_host_value`, so a
+        // wired `host.value` would answer `null` for every key.
+        let row = HOST_VERB_SUPPORT
+            .iter()
+            .find(|row| row.verb == HostVerb::HostValue)
+            .expect("host.value has a host support row");
 
         assert_eq!(row.state, SupportState::Reserved);
         assert!(row.owner.contains("THE-162"));

@@ -89,7 +89,9 @@ impl Gate {
         let state = self.state.lock().unwrap();
         let (state, _) = self
             .changed
-            .wait_timeout_while(state, Duration::from_secs(3), |s| !s.0)
+            // Generous: the worker probes and prepares before most barriers,
+            // which can take seconds on a loaded host. A pass returns at once.
+            .wait_timeout_while(state, Duration::from_secs(30), |s| !s.0)
             .unwrap();
         assert!(state.0, "production worker did not reach fixture barrier");
     }
@@ -480,6 +482,20 @@ mod unix {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A short caller deadline can return while the owned worker is still
+    /// probing or spawning (slow on a loaded macOS host). Wait for the fixture's
+    /// observable side effect instead of assuming it already happened.
+    fn eventually_exists(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     struct Harness {
         fixture: OwnedFixture,
         directory: Arc<tempfile::TempDir>,
@@ -508,6 +524,17 @@ mod unix {
         let digest = super::super::super::config_digest(&config).unwrap();
         std::fs::write(&script, format!("#!{}\nif [ \"$1\" = --version ]; then printf 'fixture 1\\n'; exit 0; fi\n[ \"$#\" = 5 ] && [ \"$1\" = up ] && [ \"$2\" = --workspace-folder ] && [ \"$4\" = --config ] || exit 91\n[ -f \"$5\" ] || exit 92\nprintf 'up\\n' >> \"$3/starts\"\n{body}\n", tool("sh").display())).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Pay the first exec of the freshly written script (slow on macOS) before any
+        // caller deadline starts.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only warm-up of a local fixture script, never on the event loop"
+        )]
+        let warmed = std::process::Command::new(&script)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(warmed.status.success());
         let env = vec![
             ("FIXTURE_RELEASE".into(), release.display().to_string()),
             ("FIXTURE_SLEEP".into(), tool("sleep").display().to_string()),
@@ -601,6 +628,12 @@ mod unix {
         }
     }
 
+    /// Caller deadline for fixtures whose child (or barrier) is held until
+    /// release, so the deadline always expires. It must outlast the worker's
+    /// startup path (owner thread at Utility QoS, `--version` probe, config
+    /// snapshot): production refuses a spawn claimed after the deadline, and on
+    /// a loaded macOS host that path alone exceeded the old 150-400 ms values.
+    const HELD_DEADLINE: Duration = Duration::from_secs(3);
     const HOLD: &str = "while [ ! -f \"$FIXTURE_RELEASE\" ]; do \"$FIXTURE_SLEEP\" 0.01; done";
     fn assert_held(
         result: Result<PendingSession, StartFailure>,
@@ -677,13 +710,10 @@ mod unix {
             };
             let h = harness(&body);
             let before = Instant::now();
-            assert_held(
-                h.fixture.pending(Duration::from_millis(300)),
-                StartReason::Deadline,
-            );
-            assert!(before.elapsed() < Duration::from_secs(2));
+            assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
+            assert!(before.elapsed() < HELD_DEADLINE + Duration::from_secs(2));
             assert!(
-                h.directory.path().join("resource").exists(),
+                eventually_exists(&h.directory.path().join("resource")),
                 "deadline fixture never actually spawned"
             );
             let operation = h.fixture.operation();
@@ -897,13 +927,13 @@ mod unix {
             let h = harness(&body);
             let fallback = AtomicUsize::new(0);
             let mut warnings = Vec::new();
-            let result =
-                h.fixture
-                    .agent_decision(Duration::from_millis(400), &fallback, &mut warnings);
+            let result = h
+                .fixture
+                .agent_decision(HELD_DEADLINE, &fallback, &mut warnings);
             assert!(matches!(result, Err(StartFailure::HeldUnknown(_, _))));
             assert_eq!(fallback.load(Ordering::Acquire), 0);
             assert!(warnings.is_empty());
-            assert!(h.directory.path().join("resource").exists());
+            assert!(eventually_exists(&h.directory.path().join("resource")));
             assert!(h.fixture.sessions.lock().unwrap().is_empty());
             let second = h
                 .fixture
@@ -1103,10 +1133,10 @@ mod unix {
     #[test]
     fn held_startup_does_not_occupy_git_or_capability_capture_lanes() {
         let h = harness(HOLD);
-        assert_held(
-            h.fixture.pending(Duration::from_millis(300)),
-            StartReason::Deadline,
-        );
+        assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
+        // `starts` is written by the held `up` child, which is spawned only
+        // after the worker's `--version` probe (the capability slot) returned.
+        assert!(eventually_exists(&h.directory.path().join("starts")));
         let git_path = tool("git");
         let mut git = std::process::Command::new(git_path);
         git.arg("--version")
@@ -1135,10 +1165,7 @@ mod unix {
         for (point, expected_spawns) in [(Point::BeforeSpawnClaim, 0), (Point::SpawnClaimed, 1)] {
             let h = harness("exit 0");
             let gate = h.fixture.controller.hooks.hold(point);
-            assert_held(
-                h.fixture.pending(Duration::from_millis(150)),
-                StartReason::Deadline,
-            );
+            assert_held(h.fixture.pending(HELD_DEADLINE), StartReason::Deadline);
             gate.entered();
             h.fixture.finish();
             assert_eq!(

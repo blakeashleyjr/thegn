@@ -1,12 +1,18 @@
 //! Opt-in inference measurements on supplied PCM16 mono/16 kHz audio.
 //! Never opens a microphone. See docs/voice-verification.md.
-#[cfg(feature = "native")]
+#[cfg(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
 fn main() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use std::io::{Read, Write};
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
-    use thegn_voice::{SAMPLE_RATE, WINDOW_SAMPLES, whisper::Engine};
+    use thegn_voice::{
+        SAMPLE_RATE, WINDOW_SAMPLES,
+        whisper::{Engine, Pass},
+    };
 
     let args: Vec<_> = std::env::args().collect();
     ensure!(
@@ -41,8 +47,10 @@ fn main() -> anyhow::Result<()> {
         let text = engine.transcribe(
             window,
             language,
+            Pass::Preview,
             Arc::new(AtomicBool::new(false)),
             Duration::from_secs(60),
+            None,
         )?;
         writeln!(
             output,
@@ -55,8 +63,10 @@ fn main() -> anyhow::Result<()> {
     let text = engine.transcribe(
         &samples,
         language,
+        Pass::Final,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(60),
+        None,
     )?;
     writeln!(
         output,
@@ -70,8 +80,10 @@ fn main() -> anyhow::Result<()> {
             .transcribe(
                 window,
                 language,
+                Pass::Preview,
                 Arc::new(AtomicBool::new(true)),
-                Duration::from_secs(60)
+                Duration::from_secs(60),
+                None
             )
             .is_err(),
         "cancelled decode succeeded"
@@ -80,8 +92,10 @@ fn main() -> anyhow::Result<()> {
     let silent = engine.transcribe(
         &vec![0.0; SAMPLE_RATE],
         language,
+        Pass::Preview,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(1),
+        None,
     )?;
     ensure!(silent.is_empty(), "digital silence produced a transcript");
     writeln!(output, "silence\tpassed")?;
@@ -89,7 +103,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(not(all(
+    feature = "native",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+)))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("build the verify example with --features native (metal on Apple silicon)")
 }

@@ -48,65 +48,82 @@ fn ro(host: &str) -> Mount {
 
 // ── enter_argv emission (deterministic; no backend binary needed) ────────────
 
+/// A real, canonical synthetic `$HOME`. Local mount sources are canonicalised
+/// before emission (`/tmp` is `/private/tmp` and `/home` is an autofs
+/// link on macOS), so a hard-coded `/home/tester` would not round-trip there.
+fn synthetic_home() -> (tempfile::TempDir, String) {
+    let td = tempfile::tempdir().unwrap();
+    let home = td
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    (td, home)
+}
+
 #[test]
 fn bwrap_ro_home_emits_ro_bind_worktree_stays_rw() {
+    let (_td, home) = synthetic_home();
     // The read-only $HOME parent must be emitted `--ro-bind` while the worktree
     // (its child) is emitted `--bind` so it overmounts read-write.
     let spec = mk_spec(
         Backend::Bwrap,
         FileAccess::WorktreePlusCaches,
-        vec![ro("/home/tester"), rw("/home/tester/wt")],
+        vec![ro(&home), rw(&format!("{home}/wt"))],
         true,
     );
     let joined = enter_argv(&spec, "exec claude")
         .expect("valid volume names")
         .join(" ");
     assert!(
-        joined.contains("--ro-bind /home/tester /home/tester"),
+        joined.contains(&format!("--ro-bind {home} {home}")),
         "expected read-only $HOME bind, got: {joined}"
     );
     assert!(
-        !joined.contains("--bind /home/tester /home/tester"),
+        !joined.contains(&format!("--bind {home} {home}")),
         "must NOT bind $HOME read-write under a read-only profile: {joined}"
     );
     assert!(
-        joined.contains("--bind /home/tester/wt /home/tester/wt"),
+        joined.contains(&format!("--bind {home}/wt {home}/wt")),
         "worktree must stay writable: {joined}"
     );
 }
 
 #[test]
 fn bwrap_open_home_emits_rw_bind() {
+    let (_td, home) = synthetic_home();
     // `profile = "open"` surfaces as a read-write $HOME mount → `--bind`.
     let spec = mk_spec(
         Backend::Bwrap,
         FileAccess::WorktreePlusCaches,
-        vec![rw("/home/tester"), rw("/home/tester/wt")],
+        vec![rw(&home), rw(&format!("{home}/wt"))],
         false,
     );
     let joined = enter_argv(&spec, "exec claude")
         .expect("valid volume names")
         .join(" ");
     assert!(
-        joined.contains("--bind /home/tester /home/tester"),
+        joined.contains(&format!("--bind {home} {home}")),
         "open profile must bind $HOME read-write: {joined}"
     );
 }
 
 #[test]
 fn systemd_readonly_home_keeps_worktree_and_caches_writable() {
+    let (_td, home) = synthetic_home();
     let spec = mk_spec(
         Backend::Systemd,
         FileAccess::WorktreePlusCaches,
         vec![
-            rw("/home/tester/wt"),
+            rw(&format!("{home}/wt")),
             Mount {
-                host: "/home/tester/.cargo/registry".into(),
-                dest: "/home/tester/.cargo/registry".into(),
+                host: format!("{home}/.cargo/registry"),
+                dest: format!("{home}/.cargo/registry"),
                 ro: false,
                 cache: true,
             },
-            ro("/home/tester/repo/.git/config"),
+            ro(&format!("{home}/repo/.git/config")),
         ],
         true,
     );
@@ -118,11 +135,11 @@ fn systemd_readonly_home_keeps_worktree_and_caches_writable() {
         "must lock $HOME read-only: {joined}"
     );
     assert!(
-        joined.contains("ReadWritePaths=/home/tester/wt"),
+        joined.contains(&format!("ReadWritePaths={home}/wt")),
         "worktree must be writable: {joined}"
     );
     assert!(
-        joined.contains("ReadWritePaths=/home/tester/.cargo/registry"),
+        joined.contains(&format!("ReadWritePaths={home}/.cargo/registry")),
         "build caches must stay writable: {joined}"
     );
 }

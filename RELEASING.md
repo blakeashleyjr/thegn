@@ -228,11 +228,11 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    tap and copy the generated release asset into it:
 
    ```sh
-   brew tap-new blakeashleyjr/tap                     # scaffolds Formula/
+   brew tap-new blakeashleyjr/thegn                   # scaffolds Formula/
    cp thegn-v<version>-homebrew.rb \
-     "$(brew --repository blakeashleyjr/tap)/Formula/thegn.rb"
-   brew install blakeashleyjr/tap/thegn
-   brew uninstall thegn && brew untap blakeashleyjr/tap   # when done
+     "$(brew --repository blakeashleyjr/thegn)/Formula/thegn.rb"
+   brew install blakeashleyjr/thegn/thegn
+   brew uninstall thegn && brew untap blakeashleyjr/thegn   # when done
    ```
 
 ## Release notes template
@@ -250,10 +250,10 @@ CHANGELOG entries rather than copying them.
 
 ## Channel
 
-| Channel statement | Details                                                                                                                                                                                         |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| This build        | **stable** channel                                                                                                                                                                              |
-| Experimental      | Remote worktrees, cloud providers, placement, and voice are compiled in but off unless you opt into the dev channel via `.#dev` or `THEGN_CHANNEL=dev`. Observe and plugin app tabs are stable. |
+| Channel statement | Details                                                                                                                                                                                                                                                                             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| This build        | **stable** channel                                                                                                                                                                                                                                                                  |
+| Experimental      | Remote worktrees, cloud providers, and placement are compiled in but off unless you opt into the dev channel via `.#dev` or `THEGN_CHANNEL=dev`. Observe, plugin app tabs and voice are stable (voice is opt-in; native dictation ships in the Nix package and macOS release only). |
 
 ## Platforms
 

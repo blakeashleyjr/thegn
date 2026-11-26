@@ -143,8 +143,10 @@
         src = thegnSrc;
         pname = "thegn";
         version = cargoVersion;
-        nativeBuildInputs = [pkgs.pkg-config];
-        buildInputs = [pkgs.zlib];
+        # Must match nix/package.nix: native dictation is a default feature.
+        nativeBuildInputs = [pkgs.pkg-config pkgs.cmake pkgs.rustPlatform.bindgenHook];
+        buildInputs = [pkgs.zlib] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.alsa-lib];
+        dontUseCmakeConfigure = true;
         cargoExtraArgs = "-p thegn-host --bin thegn --features iroh";
         doCheck = false;
       };
@@ -215,9 +217,10 @@
       msrvCargo = pkgs.writeShellScriptBin "cargo-1.96" ''
         exec ${msrvRustToolchain}/bin/cargo "$@"
       '';
-      # Optional native dictation is exercised by the all-features gate. Keep
-      # its build tools in the development/CI shells without enabling it in
-      # release packages or the static remote bridge.
+      # Native dictation (cpal + whisper.cpp) ships in the default `thegn`
+      # package and the dev/CI shells. The static remote bridge below builds with
+      # `--no-default-features` and never links it. whisper-rs-sys needs cmake and
+      # libclang (bindgen; the shells set LIBCLANG_PATH, packages use bindgenHook).
       voiceNativeInputs =
         [pkgs.cmake pkgs.pkg-config]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.alsa-lib];
@@ -265,7 +268,8 @@
         # overridden by buildRustPackage → a glibc host binary that can't run in a
         # bare microVM). `+crt-static` makes it fully static (no ld-musl loader
         # needed in the sandbox). Install from the cross target dir, not target/release.
-        cargoBuildFlags = ["-p" "thegn-host" "--bin" "thegn" "--target" muslTarget];
+        # musl cannot link ALSA/whisper.cpp: build without the default voice feature.
+        cargoBuildFlags = ["-p" "thegn-host" "--bin" "thegn" "--no-default-features" "--target" muslTarget];
         CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = muslCc;
         CC_x86_64_unknown_linux_musl = muslCc;

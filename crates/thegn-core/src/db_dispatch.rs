@@ -9,6 +9,27 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::OptionalExtension as _;
 
+/// A lane that reached a terminal status has nobody left to answer it: mark
+/// read its pipeline escalations (`escalation:{id}@…`) and the agent-hook
+/// attention rows its worker raised in the lane worktree (THE-2732). Runs in
+/// the caller's transaction, on the status write itself, so no poller exists.
+fn resolve_lane_attention(
+    conn: &rusqlite::Connection,
+    id: i64,
+    status: AgentDispatchStatus,
+) -> rusqlite::Result<usize> {
+    if !status.is_terminal() {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE notifications SET read=1 WHERE read=0 AND kind='agent_attention' AND (\
+           substr(issue_id, 1, length(?2)) = ?2 \
+           OR (issue_id LIKE 'agent-hook:%' AND worktree_path <> '' AND worktree_path = \
+               (SELECT worktree_path FROM agent_dispatches WHERE id=?1)))",
+        rusqlite::params![id, format!("escalation:{id}@")],
+    )
+}
+
 pub const MIN_LEASE_TTL_SECS: i64 = 5;
 pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
 pub const FORCE_REASON_MAX_CHARS: usize = 512;
@@ -749,6 +770,7 @@ impl Db {
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 conn.execute("INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)", rusqlite::params![id, util::now_ms(), audit])?;
             }
+            resolve_lane_attention(conn, id, to)?;
             Ok(())
         })();
         match result {
@@ -839,6 +861,7 @@ impl Db {
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 conn.execute("INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)", rusqlite::params![id, util::now_ms(), audit])?;
             }
+            resolve_lane_attention(conn, id, to)?;
             Ok(())
         })();
         match result {
@@ -1134,6 +1157,7 @@ impl Db {
             "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, util::now_ms(), note],
         )?;
+        resolve_lane_attention(&tx, id, status)?;
         tx.commit()?;
         Ok(())
     }
@@ -1225,6 +1249,7 @@ impl Db {
                 rusqlite::params![id, util::now_ms(), note],
             )?;
         }
+        resolve_lane_attention(&tx, id, status)?;
         tx.commit()?;
         Ok(true)
     }
@@ -4658,6 +4683,50 @@ mod tests {
             &db,
             NEWEST_DISPATCH_NOTES_SINCE_SQL,
             rusqlite::params![1_i64, 0_i64, 20_i64],
+        );
+    }
+
+    #[test]
+    fn terminal_status_resolves_the_lanes_attention_rows() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-7", "/wt/lane");
+        let escalation = format!("escalation:{id}@abcdefg:awaiting-approval");
+        let other_lane = format!("escalation:{}@abcdefg:awaiting-approval", id + 100);
+        db.put_notification(
+            "agent_attention",
+            &escalation,
+            "Pipeline lane needs you",
+            "/wt/lane",
+        )
+        .unwrap();
+        db.put_notification(
+            "agent_attention",
+            "agent-hook:claude@/wt/lane",
+            "needs",
+            "/wt/lane",
+        )
+        .unwrap();
+        db.put_notification("agent_attention", &other_lane, "other lane", "/wt/other")
+            .unwrap();
+        db.put_notification("agent_attention", "0123456789abcdef", "hand", "/wt/lane")
+            .unwrap();
+        let unread = |db: &Db| db.get_unread_notifications().unwrap().len();
+        db.update_dispatch_status_with_note(id, AgentDispatchStatus::WaitingHuman, "parked")
+            .unwrap();
+        assert_eq!(unread(&db), 4, "a non-terminal status resolves nothing");
+        db.update_dispatch_status_with_note(id, AgentDispatchStatus::Failed, "gave up")
+            .unwrap();
+        let left: Vec<String> = db
+            .get_unread_notifications()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.source_ref)
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.contains(&other_lane), "another lane's row stays");
+        assert!(
+            left.contains(&"0123456789abcdef".to_string()),
+            "a session hand stays"
         );
     }
 

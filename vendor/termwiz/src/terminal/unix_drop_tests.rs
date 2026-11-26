@@ -1,7 +1,56 @@
 use super::*;
 use std::os::fd::FromRawFd;
 
-fn pty() -> (std::fs::File, std::fs::File) {
+/// The master side of a test PTY, drained by a reader thread. termwiz's flush
+/// ends in `tcdrain`, and on macOS `tcdrain` on a PTY slave waits until the
+/// master has read the output (Linux returns at once), so an unread master
+/// would hang every write. Dropping this stops the reader before closing the
+/// only master descriptor, so the PTY really hangs up.
+struct Master {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    _file: std::sync::Arc<std::fs::File>,
+}
+
+impl Drop for Master {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            reader.join().ok();
+        }
+    }
+}
+
+fn drained(master: std::fs::File) -> Master {
+    let file = std::sync::Arc::new(master);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reader_file, reader_stop) = (file.clone(), stop.clone());
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while !reader_stop.load(std::sync::atomic::Ordering::Acquire) {
+            let mut fds = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&*reader_file),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Bounded wait so a stop request is seen within 10 ms.
+            // SAFETY: `fds` is one initialized pollfd that outlives the call.
+            if unsafe { libc::poll(&mut fds, 1, 10) } > 0 {
+                match std::io::Read::read(&mut &*reader_file, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+    Master {
+        stop,
+        reader: Some(reader),
+        _file: file,
+    }
+}
+
+fn pty() -> (Master, std::fs::File) {
     let (mut master, mut slave) = (-1, -1);
     // Both descriptors belong solely to this test, never to /dev/tty.
     let result = unsafe {
@@ -16,7 +65,7 @@ fn pty() -> (std::fs::File, std::fs::File) {
     assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
     unsafe {
         (
-            std::fs::File::from_raw_fd(master),
+            drained(std::fs::File::from_raw_fd(master)),
             std::fs::File::from_raw_fd(slave),
         )
     }
@@ -45,7 +94,10 @@ fn healthy_drop_restores_saved_terminal_modes() {
         assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut restored), 0);
         restored
     };
-    assert_eq!(saved.c_lflag, restored.c_lflag);
+    // The kernel sets PENDIN itself (retype pending input) when a mode change races
+    // buffered input; macOS leaves it set after the restore. It is not a mode we own.
+    let own = !libc::PENDIN;
+    assert_eq!(saved.c_lflag & own, restored.c_lflag & own);
     assert_eq!(saved.c_iflag, restored.c_iflag);
     assert_eq!(saved.c_oflag, restored.c_oflag);
     assert_eq!(saved.c_cflag, restored.c_cflag);

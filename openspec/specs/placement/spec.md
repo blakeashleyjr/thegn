@@ -302,6 +302,26 @@ still flows through the zone floor and mode clamp.
 - **THEN** the effective strategy is spread, with the preset supplying the
   remaining preferences (packed mode, queue on exhaustion)
 
+### Requirement: An ssh host with systemd lingering off is flagged once
+
+thegn SHALL, on the first successful connect to an ssh placement in a
+process, probe `loginctl show-user` for the `Linger` property and, when it
+is off, show a one-time notice naming the fix command
+`sudo loginctl enable-linger $USER`. A non-systemd host, a failed probe, or
+a probe past its short deadline SHALL show nothing and SHALL NOT fail or
+block the connect.
+
+#### Scenario: Linger off is named once
+
+- **WHEN** an ssh host reports `Linger=no` and is connected twice
+- **THEN** exactly one notice naming `sudo loginctl enable-linger $USER`
+  is shown, and both connects succeed
+
+#### Scenario: Unknown linger is silent
+
+- **WHEN** the host has no `loginctl`, or the probe fails or times out
+- **THEN** no notice is shown and the connect still succeeds
+
 ### Requirement: Repo overlays cannot touch fleet placement policy
 
 thegn SHALL keep every `[placement]` key out of the repo overlay schema

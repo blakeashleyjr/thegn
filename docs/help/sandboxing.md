@@ -291,9 +291,11 @@ has a symlink in any component below `$HOME` is skipped with a warning, never
 followed; the pane launches without it. `$HOME` itself may be reached through
 a system link (`/home -> /var/home`).
 
-> `~/.keychain` is carved writable for `standard` panes but **not** for
-> `sealed` ones: it holds scripts your host login shells later _source_,
-> so a writable copy from a sealed sandbox would be a persistence vector.
+> `~/.keychain` and `~/.claude-profiles` are read-only in every sandbox
+> profile: they hold scripts and agent configuration your host later _sources_
+> or runs, so a writable copy would be a persistence vector. Edit them from a
+> host shell. A HOME-swapping profile wrapper run inside a pane needs its own
+> profile directory added to `[sandbox] mounts`.
 
 The daemon socket normally lives under `$XDG_RUNTIME_DIR/thegn`. With that
 variable unset, it uses a vetted private runtime directory, then a private
@@ -384,22 +386,22 @@ The Lead (`[lead]`, experimental) runs its agent under bubblewrap. Its
   token. A generated `resolv.conf` replaces `/etc/resolv.conf` inside the
   sandbox and names pasta's DNS forwarder (`169.254.1.1`), which relays to
   your host resolver. Your host's LAN address stays reachable.
-- **Network (`[lead] network = "host"`):** the Lead shares the host's network.
-  It can reach every loopback service on your machine, and every abstract
-  unix socket, including an X11 display. Any of those that trusts a local
-  caller trusts the Lead. thegn logs a warning on every launch in this mode.
-  Use it only when pasta cannot be installed.
+- **Network (`[lead] network = "host"`):** this legacy value is refused. It
+  would let the Lead reach every loopback service and abstract unix socket,
+  including an X11 display. Set `network = "isolated"` and install `pasta`.
 
 The daemon's unix socket, which grants admin to any process of your user, is
-out of reach in both modes.
+out of reach in the admitted isolated sandbox.
 
 thegn refuses to open the Lead when:
 
 - bwrap is missing. The error is "the Lead needs bwrap (Linux); not available
   here". It never falls back to a host shell.
 - The network is `isolated` and pasta is missing. The error is "the Lead's
-  isolated network needs pasta (passt); install it or set [lead] network =
-  "host"". It never falls back to the host network on its own.
+  isolated network needs pasta (passt); install it before launching the Lead".
+  It never falls back to the host network on its own.
+- The network is `host`. The Lead refuses to launch because that setting
+  exposes host loopback services and abstract unix sockets.
 - `[lead] notes_dir` or an agent state dir is inside a registered repo or
   worktree, contains one, or is `/` or `$HOME`. Symlinks are resolved first.
 - A writable path overlaps a hidden control dir, or lies inside hidden

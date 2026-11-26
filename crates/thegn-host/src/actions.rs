@@ -2440,6 +2440,13 @@ impl CiActionCtx<'_> {
                     ov.remove_selected();
                 }
             }
+            DetailAction::DismissBatch { ids, acks, keys } => {
+                self.ack_attention_many(acks);
+                self.mutate_notifications_many(ids);
+                if let Some(ov) = overlay.as_mut() {
+                    ov.remove_notif_leaves(&keys);
+                }
+            }
             DetailAction::OpenLogPager => self.open_log_pager(),
             DetailAction::CopyLine(line) => {
                 self.model.status = match crate::clipboard::copy(&line) {
@@ -2485,12 +2492,24 @@ impl CiActionCtx<'_> {
     /// [`DetailAction::AckAllAttention`] → `mark_all_read`, the one total-clear
     /// path every surface shares.)
     fn mutate_notifications(&mut self, id: i64) {
+        self.mutate_notifications_many(vec![id]);
+    }
+
+    /// `mutate_notifications` for a batch: one off-loop DB open and one
+    /// refresh pulse for every id (a group or stale dismissal can be hundreds).
+    fn mutate_notifications_many(&mut self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
         let epoch = crate::hydrate_feed::issue_notification_write();
+        let optimistic = ids.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.mark_notification_read(id); // best-effort: DB is a cache
+                for id in ids {
+                    let _ = db.mark_notification_read(id); // best-effort: DB is a cache
+                }
             }
             crate::hydrate_feed::commit_notification_write(epoch);
             if tx.send(RefreshKind::Model).is_ok() {
@@ -2498,7 +2517,7 @@ impl CiActionCtx<'_> {
             }
         });
         // Optimistic: the chip drops on the next frame, not after the rehydrate.
-        self.model.panel.mark_read_ids_at(epoch, [id]);
+        self.model.panel.mark_read_ids_at(epoch, optimistic);
         self.model.status = "Dismissed notification".into();
     }
 
@@ -2511,37 +2530,58 @@ impl CiActionCtx<'_> {
         since: Option<i64>,
         episode: thegn_core::attention::Episode,
     ) {
-        let reason = serde_json::to_string(&reason).unwrap_or_default();
-        if reason.is_empty() {
+        self.ack_attention_many(vec![crate::detail::notif_tree::AckTarget {
+            path,
+            reason,
+            since,
+            episode,
+        }]);
+    }
+
+    /// `ack_attention` for a batch: one off-loop DB open and one
+    /// refresh pulse for every worktree (a group or stale dismissal can be
+    /// hundreds).
+    fn ack_attention_many(&mut self, targets: Vec<crate::detail::notif_tree::AckTarget>) {
+        let targets: Vec<(String, String, Option<i64>, thegn_core::attention::Episode)> = targets
+            .into_iter()
+            .filter_map(|t| {
+                let reason = serde_json::to_string(&t.reason).unwrap_or_default();
+                (!reason.is_empty()).then_some((t.path, reason, t.since, t.episode))
+            })
+            .collect();
+        if targets.is_empty() {
             return;
         }
-        let quieted = path.clone();
+        let quieted: Vec<String> = targets.iter().map(|t| t.0.clone()).collect();
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                // best-effort: DB is a cache
-                let _ = db.put_attention_ack(&path, &reason, since, episode);
-                // The worktree's inbox rows are the same item seen from the
-                // other side; leaving them unread made a quieted needs-you
-                // entry reappear under Alerts with the ⚑ count unchanged.
-                let _ = db.mark_notifications_read_for_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                // Same item from the other side: a quieted needs-you worktree
-                // must also lower its live raised hand, or the demand returns
-                // on the very next hydration.
-                // best-effort: DB is a cache
-                let _ = db.clear_session_attention_for_worktree(&path);
+                for (path, reason, since, episode) in &targets {
+                    // best-effort: DB is a cache
+                    let _ = db.put_attention_ack(path, reason, *since, *episode);
+                    // The worktree's inbox rows are the same item seen from the
+                    // other side; leaving them unread made a quieted needs-you
+                    // entry reappear under Alerts with the ⚑ count unchanged.
+                    let _ = db.mark_notifications_read_for_worktree(path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    // Same item from the other side: a quieted needs-you worktree
+                    // must also lower its live raised hand, or the demand returns
+                    // on the very next hydration.
+                    // best-effort: DB is a cache
+                    let _ = db.clear_session_attention_for_worktree(path);
+                }
             }
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
-        // Optimistic: quiet the worktree in the model now (the rehydrate
-        // re-derives the same ack from the DB).
+        // Optimistic: quiet the worktrees in the model now (the rehydrate
+        // re-derives the same acks from the DB).
+        let set: std::collections::HashSet<&str> = quieted.iter().map(String::as_str).collect();
         self.model
             .panel
-            .mark_read_where(|n| n.worktree_path == quieted);
-        self.model.sidebar_status.acked.insert(quieted);
+            .mark_read_where(|n| set.contains(n.worktree_path.as_str()));
+        self.model.sidebar_status.acked.extend(quieted);
     }
 
     /// Open the raw thegn.log in a pager pane (`$PAGER`, else `less`), scrolled

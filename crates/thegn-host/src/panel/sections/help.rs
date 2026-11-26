@@ -107,6 +107,50 @@ pub(crate) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             "help registry not loaded",
         )]))];
     }
+    if ctx.ui.help.searching || !ctx.ui.help.query.is_empty() {
+        let body = ctx.rows.saturating_sub(2);
+        let mut rows = Vec::new();
+        if ctx.ui.help.hits.is_empty() {
+            let message = if ctx.ui.help.query.trim().is_empty() {
+                "Type to search every help page"
+            } else {
+                "No matching help pages"
+            };
+            rows.push(PanelRow::plain(Line::segs(vec![seg(d(), message)])));
+        } else {
+            let start = ctx
+                .ui
+                .help
+                .selected
+                .saturating_sub(body / 2)
+                .min(ctx.ui.help.hits.len().saturating_sub(body));
+            for (index, hit) in ctx.ui.help.hits.iter().enumerate().skip(start).take(body) {
+                let marker = if index == ctx.ui.help.selected {
+                    "› "
+                } else {
+                    "  "
+                };
+                let mut text = format!("{marker}{}", hit.title);
+                if let Some(snippet) = &hit.snippet {
+                    if let Some(section) = &snippet.section {
+                        text.push_str(" › ");
+                        text.push_str(section);
+                    }
+                    text.push_str(" — ");
+                    text.push_str(&snippet.text);
+                }
+                rows.push(PanelRow::plain(Line::segs(vec![seg(d(), text)])));
+            }
+        }
+        rows.truncate(body);
+        rows.push(PanelRow::blank());
+        rows.push(hint_row(&[
+            ("↑/↓", "select"),
+            ("↵", "open"),
+            ("esc", "close search"),
+        ]));
+        return rows;
+    }
     with_lines(ctx, |lines| {
         if lines.is_empty() {
             return vec![PanelRow::plain(Line::segs(vec![seg(d(), "no help pages")]))];
@@ -152,6 +196,7 @@ mod tests {
                 reg: Some(Arc::new(crate::help::pages::registry_logged(
                     &Config::default(),
                 ))),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -202,6 +247,28 @@ mod tests {
         let (model, ui) = fixture(PanelWidth::Normal, 5);
         let scrolled = content(&ctx(&model, &ui, 39));
         assert_ne!(text(&first).lines().next(), text(&scrolled).lines().next());
+    }
+
+    #[test]
+    fn help_search_renders_selected_match_in_the_panel_body() {
+        let (model, mut ui) = fixture(PanelWidth::Normal, 0);
+        ui.help.searching = true;
+        ui.help.query = "keyboard".into();
+        ui.help.hits = vec![thegn_core::help::SearchHit {
+            page: "keys".into(),
+            title: "Keybindings".into(),
+            score: 42,
+            snippet: Some(thegn_core::help::Snippet {
+                text: "Move through the panel with keyboard shortcuts".into(),
+                hl_start: 0,
+                hl_len: 8,
+                section: Some("Navigation".into()),
+            }),
+        }];
+        let rendered = text(&content(&ctx(&model, &ui, 39)));
+        assert!(rendered.contains("› Keybindings"), "{rendered}");
+        assert!(rendered.contains("Navigation"), "{rendered}");
+        assert!(rendered.contains("↵ open"), "{rendered}");
     }
 
     #[test]

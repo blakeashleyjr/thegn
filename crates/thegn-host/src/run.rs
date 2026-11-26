@@ -2473,7 +2473,7 @@ fn connect_worktree_bridge(
 
 pub(crate) fn delete_groups_with_mode(
     session: &mut crate::session::Session,
-    _panes: &mut Panes,
+    panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
     mode: thegn_core::hooks::HookExecutionMode,
@@ -2499,6 +2499,17 @@ pub(crate) fn delete_groups_with_mode(
                 continue;
             }
             let group_name = session.worktrees[gi].name.clone();
+            // Delete-from-disk stops the group's pane programs first (THE-2736);
+            // the worker signals them after the vetoing pre-destroy hook.
+            if !keep_files {
+                let stops = session.worktrees[gi]
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.center.pane_ids())
+                    .filter_map(|id| panes.table.get(&id)?.delete_stop())
+                    .collect();
+                crate::worktree_lifecycle::register_pane_stops(Path::new(&path), stops);
+            }
             if let Err(error) = crate::worktree_lifecycle::spawn_worktree_destroy(
                 PathBuf::from(&path),
                 group_name,
@@ -2507,6 +2518,7 @@ pub(crate) fn delete_groups_with_mode(
                 mode,
                 waker.clone(),
             ) {
+                drop(crate::worktree_lifecycle::take_pane_stops(Path::new(&path)));
                 spawn_errors.push(format!("{path}: {error}"));
                 continue;
             }
@@ -8461,6 +8473,10 @@ async fn event_loop<T: Terminal>(
     // Coalesce model hydrations: one main-loop `build_model` in flight, so a refresh
     // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
     let mut inflight_hydration_gen: Option<u64> = None;
+    // The Files self-heal (see the event-loop tail) fires at most once per
+    // hydration generation: a hydration that still lands Pending (a retained
+    // model after a failed build) must not respawn `build_model` on every wake.
+    let mut files_heal_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
     // A worktree/workspace switch may spawn ONE hydration that overlaps an
     // in-flight ticker hydration (generation checks discard the older result),
@@ -15281,6 +15297,9 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
+                RefreshKind::IssueDetail(p) => {
+                    dirty |= crate::handlers::tracker::apply_detail(&mut panel_ui, *p)
+                }
                 RefreshKind::Info(p) => {
                     dirty |= crate::detail::info::apply(
                         &mut bar_detail,
@@ -15596,6 +15615,18 @@ async fn event_loop<T: Terminal>(
             current_config.semantic.file_cap(),
             &waker,
         );
+        // Self-heal: the tracked-file listing is only fetched while Files is the
+        // open section, so a model built under other hints (startup, restored
+        // `open`, a prefetch) leaves it Pending — refresh once with the live hints.
+        // Bounded to one heal per generation (`files_heal_gen`).
+        let files_heal = panel_ui.open == crate::panel::Section::Files
+            && matches!(
+                model.panel.files_load,
+                crate::panel::gitui::DocLoad::Pending
+            )
+            && inflight_hydration_gen.is_none()
+            && files_heal_gen != Some(hydration_gen);
+        want_model_refresh |= files_heal;
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         // A switch's hydration may overlap ONE in-flight ticker hydration: the
         // generation checks at the arrival site make the older result inert
@@ -15656,6 +15687,9 @@ async fn event_loop<T: Terminal>(
                 switch_hydration_gen = Some(hydration_gen);
             }
             inflight_hydration_gen = Some(hydration_gen);
+            if files_heal {
+                files_heal_gen = Some(hydration_gen);
+            }
             model_refresh_pending = false;
             switch_refresh_pending = false;
         }
@@ -15899,10 +15933,28 @@ async fn event_loop<T: Terminal>(
         // off-thread so the file write never stalls the loop. The
         // `last_acked_tab` guard only suppresses the redundant re-spawn in the
         // ~1s before hydration reflects the new `Read` state back into the model.
+        // A "mark unread" on the focused tab (THE-2737) holds it out of the ack
+        // until focus leaves it or its dot leaves the waiting/seen pair (work
+        // resumed). A stale `Read` from a hydration that predates the unread
+        // write must not drop the hold.
+        let release_hold = sb.unread_hold.as_deref().is_some_and(|hold| {
+            session.active_group().map(|g| g.name.as_str()) != Some(hold)
+                || !matches!(
+                    model.sidebar_status.activity.get(hold),
+                    Some(
+                        crate::sidebar::ActivityState::Waiting
+                            | crate::sidebar::ActivityState::Read
+                    )
+                )
+        });
+        if release_hold {
+            sb.unread_hold = None;
+        }
         if let Some(name) = session.active_group().map(|g| g.name.clone())
             && model.sidebar_status.activity.get(&name)
                 == Some(&crate::sidebar::ActivityState::Waiting)
             && last_acked_tab.as_deref() != Some(name.as_str())
+            && sb.unread_hold.as_deref() != Some(name.as_str())
         {
             last_acked_tab = Some(name.clone());
             task::spawn_blocking(move || thegn_core::activity::ack(&name));
@@ -16637,6 +16689,17 @@ async fn event_loop<T: Terminal>(
             let mut title_writes: Vec<(String, String)> = Vec::new();
             if title_gen_now != last_title_gen || dirty || switch_at.is_some() {
                 last_title_gen = title_gen_now;
+                let tab_titles = crate::tab_titles::labels(
+                    &session,
+                    &panes,
+                    current_config.ui.tab_title_from_terminal,
+                );
+                if model.tabs != tab_titles {
+                    model.tabs = tab_titles;
+                    // Tab chips share the chrome damage path. The current
+                    // frame can carry an OSC title change without pane damage.
+                    dirty = true;
+                }
                 for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
                     if model.sidebar_window_titles.get(&path) != Some(&title) {
                         title_writes.push((path.clone(), title.clone()));
@@ -23413,6 +23476,116 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // The docked Help search owns unmodified keys while focused.
+                // `/` opens the visible header field; Enter opens the selected
+                // page and its matched section in this panel.
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && panel_ui.open == crate::panel::Section::Help
+                    && panel_ui.tab == crate::panel::PanelTab::Help
+                {
+                    if panel_ui.help.searching {
+                        match (&k.key, k.modifiers) {
+                            (KeyCode::Escape, _) => {
+                                panel_ui.help.searching = false;
+                                panel_ui.help.query.clear();
+                                panel_ui.help.hits.clear();
+                                panel_ui.help.selected = 0;
+                            }
+                            (KeyCode::Backspace, _) => {
+                                panel_ui.help.query.pop();
+                                panel_ui.help.hits =
+                                    panel_ui.help.reg.as_ref().map_or_else(Vec::new, |reg| {
+                                        thegn_core::help::search(
+                                            reg.pages(),
+                                            &panel_ui.help.query,
+                                            &crate::fff_backend::fuzzy_rank,
+                                        )
+                                    });
+                                panel_ui.help.selected = 0;
+                            }
+                            (KeyCode::UpArrow, _) => {
+                                panel_ui.help.selected = panel_ui.help.selected.saturating_sub(1);
+                            }
+                            (KeyCode::DownArrow, _) => {
+                                panel_ui.help.selected = panel_ui
+                                    .help
+                                    .selected
+                                    .saturating_add(1)
+                                    .min(panel_ui.help.hits.len().saturating_sub(1));
+                            }
+                            (KeyCode::Enter, _) => {
+                                if let Some(hit) =
+                                    panel_ui.help.hits.get(panel_ui.help.selected).cloned()
+                                {
+                                    panel_ui.help.page = hit.page;
+                                    panel_ui.help.searching = false;
+                                    panel_ui.help.query.clear();
+                                    panel_ui.help.hits.clear();
+                                    panel_ui.help.selected = 0;
+                                    panel_ui.scroll = 0;
+                                    // Land on the matched section's heading,
+                                    // rendered at the docked panel's width.
+                                    if let Some(section) = hit.snippet.and_then(|sn| sn.section)
+                                        && let Some(reg) = panel_ui.help.reg.as_ref()
+                                    {
+                                        let indent =
+                                            if panel_ui.width == crate::layout::PanelWidth::Full {
+                                                2
+                                            } else {
+                                                3
+                                            };
+                                        let width = panel_geom(&chrome, &model)
+                                            .0
+                                            .saturating_sub(indent)
+                                            .saturating_sub(1)
+                                            .max(8);
+                                        let blocks = crate::help::render::page_blocks(
+                                            reg,
+                                            &panel_ui.help.page,
+                                        );
+                                        let rendered =
+                                            crate::help::render::render_page(&blocks, width, None);
+                                        if let Some((line, _)) = rendered
+                                            .headings
+                                            .iter()
+                                            .find(|(_, heading)| *heading == section)
+                                        {
+                                            panel_ui.scroll = *line;
+                                        }
+                                    }
+                                } else {
+                                    panel_ui.help.searching = false;
+                                    panel_ui.help.query.clear();
+                                }
+                            }
+                            (KeyCode::Char(c), m)
+                                if !m.intersects(Modifiers::CTRL | Modifiers::ALT) =>
+                            {
+                                panel_ui.help.query.push(*c);
+                                panel_ui.help.hits =
+                                    panel_ui.help.reg.as_ref().map_or_else(Vec::new, |reg| {
+                                        thegn_core::help::search(
+                                            reg.pages(),
+                                            &panel_ui.help.query,
+                                            &crate::fff_backend::fuzzy_rank,
+                                        )
+                                    });
+                                panel_ui.help.selected = 0;
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    } else if k.modifiers.is_empty() && k.key == KeyCode::Char('/') {
+                        panel_ui.help.searching = true;
+                        panel_ui.help.query.clear();
+                        panel_ui.help.hits.clear();
+                        panel_ui.help.selected = 0;
+                        dirty = true;
+                        continue;
+                    }
+                }
                 if forced_palette_action.is_none()
                     && focus.panel()
                     && k.modifiers == Modifiers::SHIFT
@@ -24105,9 +24278,9 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Issues => {
-                                            // Enter toggles the worktree↔issue link for
-                                            // the cursor row.
-                                            crate::handlers::tracker::toggle_link(
+                                            // Enter opens the issue's detail page
+                                            // (`l` links it to the worktree).
+                                            crate::handlers::tracker::toggle_detail(
                                                 &mut crate::handlers::tracker::TrackerCtx {
                                                     model: &mut model,
                                                     panel_ui: &mut panel_ui,
@@ -25573,25 +25746,26 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- issues: open URL, refresh, self-assign, dispatch --
-                        (Section::Issues, KeyCode::Char(c @ ('o' | 'r' | 'a' | 'D'))) => {
-                            crate::handlers::tracker::issues_key(
-                                c,
-                                &mut crate::handlers::tracker::TrackerCtx {
-                                    model: &mut model,
-                                    panel_ui: &mut panel_ui,
-                                    session: &session,
-                                    cfg: keymap.config(),
-                                    live_cfg: &current_config,
-                                    waker: &waker,
-                                    refresh_tx: &refresh_tx,
-                                    create_gen: &mut create_gen,
-                                    create_tx: &create_tx,
-                                    inflight: &mut inflight,
-                                    wizard_ui: &mut wizard_ui,
-                                    pending_issue_link: &mut pending_issue_link,
-                                },
-                            )
-                        }
+                        (
+                            Section::Issues,
+                            KeyCode::Char(c @ ('o' | 'r' | 'a' | 'D' | 'l' | 'T')),
+                        ) => crate::handlers::tracker::issues_key(
+                            c,
+                            &mut crate::handlers::tracker::TrackerCtx {
+                                model: &mut model,
+                                panel_ui: &mut panel_ui,
+                                session: &session,
+                                cfg: keymap.config(),
+                                live_cfg: &current_config,
+                                waker: &waker,
+                                refresh_tx: &refresh_tx,
+                                create_gen: &mut create_gen,
+                                create_tx: &create_tx,
+                                inflight: &mut inflight,
+                                wizard_ui: &mut wizard_ui,
+                                pending_issue_link: &mut pending_issue_link,
+                            },
+                        ),
                         // `y` / `n` approve / reject the cursor row when it is an
                         // approval request (b155 6a); `y`/`n` were free here.
                         (Section::Notifications, KeyCode::Char(c @ ('y' | 'n'))) => {
@@ -26784,7 +26958,9 @@ async fn event_loop<T: Terminal>(
                                     &panel_ui,
                                 );
                             }
-                            Action::OpenPalette => {
+                            action @ (Action::OpenPalette
+                            | Action::PaletteFiles
+                            | Action::PaletteContent) => {
                                 let key = run_palette_db::PaletteKey {
                                     kind: run_palette_db::PaletteKind::Main,
                                     context: session.id.clone(),
@@ -26807,6 +26983,28 @@ async fn event_loop<T: Terminal>(
                                 let mut open_palette =
                                     crate::search_everywhere::PaletteSession::new(items);
                                 open_palette.mark_db_pending(key.cache_id(), generation);
+                                // File and content palette actions open the palette
+                                // already in that mode: typing the mode prefix is
+                                // what switches it, so the query starts empty.
+                                let seed_prefix = match action {
+                                    Action::PaletteFiles => Some('>'),
+                                    Action::PaletteContent => Some('/'),
+                                    _ => None,
+                                };
+                                if let Some(prefix) = seed_prefix {
+                                    let (mode, _query) = open_palette.push_char(prefix);
+                                    crate::search_everywhere::kick_palette_search(
+                                        &mut open_palette,
+                                        mode,
+                                        file_index.as_ref(),
+                                        active_tab_path(&session),
+                                        &current_config,
+                                        lsp_supervisor.handle(),
+                                        &model.panel,
+                                        &panel_ui.tests,
+                                        &waker,
+                                    );
+                                }
                                 palette = Some(open_palette);
                                 let worker_session = session.clone_for_hydrate();
                                 run_palette_db::spawn_load(
@@ -27615,6 +27813,17 @@ async fn event_loop<T: Terminal>(
                                         model.status =
                                             "Info covers project and worktree rows".into();
                                     }
+                                }
+                            }
+                            Action::MarkUnread => {
+                                // Sidebar focused: marked rows, else the cursor
+                                // row. Otherwise the active worktree's tab.
+                                if focus.sidebar() {
+                                    let _ = sb.mark_unread_selection(&mut model, &session);
+                                } else if let Some(name) =
+                                    session.active_group().map(|g| g.name.clone())
+                                {
+                                    let _ = sb.mark_unread_tabs(vec![name], &mut model, &session);
                                 }
                             }
                             Action::OpenShares => {

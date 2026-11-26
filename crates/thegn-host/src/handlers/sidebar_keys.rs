@@ -449,6 +449,13 @@ impl SidebarState {
                 if row.is_pinnable() {
                     entries.push(e("pin", "Pin / unpin", Some(chord_of(Id::TogglePin))));
                 }
+                if row.activity == crate::sidebar::ActivityState::Read {
+                    entries.push(e(
+                        "mark-unread",
+                        "Mark unread",
+                        Some(chord_of(Id::MarkUnread)),
+                    ));
+                }
                 if row.worktree_path.is_some() {
                     entries.push(e("copy-path", "Copy path", Some(chord_of(Id::CopyPath))));
                 }
@@ -606,6 +613,13 @@ impl SidebarState {
                     "Collapse / expand",
                     Some(chord_of(Id::Activate)),
                 ));
+                // The one write a `Finished` row has: hide what is in it now.
+                // View state only — the worktrees stay until `wt prune`.
+                if row.kind == RowKind::PipelineLane
+                    && row.pin_key == crate::sidebar::finished_group_key(&row.workspace_slug)
+                {
+                    entries.push(e("clear-finished", "Clear finished", None));
+                }
             }
             // The "show more"/"show fewer" toggle does one thing (Enter,
             // Space or a click); a menu would only repeat it.
@@ -852,6 +866,7 @@ impl SidebarState {
             Id::SortMenu => return SidebarOutcome::SortMenu,
             Id::ToggleFlat => return self.toggle_flat(model, session),
             Id::TogglePin => return self.toggle_pin(model, session),
+            Id::MarkUnread => return self.mark_unread_selection(model, session),
             Id::CycleDetail => return self.cycle_focus_detail(model),
             Id::Info => {
                 if self.selected_row(model).is_some_and(|r| {
@@ -1183,6 +1198,108 @@ impl SidebarState {
         SidebarOutcome::Redraw
     }
 
+    /// The tab (worktree group) name a worktree row stands for — the key the
+    /// activity state machine and `sidebar_status.activity` use. `None` for
+    /// rows that are not worktrees (workspace headers, folders, lanes).
+    fn row_tab_name(
+        row: &crate::sidebar::SidebarRow,
+        session: &crate::session::Session,
+    ) -> Option<String> {
+        if !row.kind.is_worktree() {
+            return None;
+        }
+        match row.tab_target.as_ref()? {
+            crate::sidebar::RowTarget::Tab(g, _) => {
+                session.worktrees.get(*g).map(|w| w.name.clone())
+            }
+            crate::sidebar::RowTarget::Workspace { group, .. } => group.clone(),
+        }
+    }
+
+    /// `u`: return seen (hollow) dots to unread on every marked worktree row
+    /// (batch members included), else the cursor row — or, on a batch row,
+    /// every member of the batch.
+    pub(crate) fn mark_unread_selection(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        let mut tabs: Vec<String> = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| self.marked.contains(&r.pin_key))
+            .filter_map(|r| Self::row_tab_name(r, session))
+            .collect();
+        if tabs.is_empty()
+            && let Some(row) = self.selected_row(model)
+        {
+            if row.kind == crate::sidebar::RowKind::BatchGroup {
+                // A batch row stands for its members: the following rows
+                // deeper than it (collapsed members included).
+                let depth = row.depth;
+                let key = row.pin_key.clone();
+                let rows = &model.sidebar_rows;
+                if let Some(h) = rows.iter().position(|r| r.pin_key == key) {
+                    tabs.extend(
+                        rows[h + 1..]
+                            .iter()
+                            .take_while(|r| r.depth > depth)
+                            .filter_map(|r| Self::row_tab_name(r, session)),
+                    );
+                }
+            } else {
+                tabs.extend(Self::row_tab_name(row, session));
+            }
+        }
+        self.mark_unread_tabs(tabs, model, session)
+    }
+
+    /// Flip each named tab's `Read` dot back to `Waiting`: persisted off-thread
+    /// (the activity file write must not stall the loop) and mirrored into the
+    /// model at once so the dot and the attention sort update this frame. Tabs
+    /// whose dot is not `Read` are left alone — no dot stays no dot.
+    pub(crate) fn mark_unread_tabs(
+        &mut self,
+        tabs: Vec<String>,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        let flip: Vec<String> = tabs
+            .into_iter()
+            .filter(|t| {
+                model.sidebar_status.activity.get(t) == Some(&crate::sidebar::ActivityState::Read)
+            })
+            .collect();
+        if flip.is_empty() {
+            model.status = "Nothing to mark unread — only seen (hollow) dots can be".into();
+            self.sync(model);
+            return SidebarOutcome::Redraw;
+        }
+        for t in &flip {
+            model
+                .sidebar_status
+                .activity
+                .insert(t.clone(), crate::sidebar::ActivityState::Waiting);
+        }
+        model.status = format!("Marked {} unread", flip.len());
+        // The focused tab would be re-acked by the loop on the next frame;
+        // hold it filled until the user leaves and focuses it again.
+        if let Some(active) = session.active_group().map(|g| g.name.as_str())
+            && flip.iter().any(|t| t == active)
+        {
+            self.unread_hold = Some(active.to_string());
+        }
+        thegn_core::thread_name::spawn_named("thegn-mark-unrd", move || {
+            // Utility: user-requested activity-state write.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            for t in &flip {
+                thegn_core::activity::mark_unread(t);
+            }
+        });
+        self.rebuild(model, session);
+        SidebarOutcome::Redraw
+    }
+
     pub(crate) fn toggle_pin(
         &mut self,
         model: &mut FrameModel,
@@ -1344,6 +1461,21 @@ impl SidebarState {
                 }
             }
             "toggle" => return self.toggle_collapse(model, session),
+            "clear-finished" => {
+                if let Some(slug) = self
+                    .selected_row(model)
+                    .filter(|row| {
+                        row.pin_key == crate::sidebar::finished_group_key(&row.workspace_slug)
+                    })
+                    .map(|row| row.workspace_slug.clone())
+                {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as i64);
+                    self.clear_finished(&slug, now_ms);
+                    self.rebuild(model, session);
+                }
+            }
             "toggle-flat" => return self.toggle_flat(model, session),
             "cycle-detail" => return self.cycle_focus_detail(model),
             // The menu is anchored to ONE row (the caller re-lands the cursor
@@ -1351,6 +1483,12 @@ impl SidebarState {
             // marked set. A menu entry labelled for the row under the pointer
             // must not delete rows marked elsewhere; `Space` + `d`/`p` remain
             // the bulk gestures.
+            "mark-unread" => {
+                let tab = self
+                    .selected_row(model)
+                    .and_then(|r| Self::row_tab_name(r, session));
+                return self.mark_unread_tabs(tab.into_iter().collect(), model, session);
+            }
             "pin" => {
                 let key = self
                     .selected_row(model)

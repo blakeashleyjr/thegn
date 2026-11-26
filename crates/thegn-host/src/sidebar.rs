@@ -334,6 +334,10 @@ pub struct SidebarRow {
     /// rendered "(N)" count; the label itself stays the bare folder name so
     /// actions can seed rename prompts from it).
     pub child_count: usize,
+    /// Worktree rows filed under the `Merged` folder: the detail line drops the
+    /// last commit subject (a truncated "chore(r…" says nothing) and keeps the
+    /// age and size fields.
+    pub hide_subject: bool,
     /// Attention score: the worktree's own (Worktree rows) or the workspace's
     /// most-urgent-child rollup (Workspace rows). Denormalized from
     /// `SidebarStatus` in one pass at build time. Feeds sorting/bubbling only
@@ -418,6 +422,7 @@ impl SidebarRow {
             terminal_connection: None,
             folder_id: None,
             child_count: 0,
+            hide_subject: false,
             attention: None,
             mq_status: None,
             pipeline_stage: None,
@@ -663,6 +668,11 @@ pub struct ViewState {
     pub freeze: Option<std::sync::Arc<crate::sidebar_freeze::SortFreeze>>,
     /// Batch groups the user opened (`batch_open:{key}` = "1"); absent = collapsed.
     pub batch_open: HashSet<String>,
+    /// "Clear finished" cut-offs, keyed by workspace slug (epoch ms): a
+    /// finished pipeline lane whose last activity is at or before the cut-off
+    /// leaves that workspace's sidebar (its worktree is untouched). Persisted
+    /// as `finished_cleared:{slug}` in `ui_state`.
+    pub finished_cleared: std::collections::HashMap<String, i64>,
     /// The focused cursor row's pin_key at rebuild time; the row limit never folds it.
     /// Loop-owned and transient, never persisted.
     pub cursor_key: Option<String>,
@@ -711,6 +721,16 @@ pub struct DbWorktree {
     /// `[ui] sidebar_external_worktrees`. Computed in
     /// `hydrate::db_worktree_list_with_snapshot`.
     pub external: bool,
+}
+
+/// The label of a workspace's derived pipeline group. A user folder spelled
+/// the same is folded into it rather than shown as a second `Pipelines`.
+pub const PIPELINES_LABEL: &str = "Pipelines";
+
+/// The `pin_key` (and collapse key) of a workspace's `Finished` pipelines
+/// sub-group.
+pub fn finished_group_key(slug: &str) -> String {
+    format!("pipeline/finished:{slug}")
 }
 
 /// The `ViewState::collapsed`-style key of a workspace's derived "Other"
@@ -1138,13 +1158,24 @@ pub fn build_rows(
             .iter()
             .map(|path| crate::sidebar_pipeline::path_identity(path)),
     );
+    // Integration and release worktrees (`tg/bNNN-integration`, `-release`) are
+    // not driven by any issue pipeline: they stay with the ordinary worktrees.
+    pipeline_paths.retain(|path| !crate::sidebar_pipeline::is_integration_path(path));
     // An explicit user folder is an override to the default Pipelines filing.
     // Keep that worktree in its chosen folder while leaving all other rows and
-    // folder state untouched.
-    for worktree in db_worktrees
+    // folder state untouched. A user folder that is itself named `Pipelines`
+    // is not such an override: a roster-owned worktree filed there joins the
+    // one derived Pipelines section instead of a second group of that name.
+    let pipelines_named: std::collections::HashSet<i64> = db_folders
         .iter()
-        .filter(|worktree| worktree.folder_id.is_some())
-    {
+        .filter(|folder| folder.name.trim().eq_ignore_ascii_case(PIPELINES_LABEL))
+        .map(|folder| folder.folder_id)
+        .collect();
+    for worktree in db_worktrees.iter().filter(|worktree| {
+        worktree
+            .folder_id
+            .is_some_and(|id| !pipelines_named.contains(&id))
+    }) {
         pipeline_paths.remove(&crate::sidebar_pipeline::path_identity(&worktree.path));
     }
 
@@ -1229,6 +1260,10 @@ pub fn build_rows(
     let mut assigned_pipeline_paths = std::collections::HashSet::new();
     let environment_lanes =
         crate::sidebar_pipeline::lanes_with_persisted_paths(&[], &environment_paths);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let finished_window_ms = i64::from(view.display.finished_pipeline_days) * 86_400_000;
     for lane in status.pipeline_lanes.iter().chain(&environment_lanes) {
         let worktrees: Vec<_> = lane
             .worktrees
@@ -1263,6 +1298,28 @@ pub fn build_rows(
                     })
                 })
         };
+        // A finished lane ages out of the sidebar after the configured window
+        // (`[ui] sidebar_finished_pipeline_days`; `0` = never). Its worktree is
+        // untouched; only an explicit `wt prune` removes it. The active
+        // worktree's lane always stays. "Clear finished" (the `Finished`
+        // row's menu) hides every lane finished by the time it was run.
+        let cleared = home
+            .as_deref()
+            .and_then(|slug| view.finished_cleared.get(slug))
+            .is_some_and(|&cut| lane.last_ms <= cut);
+        let expired =
+            finished_window_ms > 0 && now_ms.saturating_sub(lane.last_ms) > finished_window_ms;
+        let aged_out = lane.finished
+            && (expired || cleared)
+            && !session.active_group().is_some_and(|group| {
+                let active = crate::sidebar_pipeline::path_identity(&group.path);
+                lane.worktrees
+                    .iter()
+                    .any(|w| crate::sidebar_pipeline::path_identity(&w.path) == active)
+            });
+        if aged_out {
+            continue;
+        }
         // No home ⇒ no rows. See the note above: there is no top-level group to
         // fall back to, by design.
         if let Some(slug) = home {
@@ -1475,6 +1532,7 @@ pub fn build_rows(
                 // the placement suffix bought no uniqueness.
                 let pin_key = format!("{repo_slug}/{}", gr.label);
                 let mut row = mk_row(gr, 2, pin_key);
+                row.hide_subject = folder.name.trim().eq_ignore_ascii_case("merged");
                 row.visible = !collapsed && !folder_collapsed;
                 rows.push(row);
             }
@@ -1802,10 +1860,25 @@ fn push_pipeline_group(
         collapsed: group_collapsed,
         visible: !context.parent_collapsed,
         child_count: lanes.len(),
-        ..SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", context.group_slug)
+        ..SidebarRow::base(
+            RowKind::PipelineGroup,
+            1,
+            PIPELINES_LABEL,
+            context.group_slug,
+        )
     });
-    for lane in lanes {
+    // A finished lane (every roster row terminal) moves into one `Finished`
+    // sub-group so the live pipelines read first.
+    let (finished, live): (Vec<_>, Vec<_>) = lanes.iter().partition(|lane| lane.finished);
+    for lane in live {
         let lane_key = format!("pipeline/lane:{}", lane.key);
+        // A single-worktree lane is one row: the worktree leaf carries the
+        // lane's name instead of sitting under a header that repeats it.
+        if let [wt] = lane.worktrees.as_slice() {
+            let visible = !context.parent_collapsed && !group_collapsed;
+            push_pipeline_leaf(rows, &context, wt, &lane.label, 2, visible);
+            continue;
+        }
         let lane_holds_active = context.active_path.is_some_and(|path| {
             let active = crate::sidebar_pipeline::path_identity(path);
             lane.worktrees
@@ -1826,41 +1899,84 @@ fn push_pipeline_group(
             )
         });
         for wt in &lane.worktrees {
-            let hit = context
-                .lane_targets
-                .get(&crate::sidebar_pipeline::path_identity(&wt.path));
-            let identity = crate::sidebar_pipeline::path_identity(&wt.path);
-            let mut row = context
-                .pipeline_groups
-                .get(&identity)
-                .map(|group| {
-                    worktree_row(
-                        group,
-                        context.status,
-                        context.group_slug,
-                        3,
-                        format!("pipeline/worktree:{identity}"),
-                        !context.parent_collapsed && !group_collapsed && !lane_collapsed,
-                        None,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    SidebarRow::base(
-                        RowKind::PipelineWorktree,
-                        3,
-                        wt.name.clone(),
-                        context.group_slug,
-                    )
-                });
-            row.kind = RowKind::PipelineWorktree;
-            row.pin_key = format!("{}/{}", context.group_slug, row.label);
-            row.label = wt.name.clone();
-            row.visible = !context.parent_collapsed && !group_collapsed && !lane_collapsed;
-            row.worktree_path = Some(wt.path.clone());
-            row.tab_target = hit.map(|(_, target)| target.clone());
-            rows.push(row);
+            let visible = !context.parent_collapsed && !group_collapsed && !lane_collapsed;
+            push_pipeline_leaf(rows, &context, wt, &wt.name, 3, visible);
         }
     }
+    if !finished.is_empty() {
+        let key = finished_group_key(context.group_slug);
+        let holds_active = context.active_path.is_some_and(|path| {
+            let active = crate::sidebar_pipeline::path_identity(path);
+            finished.iter().any(|lane| {
+                lane.worktrees.iter().any(|worktree| {
+                    crate::sidebar_pipeline::path_identity(&worktree.path) == active
+                })
+            })
+        });
+        let collapsed = context.view.collapsed.contains(&key) && !holds_active;
+        rows.push(SidebarRow {
+            pin_key: key,
+            collapsed,
+            visible: !context.parent_collapsed && !group_collapsed,
+            child_count: finished.len(),
+            ..SidebarRow::base(RowKind::PipelineLane, 2, "Finished", context.group_slug)
+        });
+        let visible = !context.parent_collapsed && !group_collapsed && !collapsed;
+        for lane in finished {
+            for wt in &lane.worktrees {
+                let label = if lane.worktrees.len() == 1 {
+                    lane.label.as_str()
+                } else {
+                    wt.name.as_str()
+                };
+                push_pipeline_leaf(rows, &context, wt, label, 3, visible);
+            }
+        }
+    }
+}
+
+/// Emit one pipeline-owned worktree leaf at `depth`, labelled `label`.
+fn push_pipeline_leaf(
+    rows: &mut Vec<SidebarRow>,
+    context: &PipelineGroupContext<'_>,
+    wt: &crate::sidebar_pipeline::LaneWorktree,
+    label: &str,
+    depth: u8,
+    visible: bool,
+) {
+    let hit = context
+        .lane_targets
+        .get(&crate::sidebar_pipeline::path_identity(&wt.path));
+    let identity = crate::sidebar_pipeline::path_identity(&wt.path);
+    let mut row = context
+        .pipeline_groups
+        .get(&identity)
+        .map(|group| {
+            worktree_row(
+                group,
+                context.status,
+                context.group_slug,
+                depth,
+                format!("pipeline/worktree:{identity}"),
+                visible,
+                None,
+            )
+        })
+        .unwrap_or_else(|| {
+            SidebarRow::base(
+                RowKind::PipelineWorktree,
+                depth,
+                wt.name.clone(),
+                context.group_slug,
+            )
+        });
+    row.kind = RowKind::PipelineWorktree;
+    row.pin_key = format!("{}/{}", context.group_slug, row.label);
+    row.label = label.to_string();
+    row.visible = visible;
+    row.worktree_path = Some(wt.path.clone());
+    row.tab_target = hit.map(|(_, target)| target.clone());
+    rows.push(row);
 }
 
 /// Build the unsorted worktree `Group` list for one workspace: the **union** of
@@ -2446,6 +2562,11 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::PipelineWorktree => {
+                // A one-row lane sits directly under its group (depth 2):
+                // the previous lane folder is not its parent.
+                if rows[i].depth <= 2 {
+                    last_lane = None;
+                }
                 if keep[i] {
                     if let Some(w) = last_workspace {
                         keep[w] = true;
@@ -2524,6 +2645,9 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 }
             }
             RowKind::PipelineWorktree => {
+                if rows[i].depth <= 2 {
+                    reveal_lane = false; // a one-row lane: no lane folder above it
+                }
                 if reveal_ws || reveal_group || reveal_lane {
                     keep[i] = true;
                 }
@@ -5284,6 +5408,8 @@ mod tests {
         Lane {
             key: key.into(),
             label: key.into(),
+            finished: false,
+            last_ms: 0,
             worktrees: worktrees
                 .iter()
                 .enumerate()
@@ -5297,7 +5423,9 @@ mod tests {
     }
 
     fn one_lane_status(worktree: &str) -> SidebarStatus {
-        lane_status(vec![lane("THE-74", &[worktree])])
+        // Two worktrees: a single-worktree lane collapses to one row, and these
+        // fixtures exercise the lane folder.
+        lane_status(vec![lane("THE-74", &[worktree, "/wt/zz-sibling"])])
     }
 
     fn app_workspace() -> Vec<(String, String, String, String)> {
@@ -5319,7 +5447,7 @@ mod tests {
             &s,
             &app_workspace(),
             &ViewState::default(),
-            &lane_status(vec![lane("THE-74", &["/wt/home"])]),
+            &one_lane_status("/wt/home"),
             &[],
             &[],
             &[],
@@ -5348,7 +5476,7 @@ mod tests {
         assert_eq!(rows[group + 1].depth, 2);
         assert_eq!(
             rows[group + 1].child_count,
-            1,
+            2,
             "the lane counts its worktrees"
         );
         assert_eq!(rows[group + 2].depth, 3);
@@ -5378,12 +5506,135 @@ mod tests {
     }
 
     #[test]
+    fn a_single_worktree_lane_is_one_row_named_for_the_lane() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &lane_status(vec![lane("THE-74", &["/wt/home"])]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!rows.iter().any(|r| r.kind == RowKind::PipelineLane));
+        let leaf = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree)
+            .expect("the lone worktree is still a row");
+        assert_eq!(leaf.label, "THE-74");
+        assert_eq!(leaf.depth, 2);
+        assert!(leaf.visible);
+    }
+
+    #[test]
+    fn finished_lanes_fold_into_one_finished_sub_group() {
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/other", "/wt/other")],
+            0,
+        );
+        let mut done = lane("THE-9", &["/wt/other"]);
+        done.finished = true;
+        let status = lane_status(vec![lane("THE-74", &["/wt/home"]), done]);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &status,
+            &[],
+            &[],
+            &[],
+        );
+        let finished = rows
+            .iter()
+            .position(|r| r.kind == RowKind::PipelineLane && r.label == "Finished")
+            .expect("a Finished sub-group");
+        assert_eq!(rows[finished].child_count, 1);
+        assert_eq!(rows[finished].depth, 2);
+        assert_eq!(rows[finished + 1].kind, RowKind::PipelineWorktree);
+        assert_eq!(rows[finished + 1].label, "THE-9");
+        assert_eq!(rows[finished + 1].depth, 3);
+        let live = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree && r.label == "THE-74")
+            .expect("the live lane stays above");
+        assert_eq!(live.depth, 2);
+    }
+
+    #[test]
+    fn a_finished_lane_older_than_the_window_leaves_the_sidebar() {
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/other", "/wt/other")],
+            0,
+        );
+        let mut old = lane("THE-9", &["/wt/other"]);
+        old.finished = true;
+        old.last_ms = 1;
+        let mut view = ViewState::default();
+        view.display.finished_pipeline_days = 7;
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![lane("THE-74", &["/wt/home"]), old.clone()]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.label == "THE-9" || r.label == "Finished")
+        );
+        view.display.finished_pipeline_days = 0;
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![lane("THE-74", &["/wt/home"]), old]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            rows.iter().any(|r| r.label == "Finished"),
+            "0 = never ages out"
+        );
+    }
+
+    #[test]
+    fn integration_worktrees_are_not_pipeline_rows() {
+        let s = session(
+            vec![tab("app/tg-b171-integration", "/wt/tg-b171-integration")],
+            0,
+        );
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &lane_status(vec![lane(
+                "local:tg-b171-integration",
+                &["/wt/tg-b171-integration"],
+            )]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!rows.iter().any(|r| matches!(
+            r.kind,
+            RowKind::PipelineGroup | RowKind::PipelineLane | RowKind::PipelineWorktree
+        )));
+        assert!(rows.iter().any(|r| r.kind == RowKind::Worktree
+            && r.worktree_path.as_deref() == Some("/wt/tg-b171-integration")));
+    }
+
+    #[test]
     fn a_terminal_roster_still_produces_the_lane_folders() {
         // The directive's restart-survival property: the folders ride the
         // roster's rows of ANY status, so they are there with zero active
         // dispatches.
         let s = session(vec![tab("app/home", "/wt/home")], 0);
-        let status = lane_status(vec![lane("THE-74", &["/wt/home"])]);
+        let status = one_lane_status("/wt/home");
         let rows = build_rows(
             &s,
             &app_workspace(),
@@ -5481,8 +5732,8 @@ mod tests {
             .collect();
         assert_eq!(
             mirrors,
-            vec!["home"],
-            "only the referenced worktree mirrors"
+            vec!["home", "zz-sibling"],
+            "only the worktrees the lane references mirror"
         );
         assert!(
             rows.iter()
@@ -5771,7 +6022,8 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1, "no duplicate ordinary row is emitted");
         assert_eq!(matching[0].kind, RowKind::PipelineWorktree);
-        assert_eq!(matching[0].depth, 3);
+        // A single-worktree lane is one row, directly under its group.
+        assert_eq!(matching[0].depth, 2);
         assert_eq!(matching[0].tab_target, Some(RowTarget::Tab(0, 0)));
         assert!(rows.iter().any(|row| row.kind == RowKind::PipelineGroup));
     }
@@ -5838,6 +6090,111 @@ mod tests {
                 && row.depth == 2
         }));
         assert!(!rows.iter().any(|row| row.kind == RowKind::PipelineWorktree));
+    }
+
+    #[test]
+    fn a_user_folder_named_pipelines_folds_into_the_one_pipelines_group() {
+        let (session, workspaces, mut db_worktrees, mut folders) = folder_fixture();
+        folders[0].name = "pipelines".into();
+        db_worktrees[0].env_name = Some("pipeline".into());
+        let persisted = vec!["/wt/feat".to_string()];
+        let mut status = lane_status(crate::sidebar_pipeline::lanes_with_persisted_paths(
+            &[],
+            &persisted,
+        ));
+        status.pipeline_worktree_paths = persisted
+            .iter()
+            .map(|path| crate::sidebar_pipeline::path_identity(path))
+            .collect();
+        let rows = build_rows(
+            &session,
+            &workspaces,
+            &ViewState::default(),
+            &status,
+            &db_worktrees,
+            &folders,
+            &[],
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == RowKind::PipelineWorktree
+                && row.worktree_path.as_deref() == Some("/wt/feat")
+        }));
+        assert!(!rows.iter().any(|row| {
+            row.kind == RowKind::Worktree && row.worktree_path.as_deref() == Some("/wt/feat")
+        }));
+    }
+
+    #[test]
+    fn clear_finished_hides_lanes_finished_by_then_and_keeps_later_ones() {
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/old", "/wt/old"),
+                tab("app/late", "/wt/late"),
+            ],
+            0,
+        );
+        let mut old = lane("THE-9", &["/wt/old"]);
+        old.finished = true;
+        old.last_ms = 100;
+        let mut late = lane("THE-10", &["/wt/late"]);
+        late.finished = true;
+        late.last_ms = 300;
+        let mut view = ViewState::default();
+        view.finished_cleared.insert("app".into(), 200);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![lane("THE-74", &["/wt/home"]), old, late]),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!rows.iter().any(|r| r.label == "THE-9"), "cleared");
+        let finished = rows
+            .iter()
+            .find(|r| r.pin_key == finished_group_key("app"))
+            .expect("the later lane keeps the Finished group");
+        assert_eq!(finished.child_count, 1);
+        assert!(rows.iter().any(|r| r.label == "THE-10"));
+        assert!(
+            rows.iter().any(|r| r.label == "THE-74"),
+            "live lanes never clear"
+        );
+    }
+
+    #[test]
+    fn a_matched_lane_does_not_reveal_the_one_row_lane_after_it() {
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/a", "/wt/a"),
+                tab("app/b", "/wt/b"),
+            ],
+            0,
+        );
+        let view = ViewState {
+            filter: "THE-74".into(),
+            ..ViewState::default()
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &lane_status(vec![
+                lane("THE-74", &["/wt/home", "/wt/a"]),
+                lane("ZZZ-1", &["/wt/b"]),
+            ]),
+            &[],
+            &[],
+            &[],
+        );
+        let single = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree && r.label == "ZZZ-1")
+            .expect("the one-row lane is emitted");
+        assert!(!single.visible, "THE-74's match must not leak into ZZZ-1");
     }
 
     #[test]
@@ -5952,8 +6309,8 @@ mod tests {
         let mut view = ViewState::default();
         view.collapsed.insert("pipeline/lane:THE-9".into());
         let status = lane_status(vec![
-            lane("THE-74", &["/wt/home"]),
-            lane("THE-9", &["/wt/other"]),
+            lane("THE-74", &["/wt/home", "/wt/zz-a"]),
+            lane("THE-9", &["/wt/other", "/wt/zz-b"]),
         ]);
         let rows = build_rows(&s, &app_workspace(), &view, &status, &[], &[], &[]);
         let lanes: Vec<(&str, bool)> = rows
@@ -5991,7 +6348,8 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(derived.len(), 3);
+        // Group + lane folder + the two worktrees the fixture lane references.
+        assert_eq!(derived.len(), 4);
         for r in derived
             .iter()
             .filter(|r| r.kind != RowKind::PipelineWorktree)

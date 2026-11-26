@@ -342,9 +342,7 @@ impl<F: ThermalFs> Collector for ThermalZoneCollector<F> {
             }
         }
         part.zones.truncate(self.zones.len());
-        for counts in &mut self.cooling_counts {
-            *counts = (0, 0);
-        }
+        self.cooling_counts.fill((0, 0));
         for cooling in &mut self.cooling {
             let len = match cooling.state.as_ref() {
                 Some(handle) => self.fs.pread(handle, &mut buffer).ok(),

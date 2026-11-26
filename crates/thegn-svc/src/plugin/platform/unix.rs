@@ -743,7 +743,17 @@ impl Leader {
             }
         };
         let group = -(child.id() as libc::pid_t);
-        let group_result = self.signal_group(group);
+        let mut group_result = self.signal_group(group);
+        // macOS and the BSDs fail kill(-pgid) with EPERM rather than ESRCH when
+        // every remaining member is a zombie, this exited-but-unreaped leader
+        // included. That means nothing is left to signal.
+        let zombie_group = group_result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+            && matches!(self.exited_without_reaping(), Ok(true));
+        if zombie_group {
+            group_result = Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
         // Group success does not prove the leader still belonged to that
         // group. Ensure this exclusively owned, unreaped child terminates too;
         // never discover or signal its potentially changed process group.
@@ -751,8 +761,31 @@ impl Leader {
             .child
             .as_mut()
             .expect("unreaped child ownership")
-            .kill();
+            .kill()
+            // A leader already observed exited needs no signal; how a platform
+            // reports signalling its zombie does not matter.
+            .or_else(|error| if zombie_group { Ok(()) } else { Err(error) });
         kill_tracked(&tracked);
+        // macOS answers EPERM (not ESRCH) when signalling a group or pid whose only
+        // member is an exited-but-unreaped zombie. The leader is unreaped here, so
+        // a still-observable exit means there is nothing left to signal.
+        let saw_eperm = [&group_result, &leader_result]
+            .iter()
+            .any(|r| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EPERM)));
+        let leader_gone = cfg!(target_os = "macos")
+            && saw_eperm
+            && matches!(self.exited_without_reaping(), Ok(true));
+        let eperm_is_gone = |error: &io::Error| {
+            cfg!(target_os = "macos") && leader_gone && error.raw_os_error() == Some(libc::EPERM)
+        };
+        let group_result = match group_result {
+            Err(error) if eperm_is_gone(&error) => Ok(()),
+            other => other,
+        };
+        let leader_result = match leader_result {
+            Err(error) if eperm_is_gone(&error) => Ok(()),
+            other => other,
+        };
         match (group_result, leader_result) {
             (Ok(()), leader) => leader,
             (Err(group), leader) if group.raw_os_error() == Some(libc::ESRCH) => leader,
