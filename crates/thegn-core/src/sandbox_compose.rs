@@ -1669,11 +1669,22 @@ mod tests {
                 expected.push((home.join(path), "credential"));
             }
         }
-        expected.extend(
-            crate::sandbox_runtime_escape::engine_socket_paths(home.as_deref(), runtime.as_deref())
-                .into_iter()
-                .map(|path| (path, "engine socket")),
-        );
+        // Snapshot of the engine-socket entries `for_host` listed inline before
+        // they moved to `engine_socket_paths`; do not derive this from it.
+        if let Some(home) = &home {
+            expected.push((home.join(".docker/run/docker.sock"), "engine socket"));
+        }
+        for path in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/run/podman/podman.sock",
+            "/run/containerd/containerd.sock",
+        ] {
+            expected.push((PathBuf::from(path), "engine socket"));
+        }
+        if let Some(runtime) = &runtime {
+            expected.push((runtime.join("podman/podman.sock"), "engine socket"));
+        }
         expected.push((extra, "control socket"));
 
         assert_eq!(

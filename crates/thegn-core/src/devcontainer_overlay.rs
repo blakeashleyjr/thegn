@@ -157,12 +157,12 @@ pub fn apply_gated_with_policy(
     };
 
     o.warnings = devcontainer::recognized_unapplied(dc).warnings();
-    o.warnings.extend(refused_engine_socket_mounts(
-        dc,
-        ctx,
-        local_env_allowed,
-        &mut o.substitution,
-    ));
+    // Protected binds are classified once, with the real context, before any
+    // approval: the same flags shape the mounts request and the fold, so an
+    // approval never covers a mount that was not in its value.
+    let (privileged_mounts, refusals) =
+        classify_privileged_mounts(dc, ctx, local_env_allowed, &mut o.substitution);
+    o.warnings.extend(refusals);
 
     // image / build / compose
     if let Some(req) = source_request(dc)
@@ -172,14 +172,17 @@ pub fn apply_gated_with_policy(
     }
 
     // mounts
-    if let Some(req) = mounts_request(dc)
+    if let Some(req) = mounts_request_excluding(dc, &privileged_mounts)
         && ok(&req, &mut o)
     {
-        for warning in fold_mounts(dc, sb, ctx, local_env_allowed, &mut o.substitution) {
-            if !o.warnings.contains(&warning) {
-                o.warnings.push(warning);
-            }
-        }
+        o.warnings.extend(fold_mounts_excluding(
+            dc,
+            sb,
+            ctx,
+            local_env_allowed,
+            &mut o.substitution,
+            &privileged_mounts,
+        ));
     }
 
     // ports
@@ -520,8 +523,25 @@ fn fold_mounts(
     local_env_allowed: &dyn Fn(&str) -> bool,
     report: &mut SubstitutionReport,
 ) -> Vec<String> {
+    fold_mounts_excluding(dc, sb, ctx, local_env_allowed, report, &[])
+}
+
+/// Fold every mount except those flagged in `skip` (already refused and
+/// reported by the caller). A mount that turns privileged between the
+/// caller's classification and this fold is still refused here.
+fn fold_mounts_excluding(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+    skip: &[bool],
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    for m in &dc.mounts {
+    for (index, m) in dc.mounts.iter().enumerate() {
+        if skip.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         match mount_to_sandbox(m, ctx, local_env_allowed, report, dc) {
             MountOutcome::Bind(spec) => {
                 if !sb.mounts.contains(&spec) {
@@ -717,11 +737,29 @@ fn source_request(dc: &DevContainer) -> Option<GatedRequest> {
     }
 }
 
+/// The generic mounts request for a review listing, which has no workspace
+/// context: protected binds are classified with an empty workspace folder.
+/// `apply_gated_with_policy` rebuilds the request from its own classification
+/// (see `mounts_request_excluding`), so a listing that classified differently
+/// only re-prompts; it never widens what applies.
 fn mounts_request(dc: &DevContainer) -> Option<GatedRequest> {
+    let privileged: Vec<bool> = dc
+        .mounts
+        .iter()
+        .map(|mount| mount_request_is_engine_socket(dc, mount))
+        .collect();
+    mounts_request_excluding(dc, &privileged)
+}
+
+/// The generic mounts request over every mount whose `privileged` flag is
+/// false (a missing flag counts as not privileged).
+fn mounts_request_excluding(dc: &DevContainer, privileged: &[bool]) -> Option<GatedRequest> {
     let mounts: Vec<&Mount> = dc
         .mounts
         .iter()
-        .filter(|mount| !mount_request_is_engine_socket(dc, mount))
+        .enumerate()
+        .filter(|(index, _)| !privileged.get(*index).copied().unwrap_or(false))
+        .map(|(_, mount)| mount)
         .collect();
     if mounts.is_empty() {
         return None;
@@ -887,6 +925,9 @@ fn mount_to_sandbox(
     }
 }
 
+/// Classify a bind for the context-free review listing (`mounts_request`):
+/// workspace folders substitute as empty, so a source built on them is judged
+/// by its remaining text only.
 fn mount_request_is_engine_socket(dc: &DevContainer, mount: &Mount) -> bool {
     if mount.kind != MountKind::Bind {
         return false;
@@ -894,23 +935,19 @@ fn mount_request_is_engine_socket(dc: &DevContainer, mount: &Mount) -> bool {
     let Some(source) = mount.source.as_deref() else {
         return false;
     };
-    let local_env = |name: &str| std::env::var(name).ok();
-    let container_env = |_| None;
     let ctx = SubstCtx {
         local_workspace_folder: String::new(),
         container_workspace_folder: String::new(),
-        local_env: &local_env,
-        container_env: &container_env,
+        local_env: &|name: &str| std::env::var(name).ok(),
+        container_env: &|_| None,
     };
     let mut report = SubstitutionReport::default();
     let source = ctx_subst(dc, source, &ctx, &|_| true, &mut report);
-    source_is_engine_socket(&source)
+    engine_socket_request(&source).is_some()
 }
 
-fn source_is_engine_socket(source: &str) -> bool {
-    engine_socket_request(source).is_some()
-}
-
+/// The `EngineSocket` request for a substituted bind source that equals,
+/// contains, or symlinks to an engine socket or thegn's state or runtime dir.
 fn engine_socket_request(source: &str) -> Option<PrivilegeRequest> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -932,37 +969,39 @@ fn engine_socket_request_with_protected(
         .then_some(PrivilegeRequest::EngineSocket(source))
 }
 
-fn source_reaches_engine_socket(source: &Path, protected: &[PathBuf]) -> bool {
-    engine_socket_request_with_protected(&source.to_string_lossy(), protected).is_some()
-}
-
 fn privilege_refusal(request: &PrivilegeRequest, origin: &RequestOrigin) -> String {
     match (request, origin) {
-        (PrivilegeRequest::EngineSocket(_), RequestOrigin::RepoFile) => {
-            "refused: engine-socket bind reaches a protected host path".into()
-        }
+        (PrivilegeRequest::EngineSocket(path), RequestOrigin::RepoFile) => format!(
+            "refused: engine-socket: devcontainer bind of '{}' reaches a container-engine \
+             socket or thegn's control/state dir (needs a per-repo privilege grant)",
+            path.display()
+        ),
         _ => "refused: devcontainer privilege request".into(),
     }
 }
 
-fn refused_engine_socket_mounts(
+/// Per-mount privilege flags (index-aligned with `dc.mounts`) plus one
+/// refusal line per privileged mount, classified with the real context.
+fn classify_privileged_mounts(
     dc: &DevContainer,
     ctx: &SubstCtx,
     local_env_allowed: &dyn Fn(&str) -> bool,
     report: &mut SubstitutionReport,
-) -> Vec<String> {
-    dc.mounts
-        .iter()
-        .filter(|mount| mount.kind == MountKind::Bind)
-        .filter_map(
-            |mount| match mount_to_sandbox(mount, ctx, local_env_allowed, report, dc) {
+) -> (Vec<bool>, Vec<String>) {
+    let mut flags = Vec::with_capacity(dc.mounts.len());
+    let mut refusals = Vec::new();
+    for mount in &dc.mounts {
+        let privileged = mount.kind == MountKind::Bind
+            && match mount_to_sandbox(mount, ctx, local_env_allowed, report, dc) {
                 MountOutcome::Privilege(request, origin) => {
-                    Some(privilege_refusal(&request, &origin))
+                    refusals.push(privilege_refusal(&request, &origin));
+                    true
                 }
-                _ => None,
-            },
-        )
-        .collect()
+                _ => false,
+            };
+        flags.push(privileged);
+    }
+    (flags, refusals)
 }
 
 /// Render a lifecycle [`Command`] to a single shell line with `${...}`
@@ -1512,7 +1551,14 @@ mod tests {
         )
         .unwrap();
         assert!(mounts_request(&dc).is_none());
-        assert!(source_is_engine_socket("/var/run/docker.sock"));
+        assert!(matches!(
+            engine_socket_request("/var/run/docker.sock"),
+            Some(PrivilegeRequest::EngineSocket(_))
+        ));
+    }
+
+    fn source_reaches_engine_socket(source: &Path, protected: &[PathBuf]) -> bool {
+        engine_socket_request_with_protected(&source.to_string_lossy(), protected).is_some()
     }
 
     #[test]

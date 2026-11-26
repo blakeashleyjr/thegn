@@ -24,6 +24,23 @@ Image-label `devcontainer.metadata` inspection and merging SHALL remain
 reserved. Because selection and doctor do not inspect images, thegn MUST NOT
 claim to detect that label.
 
+#### Scenario: Privileged cannot be approved
+
+- **WHEN** a devcontainer declares `privileged: true`, even alongside approved
+  categories
+- **THEN** privileged mode is not applied or passed to the CLI and the field is
+  reported as refused for weakening isolation
+
+#### Scenario: Unknown fields do not silently execute
+
+- **WHEN** a selected file contains an unrecognized top-level field
+- **THEN** the field is not applied and is reported as unknown and reserved
+
+#### Scenario: Editor customization stays silent
+
+- **WHEN** a selected file contains `customizations.vscode`
+- **THEN** it is ignored without a warning
+
 #### Scenario: Protected bind is not covered by generic mount approval
 
 - **WHEN** a devcontainer declares a bind of an engine socket, an ancestor of
