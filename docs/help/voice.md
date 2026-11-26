@@ -7,6 +7,28 @@ actions: [voice-toggle, voice-cancel]
 
 # Voice mode
 
+## Quick start
+
+1. Voice is experimental: launch with `THEGN_CHANNEL=dev`. On the stable
+   channel it is forced off, and `Alt v` says so.
+2. Use a build with native dictation (`voice-native`, or `voice-metal` on
+   Apple silicon macOS 14.2+). Release tarball and flake builds omit it; with
+   those, use an HTTP provider or `capture_command` instead.
+3. Run `thegn voice setup --language en`. It offers to download the Whisper
+   model (about 141 MiB for `base.en`) and enables voice.
+4. Run `thegn voice status`. The `Ready:` line names the next missing step;
+   `thegn doctor` shows the same line. Readiness never opens the microphone.
+5. Press `Alt v` in a pane. On macOS, allow Microphone for your terminal app
+   (System Settings > Privacy & Security > Microphone) when prompted, then
+   restart the terminal if you had denied it. On Linux, make sure the default
+   PipeWire/PulseAudio/ALSA source is your microphone.
+
+With no microphone or a missing model, recording stops with an error in the
+status line and nothing is pasted. A denied macOS microphone permission usually
+records silence instead, so the status line shows `Voice: no speech detected`;
+check the Microphone privacy setting for your terminal app. Disabled voice starts no
+worker and opens no audio device.
+
 Voice mode is an experimental, opt-in toggle-to-talk feature. Press `Alt v` to
 start recording from the focused pane, press it again to stop and transcribe,
 or press `Esc`/`Alt V` to cancel and discard the utterance. If focus moved or

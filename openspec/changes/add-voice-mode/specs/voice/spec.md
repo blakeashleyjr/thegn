@@ -49,6 +49,13 @@ model list/pull/rm.
 - **THEN** remove its temporary artifact and preserve an existing installed model
 - **AND** allow explicit retry
 
+#### Scenario: Readiness verdict
+
+- **WHEN** a user runs voice status or doctor
+- **THEN** report whether configuration is complete, naming the first missing step
+  in order: experimental channel, enabled, native build, model or provider
+- **AND** never open the microphone, so readiness does not prove device access
+
 ### Requirement: HTTP provider and command compatibility
 
 HTTP SHALL support configured endpoint/model/language and broker credential

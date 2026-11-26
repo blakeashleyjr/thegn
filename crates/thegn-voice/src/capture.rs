@@ -83,12 +83,22 @@ impl Drop for Capture {
     }
 }
 
+/// First-run guidance. macOS attributes microphone access to the terminal app
+/// hosting thegn, and a denial often surfaces as a missing or unopenable device.
+#[cfg(target_os = "macos")]
+const NO_DEVICE_HINT: &str = "no default input device; connect a microphone and allow Microphone for your terminal app in System Settings > Privacy & Security";
+#[cfg(not(target_os = "macos"))]
+const NO_DEVICE_HINT: &str = "no default input device; connect a microphone and check the default source in PipeWire/PulseAudio/ALSA (`pactl list sources short`)";
+#[cfg(target_os = "macos")]
+const OPEN_HINT: &str = "could not open the microphone; allow Microphone for your terminal app in System Settings > Privacy & Security, then restart it";
+#[cfg(not(target_os = "macos"))]
+const OPEN_HINT: &str =
+    "could not open the microphone; another app may hold it or the default source is misconfigured";
+
 fn run(audio: Arc<Mutex<Audio>>, max_seconds: u64, stop: &AtomicBool) -> Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .context("no default input device; check audio routing and microphone permission")?;
-    let supported = device.default_input_config()?;
+    let device = host.default_input_device().context(NO_DEVICE_HINT)?;
+    let supported = device.default_input_config().context(OPEN_HINT)?;
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let limit = max_seconds as usize * SAMPLE_RATE;
@@ -96,55 +106,57 @@ fn run(audio: Arc<Mutex<Audio>>, max_seconds: u64, stop: &AtomicBool) -> Result<
     let on_error = audio.clone();
     let input = audio.clone();
     // Use CPAL's raw callback to handle all common hardware sample formats.
-    let stream = device.build_input_stream_raw(
-        config,
-        format,
-        move |data, _| {
-            let samples: Vec<f32> = match format {
-                cpal::SampleFormat::F32 => data.as_slice::<f32>().unwrap_or_default().to_vec(),
-                cpal::SampleFormat::F64 => data
-                    .as_slice::<f64>()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| *v as f32)
-                    .collect(),
-                cpal::SampleFormat::I16 => data
-                    .as_slice::<i16>()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| *v as f32 / 32768.0)
-                    .collect(),
-                cpal::SampleFormat::U16 => data
-                    .as_slice::<u16>()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| (*v as f32 - 32768.0) / 32768.0)
-                    .collect(),
-                cpal::SampleFormat::I32 => data
-                    .as_slice::<i32>()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|v| *v as f32 / 2147483648.0)
-                    .collect(),
-                _ => {
-                    if let Ok(mut a) = input.lock() {
-                        a.error = Some("unsupported microphone sample format".into());
+    let stream = device
+        .build_input_stream_raw(
+            config,
+            format,
+            move |data, _| {
+                let samples: Vec<f32> = match format {
+                    cpal::SampleFormat::F32 => data.as_slice::<f32>().unwrap_or_default().to_vec(),
+                    cpal::SampleFormat::F64 => data
+                        .as_slice::<f64>()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect(),
+                    cpal::SampleFormat::I16 => data
+                        .as_slice::<i16>()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| *v as f32 / 32768.0)
+                        .collect(),
+                    cpal::SampleFormat::U16 => data
+                        .as_slice::<u16>()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| (*v as f32 - 32768.0) / 32768.0)
+                        .collect(),
+                    cpal::SampleFormat::I32 => data
+                        .as_slice::<i32>()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| *v as f32 / 2147483648.0)
+                        .collect(),
+                    _ => {
+                        if let Ok(mut a) = input.lock() {
+                            a.error = Some("unsupported microphone sample format".into());
+                        }
+                        return;
                     }
-                    return;
+                };
+                if let Ok(mut a) = input.lock() {
+                    normalizer.push(&samples, &mut a.samples, limit);
                 }
-            };
-            if let Ok(mut a) = input.lock() {
-                normalizer.push(&samples, &mut a.samples, limit);
-            }
-        },
-        move |e| {
-            if let Ok(mut a) = on_error.lock() {
-                a.error = Some(e.to_string());
-            }
-        },
-        Some(Duration::from_secs(5)),
-    )?;
-    stream.play()?;
+            },
+            move |e| {
+                if let Ok(mut a) = on_error.lock() {
+                    a.error = Some(e.to_string());
+                }
+            },
+            Some(Duration::from_secs(5)),
+        )
+        .context(OPEN_HINT)?;
+    stream.play().context(OPEN_HINT)?;
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
     while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
         if audio
@@ -162,4 +174,21 @@ fn run(audio: Arc<Mutex<Audio>>, max_seconds: u64, stop: &AtomicBool) -> Result<
     stop.store(true, Ordering::Release);
     drop(stream); // Close device before any final inference.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_failures_tell_the_user_where_to_look() {
+        assert!(NO_DEVICE_HINT.starts_with("no default input device"));
+        assert!(OPEN_HINT.starts_with("could not open the microphone"));
+        let permission_site = if cfg!(target_os = "macos") {
+            "Privacy & Security"
+        } else {
+            "PipeWire"
+        };
+        assert!(NO_DEVICE_HINT.contains(permission_site) || OPEN_HINT.contains(permission_site));
+    }
 }
