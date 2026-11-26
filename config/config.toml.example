@@ -5143,10 +5143,10 @@ poll_interval_secs = 3
 # outward_allow = []                # outward caps ("issues.comment", "issues.update") allowed without a per-call owner approval
 # preview = false                   # written by the in-app setup flow: keeps [lead] active on the stable channel (preview)
 
-# ── Voice mode (stable, opt-in) ─────────────────────────────────────────────────
+# ── Voice mode (stable, opt-in) ─────────────────────────────────────────────
 # Alt v records/stops; Esc cancels. Final text is pasted without submission.
 # Run `thegn voice setup --language en` before native capture. Downloads require
-# size confirmation and finish before the microphone opens. Stable clamps off.
+# size confirmation and finish before the microphone opens. Stable keeps it.
 [voice]
 enabled = false
 # command (legacy WAV-in/text-out), embedded (Whisper), or http (multipart JSON).

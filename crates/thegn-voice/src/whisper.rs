@@ -51,10 +51,10 @@ impl Engine {
     pub fn load(path: &Path) -> Result<Self> {
         let path = path.to_str().context("model path must be UTF-8")?;
         let mut params = WhisperContextParameters::default();
-        params.use_gpu(cfg!(all(target_os = "macos", feature = "metal")));
+        params.use_gpu(cfg!(target_os = "macos"));
         let context = WhisperContext::new_with_params(path, params)
             .and_then(|context| {
-                if cfg!(all(target_os = "macos", feature = "metal")) {
+                if cfg!(target_os = "macos") {
                     // The no-state loader can succeed before Metal compute
                     // buffers are allocated. Preflight that allocation too so
                     // startup can fall back to CPU before opening the mic.
@@ -63,7 +63,7 @@ impl Engine {
                 Ok(context)
             })
             .or_else(|error| {
-                if cfg!(all(target_os = "macos", feature = "metal")) {
+                if cfg!(target_os = "macos") {
                     let mut cpu = WhisperContextParameters::default();
                     cpu.use_gpu(false);
                     WhisperContext::new_with_params(path, cpu)

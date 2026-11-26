@@ -29,7 +29,8 @@ cpal = { version = "=0.18.2", optional = true }
 whisper-rs = { version = "=0.16.0", default-features = false, optional = true }
 
 # Compile Metal only for Apple builds, including `--all-features` on Linux.
-# The `metal` feature selects GPU use at runtime; CPU fallback stays available.
+# Every macOS `native` build links Metal and uses the GPU with CPU fallback;
+# the `metal` feature is kept as a compatibility alias for `native`.
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 whisper-rs = { version = "=0.16.0", default-features = false, features = [

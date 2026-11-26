@@ -47,7 +47,8 @@ iroh = ["dep:iroh", "thegn-svc/iroh"]
 # on targets that cannot link it (musl static, Windows): `build.rs` only emits
 # `cfg(voice_native)` on Linux glibc and macOS, and thegn-voice compiles its
 # native modules away elsewhere, so the bridge and musl archive still build.
-# Opt out with `--no-default-features`. Metal is on automatically on macOS.
+# Opt out with `--no-default-features`. Metal is on automatically on macOS
+# (`voice-metal` is a compatibility alias).
 default = ["voice-native"]
 voice-native = ["dep:thegn-voice", "thegn-voice/native"]
 voice-metal = ["voice-native", "thegn-voice/metal"]
