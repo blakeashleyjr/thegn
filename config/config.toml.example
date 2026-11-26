@@ -5177,6 +5177,9 @@ timeout_seconds = 60
 # case-insensitive, on whole words; an empty `to` deletes the phrase.
 # replacements = [{ from = "open code", to = "OpenCode" }]
 replacements = []
+# Names Whisper should spell: repos, tools, people. Embedded and HTTP only.
+# Trimmed; entries over 64 characters are dropped; at most 200 are used.
+vocabulary = []
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,

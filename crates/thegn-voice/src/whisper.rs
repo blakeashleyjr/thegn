@@ -74,6 +74,8 @@ impl Engine {
             .context("load Whisper model (Metal with CPU fallback on macOS; CPU on Linux)")?;
         Ok(Self { context })
     }
+    /// `prompt` is the Whisper initial prompt (final pass only); the caller
+    /// drops a transcript that merely echoes it.
     pub fn transcribe(
         &self,
         samples: &[f32],
@@ -81,6 +83,7 @@ impl Engine {
         pass: Pass,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
+        prompt: Option<&str>,
     ) -> Result<String> {
         if cancelled.load(Ordering::Acquire) {
             bail!("Whisper transcription cancelled");
@@ -113,6 +116,9 @@ impl Engine {
         } else {
             Some(language)
         });
+        if let Some(prompt) = prompt {
+            params.set_initial_prompt(prompt);
+        }
         params.set_translate(false);
         params.set_no_context(true);
         params.set_print_progress(false);

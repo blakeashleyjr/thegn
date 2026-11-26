@@ -62,7 +62,13 @@ pub struct VoiceConfig {
     /// Ordered replacement rules applied to every final transcript. Rules past
     /// [`MAX_REPLACEMENTS`] are ignored.
     pub replacements: Vec<VoiceReplacement>,
+    /// Names Whisper should spell: repos, tools, people. Trimmed; entries over
+    /// 64 characters are dropped and at most 200 are kept.
+    pub vocabulary: Vec<String>,
 }
+
+pub const MAX_VOCABULARY_TERMS: usize = 200;
+pub const MAX_VOCABULARY_TERM_CHARS: usize = 64;
 
 pub const MIN_MAX_SECONDS: u64 = 1;
 pub const MAX_MAX_SECONDS: u64 = 300;
@@ -85,6 +91,7 @@ impl Default for VoiceConfig {
             live_preview: true,
             timeout_seconds: 60,
             replacements: Vec::new(),
+            vocabulary: Vec::new(),
         }
     }
 }
@@ -98,6 +105,28 @@ impl VoiceConfig {
     /// The safe capture limit as a duration.
     pub fn max_duration(&self) -> Duration {
         Duration::from_secs(self.effective_max_seconds())
+    }
+
+    /// The vocabulary after trimming, dropping empty, over-long or
+    /// control-character entries (a NUL would abort Whisper) and capping the
+    /// count.
+    pub fn vocabulary_terms(&self) -> Vec<String> {
+        self.vocabulary
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| {
+                !term.is_empty()
+                    && term.chars().count() <= MAX_VOCABULARY_TERM_CHARS
+                    && !term.chars().any(char::is_control)
+            })
+            .take(MAX_VOCABULARY_TERMS)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The final-pass vocabulary prompt, or `None` when no terms are set.
+    pub fn vocabulary_prompt(&self) -> Option<String> {
+        crate::voice::vocabulary_prompt(&self.vocabulary_terms(), crate::voice::PROMPT_MAX_CHARS)
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -195,6 +224,26 @@ max_seconds = 17
         let cfg: VoiceConfig = toml::from_str("kind = \"hex\"").unwrap();
         assert_eq!(cfg.kind, VoiceKind::Hex);
         assert!(toml::to_string(&cfg).unwrap().contains("kind = \"hex\""));
+    }
+
+    #[test]
+    fn vocabulary_defaults_empty_round_trips_and_is_sanitized() {
+        assert!(VoiceConfig::default().vocabulary.is_empty());
+        let long = "x".repeat(MAX_VOCABULARY_TERM_CHARS + 1);
+        let cfg: VoiceConfig = toml::from_str(&format!(
+            "vocabulary = [\"  T3 Code \", \"\", \"{long}\", \"a\\u0000b\", \"Ottobit\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.vocabulary_terms(), ["T3 Code", "Ottobit"]);
+        assert_eq!(cfg.vocabulary_prompt().as_deref(), Some("T3 Code, Ottobit"));
+        assert_eq!(VoiceConfig::default().vocabulary_prompt(), None);
+        let back: VoiceConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        let many = VoiceConfig {
+            vocabulary: (0..300).map(|i| format!("t{i}")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(many.vocabulary_terms().len(), MAX_VOCABULARY_TERMS);
     }
 
     #[test]
