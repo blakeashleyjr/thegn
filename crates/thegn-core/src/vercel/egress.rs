@@ -24,7 +24,8 @@ pub const REGISTRY_PRESET: &[&str] = &[
 /// Hosts a selected cargo Job attempt needs on top of the env's allow list:
 /// rustup and the toolchain (`sh.rustup.rs`, `static.rust-lang.org`), the crates
 /// index and downloads, and the OS package mirrors the launcher uses to install
-/// a C linker (Ubuntu, Debian, Amazon Linux, Alpine). Exact names only.
+/// a C linker (Ubuntu, Debian, Amazon Linux, Alpine), fetched over HTTPS (the
+/// launcher rewrites apt sources to `https://`). Exact names only.
 pub const JOB_TOOLCHAIN_HOSTS: &[&str] = &[
     "sh.rustup.rs",
     "static.rust-lang.org",
