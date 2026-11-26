@@ -569,13 +569,6 @@
       ]
     },
     {
-      "issue": "THE-2172",
-      "project": "Agent & Workflow Platform",
-      "changes": [
-        "add-lead-tool-surface"
-      ]
-    },
-    {
       "issue": "THE-2173",
       "project": "Agent & Workflow Platform",
       "changes": [
