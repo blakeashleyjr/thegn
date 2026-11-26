@@ -112,3 +112,18 @@ SHALL be measured separately; implementation alone SHALL NOT assert these result
 
 - **WHEN** platform evidence or tracker reconciliation remains outstanding
 - **THEN** retain experimental gating and mark delivery verification-gated
+
+### Requirement: Non-speech annotation and credit stripping
+
+Before a final transcript is normalized, voice SHALL remove Whisper non-speech
+annotations (for example `[BLANK_AUDIO]`, `[Music]`, or `(laughter)`) and one
+trailing subtitle credit. Square-bracket spans SHALL be removed when their text
+starts with a non-speech word. Parenthesized spans SHALL be removed only when that
+word ends the span, so `(see above)` is kept. A bare `Thank you.` SHALL be kept.
+Foreign-language credits SHALL apply only when the configured language is not `en`.
+
+#### Scenario: Annotations and credits
+
+- **WHEN** a final transcript is `Ship it. Thanks for watching!`
+- **THEN** insert `Ship it.`
+- **AND** `hello [Music] world` becomes `hello world`, and `see (above)` is unchanged

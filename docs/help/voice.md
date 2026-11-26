@@ -38,6 +38,9 @@ and the status shows a preview. `Alt v` inserts it into the focused pane;
 config change clears it. Text is pasted without a newline and is never
 auto-submitted.
 Line breaks and control characters in a transcript are inserted as spaces.
+Whisper annotations such as `[BLANK_AUDIO]`, `[Music]` or `(laughter)` are removed,
+along with one trailing subtitle credit such as `Thanks for watching!`. A bare
+`Thank you.` is kept.
 
 `[voice] replacements` is an ordered list of up to 200 find/replace rules applied
 to every final transcript, whether it came from the command, HTTP, or embedded
