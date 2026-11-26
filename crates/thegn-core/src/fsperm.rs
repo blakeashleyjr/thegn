@@ -1218,12 +1218,25 @@ impl PrivateDir {
             if append {
                 flags |= OFlag::O_APPEND;
             }
-            let fd = openat(
-                &self.fd,
-                name_path,
-                flags,
-                nix::sys::stat::Mode::from_bits_truncate(0o600),
-            )
+            // APFS can fail one of two racing O_CREAT opens of the same new
+            // name with ENOENT (macOS: two threads creating one lock or log
+            // file). The parent stays open and the name is a single
+            // component, so ENOENT here is transient; retry it a few times.
+            let mut enoent_retries = 0;
+            let fd = loop {
+                match openat(
+                    &self.fd,
+                    name_path,
+                    flags,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                ) {
+                    Err(nix::errno::Errno::ENOENT) if enoent_retries < 8 => {
+                        enoent_retries += 1;
+                        std::thread::yield_now();
+                    }
+                    other => break other,
+                }
+            }
             .map_err(|error| {
                 if error == nix::errno::Errno::EISDIR {
                     std::io::Error::new(
