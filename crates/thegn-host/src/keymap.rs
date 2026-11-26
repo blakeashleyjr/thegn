@@ -216,6 +216,8 @@ pub enum Action {
     OpenUsage,
     /// Open the Info screen for the sidebar row under the cursor, else the active worktree.
     OpenInfo,
+    /// Return a seen (hollow) activity dot to its filled unread state.
+    MarkUnread,
     /// Open the tabbed system monitor.
     OpenMonitor,
     /// Open the system monitor straight onto the agent-pipeline board.
@@ -673,6 +675,7 @@ impl Action {
             Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
             Action::OpenInfo => "open-info",
+            Action::MarkUnread => "mark-unread",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
             Action::OpenCalendar => "open-calendar",
@@ -842,6 +845,7 @@ impl Action {
             "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
             "open-info" | "info" => Action::OpenInfo,
+            "mark-unread" => Action::MarkUnread,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
             "open-calendar" => Action::OpenCalendar,

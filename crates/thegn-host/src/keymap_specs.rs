@@ -1484,6 +1484,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "mark-unread",
+        label: "Mark worktree unread",
+        message_key: "action-mark-unread",
+        hint: "unread",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "unread",
+            "seen",
+            "hollow dot",
+            "flag",
+            "attention",
+            "activity",
+        ],
+    },
+    ActionSpec {
         id: "open-monitor",
         label: "System monitor",
         message_key: "action-open-monitor",

@@ -14,6 +14,7 @@ actions:
     sidebar-narrower,
     sidebar-wider,
     open-info,
+    mark-unread,
   ]
 ---
 
@@ -105,6 +106,10 @@ checkout in it is not a live worktree, so it gets no row.
 - `f` — move to a folder (or create one)
 - `r` / `F2` — rename
 - `p` — pin to top
+- `u` — mark unread: turn a hollow (seen) dot back to its filled amber/red
+  state until you focus the tab again. Acts on every marked row, else the
+  cursor row; a row with no dot is left alone. Also in the row menu and the
+  palette ("Mark worktree unread").
 - `s` — sort menu: manual / name / recent / attention / live (live orders
   worktrees by most-recent process/agent activity, newest first). The
   active mode is always on screen: it is the quiet word at the right of
@@ -384,6 +389,8 @@ Two things the dots deliberately do **not** do:
 
 A red or amber dot is sticky: focusing the tab makes it hollow (seen) but
 does not clear it. It only goes back to white when work genuinely resumes.
+Press `u` on a hollow row to flag it again (filled, and ranked up by the
+attention sort) until you next focus it.
 Thresholds are tunable — see [[config-reference]] `[activity]`, and
 `[theme.colors]` for the three dot colours.
 

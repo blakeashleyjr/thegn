@@ -27641,6 +27641,17 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            Action::MarkUnread => {
+                                // Sidebar focused: marked rows, else the cursor
+                                // row. Otherwise the active worktree's tab.
+                                if focus.sidebar() {
+                                    let _ = sb.mark_unread_selection(&mut model, &session);
+                                } else if let Some(name) =
+                                    session.active_group().map(|g| g.name.clone())
+                                {
+                                    let _ = sb.mark_unread_tabs(vec![name], &mut model, &session);
+                                }
+                            }
                             Action::OpenShares => {
                                 panel_auto_revealed = None;
                                 if chrome.panel.is_none() {
