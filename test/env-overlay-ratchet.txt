@@ -592,6 +592,7 @@ voice.max_seconds
 voice.model
 voice.model_path
 voice.timeout_seconds
+voice.vocabulary
 watch.pr_interval_secs
 weather.api_key
 weather.forecast_days

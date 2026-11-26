@@ -113,7 +113,19 @@ pub fn transcribe(
     wav: &[u8],
     cancel: &AtomicBool,
 ) -> Result<String, VoiceError> {
-    transcribe_with_proxy(cfg, credential, wav, cancel, None)
+    transcribe_with_prompt(cfg, credential, wav, cancel, None)
+}
+
+/// Like `transcribe`, adding the OpenAI-compatible multipart `prompt` field
+/// when a vocabulary prompt is supplied. Servers that do not know it ignore it.
+pub fn transcribe_with_prompt(
+    cfg: &VoiceConfig,
+    credential: Option<&str>,
+    wav: &[u8],
+    cancel: &AtomicBool,
+    prompt: Option<&str>,
+) -> Result<String, VoiceError> {
+    transcribe_with_proxy(cfg, credential, wav, cancel, None, prompt)
 }
 
 fn transcribe_with_proxy(
@@ -122,6 +134,7 @@ fn transcribe_with_proxy(
     wav: &[u8],
     cancel: &AtomicBool,
     proxy: Option<reqwest::Proxy>,
+    prompt: Option<&str>,
 ) -> Result<String, VoiceError> {
     validate_transport(&cfg.endpoint, credential)?;
     if cfg.model.is_empty() {
@@ -149,6 +162,9 @@ fn transcribe_with_proxy(
                 .text("response_format", "json");
             if !cfg.language.is_empty() && cfg.language != "auto" {
                 form = form.text("language", cfg.language.clone());
+            }
+            if let Some(prompt) = prompt {
+                form = form.text("prompt", prompt.to_owned());
             }
             let mut request = client.post(&cfg.endpoint).multipart(form);
             if let Some(token) = credential {
@@ -431,6 +447,29 @@ mod loopback_tests {
         }
     }
     #[test]
+    fn voice_http_prompt_part_only_when_configured() {
+        for prompt in [Some("T3 Code, Ottobit"), None] {
+            let (endpoint, server) = server(200, br#"{"text":"ok"}"#.to_vec(), false);
+            let cfg = VoiceConfig {
+                endpoint,
+                model: "fixture-model".into(),
+                ..Default::default()
+            };
+            let text = transcribe_with_prompt(
+                &cfg,
+                None,
+                b"RIFF0000WAVE",
+                &AtomicBool::new(false),
+                prompt,
+            )
+            .unwrap();
+            assert_eq!(text, "ok");
+            let request = String::from_utf8(server.join().unwrap()).unwrap();
+            assert_eq!(request.contains("name=\"prompt\""), prompt.is_some());
+            assert_eq!(request.contains("T3 Code, Ottobit"), prompt.is_some());
+        }
+    }
+    #[test]
     fn voice_http_stalled_response_deadline_and_cancellation() {
         for cancelled in [false, true] {
             let (endpoint, server) = server(200, Vec::new(), true);
@@ -512,7 +551,8 @@ mod loopback_tests {
                 Some("fixture-token"),
                 b"RIFF0000WAVE",
                 &AtomicBool::new(false),
-                Some(reqwest::Proxy::http(&proxy_endpoint).unwrap())
+                Some(reqwest::Proxy::http(&proxy_endpoint).unwrap()),
+                None
             )
             .unwrap(),
             "direct"

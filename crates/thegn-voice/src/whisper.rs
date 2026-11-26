@@ -69,6 +69,7 @@ impl Engine {
         language: &str,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
+        prompt: Option<&str>,
     ) -> Result<String> {
         if cancelled.load(Ordering::Acquire) {
             bail!("Whisper transcription cancelled");
@@ -97,6 +98,9 @@ impl Engine {
         } else {
             Some(language)
         });
+        if let Some(prompt) = prompt {
+            params.set_initial_prompt(prompt);
+        }
         params.set_translate(false);
         params.set_no_context(true);
         params.set_print_progress(false);
@@ -119,11 +123,15 @@ impl Engine {
             bail!("Whisper transcription cancelled or timed out");
         }
         result?;
-        Ok(state
+        let text = state
             .as_iter()
             .map(|s| s.to_str_lossy().map(|text| text.into_owned()))
             .collect::<std::result::Result<Vec<_>, _>>()?
-            .join(""))
+            .join("");
+        Ok(match prompt {
+            Some(prompt) => crate::drop_prompt_echo(&text, prompt),
+            None => text,
+        })
     }
 }
 

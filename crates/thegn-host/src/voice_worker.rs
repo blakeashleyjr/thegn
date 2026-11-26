@@ -149,21 +149,30 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         })?;
     let mut rolling = RollingTranscript::default();
     let mut decoded_end = 0;
-    let transcribe = |samples: &[f32], flag: Arc<AtomicBool>| -> Result<String> {
-        match cfg.kind {
-            VoiceKind::Embedded => engine
-                .as_ref()
-                .context("missing embedded engine")?
-                .transcribe(samples, &cfg.language, flag, cfg.request_timeout()),
-            VoiceKind::Http => Ok(thegn_svc::voice_http::transcribe(
-                &cfg,
-                request.token.as_deref(),
-                &thegn_voice::wav(samples),
-                &flag,
-            )?),
-            VoiceKind::Command => bail!("command transcription belongs to the parent adapter"),
-        }
-    };
+    let prompt = thegn_voice::prompt(&cfg.vocabulary_terms(), thegn_voice::PROMPT_MAX_CHARS);
+    let transcribe =
+        |samples: &[f32], flag: Arc<AtomicBool>, prompt: Option<&str>| -> Result<String> {
+            match cfg.kind {
+                VoiceKind::Embedded => engine
+                    .as_ref()
+                    .context("missing embedded engine")?
+                    .transcribe(samples, &cfg.language, flag, cfg.request_timeout(), prompt),
+                VoiceKind::Http => {
+                    let text = thegn_svc::voice_http::transcribe_with_prompt(
+                        &cfg,
+                        request.token.as_deref(),
+                        &thegn_voice::wav(samples),
+                        &flag,
+                        prompt,
+                    )?;
+                    Ok(match prompt {
+                        Some(prompt) => thegn_voice::drop_prompt_echo(&text, prompt),
+                        None => text,
+                    })
+                }
+                VoiceKind::Command => bail!("command transcription belongs to the parent adapter"),
+            }
+        };
     loop {
         if cancel.load(Ordering::Acquire) {
             capture.close()?;
@@ -179,7 +188,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
             let began = Instant::now();
             // The stop flag aborts a preview to make room for the final pass.
             // No queue: after decoding, snapshot the newest window directly.
-            match transcribe(&samples, stop.clone()) {
+            match transcribe(&samples, stop.clone(), None) {
                 Ok(text) if !stop.load(Ordering::Acquire) => {
                     let text = rolling.update(start, &text);
                     emit(Event::Partial(thegn_voice::preview_snippet(&text).into()))?;
@@ -217,7 +226,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     }
     let (_, samples, _) = capture.snapshot(None)?;
     let began = Instant::now();
-    let text = transcribe(&samples, cancel)?;
+    let text = transcribe(&samples, cancel, prompt.as_deref())?;
     emit(Event::Timing {
         final_pass: true,
         decode_ms: began.elapsed().as_millis() as u64,

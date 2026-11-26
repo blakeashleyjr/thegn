@@ -5168,6 +5168,9 @@ endpoint = ""
 live_preview = true
 # Separate total deadline for each inference/HTTP request, clamped 1..=300.
 timeout_seconds = 60
+# Names Whisper should spell: repos, tools, people. Embedded and HTTP only.
+# Trimmed; entries over 64 characters are dropped; at most 200 are used.
+vocabulary = []
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,

@@ -49,7 +49,13 @@ pub struct VoiceConfig {
     /// Total deadline for each transcription, independent of capture duration.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_seconds: u64,
+    /// Names Whisper should spell: repos, tools, people. Trimmed; entries over
+    /// 64 characters are dropped and at most 200 are kept.
+    pub vocabulary: Vec<String>,
 }
+
+pub const MAX_VOCABULARY_TERMS: usize = 200;
+pub const MAX_VOCABULARY_TERM_CHARS: usize = 64;
 
 pub const MIN_MAX_SECONDS: u64 = 1;
 pub const MAX_MAX_SECONDS: u64 = 300;
@@ -69,6 +75,7 @@ impl Default for VoiceConfig {
             credential: None,
             live_preview: true,
             timeout_seconds: 60,
+            vocabulary: Vec::new(),
         }
     }
 }
@@ -82,6 +89,18 @@ impl VoiceConfig {
     /// The safe capture limit as a duration.
     pub fn max_duration(&self) -> Duration {
         Duration::from_secs(self.effective_max_seconds())
+    }
+
+    /// The vocabulary after trimming, dropping empty or over-long entries and
+    /// capping the count.
+    pub fn vocabulary_terms(&self) -> Vec<String> {
+        self.vocabulary
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty() && term.chars().count() <= MAX_VOCABULARY_TERM_CHARS)
+            .take(MAX_VOCABULARY_TERMS)
+            .map(str::to_owned)
+            .collect()
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -158,6 +177,22 @@ max_seconds = 17
         assert_eq!(cfg.capture_command, ["mic", "--wav"]);
         assert_eq!(cfg.command, ["stt", "--stdin"]);
         assert_eq!(cfg.max_seconds, 17);
+    }
+
+    #[test]
+    fn vocabulary_defaults_empty_round_trips_and_is_sanitized() {
+        assert!(VoiceConfig::default().vocabulary.is_empty());
+        let long = "x".repeat(MAX_VOCABULARY_TERM_CHARS + 1);
+        let cfg: VoiceConfig = toml::from_str(&format!(
+            "vocabulary = [\"  T3 Code \", \"\", \"{long}\", \"Ottobit\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.vocabulary_terms(), ["T3 Code", "Ottobit"]);
+        let many = VoiceConfig {
+            vocabulary: (0..300).map(|i| format!("t{i}")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(many.vocabulary_terms().len(), MAX_VOCABULARY_TERMS);
     }
 
     #[test]
