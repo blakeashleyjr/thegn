@@ -62,9 +62,64 @@ pub struct HostSnapshot {
     /// declared in `config.toml` — only these can be removed from the UI
     /// (declarative config hosts are edited in the file). Set by hydration.
     pub is_db_def: bool,
+    /// `ssh -J` bastion for an ssh host; `""` when none.
+    pub jump: String,
+    /// `[env.*]` names bound to this host (config order).
+    pub envs: Vec<String>,
+    /// This host backs the `[jobs] runner` env.
+    pub job_runner: bool,
 }
 
 impl HostSnapshot {
+    /// One plain-words line on why the host is in its current state.
+    pub fn reason(&self) -> String {
+        if self.provisioning {
+            return "provisioning is running now".into();
+        }
+        match self.state.as_str() {
+            "ready" => "runtime, base image and warm volumes are in place".into(),
+            "failed" if !self.error.is_empty() => self.error.clone(),
+            "failed" => "the last provisioning attempt failed".into(),
+            "runtime_ready" => "container runtime found; base image not delivered yet".into(),
+            "image_ready" => "base image delivered; warm volumes not seeded yet".into(),
+            _ if self.last_probe.is_none() => "never probed or provisioned".into(),
+            _ => "probed, but not provisioned yet".into(),
+        }
+    }
+
+    /// The next action key worth pressing, in plain words.
+    pub fn next_action(&self) -> &'static str {
+        if self.provisioning {
+            return "wait for provisioning to finish";
+        }
+        match self.state.as_str() {
+            "ready" => "none needed (r re-checks the host)",
+            "failed" if self.retryable => "p retries provisioning (it also retries on its own)",
+            "failed" => "fix the cause above, then p provisions again",
+            _ if self.last_probe.is_none() => "r probes the host, or p provisions it",
+            _ => "p provisions the host",
+        }
+    }
+
+    /// The install-consent line spelled out. Consent decides whether thegn may
+    /// install a container runtime on the host when it finds none.
+    pub fn consent_plain(&self) -> String {
+        match self.consent.as_str() {
+            "granted" => "granted: thegn may install a container runtime here".into(),
+            "declined" => "declined: thegn will not install a runtime here (c grants)".into(),
+            "never (config)" => format!(
+                "never: [host.{}] sets install_runtime = \"never\", so thegn will not install \
+                 a container runtime here; install one yourself or set it to \"ask\"",
+                self.name
+            ),
+            "auto (config)" => "auto: config lets thegn install a runtime if none is found".into(),
+            c if c.starts_with("unset") => {
+                "not decided: thegn asks before installing a runtime (c grants)".into()
+            }
+            other => other.to_string(),
+        }
+    }
+
     /// The state glyph shared by the panel, sidebar, and wizard badge:
     /// ● ready / ◐ provisioning / ✗ failed / ○ unprovisioned.
     pub fn glyph(&self) -> &'static str {
@@ -97,6 +152,19 @@ impl HostSnapshot {
             "" => "unprovisioned".into(),
             other => other.to_string(),
         }
+    }
+}
+
+/// The consent display tag, in the order provisioning applies it: a config
+/// `never` beats any persisted answer (`host_flow::consent_answer`) and a config
+/// `auto` skips the ask entirely, so only `ask` consults the per-host DB answer.
+fn consent_label(policy: InstallConsent, persisted: Option<bool>) -> String {
+    match (policy, persisted) {
+        (InstallConsent::Never, _) => "never (config)".into(),
+        (InstallConsent::Auto, _) => "auto (config)".into(),
+        (InstallConsent::Ask, Some(true)) => "granted".into(),
+        (InstallConsent::Ask, Some(false)) => "declined".into(),
+        (InstallConsent::Ask, None) => "unset — will ask".into(),
     }
 }
 
@@ -133,15 +201,7 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
             } else {
                 hc.image.clone()
             };
-            let consent = match row.and_then(|r| r.install_consent) {
-                Some(true) => "granted".into(),
-                Some(false) => "declined".into(),
-                None => match hc.install_runtime {
-                    InstallConsent::Auto => "auto (config)".into(),
-                    InstallConsent::Never => "never (config)".into(),
-                    InstallConsent::Ask => "unset — will ask".to_string(),
-                },
-            };
+            let consent = consent_label(hc.install_runtime, row.and_then(|r| r.install_consent));
             let caps = row.and_then(|r| r.caps.as_ref());
             let mut snap = HostSnapshot {
                 name: name.clone(),
@@ -171,8 +231,16 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
                 last_probe: row.and_then(|r| r.last_probe),
                 active_step: row.and_then(|r| r.active_step.clone()),
                 is_db_def: db_defs.contains(name),
+                jump: hc.ssh.jump_host.trim().to_string(),
+                envs: cfg
+                    .env
+                    .iter()
+                    .filter(|(_, e)| e.host.trim() == name)
+                    .map(|(n, _)| n.clone())
+                    .collect(),
                 ..HostSnapshot::default()
             };
+            snap.job_runner = snap.envs.iter().any(|e| *e == cfg.jobs.runner);
             if let Some(HostState::Failed(f)) = row.map(|r| &r.state) {
                 snap.error = crate::host_flow::failure_reason(f);
                 snap.retryable = f.retryable;
@@ -679,5 +747,36 @@ mod tests {
         assert_eq!(h.short_status(), "provisioning");
         h.live_status = "seed cargo".into();
         assert_eq!(h.short_status(), "seed cargo");
+    }
+
+    #[test]
+    fn consent_label_follows_provisioning_precedence() {
+        // Config `never` beats a persisted grant (consent_answer refuses first),
+        // and config `auto` skips the ask, so a stored decline is moot.
+        assert_eq!(
+            consent_label(InstallConsent::Never, Some(true)),
+            "never (config)"
+        );
+        assert_eq!(
+            consent_label(InstallConsent::Auto, Some(false)),
+            "auto (config)"
+        );
+        assert_eq!(consent_label(InstallConsent::Ask, Some(true)), "granted");
+        assert_eq!(consent_label(InstallConsent::Ask, Some(false)), "declined");
+        assert_eq!(consent_label(InstallConsent::Ask, None), "unset — will ask");
+        let h = HostSnapshot {
+            name: "ws".into(),
+            consent: "never (config)".into(),
+            ..Default::default()
+        };
+        let plain = h.consent_plain();
+        assert!(
+            plain.contains("[host.ws]") && plain.contains("will not install"),
+            "{plain}"
+        );
+        assert!(
+            !plain.contains("c grants"),
+            "c cannot override config never: {plain}"
+        );
     }
 }
