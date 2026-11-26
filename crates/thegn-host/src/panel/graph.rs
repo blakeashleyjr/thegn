@@ -179,7 +179,7 @@ fn clamp_cells(cells: &[(char, usize)]) -> Vec<(char, usize)> {
 }
 
 /// Keep commit decorations from taking over a row when many refs point at it.
-fn compact_refs(refs: &str) -> String {
+pub(crate) fn compact_refs(refs: &str) -> String {
     let refs: Vec<&str> = refs.split(", ").filter(|r| !r.is_empty()).collect();
     match refs.as_slice() {
         [] => String::new(),
