@@ -891,6 +891,32 @@ impl OciRunner {
         matches!(self.placement, Placement::Local)
     }
 
+    /// Warn once per ssh host when systemd lingering is off (agents die when the
+    /// session ends). Best-effort: a failed or slow probe is treated as unknown.
+    fn warn_if_no_linger(&self) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        use thegn_core::host_probe::{LINGER_PROBE_SCRIPT, Linger, linger_notice, parse_linger};
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let Placement::Ssh(ssh) = &self.placement else {
+            return;
+        };
+        let Ok(out) = self.exec(LINGER_PROBE_SCRIPT, Duration::from_secs(5)) else {
+            return;
+        };
+        if !out.ok || parse_linger(&out.stdout) != Linger::Off {
+            return;
+        }
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let first = seen
+            .lock()
+            .map(|mut g| g.insert(ssh.host.clone()))
+            .unwrap_or(false);
+        if first {
+            thegn_core::msg::warn(&linger_notice(&ssh.host));
+        }
+    }
+
     /// Run a shell command on the host with a deadline. On transport-failure
     /// evidence (exit 255 / deadline kill) the ControlMaster is health-checked
     /// and a dead socket cleared, so the caller's *next* attempt builds a
@@ -1231,7 +1257,10 @@ impl HostRunner for OciRunner {
         retry::master_hygiene(&self.placement);
         // Warm the multiplexed master; one cheap exec proves reachability.
         match self.exec("true", Duration::from_secs(30)) {
-            Ok(o) if o.ok => Ok(()),
+            Ok(o) if o.ok => {
+                self.warn_if_no_linger();
+                Ok(())
+            }
             Ok(o) => Err(o.cerr("connect")),
             Err(f) => Err(f.cerr("connect")),
         }

@@ -40,6 +40,41 @@ impl Headroom {
     }
 }
 
+/// Shell probe for systemd user lingering. Prints `LINGER=yes|no` when
+/// `loginctl` can answer, and nothing at all on a non-systemd host.
+pub const LINGER_PROBE_SCRIPT: &str = r#"command -v loginctl >/dev/null 2>&1 || exit 0
+v=$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null) || exit 0
+echo "LINGER=${v#Linger=}""#;
+
+/// Whether systemd keeps this user's processes alive after the last session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linger {
+    On,
+    Off,
+    /// Non-systemd host, probe failure, or unparsable output.
+    Unknown,
+}
+
+/// The one-time notice (with the exact fix command) for a host with linger off.
+pub fn linger_notice(host: &str) -> String {
+    format!(
+        "{host}: systemd may kill agents there when the ssh session ends (user lingering is \
+         off). Fix on the host: sudo loginctl enable-linger $USER"
+    )
+}
+
+/// Parse [`LINGER_PROBE_SCRIPT`] output; anything unexpected is `Unknown`.
+pub fn parse_linger(out: &str) -> Linger {
+    for line in out.lines() {
+        match line.trim() {
+            "LINGER=yes" => return Linger::On,
+            "LINGER=no" => return Linger::Off,
+            _ => {}
+        }
+    }
+    Linger::Unknown
+}
+
 /// Parse the headroom script's output. Same discipline as
 /// [`crate::host::HostCaps::parse_probe`]: one `KEY=VALUE` per line, unknown
 /// keys ignored (script and core evolve independently), required keys
@@ -233,5 +268,14 @@ mod tests {
         let h = parse_headroom(FULL).unwrap();
         let j = serde_json::to_string(&h).unwrap();
         assert_eq!(serde_json::from_str::<Headroom>(&j).unwrap(), h);
+    }
+
+    #[test]
+    fn linger_parser() {
+        assert_eq!(parse_linger("LINGER=no\n"), Linger::Off);
+        assert_eq!(parse_linger("motd\nLINGER=yes\n"), Linger::On);
+        assert_eq!(parse_linger(""), Linger::Unknown);
+        assert_eq!(parse_linger("LINGER=\n"), Linger::Unknown);
+        assert!(linger_notice("h").contains("sudo loginctl enable-linger $USER"));
     }
 }
