@@ -37,6 +37,33 @@ fn dtach_session_id(host: &str, raw_command: &str) -> String {
         .collect()
 }
 
+/// One-time in-pane warning printed when an ssh pane launches on a host with no
+/// usable dtach (missing, or its socket dir can't be made safe): without it the
+/// remote shell ends when the client detaches or is killed, so nothing can be
+/// reattached.
+pub fn dtach_missing_warning() -> &'static str {
+    "thegn: no usable dtach on this host, so this ssh pane will END when you detach. \
+Install dtach (brew install dtach / apt install dtach) or mosh-server to keep it alive."
+}
+
+/// Build the remote `sh -lc` script: dtach when present, else run the raw
+/// command directly. Over plain ssh the fallback first prints
+/// [`dtach_missing_warning`] to stderr (mosh keeps its own session alive, so it
+/// needs no warning). The shell is `exec`ed so the pty hangup (SIGHUP) reaches
+/// it directly and it exits instead of being orphaned.
+fn remote_launch_script(kind: TransportKind, session_id: &str, raw: &str) -> String {
+    let fallback = match kind {
+        TransportKind::Ssh => format!(
+            "printf '%s\\n' '{}' >&2; exec {raw}",
+            dtach_missing_warning()
+        ),
+        TransportKind::Mosh => format!("exec {raw}"),
+    };
+    format!(
+        "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else {fallback}; fi"
+    )
+}
+
 /// Interactive-pane transport for an SSH placement. The control plane always
 /// uses plain ssh (mosh can't pipe non-interactive commands); only the pane
 /// honours `Mosh`.
@@ -153,9 +180,7 @@ impl SshPlacement {
         // Build the remote command: dtach (if present) else raw backend
         let raw = util::sh_join(backend_argv);
         let session_id = dtach_session_id(&self.host, &raw);
-        let remote_cmd = format!(
-            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
-        );
+        let remote_cmd = remote_launch_script(self.kind, &session_id, &raw);
 
         match self.kind {
             TransportKind::Mosh => {
@@ -814,9 +839,7 @@ mod tests {
 
         let raw = util::sh_join(&argv);
         let session_id = dtach_session_id("dev@box", &raw);
-        let remote_cmd = format!(
-            "if command -v dtach >/dev/null 2>&1 && d=\"${{XDG_RUNTIME_DIR:-$HOME/.cache}}/thegn/dtach\" && (umask 077; mkdir -p \"$d\") && [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ] && chmod 700 \"$d\"; then exec dtach -A \"$d/{session_id}\" -E -z -r winch {raw}; else exec {raw}; fi"
-        );
+        let remote_cmd = remote_launch_script(TransportKind::Ssh, &session_id, &raw);
         let expected = util::sh_join(&["/bin/sh".to_string(), "-lc".to_string(), remote_cmd]);
         assert_eq!(out[out.len() - 1], expected);
         // Plain target adds no -F/-J/-i.
@@ -842,7 +865,24 @@ mod tests {
         assert!(cmd.contains("-E -z -r winch"));
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
-        assert!(cmd.contains("; else exec echo hello; fi"));
+        assert!(cmd.contains("; else printf '%s\\n' 'thegn: no usable dtach on this host"));
+        assert!(cmd.contains("; exec echo hello; fi"));
+    }
+
+    #[test]
+    fn warning_text_names_the_fix() {
+        let w = dtach_missing_warning();
+        assert!(w.contains("brew install dtach"));
+        assert!(w.contains("apt install dtach"));
+        assert!(w.contains("mosh-server"));
+        assert!(!w.contains('\''), "must stay safe inside single quotes");
+    }
+
+    #[test]
+    fn mosh_fallback_has_no_warning() {
+        let s = remote_launch_script(TransportKind::Mosh, "id", "echo hi");
+        assert!(s.contains("; else exec echo hi; fi"));
+        assert!(!s.contains("no usable dtach"));
     }
 
     #[test]
