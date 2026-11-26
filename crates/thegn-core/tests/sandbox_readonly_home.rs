@@ -118,8 +118,8 @@ fn systemd_readonly_home_keeps_worktree_and_caches_writable() {
         vec![
             rw(&format!("{home}/wt")),
             Mount {
-                host: format!("{home}/.cargo/registry").into(),
-                dest: format!("{home}/.cargo/registry").into(),
+                host: format!("{home}/.cargo/registry"),
+                dest: format!("{home}/.cargo/registry"),
                 ro: false,
                 cache: true,
             },
