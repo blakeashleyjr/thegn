@@ -58,7 +58,7 @@ pub enum ModelAction {
     },
 }
 
-/// Inputs to [`readiness`], separated from the process so every branch is testable.
+/// Inputs to `readiness`, separated from the process so every branch is testable.
 struct Facts<'a> {
     channel_allowed: bool,
     native_compiled: bool,
@@ -138,7 +138,7 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
         "enabled": cfg.enabled, "kind": cfg.kind.as_str(), "language": cfg.language,
         "model": cfg.model, "model_path": path.as_ref().map(|p|p.display().to_string()),
         "model_error": model_error,
-        "model_present": path.is_some_and(|p|p.is_file()), "native_compiled": cfg!(feature="voice-native"),
+        "model_present": model_present, "native_compiled": cfg!(feature="voice-native"),
         "metal_compiled": cfg!(feature="voice-metal"), "live_preview": cfg.live_preview && cfg.kind != VoiceKind::Command && native_capture && cfg!(feature="voice-native"),
         "credential_configured": cfg.credential.is_some(), "timeout_seconds": cfg.request_timeout().as_secs(),
         "setup": "thegn voice setup; experimental channel required; ready means configuration is complete, not that the microphone works (macOS: allow Microphone for your terminal)"

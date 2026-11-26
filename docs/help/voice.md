@@ -23,8 +23,10 @@ actions: [voice-toggle, voice-cancel]
    restart the terminal if you had denied it. On Linux, make sure the default
    PipeWire/PulseAudio/ALSA source is your microphone.
 
-With no microphone, a denied permission or a missing model, recording stops with
-an error in the status line and nothing is pasted. Disabled voice starts no
+With no microphone or a missing model, recording stops with an error in the
+status line and nothing is pasted. A denied macOS microphone permission usually
+records silence instead, so the status line shows `Voice: no speech detected`;
+check the Microphone privacy setting for your terminal app. Disabled voice starts no
 worker and opens no audio device.
 
 Voice mode is an experimental, opt-in toggle-to-talk feature. Press `Alt v` to
