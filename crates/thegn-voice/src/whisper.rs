@@ -12,6 +12,17 @@ pub struct Engine {
     context: WhisperContext,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Pass {
+    Preview,
+    Final,
+}
+
+/// Return a Whisper encoder context sized to an audio window, plus a small margin.
+pub fn audio_ctx_for(n: usize) -> i32 {
+    (n.saturating_add(319) / 320).saturating_add(64).min(1500) as i32
+}
+
 struct Abort {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
@@ -67,6 +78,7 @@ impl Engine {
         &self,
         samples: &[f32],
         language: &str,
+        pass: Pass,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
     ) -> Result<String> {
@@ -90,7 +102,7 @@ impl Engine {
         let mut state = self.context.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(
-            std::thread::available_parallelism().map_or(2, |n| n.get().min(4)) as i32,
+            std::thread::available_parallelism().map_or(2, |n| n.get().min(8)) as i32,
         );
         params.set_language(if language == "auto" || language.is_empty() {
             None
@@ -103,6 +115,14 @@ impl Engine {
         params.set_print_realtime(false);
         params.set_print_special(false);
         params.set_print_timestamps(false);
+        params.set_suppress_nst(true);
+        params.set_suppress_blank(true);
+        if pass == Pass::Preview {
+            params.set_temperature_inc(0.0);
+            params.set_single_segment(true);
+            params.set_no_timestamps(true);
+            params.set_audio_ctx(audio_ctx_for(samples.len()));
+        }
         // whisper-rs 0.16.0's safe helper double-boxes a trait object, then
         // casts that allocation to the original closure type in its trampoline.
         // Use a concrete, owned callback context instead (and avoid its leak).
@@ -124,6 +144,20 @@ impl Engine {
             .map(|s| s.to_str_lossy().map(|text| text.into_owned()))
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join(""))
+    }
+}
+
+#[cfg(test)]
+mod audio_context_tests {
+    use super::audio_ctx_for;
+
+    #[test]
+    fn audio_context_scales_to_window_and_clamps() {
+        assert_eq!(audio_ctx_for(0), 64);
+        assert_eq!(audio_ctx_for(16_000), 114);
+        assert_eq!(audio_ctx_for(8 * 16_000), 464);
+        assert_eq!(audio_ctx_for(30 * 16_000), 1500);
+        assert_eq!(audio_ctx_for(60 * 16_000), 1500);
     }
 }
 

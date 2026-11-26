@@ -89,7 +89,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     };
     use std::time::{Duration, Instant};
     use thegn_core::config::VoiceKind;
-    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES};
+    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES, whisper::Pass};
     let cfg = request.cfg;
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -149,12 +149,12 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         })?;
     let mut rolling = RollingTranscript::default();
     let mut decoded_end = 0;
-    let transcribe = |samples: &[f32], flag: Arc<AtomicBool>| -> Result<String> {
+    let transcribe = |samples: &[f32], flag: Arc<AtomicBool>, pass: Pass| -> Result<String> {
         match cfg.kind {
             VoiceKind::Embedded => engine
                 .as_ref()
                 .context("missing embedded engine")?
-                .transcribe(samples, &cfg.language, flag, cfg.request_timeout()),
+                .transcribe(samples, &cfg.language, pass, flag, cfg.request_timeout()),
             VoiceKind::Http => Ok(thegn_svc::voice_http::transcribe(
                 &cfg,
                 request.token.as_deref(),
@@ -179,7 +179,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
             let began = Instant::now();
             // The stop flag aborts a preview to make room for the final pass.
             // No queue: after decoding, snapshot the newest window directly.
-            match transcribe(&samples, stop.clone()) {
+            match transcribe(&samples, stop.clone(), Pass::Preview) {
                 Ok(text) if !stop.load(Ordering::Acquire) => {
                     let text = rolling.update(start, &text);
                     emit(Event::Partial(thegn_voice::preview_snippet(&text).into()))?;
@@ -217,7 +217,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     }
     let (_, samples, _) = capture.snapshot(None)?;
     let began = Instant::now();
-    let text = transcribe(&samples, cancel)?;
+    let text = transcribe(&samples, cancel, Pass::Final)?;
     emit(Event::Timing {
         final_pass: true,
         decode_ms: began.elapsed().as_millis() as u64,
