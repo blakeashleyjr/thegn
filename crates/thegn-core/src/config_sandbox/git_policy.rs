@@ -268,7 +268,10 @@ fn carve_out_conflict(
 ///   `config.worktree` inside `admin_dir` re-pinned read-only (a writable
 ///   `commondir` would point host git at a sandbox-planted common dir with its
 ///   own config and hooks). `hooks/`, `config`, `packed-refs`,
-///   `refs/heads/main` and every other ref stay read-only.
+///   `refs/heads/main` and every other ref stay read-only. The object store's
+///   `objects/info/alternates` and `objects/info/http-alternates` are re-pinned
+///   read-only too (created empty when missing), so a sandbox cannot redirect
+///   object lookups to a planted directory (THE-2148).
 /// - `push-lane`: the same binds (pushes go through thegn, not `.git` writes).
 /// - `full`: the same binds plus `credential_wanted`.
 ///
@@ -343,6 +346,11 @@ pub fn plan_git_mounts(
                 ["commondir", "gitdir", "config.worktree"]
                     .iter()
                     .map(|name| admin_dir.join(name)),
+            )
+            .chain(
+                ["alternates", "http-alternates"]
+                    .iter()
+                    .map(|name| common_dir.join("objects/info").join(name)),
             )
             .collect(),
         mkdirs: vec![heads, logs],
@@ -663,6 +671,8 @@ mod tests {
                     admin.join("commondir"),
                     admin.join("gitdir"),
                     admin.join("config.worktree"),
+                    PathBuf::from("/repo/.git/objects/info/alternates"),
+                    PathBuf::from("/repo/.git/objects/info/http-alternates"),
                 ],
                 "{mode}"
             );

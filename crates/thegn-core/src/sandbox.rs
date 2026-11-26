@@ -632,6 +632,11 @@ pub struct SandboxSpec {
     /// Added by WS00-P1-03 and always `None` until WS04-P2-08 sets it (and
     /// fingerprints it, policy fingerprint v3, when it first does).
     pub egress: Option<crate::egress::plan::EgressPlan>,
+    /// A sealed launch's object-store refusal from
+    /// `sandbox_floor::git_integrity_gate` (alternates, symlinks in
+    /// `objects/`, or an outside `commondir`); surfaced by `home_gate` so the
+    /// existing refusal channel stops the launch before any host spawn.
+    pub git_integrity_refusal: Option<String>,
 }
 
 /// An inert spec for tests and struct-update syntax (WS00-P1-02; the spec's
@@ -683,6 +688,7 @@ impl Default for SandboxSpec {
             hidden_paths: Vec::new(),
             volume_owners: Vec::new(),
             egress: None,
+            git_integrity_refusal: None,
         }
     }
 }
@@ -1770,22 +1776,74 @@ pub fn set_merge_target_lookup(lookup: MergeTargetLookup) {
 
 /// What the git mount plan needs to know about a local linked worktree.
 #[derive(Debug, Clone, Default)]
-struct GitProbe {
+pub(crate) struct GitProbe {
     /// The git common dir (`<repo>/.git`).
-    common: PathBuf,
+    pub(crate) common: PathBuf,
     /// The worktree's own git dir (`<common>/worktrees/<name>`), when linked.
-    admin: Option<PathBuf>,
+    pub(crate) admin: Option<PathBuf>,
     /// The checked-out branch (`None` when detached).
-    branch: Option<String>,
+    pub(crate) branch: Option<String>,
     /// The merge target (`auto` resolved to the default branch), when known.
-    target: Option<String>,
+    pub(crate) target: Option<String>,
     /// The repository's default branch, when known (never `HEAD`).
-    default: Option<String>,
+    pub(crate) default: Option<String>,
+    /// `objects/info/alternates` lists at least one non-comment path (read
+    /// before the read-only pin creates the file empty).
+    pub(crate) alternates_nonempty: bool,
+    /// The borrowed object directories named by `objects/info/alternates`.
+    pub(crate) alternates: Vec<String>,
+    /// An entry directly under `<common>/objects` is a symlink.
+    pub(crate) objects_symlinks: bool,
+    /// `<admin>/commondir` resolves outside the common dir.
+    pub(crate) commondir_outside: bool,
     /// The host's effective commit identity for this repo (validated), handed
     /// to the sandbox as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`: the shared
     /// `.git/config` is read-only under `[sandbox.git]` and the global
     /// gitconfig may be unreachable from the sandbox `$HOME`.
-    identity: crate::git_identity::GitIdentity,
+    pub(crate) identity: crate::git_identity::GitIdentity,
+}
+
+/// Object-store integrity facts for `probe_git`: the borrowed alternates
+/// paths, whether `objects/` is or holds a symlink, and whether `commondir`
+/// points outside the common dir. A few `read`/`stat` calls, no git
+/// subprocess.
+fn probe_object_store(
+    common: &std::path::Path,
+    admin: Option<&std::path::Path>,
+) -> (Vec<String>, bool, bool) {
+    let alternates: Vec<String> = std::fs::read_to_string(common.join("objects/info/alternates"))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let objects = common.join("objects");
+    let objects_symlinks = std::fs::symlink_metadata(&objects).is_ok_and(|m| m.is_symlink())
+        || std::fs::read_dir(&objects).is_ok_and(|rd| {
+            rd.flatten()
+                .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        });
+    // `common` is what git itself resolved from this very `commondir`, so it
+    // cannot tell a redirected file apart. The anchor is where the admin dir
+    // lives: a linked worktree's admin dir is `<common>/worktrees/<name>`.
+    let commondir_outside = admin.is_some_and(|admin| {
+        let Ok(text) = std::fs::read_to_string(admin.join("commondir")) else {
+            return false;
+        };
+        let Ok(target) = admin.join(text.trim()).canonicalize() else {
+            return false;
+        };
+        let own = admin
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+            .and_then(std::path::Path::parent)
+            .and_then(|p| p.canonicalize().ok());
+        own.is_none_or(|own| own != target) || common.canonicalize().is_ok_and(|c| c != target)
+    });
+    (alternates, objects_symlinks, commondir_outside)
 }
 
 /// How long a resolved per-repo identity is reused before git is asked again.
@@ -1843,12 +1901,18 @@ fn probe_git(loc: &GitLoc, worktree: &std::path::Path, common: &std::path::Path)
         .filter(|t| !t.is_empty() && t != "auto")
         .or_else(|| default.clone());
     let identity = cached_git_identity(repo_root, &|args| loc.git_out(args));
+    let (alternates, objects_symlinks, commondir_outside) =
+        probe_object_store(common, admin.as_deref());
     GitProbe {
         common: common.to_path_buf(),
         admin,
         branch,
         target,
         default,
+        alternates_nonempty: !alternates.is_empty(),
+        alternates,
+        objects_symlinks,
+        commondir_outside,
         identity,
     }
 }
@@ -2009,11 +2073,20 @@ fn git_policy_mounts(
         mounts.push(path_mount(&config, true));
     }
     for path in &plan.ro_after {
+        // The parent too: a repo without `objects/info/` would otherwise skip
+        // the alternates pin and leave the sandbox free to create the file
+        // under the writable `objects/` (THE-2148).
         if !path.exists()
-            && let Err(error) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            && let Err(error) = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .map(drop)
+                })
         {
             tracing::warn!(
                 target: "thegn::sandbox",
@@ -2240,10 +2313,12 @@ fn resolve_placed_with(
     // The probe's host commit identity, carried to the env assembly below.
     let probed_identity: std::cell::RefCell<Option<crate::git_identity::GitIdentity>> =
         std::cell::RefCell::new(None);
+    let probed_git: std::cell::RefCell<Option<GitProbe>> = std::cell::RefCell::new(None);
     let add_worktree_mounts = |mounts: &mut Vec<Mount>| match &git_common {
         Some(gc) if git_policy_applies => {
             let probe = probe_git(loc, &worktree, gc);
             probed_identity.replace(Some(probe.identity.clone()));
+            probed_git.replace(Some(probe.clone()));
             let (git_mounts, warning) = git_policy_mounts(&cfg.git, &worktree, &probe);
             if let Some(reason) = warning {
                 warn_git_fallback_once(&loc.path(), &reason);
@@ -2636,7 +2711,17 @@ fn resolve_placed_with(
         hidden_paths,
         // WS00-P1-03 stub: no egress plan until WS04-P2-08 resolves one.
         egress: None,
+        git_integrity_refusal: None,
     };
+    if let Some(probe) = probed_git.take()
+        && let Some(miss) = crate::sandbox_floor::git_integrity_gate(&spec, &probe)
+    {
+        if spec.seal_home.is_some() {
+            spec.git_integrity_refusal = Some(miss);
+        } else {
+            warn_git_fallback_once(&loc.path(), &miss);
+        }
+    }
     if abi_ok && nix_daemon && !add_nix_daemon_access(&mut spec) {
         // Only nag when explicitly requested; the auto backstop stays silent.
         msg::warn(

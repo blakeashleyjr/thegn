@@ -472,6 +472,10 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
     use crate::sandbox::BackendFamily;
     use crate::sandbox_mounts::{HomeView, home_view};
     let home = spec.seal_home.as_deref()?;
+    // THE-2148: the object-store verdict recorded at spec-build time.
+    if let Some(miss) = &spec.git_integrity_refusal {
+        return Some(miss.clone());
+    }
     // An unset/empty/relative/unresolvable `$HOME` cannot be hidden or checked:
     // refuse rather than silently disable sealing.
     let home_path = std::path::Path::new(home);
@@ -525,6 +529,66 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
             standard_switch_hint(None),
         )
     })
+}
+
+/// Sealed refusal when the object store borrows objects through alternates.
+pub const GIT_ALTERNATES_REFUSAL: &str = "sealed refused: this repository's object store borrows \
+     objects from elsewhere (objects/info/alternates); use a private copy";
+/// Sealed refusal when `objects/` holds a symlink.
+pub const GIT_OBJECTS_SYMLINK_REFUSAL: &str = "sealed refused: this repository's object store \
+     contains a symlink under objects/ (objects can be redirected); use a private copy";
+/// Sealed refusal when the worktree's `commondir` leaves the common dir.
+pub const GIT_COMMONDIR_REFUSAL: &str = "sealed refused: this worktree's commondir points \
+     outside its git common dir (the object store is not this repository's own); use a private copy";
+/// Warning when `objects/` holds a symlink (non-sealed profiles).
+pub const GIT_OBJECTS_SYMLINK_WARNING: &str =
+    "objects symlink present: an entry under objects/ is a symlink, so objects can be redirected";
+/// Warning when `commondir` leaves the common dir (non-sealed profiles).
+pub const GIT_COMMONDIR_WARNING: &str =
+    "commondir outside: this worktree's commondir points outside its git common dir";
+
+/// The git object-store integrity gate (THE-2148). `None` when the probe finds
+/// no alternates, no symlink in `objects/` and a contained `commondir`;
+/// otherwise the message for the first failing check. Sealed specs
+/// (`seal_home` set: `sealed` and `sealed-tunnel`) get the refusal wording
+/// (the caller refuses the launch); every other profile gets the warning
+/// wording (the caller posts it and launches).
+pub(crate) fn git_integrity_gate(
+    spec: &crate::sandbox::SandboxSpec,
+    probe: &crate::sandbox::GitProbe,
+) -> Option<String> {
+    let sealed = spec.seal_home.is_some();
+    if probe.alternates_nonempty {
+        return Some(if sealed {
+            GIT_ALTERNATES_REFUSAL.to_string()
+        } else {
+            format!(
+                "alternates present: objects from {} are shared with this sandbox",
+                probe.alternates.join(", ")
+            )
+        });
+    }
+    if probe.objects_symlinks {
+        return Some(
+            if sealed {
+                GIT_OBJECTS_SYMLINK_REFUSAL
+            } else {
+                GIT_OBJECTS_SYMLINK_WARNING
+            }
+            .to_string(),
+        );
+    }
+    if probe.commondir_outside {
+        return Some(
+            if sealed {
+                GIT_COMMONDIR_REFUSAL
+            } else {
+                GIT_COMMONDIR_WARNING
+            }
+            .to_string(),
+        );
+    }
+    None
 }
 
 fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
@@ -724,6 +788,71 @@ mod tests {
         assert!(strict_gate(&strict_spec(Backend::Apple, FileAccess::Worktree)).is_some());
         assert!(strict_gate(&strict_spec(Backend::Systemd, FileAccess::Worktree)).is_some());
         assert!(strict_gate(&strict_spec(Backend::Bwrap, FileAccess::Worktree)).is_none());
+    }
+
+    fn integrity_probe(alt: bool, sym: bool, outside: bool) -> crate::sandbox::GitProbe {
+        crate::sandbox::GitProbe {
+            alternates_nonempty: alt,
+            alternates: if alt {
+                vec!["/shared/objects".into()]
+            } else {
+                vec![]
+            },
+            objects_symlinks: sym,
+            commondir_outside: outside,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sealed_refuses_external_alternates() {
+        let mut spec = crate::sandbox::SandboxSpec {
+            seal_home: Some("/home/x".into()),
+            ..Default::default()
+        };
+        let miss = git_integrity_gate(&spec, &integrity_probe(true, false, false));
+        assert_eq!(miss.as_deref(), Some(GIT_ALTERNATES_REFUSAL));
+        assert!(GIT_ALTERNATES_REFUSAL.contains("use a private copy"));
+        spec.git_integrity_refusal = miss;
+        assert_eq!(home_gate(&spec).as_deref(), Some(GIT_ALTERNATES_REFUSAL));
+    }
+
+    #[test]
+    fn standard_warns_on_alternates() {
+        let spec = crate::sandbox::SandboxSpec::default();
+        let miss = git_integrity_gate(&spec, &integrity_probe(true, false, false)).unwrap();
+        assert_eq!(
+            miss,
+            "alternates present: objects from /shared/objects are shared with this sandbox"
+        );
+        assert_eq!(home_gate(&spec), None, "a warning never refuses");
+    }
+
+    #[test]
+    fn commondir_outside_refused_sealed() {
+        let mut spec = crate::sandbox::SandboxSpec {
+            seal_home: Some("/home/x".into()),
+            ..Default::default()
+        };
+        let probe = integrity_probe(false, false, true);
+        assert_eq!(
+            git_integrity_gate(&spec, &probe).as_deref(),
+            Some(GIT_COMMONDIR_REFUSAL)
+        );
+        let probe = integrity_probe(false, true, false);
+        assert_eq!(
+            git_integrity_gate(&spec, &probe).as_deref(),
+            Some(GIT_OBJECTS_SYMLINK_REFUSAL)
+        );
+        spec.seal_home = None;
+        assert_eq!(
+            git_integrity_gate(&spec, &probe).as_deref(),
+            Some(GIT_OBJECTS_SYMLINK_WARNING)
+        );
+        assert_eq!(
+            git_integrity_gate(&spec, &integrity_probe(false, false, false)),
+            None
+        );
     }
 
     #[test]

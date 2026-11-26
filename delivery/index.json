@@ -1447,6 +1447,18 @@
       "summary": "Per-tab zoom renders as a pane stack with one-row bars; keyboard, mouse and narrow-width geometry share one drawn layout."
     },
     {
+      "change": "pin-git-alternates-read-only",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2148",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2148 (WS11-P3-02) pins objects/info/alternates and http-alternates read-only under [sandbox.git] and probes the object store at launch (alternates, symlinks in objects/, an outside commondir): sealed and sealed-tunnel refuse, other profiles warn; remote build and tests remain unchecked."
+    },
+    {
       "change": "preserve-config-validation-severity",
       "archive_path": "openspec/changes/archive/2026-10-19-preserve-config-validation-severity/",
       "lifecycle": "archived",
