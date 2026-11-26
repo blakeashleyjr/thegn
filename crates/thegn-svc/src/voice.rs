@@ -157,7 +157,10 @@ impl CommandVoiceProvider {
         let Some(program) = command_argv.first() else {
             return Err(VoiceError::NotConfigured);
         };
-        let file_input = command_argv.iter().any(|arg| arg == "{wav}");
+        // The `{wav}` path placeholder is a Hex-preset contract only; plain command
+        // adapters keep the WAV-on-stdin contract byte for byte.
+        let file_input =
+            self.cfg.kind == VoiceKind::Hex && command_argv.iter().any(|arg| arg == "{wav}");
         let wav_file = if file_input {
             let mut file = tempfile::Builder::new()
                 .prefix("thegn-voice-")
@@ -172,17 +175,9 @@ impl CommandVoiceProvider {
         };
         let command_argv = command_argv
             .into_iter()
-            .map(|arg| {
-                if arg == "{wav}" {
-                    wav_file
-                        .as_ref()
-                        .expect("WAV placeholder creates a temporary file")
-                        .path()
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    arg
-                }
+            .map(|arg| match &wav_file {
+                Some(file) if arg == "{wav}" => file.path().to_string_lossy().into_owned(),
+                _ => arg,
             })
             .collect();
         let argv = thegn_core::sandbox_cpucap::wrap_background_argv(command_argv);
@@ -574,6 +569,21 @@ mod tests {
         let used_path = std::fs::read_to_string(used_path).unwrap();
         assert!(used_path.ends_with(".wav"));
         assert!(!std::path::Path::new(&used_path).exists());
+    }
+
+    #[test]
+    fn command_kind_keeps_wav_placeholder_literal_and_reads_stdin() {
+        let provider = CommandVoiceProvider::new(cfg(&[
+            "sh",
+            "-c",
+            "[ \"$1\" = '{wav}' ] || exit 9; [ \"$(wc -c)\" -eq 12 ] || exit 8; printf ok",
+            "sh",
+            "{wav}",
+        ]));
+        assert_eq!(
+            provider.transcribe_push_to_talk(b"RIFF0000WAVE").unwrap(),
+            "ok"
+        );
     }
 
     #[test]

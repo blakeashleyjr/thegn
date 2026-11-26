@@ -5145,7 +5145,8 @@ poll_interval_secs = 3
 # size confirmation and finish before the microphone opens. Stable clamps off.
 [voice]
 enabled = false
-# command (legacy WAV-in/text-out), embedded (Whisper), or http (multipart JSON).
+# command (legacy WAV-in/text-out), embedded (Whisper), http (multipart JSON), or
+# hex (`hex transcribe <temporary WAV>`; needs the Hex CLI on PATH).
 kind = "command"
 # Empty selects native capture (voice-native build); command arrays are argv,
 # never shell strings. External capture is final-only. Embedded uses native capture.
