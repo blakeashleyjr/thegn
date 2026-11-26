@@ -87,6 +87,15 @@ durable inbox row. Notification text can include branch names, issue titles,
 and log fragments, so route chat sinks with care. `thegn doctor` performs an
 offline configuration/request-shape probe and never posts a test message.
 
+## The notifications overlay
+
+The overlay opened by the `✋`/`✉` chip groups items by kind (needs input,
+failed, finished, info) under a count line, and folds several items from one
+pipeline batch or project into a single row with a count. `↵`/`→` expands a
+group, `←` collapses it, `x` dismisses the row or group under the cursor, `D`
+dismisses everything older than 24 hours, and `/` filters by text. Older items
+sit in a collapsed **Older (N)** group and are not counted on the chip.
+
 ## Approvals
 
 Approval requests raised by agents and automations are pinned at the top of the

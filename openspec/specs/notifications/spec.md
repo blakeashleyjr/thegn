@@ -213,12 +213,21 @@ The red attention flag SHALL count only unread Alert notifications, the neutral 
 
 ### Requirement: One statusbar attention chip
 
-The statusbar SHALL carry a single attention chip: `✋ N` where N is the number of needs-you worktrees plus unread Alert notifications not attributed to one of those worktrees (red when anything is blocked/failing or an alert is unread, amber otherwise); when N is zero and unread Notice rows exist, a quiet `✉ N` inbox count instead; nothing when only Info rows are unread. The chip's count MUST equal the number of rows in the unified surface's "Needs you" and "Alerts" groups.
+The statusbar SHALL carry a single attention chip: `✋ N` where N is the number of needs-you worktrees plus unread Alert notifications not attributed to one of those worktrees (red when anything is blocked/failing or an alert is unread, amber otherwise); when N is zero and unread Notice rows exist, a quiet `✉ N` inbox count instead; nothing when only Info rows are unread. The chip's count MUST equal the number of live (non-stale) items in the unified surface's grouped list; an item first raised more than 24 hours ago is stale and MUST NOT be counted.
 
 #### Scenario: A failed pane lights one chip, not two
 
 - **WHEN** a `process_failed` notification for worktree W is unread and W scores as a needs-you worktree
-- **THEN** the statusbar shows `✋ 1` (not a separate `⚑ 1`) and the unified surface lists W once under Needs you
+- **THEN** the statusbar shows `✋ 1` (not a separate `⚑ 1`) and the unified surface lists W once, under its kind group
+
+### Requirement: The unified surface groups, folds and ages items
+
+The unified surface SHALL open with a count line per kind (needs input, failed, finished, info) and list items grouped by kind, most urgent first. Within a kind, two or more items from one source (a pipeline batch, or the project a worktree lives in) SHALL fold into one collapsed row carrying the count (for example "Pipeline b313 — 23 need input"); `Enter` or `Right` SHALL expand it and `Left` SHALL collapse it. Items first raised more than 24 hours ago SHALL appear only in a collapsed "Older (N)" group at the bottom. `x` SHALL dismiss the item or the whole group under the cursor, `D` SHALL dismiss every stale item, and `/` SHALL filter by text; these keys SHALL be shown in the footer.
+
+#### Scenario: A hundred stale lane rows no longer bury live ones
+
+- **WHEN** 100 needs-input items from old pipeline batches are older than 24 hours and one item is fresh
+- **THEN** the fresh item is listed under its kind, the 100 are folded under "Older (100)", and the chip counts 1
 
 ### Requirement: The unified surface shows live items and acts in place
 
