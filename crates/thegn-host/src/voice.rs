@@ -400,7 +400,13 @@ impl VoiceController {
             let reaped_waker = wk.clone();
             let result = if cfg.kind == thegn_core::config::VoiceKind::Http {
                 resolve_credential(&cfg).and_then(|token| {
-                    thegn_svc::voice_http::transcribe(&cfg, token.as_deref(), &wav, &cancel)
+                    thegn_svc::voice_http::transcribe_with_prompt(
+                        &cfg,
+                        token.as_deref(),
+                        &wav,
+                        &cancel,
+                        cfg.vocabulary_prompt().as_deref(),
+                    )
                 })
             } else {
                 thegn_svc::voice::CommandVoiceProvider::new(cfg)
@@ -889,7 +895,10 @@ fn native_session(
             Event::Failed(_) => {}
             Event::Captured(encoded) => {
                 use base64::Engine;
-                if cfg.kind != thegn_core::config::VoiceKind::Command {
+                if !matches!(
+                    cfg.kind,
+                    thegn_core::config::VoiceKind::Command | thegn_core::config::VoiceKind::Hex
+                ) {
                     result = Err("unexpected capture from transcription worker".into());
                 } else {
                     match base64::engine::general_purpose::STANDARD.decode(encoded) {

@@ -47,6 +47,7 @@ fn main() -> anyhow::Result<()> {
             Pass::Preview,
             Arc::new(AtomicBool::new(false)),
             Duration::from_secs(60),
+            None,
         )?;
         writeln!(
             output,
@@ -62,6 +63,7 @@ fn main() -> anyhow::Result<()> {
         Pass::Final,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(60),
+        None,
     )?;
     writeln!(
         output,
@@ -77,7 +79,8 @@ fn main() -> anyhow::Result<()> {
                 language,
                 Pass::Preview,
                 Arc::new(AtomicBool::new(true)),
-                Duration::from_secs(60)
+                Duration::from_secs(60),
+                None
             )
             .is_err(),
         "cancelled decode succeeded"
@@ -89,6 +92,7 @@ fn main() -> anyhow::Result<()> {
         Pass::Preview,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(1),
+        None,
     )?;
     ensure!(silent.is_empty(), "digital silence produced a transcript");
     writeln!(output, "silence\tpassed")?;

@@ -74,6 +74,8 @@ impl Engine {
             .context("load Whisper model (Metal with CPU fallback on macOS; CPU on Linux)")?;
         Ok(Self { context })
     }
+    /// `prompt` is the Whisper initial prompt (final pass only); the caller
+    /// drops a transcript that merely echoes it.
     pub fn transcribe(
         &self,
         samples: &[f32],
@@ -81,6 +83,7 @@ impl Engine {
         pass: Pass,
         cancelled: Arc<AtomicBool>,
         timeout: Duration,
+        prompt: Option<&str>,
     ) -> Result<String> {
         if cancelled.load(Ordering::Acquire) {
             bail!("Whisper transcription cancelled");
@@ -89,10 +92,14 @@ impl Engine {
             return Ok(String::new());
         }
         Self::validate_language(language)?;
-        // Avoid Whisper's tendency to hallucinate on digital silence.
-        if samples.iter().map(|s| s * s).sum::<f32>() / (samples.len() as f32) < 0.000001 {
+        if !crate::level::has_speech(samples) {
             return Ok(String::new());
         }
+        let span = if pass == Pass::Final {
+            crate::level::speech_span(samples).unwrap_or(0..samples.len())
+        } else {
+            0..samples.len()
+        };
         // Declare the callback context before `state`: ggml stores this
         // pointer in the state backend, so the context must outlive the state.
         let abort = Abort {
@@ -109,6 +116,9 @@ impl Engine {
         } else {
             Some(language)
         });
+        if let Some(prompt) = prompt {
+            params.set_initial_prompt(prompt);
+        }
         params.set_translate(false);
         params.set_no_context(true);
         params.set_print_progress(false);
@@ -134,7 +144,7 @@ impl Engine {
             params.set_abort_callback(Some(should_abort));
             params.set_abort_callback_user_data(std::ptr::from_ref(&abort).cast_mut().cast());
         }
-        let result = state.full(params, samples);
+        let result = state.full(params, &samples[span]);
         if cancelled.load(Ordering::Acquire) || Instant::now() >= abort.deadline {
             bail!("Whisper transcription cancelled or timed out");
         }

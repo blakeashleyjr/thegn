@@ -191,7 +191,7 @@ pub(crate) fn drain(
                 crate::voice_worker::Event::Final(transcript) => VoiceEvent::TranscriptSucceeded {
                     pane_id,
                     request_id,
-                    transcript: voice_text::process(&voice.config().replacements, transcript),
+                    transcript: voice_text::finalize(voice.config(), &transcript),
                 },
                 crate::voice_worker::Event::Failed(reason) => VoiceEvent::TranscriptFailed {
                     pane_id,
@@ -216,7 +216,7 @@ pub(crate) fn drain(
             } => VoiceEvent::TranscriptSucceeded {
                 pane_id,
                 request_id,
-                transcript: voice_text::process(&voice.config().replacements, transcript),
+                transcript: voice_text::finalize(voice.config(), &transcript),
             },
             VoiceMessage::TranscriptFailed {
                 pane_id,

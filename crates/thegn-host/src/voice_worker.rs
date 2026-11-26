@@ -89,7 +89,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     };
     use std::time::{Duration, Instant};
     use thegn_core::config::VoiceKind;
-    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES, whisper::Pass};
+    use thegn_voice::{PREVIEW_STEP, RollingTranscript, WINDOW_SAMPLES, level, whisper::Pass};
     let cfg = request.cfg;
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -105,38 +105,10 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         }
         stopped.store(true, Ordering::Release);
     })?;
-    // Model acquisition is explicitly CLI-only. Never download or open a mic
-    // until setup has installed the selected artifact.
-    let engine = if cfg.kind == VoiceKind::Embedded {
-        thegn_voice::whisper::Engine::validate_language(&cfg.language)?;
-        let path = thegn_svc::voice_models::resolve(&cfg)?;
-        anyhow::ensure!(
-            path.is_file(),
-            "voice model missing; run thegn voice setup before recording"
-        );
-        if cfg.model_path.is_none() {
-            thegn_svc::voice_models::verify(
-                &path,
-                thegn_svc::voice_models::model(&cfg.model)?,
-                &cancel,
-            )?;
-        }
-        Some(thegn_voice::whisper::Engine::load(&path)?)
-    } else {
-        None
-    };
-    if cfg.kind == VoiceKind::Http {
-        thegn_svc::voice_http::validate_endpoint(&cfg.endpoint)?;
-        cfg.validate_credential_transport()
-            .map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(
-            !cfg.model.is_empty(),
-            "HTTP model is missing; run thegn voice setup --kind http"
-        );
-    }
-    if cfg.kind == VoiceKind::Command && cfg.command.is_empty() {
-        bail!("no transcriber command configured");
-    }
+    // Model *acquisition* is explicitly CLI-only: never download with a mic
+    // open. Only the model *load* overlaps capture, so the first words spoken
+    // right after the toggle are not lost to a slow load.
+    let model_path = preflight(&cfg, &cancel)?;
     if cancel.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -147,39 +119,82 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         thegn_voice::capture::Capture::start(cfg.effective_max_seconds(), stop.clone(), || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility)
         })?;
+    let engine = match model_path {
+        Some(path) => match thegn_voice::whisper::Engine::load(&path) {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                capture.close_now()?;
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    if cancel.load(Ordering::Acquire) {
+        capture.close_now()?;
+        return Ok(());
+    }
     let mut rolling = RollingTranscript::default();
     let mut decoded_end = 0;
-    let transcribe = |samples: &[f32], flag: Arc<AtomicBool>, pass: Pass| -> Result<String> {
+    // The vocabulary prompt is for the final pass only: previews stay unprompted.
+    let prompt = cfg.vocabulary_prompt();
+    let transcribe = |samples: &[f32],
+                      flag: Arc<AtomicBool>,
+                      pass: Pass,
+                      prompt: Option<&str>|
+     -> Result<String> {
         match cfg.kind {
-            VoiceKind::Embedded => engine
-                .as_ref()
-                .context("missing embedded engine")?
-                .transcribe(samples, &cfg.language, pass, flag, cfg.request_timeout()),
-            VoiceKind::Http => Ok(thegn_svc::voice_http::transcribe(
+            VoiceKind::Embedded => {
+                let text = engine
+                    .as_ref()
+                    .context("missing embedded engine")?
+                    .transcribe(
+                        samples,
+                        &cfg.language,
+                        pass,
+                        flag,
+                        cfg.request_timeout(),
+                        prompt,
+                    )?;
+                Ok(match prompt {
+                    Some(prompt) => thegn_core::voice::drop_prompt_echo(&text, prompt),
+                    None => text,
+                })
+            }
+            VoiceKind::Http => Ok(thegn_svc::voice_http::transcribe_with_prompt(
                 &cfg,
                 request.token.as_deref(),
                 &thegn_voice::wav(samples),
                 &flag,
+                prompt,
             )?),
-            VoiceKind::Command => bail!("command transcription belongs to the parent adapter"),
+            VoiceKind::Command | VoiceKind::Hex => {
+                bail!("command transcription belongs to the parent adapter")
+            }
         }
     };
     loop {
         if cancel.load(Ordering::Acquire) {
-            capture.close()?;
+            capture.close_now()?;
             return Ok(());
         }
         let (end, closed) = capture.progress()?;
         if stop.load(Ordering::Acquire) || closed {
             break;
         }
-        if cfg.live_preview && cfg.kind != VoiceKind::Command && end >= decoded_end + PREVIEW_STEP {
+        if cfg.live_preview
+            && !matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex)
+            && end >= decoded_end + PREVIEW_STEP
+        {
             let (start, samples, _) = capture.snapshot(Some(WINDOW_SAMPLES))?;
             let end = start + samples.len();
             let began = Instant::now();
             // The stop flag aborts a preview to make room for the final pass.
             // No queue: after decoding, snapshot the newest window directly.
-            match transcribe(&samples, stop.clone(), Pass::Preview) {
+            if cfg.kind == VoiceKind::Http && !level::has_speech(&samples) {
+                decoded_end = end;
+                continue;
+            }
+            match transcribe(&samples, stop.clone(), Pass::Preview, None) {
                 Ok(text) if !stop.load(Ordering::Acquire) => {
                     let text = rolling.update(start, &text);
                     emit(Event::Partial(thegn_voice::preview_snippet(&text).into()))?;
@@ -190,7 +205,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
                     })?;
                 }
                 Err(e) if !stop.load(Ordering::Acquire) => {
-                    capture.close()?;
+                    capture.close_now()?;
                     return Err(e);
                 }
                 _ => {}
@@ -200,8 +215,15 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    capture.close()?;
-    if cfg.kind == VoiceKind::Command {
+    // The control thread sets `cancel` just before `stop`, so the loop can
+    // break on `stop` with a cancel already pending; cancel never waits for
+    // the post-stop tail.
+    if cancel.load(Ordering::Acquire) {
+        capture.close_now()?;
+    } else {
+        capture.close()?;
+    }
+    if matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex) {
         use base64::Engine;
         if cancel.load(Ordering::Acquire) {
             return Ok(());
@@ -217,7 +239,10 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     }
     let (_, samples, _) = capture.snapshot(None)?;
     let began = Instant::now();
-    let text = transcribe(&samples, cancel, Pass::Final)?;
+    if cfg.kind == VoiceKind::Http && !level::has_speech(&samples) {
+        return emit(Event::Final(String::new()));
+    }
+    let text = transcribe(&samples, cancel, Pass::Final, prompt.as_deref())?;
     emit(Event::Timing {
         final_pass: true,
         decode_ms: began.elapsed().as_millis() as u64,
@@ -226,9 +251,62 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     emit(Event::Final(text))
 }
 
+/// Every check that must pass before the microphone opens. Returns the model
+/// path to load for the embedded kind. Never touches capture or the engine.
+#[cfg(feature = "voice-native")]
+fn preflight(
+    cfg: &VoiceConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<std::path::PathBuf>> {
+    use thegn_core::config::VoiceKind;
+    let mut model_path = None;
+    if cfg.kind == VoiceKind::Embedded {
+        thegn_voice::whisper::Engine::validate_language(&cfg.language)?;
+        let path = thegn_svc::voice_models::resolve(cfg)?;
+        anyhow::ensure!(
+            path.is_file(),
+            "voice model missing; run thegn voice setup before recording"
+        );
+        if cfg.model_path.is_none() {
+            thegn_svc::voice_models::verify(
+                &path,
+                thegn_svc::voice_models::model(&cfg.model)?,
+                cancel,
+            )?;
+        }
+        model_path = Some(path);
+    }
+    if cfg.kind == VoiceKind::Http {
+        thegn_svc::voice_http::validate_endpoint(&cfg.endpoint)?;
+        cfg.validate_credential_transport()
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            !cfg.model.is_empty(),
+            "HTTP model is missing; run thegn voice setup --kind http"
+        );
+    }
+    if cfg.kind == VoiceKind::Command && cfg.command.is_empty() {
+        bail!("no transcriber command configured");
+    }
+    Ok(model_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "voice-native")]
+    #[test]
+    fn preflight_fails_on_missing_model_before_capture_or_load() {
+        use thegn_core::config::VoiceKind;
+        let cfg = VoiceConfig {
+            kind: VoiceKind::Embedded,
+            model_path: Some("/nonexistent/thegn-voice-l1/model.bin".into()),
+            ..VoiceConfig::default()
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let err = preflight(&cfg, &cancel).unwrap_err();
+        assert!(err.to_string().contains("voice model missing"));
+    }
     #[test]
     fn voice_protocol_rejects_truncated_and_excessive_events() {
         assert_eq!(

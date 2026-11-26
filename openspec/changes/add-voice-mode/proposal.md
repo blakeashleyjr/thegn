@@ -18,4 +18,6 @@ features only after real-platform evidence in docs/voice-verification.md passes.
 
 The native leaf holds CPAL and whisper-rs; core stays free of audio/inference
 substrates. Model acquisition is separate from executable downloads (base exceeds
-their 128 MiB cap). Recordings stay in RAM; only model artifacts persist.
+their 128 MiB cap). Recordings stay in RAM except for Hex transcription, which
+uses a private temporary WAV removed after the command finishes; only model
+artifacts persist beyond a transcription.

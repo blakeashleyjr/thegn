@@ -32,7 +32,7 @@ worktrees, cloud providers, placement, and voice stay off in stable even when
 configured. Observe dashboards and plugin app tabs are stable. The stable/dev
 matrix is shown by `thegn doctor` and [release channels](help/release-channels.md).
 
-`voice setup [--language en|auto] [--model NAME] [--kind embedded|http|command]`
+`voice setup [--language en|auto] [--model NAME] [--kind embedded|http|command|hex]`
 configures experimental dictation. Setup confirms model size before download;
 `--yes` accepts it in scripts, and `--model-path PATH` uses a local GGML file.
 HTTP setup accepts a full `--endpoint` and optional `--credential` secret reference;
