@@ -4602,6 +4602,28 @@ fn stderr_with_timeout_stdin_redacts_payload_and_reports_child_failure() {
 
 #[cfg(unix)]
 #[test]
+fn stderr_with_timeout_stdin_keeps_canary_out_of_live_process_argv() {
+    let argv = vec!["sh".into(), "-c".into(), "ps -o command= -p $$ >&2".into()];
+    let (success, stderr) = stderr_with_timeout_stdin(
+        &argv,
+        Duration::from_secs(2),
+        b"GH_TOKEN=live-process-canary\n".to_vec(),
+    )
+    .expect("process listing completes");
+
+    assert!(success, "process listing failed: {stderr}");
+    assert!(
+        !stderr.contains("live-process-canary"),
+        "stdin secret appeared in live process argv: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[REDACTED]"),
+        "process argv output was redacted, so raw argv secrecy was not verified: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn stderr_with_timeout_stdin_keeps_stderr_when_feeder_hits_epipe() {
     let argv = vec![
         "sh".into(),
