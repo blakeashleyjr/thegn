@@ -1,6 +1,6 @@
 //! Device owner runs separately from inference, so stop closes the microphone
 //! even when inference is slow. The parent process enforces the hard deadline.
-use crate::{Normalizer, SAMPLE_RATE};
+use crate::{Normalizer, SAMPLE_RATE, STOP_TAIL, tail_done};
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{
@@ -19,6 +19,7 @@ struct Audio {
 pub struct Capture {
     audio: Arc<Mutex<Audio>>,
     stop: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 impl Capture {
@@ -27,11 +28,18 @@ impl Capture {
         let audio = Arc::new(Mutex::new(Audio::default()));
         let shared = audio.clone();
         let stopped = stop.clone();
+        let abort = Arc::new(AtomicBool::new(false));
+        let aborted = abort.clone();
         let worker = std::thread::Builder::new()
             .name("thegn-mic".into())
             .spawn(move || {
                 on_thread_start(); // Host supplies its platform scheduling class.
-                let result = run(shared.clone(), max_seconds.clamp(1, 300), &stopped);
+                let result = run(
+                    shared.clone(),
+                    max_seconds.clamp(1, 300),
+                    &stopped,
+                    &aborted,
+                );
                 if let Ok(mut a) = shared.lock() {
                     if let Err(e) = result {
                         a.error = Some(format!("microphone: {e:#}"));
@@ -42,6 +50,7 @@ impl Capture {
         Ok(Self {
             audio,
             stop,
+            abort,
             worker: Some(worker),
         })
     }
@@ -67,8 +76,18 @@ impl Capture {
         let start = last.map_or(0, |n| end.saturating_sub(n));
         Ok((start, a.samples[start..].to_vec(), a.closed))
     }
+    /// Stop and wait for the post-stop tail (at most `STOP_TAIL`) to be kept.
     pub fn close(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::Release);
+        self.join()
+    }
+    /// Cancel path: stop immediately, skipping the tail.
+    pub fn close_now(&mut self) -> Result<()> {
+        self.abort.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+        self.join()
+    }
+    fn join(&mut self) -> Result<()> {
         if let Some(worker) = self.worker.take() {
             worker
                 .join()
@@ -79,11 +98,17 @@ impl Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.abort.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
     }
 }
 
-fn run(audio: Arc<Mutex<Audio>>, max_seconds: u64, stop: &AtomicBool) -> Result<()> {
+fn run(
+    audio: Arc<Mutex<Audio>>,
+    max_seconds: u64,
+    stop: &AtomicBool,
+    abort: &AtomicBool,
+) -> Result<()> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -146,7 +171,18 @@ fn run(audio: Arc<Mutex<Audio>>, max_seconds: u64, stop: &AtomicBool) -> Result<
     )?;
     stream.play()?;
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
-    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+    let mut stop_seen: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline || abort.load(Ordering::Acquire) {
+            break;
+        }
+        if stop_seen.is_none() && stop.load(Ordering::Acquire) {
+            stop_seen = Some(now);
+        }
+        if tail_done(stop_seen, now, STOP_TAIL) {
+            break;
+        }
         if audio
             .lock()
             .map_err(|_| anyhow::anyhow!("microphone buffer unavailable"))?
