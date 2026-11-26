@@ -111,9 +111,9 @@ pub(crate) fn build_search_sources<'a>(
                 }
             }
         }
-        // A workspace/profile search spans groups, so the worktree name is the
+        // A workspace search spans groups, so the worktree name is the
         // part that cannot be guessed: two tabs can share a title.
-        SearchScope::Workspace | SearchScope::Profile => {
+        SearchScope::Workspace => {
             for group in &session.worktrees {
                 for tab in &group.tabs {
                     for pane_id in tab.center.pane_ids() {

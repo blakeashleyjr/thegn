@@ -744,7 +744,7 @@ impl SearchOverlay {
             } else if self.searching() {
                 "searching…".to_string()
             } else if engine.query().trim().is_empty() {
-                "no history yet".to_string()
+                "no output yet".to_string()
             } else if matches!(engine.scope(), SearchScope::Pane(_)) {
                 "no matches in this pane: Tab to widen".to_string()
             } else if engine.mode() == MatchMode::Literal {
@@ -1556,7 +1556,7 @@ mod tests {
         ));
         ov.apply_scope(SearchScope::Workspace, &srcs);
         assert_eq!(ov.scope(), SearchScope::Workspace);
-        // Profile is skipped: wrap back to Pane.
+        // Workspace wraps back to Pane; there is no separate profile scope.
         assert!(matches!(
             ov.handle_key(&KeyCode::Tab, Modifiers::NONE, &srcs),
             SearchOutcome::Rescope(SearchScope::Pane(5))
