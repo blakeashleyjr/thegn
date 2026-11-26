@@ -6,7 +6,10 @@ fn main() -> anyhow::Result<()> {
     use std::io::{Read, Write};
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
-    use thegn_voice::{SAMPLE_RATE, WINDOW_SAMPLES, whisper::Engine};
+    use thegn_voice::{
+        SAMPLE_RATE, WINDOW_SAMPLES,
+        whisper::{Engine, Pass},
+    };
 
     let args: Vec<_> = std::env::args().collect();
     ensure!(
@@ -41,6 +44,7 @@ fn main() -> anyhow::Result<()> {
         let text = engine.transcribe(
             window,
             language,
+            Pass::Preview,
             Arc::new(AtomicBool::new(false)),
             Duration::from_secs(60),
         )?;
@@ -55,6 +59,7 @@ fn main() -> anyhow::Result<()> {
     let text = engine.transcribe(
         &samples,
         language,
+        Pass::Final,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(60),
     )?;
@@ -70,6 +75,7 @@ fn main() -> anyhow::Result<()> {
             .transcribe(
                 window,
                 language,
+                Pass::Preview,
                 Arc::new(AtomicBool::new(true)),
                 Duration::from_secs(60)
             )
@@ -80,6 +86,7 @@ fn main() -> anyhow::Result<()> {
     let silent = engine.transcribe(
         &vec![0.0; SAMPLE_RATE],
         language,
+        Pass::Preview,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(1),
     )?;

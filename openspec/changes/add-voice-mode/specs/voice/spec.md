@@ -28,6 +28,10 @@ Native capture and embedded inference SHALL run in a first-party worker process.
 Capture SHALL normalize to 16 kHz mono PCM in memory, bounded to 300 seconds.
 Rolling windows SHALL overlap and at most one request SHALL be in flight, with
 pending work coalesced. Linux SHALL use CPU; macOS MAY use Metal with CPU fallback.
+Preview inference SHALL suppress non-speech and blank tokens, disable temperature
+fallback retries, use one segment without timestamps, and scale its audio context
+to the preview window. Final inference SHALL suppress non-speech and blank tokens
+while retaining the default temperature fallback and full audio context.
 
 #### Scenario: Slow inference
 

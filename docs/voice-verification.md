@@ -90,6 +90,18 @@ are checked in. Machine: Ryzen AI 9 HX 370, Linux 7.2.9, about 94 GiB RAM;
 | Peak inference process RSS                                      | 349,820 KiB (about 342 MiB)           |
 | Pre-cancel / digital silence                                    | Passed; pre-cancel returned in < 1 ms |
 
+### Whisper preview parameter change (VOICE-L3)
+
+| Measurement                                      | Before                                                                                     | After                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| Preview parameters                               | 4-thread cap; default temperature fallback; full/default audio context; timestamps enabled | Up to 8 threads; no temperature fallback; single segment, no timestamps; window-scaled audio context |
+| Preview decode, 20 calls, nearest-rank p50 / p95 | 2,375 / 2,914 ms on the Linux reference machine above                                      | Pending supplied-audio rerun with the command below                                                  |
+
+The after latency and transcript still need measurement on the reference machine;
+the <1.2 s preview p50 target is not claimed by this code change alone. Final pass
+keeps default temperature fallback and full audio context. Both passes suppress
+non-speech and blank tokens.
+
 These are decoder measurements, not capture-to-display acceptance or a broad
 corpus. The tail is close to (and individual calls exceed) the 3-second target.
 Physical Linux and Apple reports remain required.
