@@ -256,6 +256,17 @@ pub enum SecretFileError {
     Refused(String),
 }
 
+impl std::fmt::Display for SecretFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("secret file not found"),
+            Self::Refused(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SecretFileError {}
+
 /// Read a `file:` SecretRef after checking its resolved target's owner, mode, link, size and UTF-8.
 ///
 /// Final-component symlinks are followed. Group access is allowed with a one-time warning; world
