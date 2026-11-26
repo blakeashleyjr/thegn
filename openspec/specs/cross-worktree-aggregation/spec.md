@@ -2,7 +2,7 @@
 
 ## Purpose
 
-A read-only "Across" panel section that aggregates status, diffs, CI, and grep excerpts across every worktree of a workspace at once.
+A read-only "Attention" panel section (config key `attention`; formerly labelled "Across", key `across`, still accepted) that aggregates status, diffs, CI, and grep excerpts across every worktree of a workspace at once.
 
 ## Requirements
 

@@ -6082,7 +6082,7 @@ pub(crate) fn toggle_system_scope(
     }
 }
 
-/// Toggle the Across section between the active workspace (default) and every
+/// Toggle the Attention (Across) section between the active workspace (default) and every
 /// workspace, rehydrate so the aggregation rebuilds under the new scope, and
 /// return the status line. Same shape as [`toggle_system_scope`].
 pub(crate) fn toggle_across_scope(
@@ -6107,9 +6107,9 @@ pub(crate) fn toggle_across_scope(
         None,
     );
     if all {
-        "Across: all projects".into()
+        "Attention: all projects".into()
     } else {
-        "Across: this project".into()
+        "Attention: this project".into()
     }
 }
 

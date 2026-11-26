@@ -272,7 +272,7 @@ impl Section {
             Section::Branches => "branches",
             Section::Stash => "stash",
             Section::Mine => "mine",
-            Section::Across => "across",
+            Section::Across => "attention",
             Section::Pr => "pr",
             Section::Ci => "ci",
             Section::MergeQueue => "merge",
@@ -351,9 +351,15 @@ impl Section {
         }
     }
 
-    /// Stable id for ui_state persistence and `[panel] sections` config keys.
+    /// Stable id for ui_state persistence, keybinding ids and help contexts
+    /// (`panel:<key>`). Differs from the label for `Across`: its label is
+    /// "attention", but its id stays "across" so saved state and bindings
+    /// keep working.
     pub fn as_key(self) -> &'static str {
-        self.label()
+        match self {
+            Section::Across => "across",
+            _ => self.label(),
+        }
     }
 
     pub fn from_key(key: &str) -> Option<Section> {
@@ -361,6 +367,7 @@ impl Section {
         let key = match key {
             "prs" | "git" => "pr",
             "tasks" => "jobs",
+            "attention" => "across",
             k => k,
         };
         SECTION_ORDER.iter().copied().find(|s| s.as_key() == key)
@@ -1902,6 +1909,12 @@ mod tests {
         assert_eq!(Section::from_key("prs"), Some(Section::Pr));
         assert_eq!(Section::from_key("git"), Some(Section::Pr));
         assert_eq!(Section::from_key("tasks"), Some(Section::Jobs));
+        // The Across section is labelled "attention"; its old "across" key
+        // still resolves, and so does the new name.
+        assert_eq!(Section::Across.label(), "attention");
+        assert_eq!(Section::Across.as_key(), "across");
+        assert_eq!(Section::from_key("attention"), Some(Section::Across));
+        assert_eq!(Section::from_key("across"), Some(Section::Across));
         assert_eq!(Section::from_key("nope"), None);
     }
 

@@ -2555,15 +2555,16 @@ visible = true
 # `sections` reorders sections across all tabs — any section left out is hidden;
 # an empty/absent list shows every section in the built-in order:
 #   Git tab:    changes · commits · branches · stash · files
-#   Work tab:   mine · across · pr · ci · merge · issues · problems · jobs
+#   Work tab:   mine · attention · pr · ci · merge · issues · problems · jobs
 #               · tests · symbols
 #   System tab: notifications · logs · sandbox · hosts · environments · share
 #               · forward · telemetry · media · keys
 # "mine" is the "My Work" feed (assigned issues across all trackers +
 # review-requested/authored PRs + high-priority notifications), scoped to the
-# active repo by default ("a" widens to all repos). "across" aggregates other
+# active repo by default ("a" widens to all repos). "attention" lists other
 # worktrees' failing CI, scoped to the active workspace ("a" widens).
-# The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
+# The old "across" key still works for "attention", and "prs" / "tasks" work
+# as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]
 # sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]

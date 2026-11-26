@@ -1,5 +1,5 @@
-//! The `Across` section — a cross-worktree attention stream
-//! (multibuffer-style). Reads `model.panel.across` (built off-loop during
+//! The `Attention` section (internal id `Across`) — a cross-worktree attention
+//! stream (multibuffer-style). Reads `model.panel.across` (built off-loop during
 //! hydration from the CI caches of the active repo's worktrees — or every
 //! workspace's, under the `a` toggle): failing CI — and, as those producers
 //! land, dirty files / content matches — grouped by worktree with per-row
@@ -25,6 +25,16 @@ fn kind_glyph(kind: ExcerptKind) -> Seg {
     }
 }
 
+/// The one-line scope hint: what the section covers and what `a` switches to.
+/// Spelled out in words so the scope is never a bare symbol to decode.
+fn scope_hint(all: bool) -> &'static str {
+    if all {
+        " (all projects · a = this project only)"
+    } else {
+        " (this project · a = all projects)"
+    }
+}
+
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() && !ctx.model.panel.across.is_empty() {
         return full_view(ctx);
@@ -43,20 +53,16 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let s = agg.summary();
     rows.push(PanelRow::plain(Line::segs(vec![
-        seg(d(), "ACROSS"),
+        seg(d(), "ATTENTION"),
         seg(
             f(),
             format!(
-                " · {}✗ {}● {}· across {} worktrees{}",
+                " · {}✗ {}● {}· {} worktrees{}",
                 s.failures,
                 s.dirty,
                 s.matches,
                 s.worktrees,
-                if all {
-                    " (all projects)"
-                } else {
-                    " (this project · a = all)"
-                }
+                scope_hint(all)
             ),
         ),
     ])));
@@ -153,21 +159,23 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// it is unit-testable without a full `FrameModel`.
 fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
     let all = crate::panel::scope::across_all();
-    let scope_tail = if all {
-        " (all projects)"
-    } else {
-        " (this project · a = all)"
-    };
+    let scope_tail = scope_hint(all);
     if agg.is_empty() {
-        return vec![PanelRow::plain(Line::segs(vec![seg(
-            d(),
-            format!("nothing needs attention across worktrees{scope_tail}"),
-        )]))];
+        return vec![
+            PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                format!("nothing needs attention in any worktree{scope_tail}"),
+            )])),
+            PanelRow::plain(Line::segs(vec![seg(
+                f(),
+                "failing CI in your worktrees shows here; ↵ jumps to it",
+            )])),
+        ];
     }
 
     let mut rows: Vec<PanelRow> = Vec::new();
 
-    // Summary line: "3✗ · 1● · across 2 worktrees (this workspace · a = all)".
+    // Summary line: "3✗ · 1● · 2 worktrees (this project · a = all projects)".
     let s = agg.summary();
     let mut sum: Vec<Seg> = Vec::new();
     if s.failures > 0 {
@@ -179,7 +187,7 @@ fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
     if s.matches > 0 {
         sum.push(seg(g(), format!(" {}·", s.matches)));
     }
-    sum.push(seg(d(), format!(" across {} worktrees", s.worktrees)));
+    sum.push(seg(d(), format!(" in {} worktrees", s.worktrees)));
     sum.push(seg(f(), scope_tail.to_string()));
     rows.push(PanelRow::plain(Line::segs(sum)));
 
@@ -237,8 +245,35 @@ mod tests {
     #[test]
     fn empty_shows_placeholder() {
         let rows = build_rows(&Aggregation::default(), true);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].hit.is_none());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.hit.is_none()));
+        // The layout pins the plain-words wording and the `a` scope hint.
+        assert_eq!(
+            row_text(&rows[0]),
+            "nothing needs attention in any worktree (this project · a = all projects)"
+        );
+        assert!(row_text(&rows[1]).contains("↵ jumps to it"));
+    }
+
+    fn row_text(row: &PanelRow) -> String {
+        match &row.line {
+            Line::Segs(segs) => segs.iter().map(|s| s.text.as_str()).collect(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn summary_names_worktrees_and_scope_in_words() {
+        let agg = Aggregation::from_excerpts(vec![
+            ex("alpha", ExcerptKind::CiFailure, "", "build"),
+            ex("zeta", ExcerptKind::CiFailure, "", "test"),
+        ]);
+        let rows = build_rows(&agg, false);
+        assert_eq!(
+            row_text(&rows[0]),
+            "2✗ in 2 worktrees (this project · a = all projects)"
+        );
+        assert!(!row_text(&rows[0]).contains("across"));
     }
 
     #[test]
