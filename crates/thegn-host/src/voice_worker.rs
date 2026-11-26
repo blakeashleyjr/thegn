@@ -176,7 +176,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
                     })?;
                 }
                 Err(e) if !stop.load(Ordering::Acquire) => {
-                    capture.close()?;
+                    capture.close_now()?;
                     return Err(e);
                 }
                 _ => {}
@@ -186,7 +186,14 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    capture.close()?;
+    // The control thread sets `cancel` just before `stop`, so the loop can
+    // break on `stop` with a cancel already pending; cancel never waits for
+    // the post-stop tail.
+    if cancel.load(Ordering::Acquire) {
+        capture.close_now()?;
+    } else {
+        capture.close()?;
+    }
     if cfg.kind == VoiceKind::Command {
         use base64::Engine;
         if cancel.load(Ordering::Acquire) {
