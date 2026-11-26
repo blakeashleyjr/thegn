@@ -5905,6 +5905,54 @@ fn v57_retires_the_unread_agent_attention_backlog_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// THE-2732 boot sweep: a missing unregistered worktree or a dead session
+/// resolves its attention rows; registered (possibly remote) worktrees, live
+/// sessions, lane rows on a live worktree and other kinds stay.
+#[test]
+fn boot_sweep_resolves_orphaned_attention_only() {
+    let db = Db::open_memory().unwrap();
+    let live_dir = tempfile::TempDir::new().unwrap();
+    let live = live_dir.path().to_string_lossy().into_owned();
+    let gone = "/nonexistent/thegn-2732/gone";
+    let remote = "/nonexistent/thegn-2732/remote";
+    db.put_worktree("tab", "/repo", remote, "b", Some("ssh:box"), None)
+        .unwrap();
+    db.put_notification("agent_attention", "escalation:1@abcdefg:x", "lane", gone)
+        .unwrap();
+    db.put_notification(
+        "agent_attention",
+        "escalation:2@abcdefg:x",
+        "remote",
+        remote,
+    )
+    .unwrap();
+    db.put_notification("agent_attention", "escalation:3@abcdefg:x", "lane", &live)
+        .unwrap();
+    db.put_notification("agent_attention", "0123456789abcdef", "dead hand", &live)
+        .unwrap();
+    db.put_notification("agent_attention", "fedcba9876543210", "live hand", &live)
+        .unwrap();
+    db.put_notification("agent_failed", "", "boom", gone)
+        .unwrap();
+    let resolved = db
+        .resolve_orphan_attention(|session| session == "fedcba9876543210")
+        .unwrap();
+    assert_eq!(resolved, 2);
+    let mut left: Vec<String> = db
+        .get_unread_notifications()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.message)
+        .collect();
+    left.sort();
+    assert_eq!(left, ["boom", "lane", "live hand", "remote"]);
+    assert_eq!(
+        db.resolve_orphan_attention(|_| true).unwrap(),
+        0,
+        "idempotent"
+    );
+}
+
 #[test]
 fn v58_rewrites_legacy_seconds_dispatch_stamps_in_place() {
     let dir = std::env::temp_dir().join(format!("thegn-mig-v58-{}", std::process::id()));

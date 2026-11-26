@@ -1108,6 +1108,7 @@ pub(crate) fn destroy_one_checked(
     if !is_remote {
         note_worktree_removed(worktree);
     }
+    resolve_removed_worktree_attention(worktree, db);
     // Removal is finished; hooks after this no longer need the admission hold.
     drop(admission);
 
@@ -1697,6 +1698,20 @@ fn physical_destroy_in_progress(key: &Path) -> bool {
     })
 }
 
+/// A removed worktree has nobody left to answer its `agent_attention` rows:
+/// mark them read on the removal itself (THE-2732). Worker/CLI thread only.
+fn resolve_removed_worktree_attention(worktree: &Path, db: Option<&Db>) {
+    let path = worktree.to_string_lossy();
+    let kind = thegn_core::notification::NotificationKind::AgentAttention.as_str();
+    let resolved = match db {
+        Some(db) => db.mark_kind_read_for_worktree(kind, &path),
+        None => Db::open().and_then(|db| db.mark_kind_read_for_worktree(kind, &path)),
+    };
+    if let Err(error) = resolved {
+        tracing::debug!(target: "thegn::db", %error, "could not resolve a removed worktree's attention rows");
+    }
+}
+
 /// Bound on remembered removals; the oldest entry is dropped first.
 const REMOVED_WORKTREES_CAP: usize = 1024;
 
@@ -1708,14 +1723,6 @@ static REMOVED_WORKTREES: OnceLock<Mutex<std::collections::VecDeque<String>>> = 
 /// made by another process (e.g. the CLI landing) is not covered.
 fn note_worktree_removed(worktree: &Path) {
     crate::agent::forget_provider_sync(&worktree.to_string_lossy());
-    if let Ok(db) = Db::open()
-        && let Err(error) = db.mark_kind_read_for_worktree(
-            thegn_core::notification::NotificationKind::AgentAttention.as_str(),
-            &worktree.to_string_lossy(),
-        )
-    {
-        tracing::debug!(target: "thegn::db", %error, "could not resolve removed worktree attention notifications");
-    }
     // Resolve the canonical alias BEFORE taking the mutex (filesystem work).
     let raw = worktree.to_string_lossy().into_owned();
     let canonical = destroy_key(worktree).to_string_lossy().into_owned();

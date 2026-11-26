@@ -1534,6 +1534,12 @@ async fn run(
         // previous incarnation can still be up (THE-68).
         // best-effort: the table is disposable derived state.
         let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&*db);
+        // Same empty map: resolve the inbox rows those dead sessions (or a
+        // since-removed worktree) left behind, so an old backlog clears on
+        // upgrade (THE-2732). Daemon boot, not a render loop.
+        if let Err(error) = db.resolve_orphan_attention(|_| false) {
+            tracing::warn!(target: "thegn::daemon", %error, "attention backlog sweep failed");
+        }
     }
 
     let (events, _) = broadcast::channel::<Arc<EventFrame>>(1024);
