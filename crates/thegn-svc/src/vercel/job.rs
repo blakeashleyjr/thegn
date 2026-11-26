@@ -158,7 +158,10 @@ pub const LAUNCH_FAILED_MARKER: &str = "thegn-job-launch-failed";
 /// memory-tight sandbox is not OOM-killed. When the recipe is `cargo` and the image has none, it
 /// first installs a minimal rustup toolchain into the per-attempt home, and
 /// when the image has no C linker (`cc`) it installs one with the image's
-/// package manager (`sudo -n` when not root). Any failure to get that far prints
+/// package manager (`sudo -n` when not root; apt sources are first rewritten to
+/// `https://` because the sandbox may allow only HTTPS). If that fails on
+/// x86_64 and the dependency tree has no C build steps, it falls back to a
+/// self-contained musl link with `rust-lld`. Any failure to get that far prints
 /// [`LAUNCH_FAILED_MARKER`] on stderr and exits 125.
 pub const LAUNCH_SCRIPT: &str = r#"fail() { echo "thegn-job-launch-failed: $1" >&2; exit 125; }
 cwd=$1
@@ -201,6 +204,11 @@ if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
         sudo="sudo -n"
     fi
     if command -v apt-get >/dev/null 2>&1; then
+        # The sandbox network policy may allow HTTPS only: port 80 to the mirrors
+        # fails. Point every apt source at https:// before the first fetch.
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] && $sudo sed -i 's#http://#https://#g' "$f" >&2
+        done
         $sudo apt-get update -qq >&2             && $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends                 gcc libc6-dev >&2 || pkg_failed=apt-get
     elif command -v dnf >/dev/null 2>&1; then
         $sudo dnf install -y -q gcc >&2 || pkg_failed=dnf
@@ -209,10 +217,26 @@ if [ "$1" = cargo ] && ! command -v cc >/dev/null 2>&1; then
     elif command -v apk >/dev/null 2>&1; then
         $sudo apk add --no-cache gcc musl-dev >&2 || pkg_failed=apk
     else
-        fail "no C linker (cc) and no supported package manager (apt-get, dnf, microdnf, apk)"
+        pkg_failed=none
     fi
-    [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed (the sandbox may deny egress to the package repository; use a runtime image that ships a C toolchain)"
-    command -v cc >/dev/null 2>&1 || fail "no C linker (cc) after the package install"
+    if ! command -v cc >/dev/null 2>&1 && [ "$(uname -m)" = x86_64 ] && command -v rustup >/dev/null 2>&1 \
+        && ! grep -Eq '^name = "(cc|cmake|pkg-config|bindgen)"' Cargo.lock 2>/dev/null; then
+        # No C linker could be installed: link with the self-contained rust-lld
+        # against musl. Only for a dependency tree with no C build steps.
+        echo "thegn-job-launch: no C linker; falling back to a self-contained musl link" >&2
+        if RUSTUP_HOME="$rustup_home" CARGO_HOME="${CARGO_HOME:-$home/cargo}" rustup target add x86_64-unknown-linux-musl >&2; then
+            set -- "CARGO_BUILD_TARGET=x86_64-unknown-linux-musl" \
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld" \
+                "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" "$@"
+            pkg_failed=
+            musl_fallback=1
+        fi
+    fi
+    if [ -z "${musl_fallback:-}" ]; then
+        [ "${pkg_failed:-}" != none ] || fail "no C linker (cc) and no supported package manager (apt-get, dnf, microdnf, apk)"
+        [ -z "${pkg_failed:-}" ] || fail "no C linker (cc): installing gcc with $pkg_failed failed (the sandbox may deny egress to the package repository; use a runtime image that ships a C toolchain)"
+        command -v cc >/dev/null 2>&1 || fail "no C linker (cc) after the package install"
+    fi
 fi
 if [ "$1" = cargo ]; then
     # A rustc can take ~3 GB, so cargo's default one-job-per-CPU parallelism
@@ -2167,6 +2191,20 @@ mod tests {
         assert!(!LAUNCH_SCRIPT.contains("VERCEL"));
         assert!(!LAUNCH_SCRIPT.contains(".claude"));
         assert!(LAUNCH_SCRIPT.contains(crate::sprites::job::SELECTED_JOB_ENV));
+    }
+
+    #[test]
+    fn the_launcher_uses_https_apt_and_a_musl_fallback() {
+        let sed = LAUNCH_SCRIPT.find("sed -i 's#http://#https://#g'").unwrap();
+        assert!(sed < LAUNCH_SCRIPT.find("apt-get update").unwrap());
+        assert!(LAUNCH_SCRIPT.contains("/etc/apt/sources.list.d/*.sources"));
+        assert!(LAUNCH_SCRIPT.contains("rustup target add x86_64-unknown-linux-musl"));
+        assert!(LAUNCH_SCRIPT.contains("link-self-contained=yes"));
+        assert!(LAUNCH_SCRIPT.contains("linker=rust-lld"));
+        // The fallback env must be set before the scrubbed exec.
+        let fb = LAUNCH_SCRIPT.find("CARGO_BUILD_TARGET=").unwrap();
+        assert!(fb < LAUNCH_SCRIPT.find("exec env -i").unwrap());
+        assert!(LAUNCH_SCRIPT.contains("installing gcc with $pkg_failed failed"));
     }
 
     #[test]

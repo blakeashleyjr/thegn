@@ -321,7 +321,13 @@ toolchain and reports as indeterminate rather than exit 127.
 Rust links through a C compiler, and the default image ships none. When `cc` is
 missing the launcher installs one before the recipe starts, with the image's
 package manager (`apt-get`: `gcc libc6-dev`; `dnf`/`microdnf`: `gcc`; `apk`:
-`gcc musl-dev`), using `sudo -n` when it is not root. If that fails the attempt
+`gcc musl-dev`), using `sudo -n` when it is not root. Sandbox network policy may allow only
+HTTPS, so for `apt-get` the launcher first rewrites `http://` to `https://` in
+`/etc/apt/sources.list` and `/etc/apt/sources.list.d/*.sources|*.list`. If the
+install still fails on x86_64 and `Cargo.lock` lists no `cc`, `cmake`,
+`pkg-config` or `bindgen` crate, the launcher falls back to a self-contained
+link: it adds the `x86_64-unknown-linux-musl` target with rustup and builds with
+`rust-lld` (`-C link-self-contained=yes`). Otherwise the attempt
 stops with `thegn-job-launch-failed: no C linker (...)`. Both installs run in
 every attempt's fresh sandbox, so each attempt pays the download and install
 time (typically under a minute) before the recipe's own clock matters.
