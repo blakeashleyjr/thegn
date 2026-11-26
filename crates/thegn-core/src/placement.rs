@@ -38,33 +38,12 @@ fn dtach_session_id(host: &str, raw_command: &str) -> String {
 }
 
 /// One-time in-pane warning printed when an ssh pane launches on a host with no
-/// dtach: without it the remote shell ends when the client detaches or is
-/// killed, so nothing can be reattached.
+/// usable dtach (missing, or its socket dir can't be made safe): without it the
+/// remote shell ends when the client detaches or is killed, so nothing can be
+/// reattached.
 pub fn dtach_missing_warning() -> &'static str {
-    "thegn: this host has no dtach, so this ssh pane will END when you detach. \
+    "thegn: no usable dtach on this host, so this ssh pane will END when you detach. \
 Install dtach (brew install dtach / apt install dtach) or mosh-server to keep it alive."
-}
-
-/// Classification of what keeps a remote pane alive across a client detach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemotePersistence {
-    /// dtach holds the session.
-    Dtach,
-    /// mosh-server holds the session (the pane rides mosh).
-    Mosh,
-    /// Nothing does: the pane dies with the client.
-    None,
-}
-
-/// Classify persistence from probe results (`has_dtach`, `has_mosh_server`).
-pub fn classify_remote_persistence(has_dtach: bool, has_mosh_server: bool) -> RemotePersistence {
-    if has_dtach {
-        RemotePersistence::Dtach
-    } else if has_mosh_server {
-        RemotePersistence::Mosh
-    } else {
-        RemotePersistence::None
-    }
 }
 
 /// Build the remote `sh -lc` script: dtach when present, else run the raw
@@ -886,28 +865,8 @@ mod tests {
         assert!(cmd.contains("-E -z -r winch"));
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
-        assert!(cmd.contains("; else printf '%s\\n' 'thegn: this host has no dtach"));
+        assert!(cmd.contains("; else printf '%s\\n' 'thegn: no usable dtach on this host"));
         assert!(cmd.contains("; exec echo hello; fi"));
-    }
-
-    #[test]
-    fn persistence_probe_classification() {
-        assert_eq!(
-            classify_remote_persistence(true, true),
-            RemotePersistence::Dtach
-        );
-        assert_eq!(
-            classify_remote_persistence(true, false),
-            RemotePersistence::Dtach
-        );
-        assert_eq!(
-            classify_remote_persistence(false, true),
-            RemotePersistence::Mosh
-        );
-        assert_eq!(
-            classify_remote_persistence(false, false),
-            RemotePersistence::None
-        );
     }
 
     #[test]
@@ -923,7 +882,7 @@ mod tests {
     fn mosh_fallback_has_no_warning() {
         let s = remote_launch_script(TransportKind::Mosh, "id", "echo hi");
         assert!(s.contains("; else exec echo hi; fi"));
-        assert!(!s.contains("no dtach"));
+        assert!(!s.contains("no usable dtach"));
     }
 
     #[test]
