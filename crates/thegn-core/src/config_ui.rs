@@ -319,6 +319,9 @@ pub struct UiConfig {
     pub sidebar_show_ahead_behind: bool,
     /// Show the compact open-PR chip (`⬡N`) in a worktree row's right cluster.
     pub sidebar_show_pr_chip: bool,
+    /// Use a focused pane's terminal title as a tab chip label when the stored
+    /// tab title is still its default ordinal.
+    pub tab_title_from_terminal: bool,
     /// Show the jujutsu-colocation marker (`ĵ`) in a worktree row's right cluster
     /// when the repo has a `.jj/` beside `.git/`.
     pub sidebar_show_jj: bool,
@@ -404,6 +407,7 @@ impl Default for UiConfig {
             sidebar_show_diff_stat: true,
             sidebar_show_ahead_behind: true,
             sidebar_show_pr_chip: true,
+            tab_title_from_terminal: true,
             sidebar_show_jj: true,
             sidebar_show_submodules: true,
             sidebar_focus_detail: FocusDetail::default(),
@@ -703,6 +707,7 @@ mod tests {
     #[test]
     fn sidebar_row_display_defaults_on_and_toggle() {
         let cfg = UiConfig::default();
+        assert!(cfg.tab_title_from_terminal);
         assert!(cfg.sidebar_show_status_icon);
         assert!(cfg.sidebar_show_diff_stat);
         assert!(cfg.sidebar_show_ahead_behind);
@@ -720,6 +725,8 @@ mod tests {
         assert!(!cfg.sidebar_show_diff_stat);
         assert!(cfg.sidebar_show_ahead_behind);
         assert_eq!(cfg.sidebar_icon_ahead, "»");
+        let cfg: UiConfig = toml::from_str("tab_title_from_terminal = false").unwrap();
+        assert!(!cfg.tab_title_from_terminal);
     }
 
     #[test]

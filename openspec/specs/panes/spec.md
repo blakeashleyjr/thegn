@@ -389,3 +389,26 @@ panel content, and MUST NOT take rows from the Lead footer.
 
 - **WHEN** `[panel] layout_hints = false`
 - **THEN** no Layout keys block is drawn
+
+### Requirement: Tab chips can use an agent's terminal title
+
+When a tab has its default ordinal title, the tab strip SHALL display the
+focused pane's cleaned terminal title when `[ui] tab_title_from_terminal` is
+true (default). Custom tab titles SHALL take precedence. The cleanup SHALL
+remove spinner prefixes and ignore titles that are only folder paths.
+
+#### Scenario: A terminal title names a default tab
+
+- **WHEN** a focused pane sets a terminal title for a tab with its default
+  ordinal title
+- **THEN** the tab chip shows the cleaned terminal title on the next redraw
+
+#### Scenario: Custom and path-only titles are ignored
+
+- **WHEN** a tab has a custom title, or its terminal title is only a folder path
+- **THEN** the chip keeps the custom or default tab title, respectively
+
+#### Scenario: Terminal title labels are disabled
+
+- **WHEN** `[ui] tab_title_from_terminal` is false
+- **THEN** the tab strip keeps the stored tab title

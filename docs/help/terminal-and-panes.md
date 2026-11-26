@@ -67,6 +67,11 @@ of PTY panes.
 
 ## Tabs
 
+When a tab still has its default number, its chip shows the focused pane's
+terminal title when available. Leading spinner glyphs and titles that are only
+folder paths are ignored. A custom tab name takes precedence. Set
+`[ui] tab_title_from_terminal = false` to keep numeric tab labels.
+
 - `Alt-t` — new tab on the _same_ worktree; `Alt-T` — a standalone
   terminal tab (no worktree).
 - `Alt-←/→` — move to the pane on the left / right (see Splits); at the pane

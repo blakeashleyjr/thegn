@@ -569,6 +569,7 @@ ui.sidebar_show_submodules
 ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
+ui.tab_title_from_terminal
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles

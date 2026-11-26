@@ -158,6 +158,10 @@ sidebar_dividers = true  # alternate the background tint per project block, so t
 # more immersive (or fully borderless) fullscreen.
 fullscreen_keep_masthead = true
 fullscreen_keep_statusbar = true
+# Tab chips show the focused pane's terminal title (spinner glyphs stripped,
+# bare folder paths ignored) while the tab keeps its default numeric name; a
+# custom tab name always wins. Set false to keep numeric labels.
+tab_title_from_terminal = true
 # Worktree-row display in the sidebar. The main line is the dynamic name (the
 # OSC window title a running agent/shell sets), falling back to the branch name.
 # The right cluster carries, in order: the dirty status icon, the uncommitted
