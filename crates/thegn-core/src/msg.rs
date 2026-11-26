@@ -115,8 +115,9 @@ pub fn die(s: &str) -> ! {
 /// shutdown or error path; here the failure is dropped instead, so the caller
 /// exits on its own terms rather than with a crash report.
 pub fn write_stderr_line(line: &str) {
-    // best-effort: the terminal may already be gone, so a failed write is dropped
-    let _ = write_line_to(&mut std::io::stderr().lock(), line);
+    if let Err(_gone) = write_line_to(&mut std::io::stderr().lock(), line) {
+        // best-effort: the terminal may already be gone, so a failed write is dropped
+    }
 }
 
 /// Write `line` and a newline to `writer`, returning the first failure.
