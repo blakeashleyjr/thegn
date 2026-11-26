@@ -223,6 +223,7 @@ pub mod host_db;
 pub mod host_db_capture;
 mod host_db_snapshot;
 pub mod host_definition_snapshot;
+pub mod host_exec_paths;
 pub mod host_machine;
 pub mod host_probe;
 pub mod i18n;
