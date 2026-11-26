@@ -93,7 +93,7 @@ fn parse_commits_with_limits(
     );
     let mut commits = Vec::with_capacity(fields.len() / 8);
     let mut seen = std::collections::HashSet::new();
-    for row in fields.chunks_exact(8) {
+    for row in fields.as_chunks::<8>().0.iter() {
         let sha = row[0];
         let short = row[1];
         anyhow::ensure!(valid_oid(sha), "malformed commit object id");
@@ -317,7 +317,9 @@ fn parse_stashes_with_limits(
     );
     let mut indexes = std::collections::HashSet::new();
     fields
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .map(|(line_no, row)| {
             let malformed = || anyhow::anyhow!("malformed stash row {}", line_no + 1);

@@ -70,7 +70,7 @@ fn parse_endpoint(input: &[u8], ipv6: bool) -> Option<(IpAddr, u16)> {
             return None;
         }
         let mut octets = [0_u8; 16];
-        for (index, word) in address_hex.chunks_exact(8).enumerate() {
+        for (index, word) in address_hex.as_chunks::<8>().0.iter().enumerate() {
             let value = u32::try_from(parse_hex(word)?).ok()?;
             octets[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
