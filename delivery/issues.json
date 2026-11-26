@@ -555,6 +555,20 @@
       ]
     },
     {
+      "issue": "THE-2147",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "harden-git-control-pins"
+      ]
+    },
+    {
+      "issue": "THE-2148",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "pin-git-alternates-read-only"
+      ]
+    },
+    {
       "issue": "THE-2172",
       "project": "Agent & Workflow Platform",
       "changes": [
@@ -785,13 +799,6 @@
       "project": "Agent & Workflow Platform",
       "changes": [
         "lead-in-app-setup"
-      ]
-    },
-    {
-      "issue": "THE-2148",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "pin-git-alternates-read-only"
       ]
     }
   ]

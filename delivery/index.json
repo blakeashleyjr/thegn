@@ -1142,6 +1142,18 @@
       "summary": "Refuse devcontainer binds of container-engine sockets and thegn control/state directories outside generic mount approval."
     },
     {
+      "change": "harden-git-control-pins",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2147",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-2147 (WS11-P3-01) pins the git control files and host-executed worktree files read-only on bwrap, OCI and systemd, in every git mode, the full fallback and remote placements; remote build and tests remain unchecked."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

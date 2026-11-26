@@ -246,8 +246,19 @@ read-only), `push-lane` or `full`. `push_refs` and `deny_refs` take ref globs
 with a trailing `/*` (one level) or `/**` (any depth), and the merge target
 and default branches are always denied. Only `refs/heads/` branches are
 accepted back from a sandbox. Set it globally or per `[env.<name>.sandbox.git]`; a
-repository's `.thegn.toml` cannot set it. The keys are validated today; the
-sandbox mounts that enforce them arrive in a later release.
+repository's `.thegn.toml` cannot set it. `mode = "full"` still lets a sandbox
+move refs.
+
+In every mode, in the `mode = "full"` fallback (main checkout, top-level or
+detached branch) and for remote placements, the git control files are read-only
+inside the sandbox on bwrap, OCI and systemd: `hooks/`, `config`, `info/`, the
+worktree's `.git` file, and its `commondir`, `gitdir` and `config.worktree`. On
+systemd a repository outside `$HOME` gets a read-only git directory with only the
+write policy's carve-outs writable. For profile `standard` and above, a local
+worktree's existing `.claude/`, `.mcp.json`, `.envrc` and `.vscode/tasks.json`
+are read-only too, because the host later runs them. `standard` is an accident
+guard, not a boundary against a hostile agent: files the sandbox creates fresh
+are not pinned, and Landlock-only cannot pin.
 
 `objects/info/alternates` and `objects/info/http-alternates` are always
 read-only inside the sandbox (created empty when missing), so a sandbox cannot
