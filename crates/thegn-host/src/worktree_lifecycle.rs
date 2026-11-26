@@ -961,12 +961,18 @@ pub(crate) fn destroy_one_checked(
 ) -> (bool, String) {
     // This function runs only on workers/CLI paths. Physical-path resolution
     // must not be moved into the loop-side lexical scheduling claim.
+    // Pane processes the loop handed over for this delete. Taken first so a
+    // refusal below drops them unsignalled: nothing is stopped or closed.
+    let handed_stops = take_pane_stops(worktree);
     let Some(_physical_claim) = try_physical_destroy_path(worktree) else {
         return (
             false,
             "physical worktree cleanup is already in progress".into(),
         );
     };
+    if let Some(reason) = thegn_core::worktree::removal_refusal(repo_root, worktree) {
+        return (false, reason);
+    }
     // Cross-process admission (THE-728): non-blocking exclusive lock held for
     // the whole removal. A pane open elsewhere holding it, or an unusable lock,
     // refuses the destroy; nothing has been touched yet.
@@ -1010,6 +1016,9 @@ pub(crate) fn destroy_one_checked(
     if pre.blocked() {
         return (false, pre.message());
     }
+    // The vetoing hook has passed: stop the worktree's programs and wait for
+    // them before any teardown can delete the folder under them.
+    let stop_note = stop_worktree_processes(worktree, handed_stops);
 
     let tip_before = (delete_branch && !branch.is_empty())
         .then(|| local_branch_tip(repo_root, branch))
@@ -1023,10 +1032,11 @@ pub(crate) fn destroy_one_checked(
         Some(teardown) => teardown().map(|()| Vec::new()),
         None => teardown_runtime(cfg, repo_root, worktree, &location, db, mode),
     };
-    let notes = match notes {
+    let mut notes = match notes {
         Ok(notes) => notes,
         Err(error) => return (false, error),
     };
+    notes.extend(stop_note);
 
     let moved = delete_branch
         && !branch.is_empty()
@@ -2062,6 +2072,98 @@ fn end_session_before_destroy(
     }
 }
 
+/// A pane process a delete-from-disk stops before the folder goes (THE-2736).
+pub(crate) enum PaneStop {
+    /// A PTY pane's child: bounded TERM, grace, KILL and reap through its owner.
+    Owned(crate::pane_pty::PtyProcessOwner),
+    /// A daemon-backed pane's session child, which leads its own process group.
+    Group(u32),
+}
+
+/// How long a delete waits for programs in the worktree to exit after their
+/// panes were stopped, before it deletes anyway and says so.
+const PROCESS_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn pane_stops() -> &'static Mutex<HashMap<PathBuf, Vec<PaneStop>>> {
+    static STOPS: OnceLock<Mutex<HashMap<PathBuf, Vec<PaneStop>>>> = OnceLock::new();
+    STOPS.get_or_init(Default::default)
+}
+
+/// Hand the panes' processes to the destroy worker for `worktree` (keyed by
+/// the lexical path the worker receives). Loop-side and I/O-free: it only
+/// stores handles; the worker signals and waits.
+pub(crate) fn register_pane_stops(worktree: &Path, stops: Vec<PaneStop>) {
+    if stops.is_empty() {
+        return;
+    }
+    pane_stops()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(worktree.to_path_buf(), stops);
+}
+
+/// Take (and so unregister) the stops handed over for `worktree`.
+pub(crate) fn take_pane_stops(worktree: &Path) -> Vec<PaneStop> {
+    pane_stops()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(worktree)
+        .unwrap_or_default()
+}
+
+/// Stop the panes' processes, then wait (bounded) until no other process has
+/// its working directory inside `worktree`. The directory scan only sees
+/// anything on Linux; elsewhere the pane stop alone applies. Returns a note
+/// naming what outlived the wait; the delete then goes ahead as before.
+fn stop_worktree_processes(worktree: &Path, stops: Vec<PaneStop>) -> Option<String> {
+    if stops.is_empty() {
+        return None;
+    }
+    let groups: Vec<crate::platform::GroupHandle> = stops
+        .iter()
+        .filter_map(|stop| match stop {
+            PaneStop::Group(pid) => i32::try_from(*pid)
+                .ok()
+                .map(crate::platform::GroupHandle::from_pid),
+            PaneStop::Owned(_) => None,
+        })
+        .collect();
+    for group in &groups {
+        group.terminate();
+    }
+    for stop in &stops {
+        if let PaneStop::Owned(owner) = stop {
+            owner.terminate_and_reap();
+        }
+    }
+    if !groups.is_empty() {
+        std::thread::sleep(crate::platform::pty_term_grace());
+        for group in &groups {
+            group.kill();
+        }
+    }
+    let own = std::process::id();
+    let deadline = std::time::Instant::now() + PROCESS_EXIT_TIMEOUT;
+    loop {
+        let left: Vec<String> = crate::platform::proc::pids_with_cwd_under(worktree)
+            .into_iter()
+            .filter(|&pid| pid != own)
+            .map(|pid| pid.to_string())
+            .collect();
+        if left.is_empty() {
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(format!(
+                "{} process(es) not started by thegn still use the folder (pid {})",
+                left.len(),
+                left.join(", ")
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// End a worktree session when the pane that just exited was its last live
 /// process. The exited pane is still present in the session tree until the
 /// drain reconciles it, so callers pass its id explicitly.
@@ -2767,6 +2869,112 @@ mod tests {
         );
         assert!(report.blocked());
         assert!(report.message().contains("injected post-create failure"));
+    }
+
+    /// A repo at `base/repo` with a linked worktree `base/feature` on branch
+    /// `feature`, plus a `sleep` running in that worktree in its own group.
+    fn feature_worktree_with_sleep(base: &Path) -> (PathBuf, PathBuf, std::process::Child) {
+        let root = base.join("repo");
+        let worktree = base.join("feature");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        let wt = worktree.to_str().unwrap();
+        git(&root, &["worktree", "add", "-q", "-b", "feature", wt]);
+        let mut sleep = std::process::Command::new("sleep");
+        sleep.arg("60").current_dir(&worktree);
+        let (child, _group) = crate::platform::spawn_grouped(&mut sleep).unwrap();
+        (root, worktree, child)
+    }
+
+    fn exited_within(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn destroy_stops_the_worktrees_programs_before_deleting_it() {
+        if !cfg!(unix) {
+            return;
+        }
+        let _state = crate::testenv::IsolatedState::new();
+        let base = tempfile::tempdir().unwrap();
+        let (root, worktree, mut sleep) = feature_worktree_with_sleep(base.path());
+        register_pane_stops(&worktree, vec![PaneStop::Group(sleep.id())]);
+
+        let (success, message) = destroy_one(
+            &Config::default(),
+            &root,
+            &worktree,
+            "feature",
+            "repo",
+            false,
+            false,
+            HookExecutionMode::Force,
+            None,
+        );
+
+        assert!(success, "destroy failed: {message}");
+        assert!(
+            exited_within(&mut sleep, std::time::Duration::from_secs(5)),
+            "the worktree's program outlived its removal"
+        );
+        assert!(!worktree.exists(), "the worktree folder must be gone");
+        assert!(thegn_core::worktree::branch_exists(&root, "feature"));
+        assert!(take_pane_stops(&worktree).is_empty());
+    }
+
+    #[test]
+    fn destroy_refuses_main_and_locked_worktrees_without_stopping_anything() {
+        if !cfg!(unix) {
+            return;
+        }
+        let _state = crate::testenv::IsolatedState::new();
+        let base = tempfile::tempdir().unwrap();
+        let (root, worktree, mut sleep) = feature_worktree_with_sleep(base.path());
+        let wt = worktree.to_str().unwrap();
+        git(&root, &["worktree", "lock", "--reason", "in use", wt]);
+        let destroy = |target: &Path| {
+            register_pane_stops(target, vec![PaneStop::Group(sleep.id())]);
+            destroy_one(
+                &Config::default(),
+                &root,
+                target,
+                "feature",
+                "repo",
+                false,
+                false,
+                HookExecutionMode::Force,
+                None,
+            )
+        };
+
+        let (locked_ok, locked) = destroy(&worktree);
+        let (main_ok, main) = destroy(&root);
+
+        assert!(
+            !locked_ok && locked.contains("is locked (in use)"),
+            "{locked}"
+        );
+        assert!(!main_ok && main.contains("main checkout"), "{main}");
+        assert!(worktree.exists() && root.join(".git").is_dir());
+        assert!(thegn_core::worktree::branch_exists(&root, "feature"));
+        assert!(
+            sleep.try_wait().unwrap().is_none(),
+            "a refused delete must not stop the worktree's programs"
+        );
+        assert!(take_pane_stops(&worktree).is_empty() && take_pane_stops(&root).is_empty());
+        let _ = sleep.kill(); // best-effort: test cleanup: the sleep is still running
+        let _ = sleep.wait(); // best-effort: test cleanup: reap the killed sleep
     }
 
     #[test]

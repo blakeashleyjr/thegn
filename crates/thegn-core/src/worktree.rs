@@ -1247,6 +1247,39 @@ fn worktree_paths_equal(left: &Path, right: &Path) -> bool {
             && std::fs::canonicalize(left).ok() == std::fs::canonicalize(right).ok())
 }
 
+/// Why `worktree` (of the repository at `root`) must not be removed, checked
+/// before anything is stopped or closed (THE-2736): the primary checkout and a
+/// linked worktree locked with `git worktree lock` are refused with a plain
+/// reason. Reads the `.git` file and Git's `locked` marker only, no
+/// subprocess. `None` means removal may go ahead; an unreadable `.git` is left
+/// to the later steps, which fail closed on their own.
+pub fn removal_refusal(root: &Path, worktree: &Path) -> Option<String> {
+    if worktree_paths_equal(root, worktree) {
+        return Some(format!(
+            "{} is the repository's main checkout; it cannot be removed. Nothing was closed",
+            worktree.display()
+        ));
+    }
+    let marker = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    // `join` keeps an absolute gitdir as is and resolves a relative one.
+    let reason = std::fs::read_to_string(worktree.join(gitdir).join("locked")).ok()?;
+    let reason = reason.trim();
+    let why = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+    Some(format!(
+        "{} is locked{why}; run `git worktree unlock {}` first. Nothing was closed",
+        worktree.display(),
+        worktree.display()
+    ))
+}
+
 /// Reclaim a worktree's build artifacts (`target/`) while keeping the checkout
 /// intact. Distinct from [`remove`], which deletes the whole worktree via `git
 /// worktree remove`. Returns the bytes reclaimed.
@@ -1641,6 +1674,45 @@ mod tests {
         ] {
             assert!(util::git_cmd(dir).args(args).status().unwrap().success());
         }
+    }
+
+    #[test]
+    fn removal_refusal_names_the_main_checkout_and_a_locked_worktree() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = scratch.path().join("feature");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &path.to_string_lossy()
+            ]
+        ));
+
+        let main = removal_refusal(&repo, &repo).expect("the main checkout is refused");
+        assert!(main.contains("main checkout"), "{main}");
+        assert_eq!(removal_refusal(&repo, &path), None);
+
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "on a usb disk",
+                &path.to_string_lossy()
+            ]
+        ));
+        let locked = removal_refusal(&repo, &path).expect("a locked worktree is refused");
+        assert!(locked.contains("is locked (on a usb disk)"), "{locked}");
+        assert!(locked.contains("git worktree unlock"), "{locked}");
+        assert!(path.exists() && branch_exists(&repo, "feature"));
     }
 
     #[test]

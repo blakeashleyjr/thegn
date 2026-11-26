@@ -2473,7 +2473,7 @@ fn connect_worktree_bridge(
 
 pub(crate) fn delete_groups_with_mode(
     session: &mut crate::session::Session,
-    _panes: &mut Panes,
+    panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
     mode: thegn_core::hooks::HookExecutionMode,
@@ -2499,6 +2499,17 @@ pub(crate) fn delete_groups_with_mode(
                 continue;
             }
             let group_name = session.worktrees[gi].name.clone();
+            // Delete-from-disk stops the group's pane programs first (THE-2736);
+            // the worker signals them after the vetoing pre-destroy hook.
+            if !keep_files {
+                let stops = session.worktrees[gi]
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.center.pane_ids())
+                    .filter_map(|id| panes.table.get(&id)?.delete_stop())
+                    .collect();
+                crate::worktree_lifecycle::register_pane_stops(Path::new(&path), stops);
+            }
             if let Err(error) = crate::worktree_lifecycle::spawn_worktree_destroy(
                 PathBuf::from(&path),
                 group_name,
@@ -2507,6 +2518,7 @@ pub(crate) fn delete_groups_with_mode(
                 mode,
                 waker.clone(),
             ) {
+                drop(crate::worktree_lifecycle::take_pane_stops(Path::new(&path)));
                 spawn_errors.push(format!("{path}: {error}"));
                 continue;
             }
