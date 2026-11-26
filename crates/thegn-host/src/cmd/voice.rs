@@ -484,7 +484,7 @@ mod tests {
         assert!(
             readiness(&cfg, &facts(true, false, true))
                 .unwrap()
-                .contains("no native capture")
+                .contains("native voice is not built")
         );
         let pull = readiness(&cfg, &facts(true, true, false)).unwrap();
         assert!(pull.contains(&format!("voice model pull {}", cfg.model)));

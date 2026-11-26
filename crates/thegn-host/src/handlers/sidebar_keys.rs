@@ -1289,7 +1289,9 @@ impl SidebarState {
         {
             self.unread_hold = Some(active.to_string());
         }
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-mark-unrd", move || {
+            // Utility: user-requested activity-state write.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             for t in &flip {
                 thegn_core::activity::mark_unread(t);
             }

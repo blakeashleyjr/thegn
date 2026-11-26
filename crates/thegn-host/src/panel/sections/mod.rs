@@ -2825,10 +2825,7 @@ mod spec {
         let rendered = text(&rows);
         assert!(rendered.contains("host connect: timeout"), "{rendered}");
         assert!(rendered.contains("ghcr.io/x/base:v1"), "{rendered}");
-        assert!(
-            rendered.contains("reach target  flaky.example"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("address  flaky.example"), "{rendered}");
         assert_eq!(
             rows.iter()
                 .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Hosts, _))))

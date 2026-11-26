@@ -1091,7 +1091,7 @@ in {
     };
 
     uiSidebarFinishedPipelineDays = lib.mkOption {
-      type = lib.types.nullOr (lib.types.ints.unsigned);
+      type = lib.types.nullOr (lib.types.ints.u32);
       default = null;
       description = "Days a finished pipeline stays in the sidebar Pipelines section before it ages out; 0 = never. The worktree is never deleted. Unset (null) = the binary's default.";
     };

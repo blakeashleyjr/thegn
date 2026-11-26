@@ -14,6 +14,9 @@
 # registry discovery rejects a symlinked socket and accepts a same-user socket.
 # `snapshot/fs_tests.rs` has whole-file `#![cfg(unix)]` because its tests rely
 # on Unix symlink and permission semantics.
+# voice.rs: only a `#[cfg(unix)]` test inside its `#[cfg(test)]` module; it writes
+# an executable fake `hex` script (`PermissionsExt::set_mode`), which has no
+# cross-platform equivalent. No production voice logic is cfg'd.
 # Prefer a compile-time `cfg!()` early return wherever an OS-specific runtime
 # dependency (such as `/proc`) is required; Wine maps `/` to `Z:`, so filesystem
 # probes can succeed on Windows even though the API is unavailable.
@@ -46,6 +49,7 @@ issue/gh_run.rs
 issue/github.rs
 plugin/proc.rs
 share/tests.rs
+voice.rs
 vpn/tests.rs
 vps/ssh_shim.rs
 
