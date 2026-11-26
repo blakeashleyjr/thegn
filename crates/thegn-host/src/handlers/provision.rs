@@ -499,6 +499,17 @@ fn no_backend_halt_body(halt: &crate::agent::SandboxHalt) -> String {
     )
 }
 
+/// Modal body for an ssh env whose host has no container runtime. The reason
+/// already names `backend = "none"` and its caveat. No `[h]` here: run-on-host
+/// would open a LOCAL shell, not the remote one the env points at.
+fn ssh_no_runtime_halt_body(halt: &crate::agent::SandboxHalt) -> String {
+    format!(
+        "{} — failover is off, so thegn won't drop to the local host. `thegn doctor` \
+         lists each ssh env's runtime status. [r] retries after you install one.",
+        halt.reason
+    )
+}
+
 pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
     if halt.sealed_home {
         let title = format!("⚠ {} unavailable", halt.placement);
@@ -524,6 +535,12 @@ pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOver
         return menu::sandbox_ask_menu("⚠ no sandbox backend", no_backend_halt_body(halt));
     }
     let title = format!("⚠ {} unavailable", halt.placement);
+    if halt
+        .reason
+        .starts_with(crate::remote_sync::SSH_NO_RUNTIME_MARKER)
+    {
+        return menu::sandbox_halt_menu(title, ssh_no_runtime_halt_body(halt));
+    }
     if halt.ask {
         // `failover = "ask"`: surface the real cause and offer an explicit host
         // escape hatch beside the retry — the pane is NOT silently degraded.
@@ -3045,6 +3062,32 @@ mod tests {
                 true,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn ssh_no_runtime_overlay_names_backend_none_without_run_on_host() {
+        let halt = crate::agent::SandboxHalt {
+            env_name: "box".into(),
+            placement: "ssh:dev@box".into(),
+            reason: format!(
+                "{} (podman not detected over ssh); set [env.box.sandbox] backend = \"none\" \
+                 to run bare with NO sandbox",
+                crate::remote_sync::SSH_NO_RUNTIME_MARKER
+            ),
+            ask: false,
+            dormant: None,
+            sealed_home: false,
+        };
+        let overlay = sandbox_halt_overlay(&halt);
+        let body = overlay.body().unwrap_or_default();
+        assert!(body.contains("backend = \"none\""), "{body}");
+        assert!(body.contains("NO sandbox"), "{body}");
+        assert!(
+            !overlay
+                .items()
+                .iter()
+                .any(|item| item.label.contains("run on host"))
         );
     }
 

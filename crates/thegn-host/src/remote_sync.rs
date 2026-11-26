@@ -84,6 +84,9 @@ fn sync_key(canonical_worktree: &str, authority: &str, slug: &str, head: &str) -
     [canonical_worktree, authority, slug, head].join("\0")
 }
 
+/// Leading words of the halt reason when an ssh env's host has no container runtime.
+pub(crate) const SSH_NO_RUNTIME_MARKER: &str = "no container runtime found on the remote host";
+
 /// Guard a REMOTE placement that resolved to a bare `Backend::None`. A remote
 /// SSH placement has no container to hold the synced worktree, so degrading to
 /// `none` would ship a `cd <local-worktree>` to a bare remote shell (the
@@ -122,10 +125,12 @@ pub(crate) fn ssh_none_guard(
         return Err(crate::agent::SandboxHalt {
             env_name: env_name.to_string(),
             placement: placement_label.to_string(),
-            reason: "no container runtime found on the remote host (podman not \
-                     detected over ssh); install a container runtime there, or \
-                     set a reachable [sandbox] backend"
-                .to_string(),
+            reason: format!(
+                "{SSH_NO_RUNTIME_MARKER} (podman not detected over ssh); install a \
+                 container runtime there, or set [env.{env_name}.sandbox] backend = \"none\" \
+                 to run bare on that host with NO sandbox (the pane can read and write \
+                 everything that ssh user can)"
+            ),
             ask,
             dormant: None,
             sealed_home: hardening.hides_home(),
@@ -761,6 +766,29 @@ mod tests {
         assert!(halt.sealed_home);
         assert!(halt.reason.contains("remote container runtime"));
         assert!(halt.reason.contains("bare SSH shell"));
+    }
+
+    #[test]
+    fn remote_sync_ssh_no_runtime_halt_names_backend_none() {
+        let error = ssh_none_guard(
+            &sandbox_spec(thegn_core::sandbox::Backend::None, true),
+            thegn_core::config::SandboxBackend::Auto,
+            false,
+            false,
+            "remote",
+            "ssh:builder",
+            thegn_core::config::SandboxProfile::Standard,
+        )
+        .unwrap_err();
+        let halt = error.downcast_ref::<crate::agent::SandboxHalt>().unwrap();
+        assert!(halt.reason.starts_with(super::SSH_NO_RUNTIME_MARKER));
+        assert!(
+            halt.reason
+                .contains("[env.remote.sandbox] backend = \"none\""),
+            "{}",
+            halt.reason
+        );
+        assert!(halt.reason.contains("NO sandbox"));
     }
 
     fn temp_home(label: &str) -> std::path::PathBuf {
