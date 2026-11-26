@@ -29,6 +29,14 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "json-rpc error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
+
 impl JsonRpcResponse {
     pub fn success(id: Value, result: Value) -> Self {
         Self {

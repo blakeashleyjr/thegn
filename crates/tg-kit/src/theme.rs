@@ -385,6 +385,21 @@ pub enum ThemeLoadError {
     Malformed(String),
 }
 
+impl std::fmt::Display for ThemeLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("theme config does not exist"),
+            Self::Unreadable(why) => write!(f, "theme config is unreadable: {why}"),
+            Self::NotRegular => f.write_str("theme config is not a regular file"),
+            Self::Oversize => f.write_str("theme config is too large"),
+            Self::InvalidUtf8 => f.write_str("theme config is not valid UTF-8"),
+            Self::Malformed(why) => write!(f, "theme config is malformed: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ThemeLoadError {}
+
 /// A problem that degraded an otherwise-applied config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeIssue {

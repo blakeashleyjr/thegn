@@ -380,6 +380,17 @@ pub enum MatchError {
     UnsupportedPattern,
 }
 
+impl fmt::Display for MatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OverBudget => f.write_str("path overlap matching exceeded its work budget"),
+            Self::UnsupportedPattern => f.write_str("path pattern is not supported for overlap"),
+        }
+    }
+}
+
+impl std::error::Error for MatchError {}
+
 pub fn paths_overlap(a: &[String], b: &[String]) -> Result<Vec<(String, String)>, MatchError> {
     let mut work = 0usize;
     paths_overlap_with_work(a, b, &mut work)

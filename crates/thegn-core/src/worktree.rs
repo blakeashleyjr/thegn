@@ -870,6 +870,14 @@ pub struct AddError {
     pub branch_probe_failed: bool,
 }
 
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AddError {}
+
 /// [`add`] with the failure reason returned instead of warned, for callers
 /// that surface errors in their own UI (the new-worktree progress overlay).
 pub fn add_checked(
