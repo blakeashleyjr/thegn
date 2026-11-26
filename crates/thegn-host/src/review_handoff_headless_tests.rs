@@ -161,10 +161,9 @@ fn non_utf8_worktree_cannot_authorize_its_lossy_sibling() {
     if let Err(error) = std::fs::create_dir(&original) {
         // APFS (macOS) refuses names that are not valid UTF-8 (EILSEQ), so no
         // such worktree can exist there. Linux filesystems must accept it.
-        assert!(
-            !cfg!(target_os = "linux"),
-            "create non-UTF-8 directory: {error}"
-        );
+        if cfg!(target_os = "linux") {
+            panic!("create non-UTF-8 directory: {error}");
+        }
         return;
     }
     std::fs::create_dir(&sibling).unwrap();

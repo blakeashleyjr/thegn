@@ -6173,8 +6173,10 @@ mod tests {
             ],
             0,
         );
-        let mut view = ViewState::default();
-        view.filter = "THE-74".into();
+        let view = ViewState {
+            filter: "THE-74".into(),
+            ..ViewState::default()
+        };
         let rows = build_rows(
             &s,
             &app_workspace(),

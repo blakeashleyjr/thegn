@@ -63,20 +63,6 @@ fn provider_sigil(provider: &str) -> &'static str {
 
 // ---- sorted + filtered issue list ------------------------------------------
 
-/// Returns issues sorted by priority (Urgent first, Done/Cancelled last) and
-/// filtered by the active text query and project filter. Shared by the render
-/// path and the Issues action-key handlers (`handlers::tracker`) so a cursor
-/// index means the same row in both — indexing the raw, unsorted
-/// `tracker_issues` from the handlers used to act on a *different* issue than
-/// the one highlighted.
-pub(crate) fn sorted_filtered_issues<'a>(
-    data: &'a crate::panel::PanelData,
-    query: &str,
-    project: Option<&str>,
-) -> Vec<&'a Issue> {
-    sorted_filtered_issues_scoped(data, query, project, None)
-}
-
 /// The team key of an issue number: `THE` for `THE-2748`. `None` for numbers
 /// without a `<KEY>-<digits>` shape (GitHub's `#42`), which no team scope hides.
 pub(crate) fn team_key(number: &str) -> Option<&str> {
@@ -137,7 +123,10 @@ pub(crate) fn next_team_scope(
     }
 }
 
-/// `sorted_filtered_issues` narrowed to one team key (`None` = every team).
+/// Returns issues sorted by priority (Urgent first, Done/Cancelled last) and
+/// filtered by the active text query, project filter and team scope (`None` =
+/// every team). Shared by the render path and the Issues action-key handlers
+/// (`handlers::tracker`) so a cursor index means the same row in both.
 pub(crate) fn sorted_filtered_issues_scoped<'a>(
     data: &'a crate::panel::PanelData,
     query: &str,
@@ -960,7 +949,7 @@ mod tests {
             issue("urgent", IssuePriority::Urgent, IssueStatus::Todo, ""),
             issue("high", IssuePriority::High, IssueStatus::InProgress, ""),
         ]);
-        let ordered: Vec<&str> = sorted_filtered_issues(&data, "", None)
+        let ordered: Vec<&str> = sorted_filtered_issues_scoped(&data, "", None, None)
             .iter()
             .map(|i| i.id.as_str())
             .collect();
@@ -976,11 +965,11 @@ mod tests {
             issue("APP-2", IssuePriority::High, IssueStatus::Todo, "proj-b"),
         ]);
         // Project filter narrows to a single issue.
-        let by_project = sorted_filtered_issues(&data, "", Some("proj-b"));
+        let by_project = sorted_filtered_issues_scoped(&data, "", Some("proj-b"), None);
         assert_eq!(by_project.len(), 1);
         assert_eq!(by_project[0].id, "APP-2");
         // Text query matches on number/title.
-        let by_query = sorted_filtered_issues(&data, "app-1", None);
+        let by_query = sorted_filtered_issues_scoped(&data, "app-1", None, None);
         assert_eq!(by_query.len(), 1);
         assert_eq!(by_query[0].id, "APP-1");
     }

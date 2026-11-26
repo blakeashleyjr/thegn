@@ -29,10 +29,11 @@ fn display_label(
     terminal_title: Option<&str>,
     enabled: bool,
 ) -> String {
-    if enabled && stored == ordinal {
-        if let Some(title) = terminal_title.and_then(clean_terminal_title) {
-            return title;
-        }
+    if enabled
+        && stored == ordinal
+        && let Some(title) = terminal_title.and_then(clean_terminal_title)
+    {
+        return title;
     }
     stored.to_owned()
 }

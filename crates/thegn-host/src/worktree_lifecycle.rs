@@ -2989,6 +2989,7 @@ mod tests {
         );
         assert!(take_pane_stops(&worktree).is_empty() && take_pane_stops(&root).is_empty());
         let _ = sleep.kill(); // best-effort: test cleanup: the sleep is still running
+        #[expect(clippy::disallowed_methods)]
         let _ = sleep.wait(); // best-effort: test cleanup: reap the killed sleep
     }
 

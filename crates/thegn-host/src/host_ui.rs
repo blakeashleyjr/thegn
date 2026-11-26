@@ -240,7 +240,7 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
                     .collect(),
                 ..HostSnapshot::default()
             };
-            snap.job_runner = snap.envs.iter().any(|e| *e == cfg.jobs.runner);
+            snap.job_runner = snap.envs.contains(&cfg.jobs.runner);
             if let Some(HostState::Failed(f)) = row.map(|r| &r.state) {
                 snap.error = crate::host_flow::failure_reason(f);
                 snap.retryable = f.retryable;
