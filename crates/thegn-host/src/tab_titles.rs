@@ -54,49 +54,30 @@ fn clean_terminal_title(raw: &str) -> Option<String> {
 }
 
 fn is_spinner(ch: char) -> bool {
+    // Claude Code's idle/working stars, plus every braille cell (the common
+    // dot-spinner family used by most CLI agents).
     matches!(
         ch,
-        '✳' | '✢'
-            | '✽'
-            | '✶'
-            | '✻'
-            | '✺'
-            | '✹'
-            | '✸'
-            | '✷'
-            | '⠋'
-            | '⠙'
-            | '⠹'
-            | '⠸'
-            | '⠼'
-            | '⠴'
-            | '⠦'
-            | '⠧'
-            | '⠇'
-            | '⠏'
-            | '⠁'
-            | '⠂'
-            | '⠄'
-            | '⡀'
-            | '⢀'
-            | '⠠'
-            | '⠐'
-            | '⠈'
+        '✳' | '✢' | '✽' | '✶' | '✻' | '✺' | '✹' | '✸' | '✷' | '·' | '⠀'..='⣿'
     )
 }
 
 fn is_bare_path(title: &str) -> bool {
-    title.starts_with('/')
+    if title.contains(char::is_whitespace) && !title.starts_with(['/', '~', '.']) {
+        return false;
+    }
+    let bytes = title.as_bytes();
+    title == "~"
+        || title.starts_with('/')
         || title.starts_with("~/")
         || title.starts_with("./")
         || title.starts_with("../")
         || title.ends_with('/')
         || title.ends_with('\\')
-        || (title.as_bytes().get(1) == Some(&b':')
-            && title
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphabetic))
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 #[cfg(test)]
@@ -111,6 +92,19 @@ mod tests {
         );
         assert_eq!(clean_terminal_title("⠋ /Users/me/project/"), None);
         assert_eq!(clean_terminal_title("  "), None);
+        assert_eq!(
+            clean_terminal_title("⠹ Refactor tabs"),
+            Some("Refactor tabs".into())
+        );
+        assert_eq!(clean_terminal_title("✳"), None);
+        assert_eq!(clean_terminal_title("~"), None);
+        assert_eq!(clean_terminal_title("~/code/thegn"), None);
+        assert_eq!(clean_terminal_title(r"C:\Users\me"), None);
+        assert_eq!(
+            clean_terminal_title("Q: why is CI red"),
+            Some("Q: why is CI red".into())
+        );
+        assert_eq!(clean_terminal_title("and/or"), Some("and/or".into()));
     }
 
     #[test]

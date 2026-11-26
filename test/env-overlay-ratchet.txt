@@ -566,10 +566,10 @@ ui.sidebar_show_jj
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
 ui.sidebar_show_submodules
-ui.tab_title_from_terminal
 ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
+ui.tab_title_from_terminal
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles
