@@ -117,7 +117,8 @@ pub fn transcribe(
 }
 
 /// Like `transcribe`, adding the OpenAI-compatible multipart `prompt` field
-/// when a vocabulary prompt is supplied. Servers that do not know it ignore it.
+/// when a vocabulary prompt is supplied (servers that do not know it ignore
+/// it) and dropping a reply that merely echoes that prompt.
 pub fn transcribe_with_prompt(
     cfg: &VoiceConfig,
     credential: Option<&str>,
@@ -125,7 +126,11 @@ pub fn transcribe_with_prompt(
     cancel: &AtomicBool,
     prompt: Option<&str>,
 ) -> Result<String, VoiceError> {
-    transcribe_with_proxy(cfg, credential, wav, cancel, None, prompt)
+    let text = transcribe_with_proxy(cfg, credential, wav, cancel, None, prompt)?;
+    Ok(match prompt {
+        Some(prompt) => thegn_core::voice::drop_prompt_echo(&text, prompt),
+        None => text,
+    })
 }
 
 fn transcribe_with_proxy(
@@ -468,6 +473,25 @@ mod loopback_tests {
             assert_eq!(request.contains("name=\"prompt\""), prompt.is_some());
             assert_eq!(request.contains("T3 Code, Ottobit"), prompt.is_some());
         }
+    }
+    #[test]
+    fn voice_http_reply_echoing_the_prompt_is_dropped() {
+        let (endpoint, server) = server(200, br#"{"text":"T3 Code, Ottobit."}"#.to_vec(), false);
+        let cfg = VoiceConfig {
+            endpoint,
+            model: "fixture-model".into(),
+            ..Default::default()
+        };
+        let text = transcribe_with_prompt(
+            &cfg,
+            None,
+            b"RIFF0000WAVE",
+            &AtomicBool::new(false),
+            Some("T3 Code, Ottobit"),
+        )
+        .unwrap();
+        assert_eq!(text, "");
+        server.join().unwrap();
     }
     #[test]
     fn voice_http_stalled_response_deadline_and_cancellation() {

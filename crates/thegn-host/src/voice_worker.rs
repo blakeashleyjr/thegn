@@ -149,27 +149,28 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         })?;
     let mut rolling = RollingTranscript::default();
     let mut decoded_end = 0;
-    let prompt = thegn_voice::prompt(&cfg.vocabulary_terms(), thegn_voice::PROMPT_MAX_CHARS);
+    // The vocabulary prompt is for the final pass only: previews stay unprompted.
+    let prompt = cfg.vocabulary_prompt();
     let transcribe =
         |samples: &[f32], flag: Arc<AtomicBool>, prompt: Option<&str>| -> Result<String> {
             match cfg.kind {
-                VoiceKind::Embedded => engine
-                    .as_ref()
-                    .context("missing embedded engine")?
-                    .transcribe(samples, &cfg.language, flag, cfg.request_timeout(), prompt),
-                VoiceKind::Http => {
-                    let text = thegn_svc::voice_http::transcribe_with_prompt(
-                        &cfg,
-                        request.token.as_deref(),
-                        &thegn_voice::wav(samples),
-                        &flag,
-                        prompt,
-                    )?;
+                VoiceKind::Embedded => {
+                    let text = engine
+                        .as_ref()
+                        .context("missing embedded engine")?
+                        .transcribe(samples, &cfg.language, flag, cfg.request_timeout(), prompt)?;
                     Ok(match prompt {
-                        Some(prompt) => thegn_voice::drop_prompt_echo(&text, prompt),
+                        Some(prompt) => thegn_core::voice::drop_prompt_echo(&text, prompt),
                         None => text,
                     })
                 }
+                VoiceKind::Http => Ok(thegn_svc::voice_http::transcribe_with_prompt(
+                    &cfg,
+                    request.token.as_deref(),
+                    &thegn_voice::wav(samples),
+                    &flag,
+                    prompt,
+                )?),
                 VoiceKind::Command => bail!("command transcription belongs to the parent adapter"),
             }
         };

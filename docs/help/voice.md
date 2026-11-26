@@ -105,13 +105,15 @@ the `.en` models are English-only. `voice model list` shows each model's size
 and whether it is installed. `voice model rm NAME` removes its model,
 verification marker and abandoned partial downloads, and succeeds if absent.
 
-`vocabulary` lists names Whisper should spell (repos, tools, people), for example
-`vocabulary = ["T3 Code", "Ottobit"]`. The first terms that fit in 500 characters
-are sent as the Whisper prompt on the final pass (embedded) or as the HTTP `prompt`
-field; live previews never use it. If the whole transcript is only the vocabulary
-echoed back (two or more terms), it is discarded.
+`vocabulary` lists names Whisper should spell (repos, tools, people), for
+example `vocabulary = ["T3 Code", "Ottobit"]`. The first terms that fit in 500
+characters are sent as the Whisper prompt on the final pass (embedded) or as the
+HTTP `prompt` field; live previews never use it, and `command` providers ignore
+it. If the whole transcript is only the vocabulary echoed back (two or more
+terms), it is discarded.
 
 All `[voice]` settings are in `config/config.toml.example`: `enabled`, `kind`,
 `capture_command`, `command`, `max_seconds`, `language`, `model`, `model_path`,
-`endpoint`, `credential`, `live_preview`, `timeout_seconds`, and `vocabulary`. Voice remains
-experimental and disabled on the stable channel; use `THEGN_CHANNEL=dev`.
+`endpoint`, `credential`, `live_preview`, `timeout_seconds`, and `vocabulary`.
+Voice remains experimental and disabled on the stable channel; use
+`THEGN_CHANNEL=dev`.

@@ -91,16 +91,26 @@ impl VoiceConfig {
         Duration::from_secs(self.effective_max_seconds())
     }
 
-    /// The vocabulary after trimming, dropping empty or over-long entries and
-    /// capping the count.
+    /// The vocabulary after trimming, dropping empty, over-long or
+    /// control-character entries (a NUL would abort Whisper) and capping the
+    /// count.
     pub fn vocabulary_terms(&self) -> Vec<String> {
         self.vocabulary
             .iter()
             .map(|term| term.trim())
-            .filter(|term| !term.is_empty() && term.chars().count() <= MAX_VOCABULARY_TERM_CHARS)
+            .filter(|term| {
+                !term.is_empty()
+                    && term.chars().count() <= MAX_VOCABULARY_TERM_CHARS
+                    && !term.chars().any(char::is_control)
+            })
             .take(MAX_VOCABULARY_TERMS)
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The final-pass vocabulary prompt, or `None` when no terms are set.
+    pub fn vocabulary_prompt(&self) -> Option<String> {
+        crate::voice::vocabulary_prompt(&self.vocabulary_terms(), crate::voice::PROMPT_MAX_CHARS)
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -184,10 +194,14 @@ max_seconds = 17
         assert!(VoiceConfig::default().vocabulary.is_empty());
         let long = "x".repeat(MAX_VOCABULARY_TERM_CHARS + 1);
         let cfg: VoiceConfig = toml::from_str(&format!(
-            "vocabulary = [\"  T3 Code \", \"\", \"{long}\", \"Ottobit\"]\n"
+            "vocabulary = [\"  T3 Code \", \"\", \"{long}\", \"a\\u0000b\", \"Ottobit\"]\n"
         ))
         .unwrap();
         assert_eq!(cfg.vocabulary_terms(), ["T3 Code", "Ottobit"]);
+        assert_eq!(cfg.vocabulary_prompt().as_deref(), Some("T3 Code, Ottobit"));
+        assert_eq!(VoiceConfig::default().vocabulary_prompt(), None);
+        let back: VoiceConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
         let many = VoiceConfig {
             vocabulary: (0..300).map(|i| format!("t{i}")).collect(),
             ..Default::default()

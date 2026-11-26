@@ -63,6 +63,8 @@ impl Engine {
             .context("load Whisper model (Metal with CPU fallback on macOS; CPU on Linux)")?;
         Ok(Self { context })
     }
+    /// `prompt` is the Whisper initial prompt (final pass only); the caller
+    /// drops a transcript that merely echoes it.
     pub fn transcribe(
         &self,
         samples: &[f32],
@@ -123,15 +125,11 @@ impl Engine {
             bail!("Whisper transcription cancelled or timed out");
         }
         result?;
-        let text = state
+        Ok(state
             .as_iter()
             .map(|s| s.to_str_lossy().map(|text| text.into_owned()))
             .collect::<std::result::Result<Vec<_>, _>>()?
-            .join("");
-        Ok(match prompt {
-            Some(prompt) => crate::drop_prompt_echo(&text, prompt),
-            None => text,
-        })
+            .join(""))
     }
 }
 

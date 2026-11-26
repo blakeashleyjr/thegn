@@ -9,73 +9,6 @@ pub const SAMPLE_RATE: usize = 16_000;
 pub const WINDOW_SAMPLES: usize = 8 * SAMPLE_RATE;
 pub const PREVIEW_STEP: usize = SAMPLE_RATE;
 
-/// Character budget for the Whisper initial prompt.
-pub const PROMPT_MAX_CHARS: usize = 500;
-
-/// Join the first terms, in order, with `", "` while they fit in `max_chars`.
-/// Whisper trims an over-long prompt from the front, so overflow must drop the
-/// last terms rather than the most important first ones.
-pub fn prompt(terms: &[String], max_chars: usize) -> Option<String> {
-    let mut out = String::new();
-    let mut used = 0;
-    for term in terms.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        let width = term.chars().count() + if out.is_empty() { 0 } else { 2 };
-        if used + width > max_chars {
-            break;
-        }
-        if !out.is_empty() {
-            out.push_str(", ");
-        }
-        out.push_str(term);
-        used += width;
-    }
-    (!out.is_empty()).then_some(out)
-}
-
-fn normalize_echo(text: &str) -> String {
-    let spaced: String = text
-        .chars()
-        .filter_map(|c| match c {
-            ',' | ';' | '\n' => Some(' '),
-            c if c.is_ascii_punctuation() => None,
-            c => Some(c),
-        })
-        .flat_map(char::to_lowercase)
-        .collect();
-    spaced
-        .split_whitespace()
-        .map(|word| match word {
-            "zero" => "0",
-            "one" => "1",
-            "two" => "2",
-            "three" => "3",
-            "four" => "4",
-            "five" => "5",
-            "six" => "6",
-            "seven" => "7",
-            "eight" => "8",
-            "nine" => "9",
-            other => other,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Whisper sometimes returns only its prompt for near-silent audio. Drop the
-/// text when it equals a prompt of two or more terms after normalization;
-/// otherwise return it unchanged.
-pub fn drop_prompt_echo(text: &str, prompt: &str) -> String {
-    let terms = prompt
-        .split([',', ';', '\n'])
-        .filter(|t| !t.trim().is_empty())
-        .count();
-    if terms >= 2 && normalize_echo(text) == normalize_echo(prompt) {
-        String::new()
-    } else {
-        text.to_owned()
-    }
-}
-
 /// Keep the newest words visible during long utterances. The host applies its
 /// cell-width/control filtering after this UTF-8-safe byte bound.
 pub fn preview_snippet(text: &str) -> &str {
@@ -274,50 +207,5 @@ mod tests {
         assert_eq!(r.update(1, "世界另见"), "你好世界另见");
         let huge = "界".repeat(100_000);
         assert!(r.update(2, &huge).len() <= 64 * 1024 + 1);
-    }
-}
-
-#[cfg(test)]
-mod prompt_tests {
-    use super::*;
-
-    fn terms(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    #[test]
-    fn prompt_keeps_first_terms_within_budget() {
-        assert_eq!(prompt(&[], 500), None);
-        assert_eq!(
-            prompt(&terms(&["a", "b", "c"]), 500).as_deref(),
-            Some("a, b, c")
-        );
-        // "aaaa, bbbb" is 10 chars; the third term would exceed 12.
-        assert_eq!(
-            prompt(&terms(&["aaaa", "bbbb", "cccc"]), 12).as_deref(),
-            Some("aaaa, bbbb")
-        );
-        let many: Vec<String> = (0..200).map(|i| format!("term{i:03}")).collect();
-        let p = prompt(&many, PROMPT_MAX_CHARS).unwrap();
-        assert!(p.chars().count() <= PROMPT_MAX_CHARS);
-        assert!(p.starts_with("term000, term001"));
-    }
-
-    #[test]
-    fn echo_is_dropped_only_for_the_whole_prompt() {
-        assert_eq!(
-            drop_prompt_echo("T3 Code, Ottobit.", "T3 Code, Ottobit"),
-            ""
-        );
-        assert_eq!(
-            drop_prompt_echo("We shipped T3 Code today", "T3 Code, Ottobit"),
-            "We shipped T3 Code today"
-        );
-        assert_eq!(drop_prompt_echo("Ottobit", "Ottobit"), "Ottobit");
-        assert_eq!(drop_prompt_echo("T3 Code;Ottobit", "T3 Code\nOttobit"), "");
-        assert_eq!(
-            drop_prompt_echo("Three Code, Ottobit", "3 Code, Ottobit"),
-            ""
-        );
     }
 }
