@@ -4137,6 +4137,34 @@ fn fleet_snap(
 }
 
 #[test]
+fn fleet_widget_shows_sprites_usage_spend_as_an_estimate() {
+    use thegn_core::placement::fleet_cost::SpritesSpend;
+    // Unrecorded sprites listed, burn estimated from usage: shown with `est.`.
+    let mut snap = fleet_snap(1, 0.0, 0, 0);
+    snap.cost.total_hourly = 0.12;
+    snap.cost.sprites = Some(SpritesSpend {
+        today_usd: 0.5,
+        burn_usd_per_hour: 0.12,
+        unrecorded: 1,
+        ..SpritesSpend::default()
+    });
+    assert_eq!(
+        fleet_widget(&snap, false),
+        Some(("$0.12/h est.".to_string(), false))
+    );
+    // Billed today with nothing burning now: still on the bar, no `est.`.
+    let mut idle = fleet_snap(0, 0.0, 0, 0);
+    idle.cost.sprites = Some(SpritesSpend {
+        today_usd: 0.5,
+        ..SpritesSpend::default()
+    });
+    assert_eq!(
+        fleet_widget(&idle, false),
+        Some(("$0.00/h".to_string(), false))
+    );
+}
+
+#[test]
 fn fleet_widget_includes_metered_ai_burn() {
     let ai = |burn: f64| thegn_core::proxy::stats::AiSpend {
         burn_hourly: burn,

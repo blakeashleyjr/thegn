@@ -486,6 +486,9 @@ pub(crate) enum RefreshKind {
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
     DaemonSessions(Box<crate::detail::DaemonSessions>),
+    /// A finished Lead-setup background job (the Lead checks, or the daemon's
+    /// live-session count before a restart): the loop reopens the flow's menu.
+    LeadSetup(Box<crate::lead::setup::Async>),
     /// An onboarding-wizard probe answer (gh auth / sandbox backends / ssh
     /// host), delivered into the live wizard by
     /// [`crate::handlers::onboarding::apply_probe`].

@@ -467,6 +467,27 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     set_key_checked(config_path, dotted, val, |_, _| Ok(()))
 }
 
+/// Remove one dotted key or whole table (`lead`, `daemon.enabled`). Ok and
+/// untouched when absent, so it is safe to repeat. The counterpart of
+/// [`set_key`] for reversible in-app setup.
+pub fn remove_key(config_path: &Path, dotted: &str) -> Result<()> {
+    let dotted = crate::config_compat::canonical_key(dotted);
+    let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(!parts.is_empty(), "empty key");
+    let (mut doc, expected) = read_doc(config_path)?;
+    let mut tbl = doc.as_table_mut();
+    for seg in &parts[..parts.len() - 1] {
+        match tbl.get_mut(seg).and_then(Item::as_table_mut) {
+            Some(t) => tbl = t,
+            None => return Ok(()),
+        }
+    }
+    if tbl.remove(parts[parts.len() - 1]).is_none() {
+        return Ok(());
+    }
+    write_doc(config_path, &doc, expected.as_deref())
+}
+
 /// Replace dictation configuration in a single fenced atomic write, preserving
 /// unrelated tables/comments. Setup only calls this after acquisition succeeds.
 pub fn set_voice(config_path: &Path, voice: &crate::config::VoiceConfig) -> Result<()> {
@@ -829,6 +850,29 @@ pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_key_drops_a_key_or_table_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# note\n[lead]\nagent = \"claude\"\n[daemon]\nenabled = true\nother = 1\n",
+        )
+        .unwrap();
+        remove_key(&path, "lead").unwrap();
+        remove_key(&path, "daemon.enabled").unwrap();
+        remove_key(&path, "daemon.enabled").unwrap();
+        remove_key(&path, "nope.deeper").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("other = 1"), "{text}");
+        assert!(
+            !text.contains("lead") && !text.contains("enabled"),
+            "{text}"
+        );
+        assert!(text.contains("other = 1"), "{text}");
+        assert!(remove_key(&path, "").is_err());
+    }
 
     #[test]
     fn voice_setup_preserves_comments_and_removes_cleared_optional_fields() {

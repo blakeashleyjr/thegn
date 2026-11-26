@@ -29,6 +29,8 @@ use thegn_core::store::WorkspaceStore;
 pub(crate) struct Applied {
     pub keymap_changed: bool,
     pub spawned: bool,
+    /// The tour closed itself to hand off to the in-app Lead setup.
+    pub open_lead_setup: bool,
 }
 
 /// The loop's onboarding state, one local: the wizard slot, the pane it is
@@ -349,6 +351,15 @@ fn handle_tour_key(
             }
             for req in fx.probes {
                 spawn_probe(req, refresh_tx.clone(), waker.clone());
+            }
+            if fx.open_lead_setup {
+                // Hand off: close the tour like a dismissal (nothing saved),
+                // restore the configured palette, and let the loop open the flow.
+                ob.tour = None;
+                persist_done(false);
+                crate::chrome::set_palette(onboarding_palette(cfg, &cfg.theme.preset, user_themes));
+                model.status = "welcome tour closed — Lead setup opened".into();
+                applied.open_lead_setup = true;
             }
         }
         TourOutcome::Close {

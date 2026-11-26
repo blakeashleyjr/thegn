@@ -13,10 +13,6 @@ pub(crate) const LEAD_GROUP_NAME: &str = "lead";
 /// The `terminals.kind` value that marks the Lead group.
 pub(crate) const LEAD_TERMINAL_KIND: &str = "lead";
 
-/// Status shown when the jump key is pressed with no `[lead]` configured.
-pub(crate) const DISABLED_STATUS: &str =
-    "Lead is not configured \u{2014} add a [lead] section (dev channel)";
-
 /// Whether a terminal group name is the reserved Lead group.
 pub(crate) fn is_lead_group(name: &str) -> bool {
     name == LEAD_GROUP_NAME
@@ -42,7 +38,7 @@ pub(crate) fn lead_choice() -> TerminalChoice {
 /// What the jump key should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JumpPlan {
-    /// `[lead]` is absent or the channel is stable: say so, do nothing else.
+    /// `[lead]` is absent or the channel is stable: open the in-app setup.
     Disabled,
     /// The Lead exists (resident or registered): activate this target.
     Activate(RowTarget),
@@ -77,24 +73,26 @@ pub(crate) fn plan(
 
 /// The run.rs arm's one-liner. Returns a target for the caller to activate
 /// through its normal row door, or `None` when it handled the jump itself
-/// (disabled: status set; created: group pushed and registry row queued, the
+/// (disabled/unready: the caller opens the setup; created: group pushed and registry row queued, the
 /// caller still refreshes/persists its layout via `created`).
 pub(crate) fn jump(
     cfg: &thegn_core::config::Config,
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
-    status: &mut String,
     db_terminals: &[TerminalRow],
     tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
     waker: &termwiz::terminal::TerminalWaker,
 ) -> JumpOutcome {
     match plan(cfg, session, db_terminals) {
-        JumpPlan::Disabled => {
-            *status = DISABLED_STATUS.into();
-            JumpOutcome::Handled
-        }
+        JumpPlan::Disabled => JumpOutcome::Setup,
         JumpPlan::Activate(t) => JumpOutcome::Activate(t),
         JumpPlan::Create => {
+            // Configured but not logged in, or the daemon's Lead listener is
+            // not up: a Lead opened now would only fail, so finish setup first.
+            let host = super::setup::RealHost { cfg };
+            if super::setup::incomplete(&super::setup::Host::facts(&host)) {
+                return JumpOutcome::Setup;
+            }
             let choice = lead_choice();
             crate::handlers::terminal::persist(&choice, tx, waker);
             crate::handlers::terminal::push_terminal_group(session, panes, &choice);
@@ -103,10 +101,21 @@ pub(crate) fn jump(
     }
 }
 
+/// Whether activating `target` is the sidebar's "Lead — set up" row: the Lead
+/// group's target while no `[lead]` is configured.
+pub(crate) fn is_setup_target(target: &RowTarget, cfg: &thegn_core::config::Config) -> bool {
+    !super::enabled(cfg)
+        && matches!(
+            target,
+            RowTarget::Workspace { repo_path, group: Some(g) }
+                if repo_path == "terminal" && is_lead_group(g)
+        )
+}
+
 /// Result of [`jump`] for the caller.
 pub(crate) enum JumpOutcome {
-    /// Nothing more to do (status already set).
-    Handled,
+    /// The Lead is not set up (or not ready): open the in-app setup flow.
+    Setup,
     /// Activate this row target.
     Activate(RowTarget),
     /// A new group was pushed: refresh the model, persist the layout, relayout.
@@ -150,7 +159,27 @@ mod tests {
             active: 0,
         };
         assert_eq!(plan(&cfg, &session, &[]), JumpPlan::Disabled);
-        assert!(DISABLED_STATUS.contains("[lead]"));
+    }
+
+    #[test]
+    fn setup_target_is_the_lead_group_only_while_unconfigured() {
+        let lead = RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some("lead".into()),
+        };
+        let other = RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some("local".into()),
+        };
+        let off = thegn_core::config::Config::default();
+        assert!(is_setup_target(&lead, &off));
+        assert!(!is_setup_target(&other, &off));
+        assert!(!is_setup_target(&RowTarget::Tab(0, 0), &off));
+        let on = thegn_core::config::Config {
+            lead: Some(thegn_core::config_lead::LeadConfig::default()),
+            ..Default::default()
+        };
+        assert!(!is_setup_target(&lead, &on));
     }
 
     #[test]

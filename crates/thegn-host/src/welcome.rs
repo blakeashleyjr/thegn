@@ -72,6 +72,8 @@ pub struct TourEffects {
     pub preview_theme: Option<String>,
     /// Off-loop probes to start.
     pub probes: Vec<ProbeRequest>,
+    /// Leave the tour and open the in-app Lead setup (agents chapter, `l`).
+    pub open_lead_setup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,6 +719,10 @@ impl WelcomeTour {
                 self.wire_accepted = !self.wire_accepted;
                 TourOutcome::Pending
             }
+            (Chapter::Agents, KeyCode::Char('l' | 'L')) => TourOutcome::Do(TourEffects {
+                open_lead_setup: true,
+                ..TourEffects::default()
+            }),
             (Chapter::Agents, _) if delta != 0 => {
                 if let Probe::Done(list) = &self.agents
                     && !list.is_empty()
@@ -965,6 +971,7 @@ impl WelcomeTour {
             Chapter::Agents => &[
                 ("up/down", "agent"),
                 ("w", "set up for thegn"),
+                ("l", "set up the Lead"),
                 ("enter", "next"),
                 ("tab", "skip"),
                 ("esc", "leave"),
@@ -1364,6 +1371,9 @@ impl WelcomeTour {
         }
         lines.push(faint(
             "Your own [[agents]] entries stay as they are; only the first one changes.",
+        ));
+        lines.push(faint(
+            "Press l to leave the tour and set up the Lead (a preview; unsaved picks are dropped).",
         ));
         lines
     }
@@ -2010,6 +2020,20 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn l_on_the_agents_chapter_asks_to_open_the_lead_setup() {
+        let mut t = tour();
+        goto(&mut t, Chapter::Agents);
+        match press(&mut t, KeyCode::Char('l')) {
+            TourOutcome::Do(fx) => assert!(fx.open_lead_setup),
+            o => panic!("{o:?}"),
+        }
+        // Only on that chapter.
+        let mut t = tour();
+        goto(&mut t, Chapter::Sandbox);
+        assert_eq!(press(&mut t, KeyCode::Char('l')), TourOutcome::Pending);
     }
 
     #[test]

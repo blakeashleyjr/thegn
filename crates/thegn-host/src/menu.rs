@@ -246,6 +246,11 @@ impl MenuOverlay {
         self
     }
 
+    /// The note row above the items, if any.
+    pub fn body(&self) -> Option<&str> {
+        self.body.as_deref()
+    }
+
     pub fn items(&self) -> &[MenuItem] {
         &self.items
     }
@@ -684,6 +689,35 @@ pub fn confirm_menu(
         vec![yes, item(Some('n'), "cancel", MenuChoice::Dismiss)],
     )
     .with_body(body)
+}
+
+/// One row of [`choice_menu`]: a hotkey, its label, and the arg it confirms
+/// with (`None` makes the row a plain dismiss).
+pub struct ChoiceRow {
+    pub key: Option<char>,
+    pub label: String,
+    pub arg: Option<String>,
+}
+
+/// A multi-row confirm: each row resolves to `Confirm { tag, arg }` (or
+/// `Dismiss` for an arg-less row); `body` is the note above the rows.
+pub fn choice_menu(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    tag: &'static str,
+    rows: Vec<ChoiceRow>,
+) -> MenuOverlay {
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let choice = match r.arg {
+                Some(arg) => MenuChoice::Confirm { tag, arg },
+                None => MenuChoice::Dismiss,
+            };
+            item(r.key, r.label, choice)
+        })
+        .collect();
+    MenuOverlay::new(MenuKindTag::Confirm, title, items).with_body(body)
 }
 
 /// [`confirm_menu`] (always `danger`) with the cursor pre-set on `cancel`, so

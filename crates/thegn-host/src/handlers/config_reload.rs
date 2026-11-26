@@ -289,6 +289,7 @@ fn sidebar(plan: &ReloadPlan, ctx: &mut ReloadCtx<'_>) {
     ctx.sb.view.workspace_sort = ui.sidebar_workspace_sort;
     ctx.sb.view.terminals_section = ui.sidebar_terminals_section;
     ctx.sb.view.lead_enabled = crate::lead::enabled(ctx.new_cfg);
+    ctx.sb.view.lead_setup_row = !ctx.sb.view.lead_enabled;
     crate::sidebar_freeze::set_enabled(ctx.sb, ui.sidebar_freeze_sort, &ctx.model.sidebar_status);
     ctx.sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(ui);
     let changed = plan

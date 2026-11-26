@@ -632,6 +632,10 @@ pub struct ViewState {
     /// The Lead section shows only when `[lead]` is configured (mirrored from
     /// `crate::lead::enabled` on startup/reload like `terminals_section`).
     pub lead_enabled: bool,
+    /// Show the "Lead — set up" row (the Lead is not configured). Opens the
+    /// in-app setup flow; mirrored from `!crate::lead::enabled` like
+    /// `lead_enabled`, on both channels.
+    pub lead_setup_row: bool,
     /// Flat cross-workspace layout (`g`): drop per-repo grouping and show one
     /// recency-ordered list of every worktree, each tagged with its repo.
     /// Persisted as the `sidebar_flat` ui_state key; independent of `sort`.
@@ -994,6 +998,25 @@ fn push_lead_section(
     });
 }
 
+/// The label of the row that opens the Lead setup flow.
+pub(crate) const LEAD_SETUP_LABEL: &str = "Lead \u{2014} set up";
+
+/// The `LEAD` section while no `[lead]` is configured: one row whose activation
+/// the loop turns into the in-app setup flow (never a Lead launch).
+fn push_lead_setup_section(rows: &mut Vec<SidebarRow>) {
+    use crate::lead::group::LEAD_GROUP_NAME;
+    rows.push(SidebarRow::base(RowKind::SectionHeading, 0, "LEAD", "lead"));
+    rows.push(SidebarRow {
+        tab_target: Some(RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some(LEAD_GROUP_NAME.into()),
+        }),
+        worktree_path: Some(LEAD_GROUP_NAME.into()),
+        terminal_connection: Some(String::new()),
+        ..SidebarRow::base(RowKind::Terminal, 1, LEAD_SETUP_LABEL, "lead/row")
+    });
+}
+
 /// Group `db_terminals` into host sections in sidebar **display order**:
 /// `local` first, then remote hosts by case-insensitive label. Each entry is
 /// `(collapse-key, display-label, is_local, terminals-in-order)`. The
@@ -1050,6 +1073,8 @@ pub fn build_rows(
     // The Lead is pinned at the very top: outside workspace ordering/reorder.
     if view.lead_enabled {
         push_lead_section(&mut rows, session, db_terminals, status.lead.as_ref());
+    } else if view.lead_setup_row {
+        push_lead_setup_section(&mut rows);
     }
 
     // Every ordering key the computed sorts read, in one place: the live status
@@ -4239,6 +4264,37 @@ mod tests {
         // Not yet registered: still shown, with the start hint.
         let none = build_rows(&s, &[], &view, &no_activity(), &[], &[], &[]);
         assert!(none[1].label.contains("Enter to start"));
+    }
+
+    #[test]
+    fn unconfigured_lead_shows_a_setup_row_only_when_asked() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let off = build_rows(
+            &s,
+            &[],
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!off.iter().any(|r| r.label == LEAD_SETUP_LABEL));
+        let view = ViewState {
+            lead_setup_row: true,
+            ..Default::default()
+        };
+        let on = build_rows(&s, &[], &view, &no_activity(), &[], &[], &[]);
+        assert_eq!(on[0].label, "LEAD");
+        assert_eq!(on[1].label, LEAD_SETUP_LABEL);
+        assert_eq!(on[1].kind, RowKind::Terminal);
+        // A configured Lead wins over the setup row.
+        let both = ViewState {
+            lead_enabled: true,
+            lead_setup_row: true,
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &[], &both, &no_activity(), &[], &[], &[]);
+        assert!(!rows.iter().any(|r| r.label == LEAD_SETUP_LABEL));
     }
 
     #[test]

@@ -45,7 +45,8 @@ pub(crate) struct FleetSnapshot {
 pub(crate) fn read(cfg: &Config) -> Result<FleetSnapshot> {
     let view = gather(cfg, None)?;
     let generated_ms = thegn_core::util::now_ms();
-    let cost = priced(cfg, &view, generated_ms);
+    let mut cost = priced(cfg, &view, generated_ms);
+    apply_sprites(cfg, &view, &mut cost, generated_ms);
     let ai = ai_spend_now(generated_ms);
     Ok(FleetSnapshot {
         generated_ms,
@@ -53,6 +54,108 @@ pub(crate) fn read(cfg: &Config) -> Result<FleetSnapshot> {
         cost,
         ai,
     })
+}
+
+/// Window for the Sprites burn estimate: usage since the start of the UTC
+/// hour two hours back (so 1 to 2 hours of buckets).
+const SPRITES_RECENT_BACK_SECS: i64 = 2 * 3600;
+
+/// Read each configured Sprites account's usage (today, month to date, and a
+/// recent window) and fold it into `cost`. Account-wide, so sprites another
+/// host created on the same account are billed here too. A read that fails
+/// leaves `cost` unchanged (logged at debug). Blocking; off-loop only.
+pub(crate) fn apply_sprites(cfg: &Config, view: &FleetView, cost: &mut FleetCost, now_ms: i64) {
+    let usage = sprites_account_usage(cfg, now_ms / 1000);
+    fleet_cost::apply_sprites_usage(cost, view, &usage);
+}
+
+fn sprites_account_usage(cfg: &Config, now_secs: i64) -> Vec<fleet_cost::SpritesAccountUsage> {
+    use thegn_svc::sprites::usage::{month_start_utc, usage_window_start};
+    let channel = crate::channel_state::current();
+    let rfc = |secs: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let day_start = now_secs - now_secs.rem_euclid(86_400);
+    let recent_start = usage_window_start(now_secs - SPRITES_RECENT_BACK_SECS);
+    let window_hours = (now_secs - recent_start) as f64 / 3600.0;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (name, envc) in &cfg.env {
+        if envc.provider.provider.trim() != "sprites"
+            || !fleet_provider_allowed(channel, &envc.provider.provider)
+        {
+            continue;
+        }
+        let Ok(Provider::Sprites(provider)) =
+            crate::provider_factory::provider_for_inventory(&envc.provider)
+        else {
+            continue;
+        };
+        let account = provider
+            .scope()
+            .map(|scope| scope.account.clone())
+            .unwrap_or_else(|| format!("env:{name}"));
+        if !seen.insert(account) {
+            continue;
+        }
+        let read = |since: i64| {
+            let start = rfc(since);
+            crate::agent::block_on_provider(|| async {
+                tokio::time::timeout(INVENTORY_TIMEOUT, provider.account_usage_since(&start))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timed out"))?
+            })
+        };
+        let reads = (
+            read(day_start),
+            read(month_start_utc(now_secs)),
+            read(recent_start),
+        );
+        match reads {
+            (Ok(day), Ok(month), Ok(recent)) => out.push(usage_from_readings(
+                &day.usage,
+                &month.usage,
+                &recent.usage,
+                window_hours,
+            )),
+            (day, month, recent) => {
+                let error = [day.err(), month.err(), recent.err()]
+                    .into_iter()
+                    .flatten()
+                    .next();
+                tracing::debug!(target: "thegn::fleet", env = %name, error = ?error, "sprites account usage read failed");
+            }
+        }
+    }
+    out
+}
+
+/// Shape three usage readings (today, month to date, recent window) into the
+/// cost input. Pure.
+pub(crate) fn usage_from_readings(
+    day: &thegn_svc::sprites::usage::SpriteUsage,
+    month: &thegn_svc::sprites::usage::SpriteUsage,
+    recent: &thegn_svc::sprites::usage::SpriteUsage,
+    window_hours: f64,
+) -> fleet_cost::SpritesAccountUsage {
+    let hours = |seconds: f64| {
+        if seconds.is_finite() && seconds > 0.0 {
+            seconds / 3600.0
+        } else {
+            0.0
+        }
+    };
+    fleet_cost::SpritesAccountUsage {
+        today_cpu_hours: hours(day.cpu_seconds),
+        today_gb_hours: day.reserved_gb_hours,
+        mtd_cpu_hours: hours(month.cpu_seconds),
+        mtd_gb_hours: month.reserved_gb_hours,
+        recent_cpu_hours: hours(recent.cpu_seconds),
+        recent_gb_hours: recent.reserved_gb_hours,
+        recent_window_hours: window_hours,
+    }
 }
 
 /// Metered AI spend (model-proxy audit rows, month to date) at `now_ms`. A
@@ -343,6 +446,28 @@ fn recorded_for(cfg: &Config, worktree: &str) -> Option<RecordedSandbox> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn sprites_usage_readings_price_from_fake_responses() {
+        use thegn_svc::sprites::usage::parse_usage;
+        let body = |cpu: f64, mem: f64| serde_json::json!({"usage": [{"cpu_time_sec": cpu, "reserved_memory_byte_sec": mem}]});
+        let gib_hour = (1u64 << 30) as f64 * 3600.0;
+        let day = parse_usage(&body(7200.0, 4.0 * gib_hour)).unwrap();
+        let month = parse_usage(&body(36_000.0, 20.0 * gib_hour)).unwrap();
+        let recent = parse_usage(&body(3600.0, 2.0 * gib_hour)).unwrap();
+        let usage = usage_from_readings(&day, &month, &recent, 2.0);
+        assert!((usage.today_cpu_hours - 2.0).abs() < 1e-9);
+        assert!((usage.mtd_gb_hours - 20.0).abs() < 1e-6);
+        let view = FleetView::default();
+        let mut cost =
+            fleet_cost::fleet_cost(&view, fleet_cost::BUNDLED_PRICES, &BTreeMap::new(), 0);
+        fleet_cost::apply_sprites_usage(&mut cost, &view, &[usage]);
+        let burn = (fleet_cost::SPRITES_CPU_USD_PER_HOUR
+            + 2.0 * fleet_cost::SPRITES_GB_USD_PER_HOUR)
+            / 2.0;
+        assert!((cost.total_hourly - burn).abs() < 1e-6);
+        assert!(cost.today > 0.0 && cost.mtd > cost.today);
+    }
 
     #[test]
     fn stable_fleet_reads_only_sprites_and_vercel() {

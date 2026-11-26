@@ -288,8 +288,8 @@ pub(crate) fn run(cfg: &Config, mcp: Option<&str>) -> anyhow::Result<()> {
     }
     if cfg.lead.is_none() {
         bail!(
-            "the Lead is not configured, or this release channel clamps [lead] off: add a [lead] \
-             section, and run with THEGN_CHANNEL=dev"
+            "the Lead is not configured: set it up from thegn (Alt i), or add a [lead] section \
+             (on the stable channel it also needs `preview = true`)"
         );
     }
     let state_home = thegn_core::util::xdg_state_home();

@@ -1236,6 +1236,11 @@ install-clean: build
 install-clean-sweep:
     rm -rf "$HOME"/.thegn-clean-*; echo "swept $HOME/.thegn-clean-*"
 
+# Install the latest published release (or `just clean-install-check --tag TAG`)
+# into clean podman containers (ubuntu, debian, fedora, musl) and smoke-test it.
+clean-install-check *args:
+    bash test/clean-install-check.sh {{args}}
+
 # Like `start`, but in the dev release channel (experimental subsystems enabled)
 # via the runtime override — no separate binary needed. `just start-dev name=x`.
 # Do not override XDG_RUNTIME_DIR: masks and the control-socket guard key off the env runtime dir.

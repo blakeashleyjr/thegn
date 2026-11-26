@@ -2575,11 +2575,7 @@ impl SpritesSelectedRunner {
                 // A 404 is a missing file or a missing sprite; only the sprite
                 // lookup tells them apart. Say so plainly for the second.
                 if matches!(self.provider.inspect(sprite).await, Ok(None)) {
-                    bail!(
-                        "sprite {sprite} does not exist; run `thegn env up` or create it \
-                         (the runner alias is `{}`, the sprite is `{sprite}`)",
-                        self.alias
-                    );
+                    bail!("sprite {sprite} does not exist; run `thegn env up` or create it");
                 }
                 let project = self.binding.project().as_bytes();
                 let first = self.provider.write(sprite, &marker, project).await;
@@ -3355,9 +3351,17 @@ impl SpritesSelectedRunner {
     }
 
     fn unavailable(&self, error: impl std::fmt::Display) -> RunnerRefusal {
+        // The user-facing message names the real sprite: the runner alias
+        // (`sprites-<sprite>`) is not a sprite name, and printing it sends
+        // operators to a sprite that does not exist. The alias stays in the log.
+        tracing::debug!(
+            target: "thegn::sprites::job",
+            runner = %self.alias,
+            "selected runner refused"
+        );
         // `{:#}` keeps the cause chain: a refusal is the operator's only clue
         // about which call the sprite rejected and why.
-        RunnerRefusal::NotStarted(format!("{}: {error:#}", self.alias))
+        RunnerRefusal::NotStarted(format!("sprite {}: {error:#}", self.binding.sprite()))
     }
 }
 

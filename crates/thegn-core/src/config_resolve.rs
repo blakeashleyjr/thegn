@@ -1189,9 +1189,15 @@ impl Config {
                     was
                 }
                 Feature::Lead => {
-                    let was = self.lead.is_some();
-                    self.lead = None;
-                    was
+                    // The in-app setup flow writes `[lead] preview = true`: an
+                    // explicit opt-in that keeps the Lead on stable (preview).
+                    if self.lead.as_ref().is_some_and(|l| l.preview) {
+                        false
+                    } else {
+                        let was = self.lead.is_some();
+                        self.lead = None;
+                        was
+                    }
                 }
                 Feature::PluginApps => {
                     let default_was_plugin = self.apps.default_tab.trim().starts_with("plugin:");

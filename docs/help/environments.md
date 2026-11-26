@@ -343,7 +343,9 @@ N`, or `not found`; exit 75 when the session is gone). A detached command has
   unknown type are accepted.
 - **Instance cap.** `max_instances` applies through the ledger; `0` (the
   default for sprites) means no cap.
-- **Cost.** `thegn fleet cost` shows a Sprites block with CPU hours and
+- **Cost.** `thegn fleet cost` also prices Sprites from the account usage
+  API (today, month to date, and an `est.` burn from recent usage at the
+  published rates, including sprites this host did not record). It shows a Sprites block with CPU hours and
   reserved GB-hours per recorded sprite, read from the Sprites usage API only
   when you run that verb. It is priced only when `[placement.price]` has a
   `sprites` entry; otherwise it is labelled "usage from the Sprites API;
@@ -424,6 +426,9 @@ stay plan-only without the spend flags.
   unchanged: the worktree is not live, the env is poolable, nothing is bound
   yet, provisioning is pending and the sandbox floor holds. The pool stays
   opt-in (`[lifecycle.pool] size`). The TUI create path claims the same way.
+  `thegn env up` also claims with the pool off when a `ready` spare baked
+  against the repo's current `flake.lock` already exists, so a repeat first
+  open skips the cold create; a spare baked against an older lock is ignored.
 - **Agent CLI preflight.** After provisioning and before the open,
   `thegn agent run` runs `command -v <prog>` in the sandbox (60 s deadline). A
   missing CLI prints one warning that names the fix; it never blocks the run.
