@@ -17,6 +17,15 @@ config_enum! {
     } default = Command;
 }
 
+/// One find/replace rule applied to each finished transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct VoiceReplacement {
+    /// Phrase matched case-insensitively on word boundaries (literal, not a pattern).
+    pub from: String,
+    /// Replacement text. Empty deletes the phrase and one adjacent space.
+    pub to: String,
+}
+
 /// `[voice]` — opt-in, experimental dictation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -49,10 +58,15 @@ pub struct VoiceConfig {
     /// Total deadline for each transcription, independent of capture duration.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_seconds: u64,
+    /// Ordered replacement rules applied to every final transcript. Rules past
+    /// [`MAX_REPLACEMENTS`] are ignored.
+    pub replacements: Vec<VoiceReplacement>,
 }
 
 pub const MIN_MAX_SECONDS: u64 = 1;
 pub const MAX_MAX_SECONDS: u64 = 300;
+/// Upper bound on `[voice] replacements` rules.
+pub const MAX_REPLACEMENTS: usize = 200;
 
 impl Default for VoiceConfig {
     fn default() -> Self {
@@ -69,6 +83,7 @@ impl Default for VoiceConfig {
             credential: None,
             live_preview: true,
             timeout_seconds: 60,
+            replacements: Vec::new(),
         }
     }
 }
@@ -158,6 +173,20 @@ max_seconds = 17
         assert_eq!(cfg.capture_command, ["mic", "--wav"]);
         assert_eq!(cfg.command, ["stt", "--stdin"]);
         assert_eq!(cfg.max_seconds, 17);
+    }
+
+    #[test]
+    fn replacements_default_empty_and_parse_inline_tables() {
+        assert!(VoiceConfig::default().replacements.is_empty());
+        let cfg: VoiceConfig =
+            toml::from_str(r#"replacements = [{ from = "open code", to = "OpenCode" }]"#).unwrap();
+        assert_eq!(
+            cfg.replacements,
+            [VoiceReplacement {
+                from: "open code".into(),
+                to: "OpenCode".into(),
+            }]
+        );
     }
 
     #[test]

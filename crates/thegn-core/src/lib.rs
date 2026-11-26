@@ -461,6 +461,7 @@ pub mod vercel;
 pub mod viz;
 pub mod viz_raster;
 pub mod voice;
+pub mod voice_text;
 pub mod weather;
 pub mod work;
 pub mod workspace_mode;

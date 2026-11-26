@@ -6,6 +6,7 @@
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::voice::{VoiceEffect, VoiceEvent, VoiceState, reduce};
+use thegn_core::voice_text;
 
 use crate::chrome::FrameModel;
 use crate::panes::Panes;
@@ -174,7 +175,7 @@ pub(crate) fn drain(
                 crate::voice_worker::Event::Final(transcript) => VoiceEvent::TranscriptSucceeded {
                     pane_id,
                     request_id,
-                    transcript,
+                    transcript: voice_text::process(&voice.config().replacements, transcript),
                 },
                 crate::voice_worker::Event::Failed(reason) => VoiceEvent::TranscriptFailed {
                     pane_id,
@@ -199,7 +200,7 @@ pub(crate) fn drain(
             } => VoiceEvent::TranscriptSucceeded {
                 pane_id,
                 request_id,
-                transcript,
+                transcript: voice_text::process(&voice.config().replacements, transcript),
             },
             VoiceMessage::TranscriptFailed {
                 pane_id,
@@ -392,6 +393,46 @@ mod tests {
         let delivery = deliver_transcript(&mut voice, 1, "spoken words".into(), 1, true);
         assert!(matches!(delivery, Delivery::Inject(text) if text == "spoken words"));
         assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn replacement_output_is_flattened_before_delivery() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _fixture) = test_waker();
+        let mut voice = VoiceController::new(VoiceConfig {
+            enabled: true,
+            replacements: vec![thegn_core::config_voice::VoiceReplacement {
+                from: "open code".into(),
+                to: "OpenCode\nnow".into(),
+            }],
+            ..VoiceConfig::default()
+        });
+        voice.set_capture_generation_for_test(2);
+        voice.next_request_id = 4;
+        voice.state = VoiceState::Transcribing {
+            pane_id: 1,
+            request_id: 4,
+        };
+        voice
+            .sender_for_test()
+            .send(VoiceMessage::Session {
+                pane_id: 1,
+                generation: 2,
+                request_id: 4,
+                event: crate::voice_worker::Event::Final("open code".into()),
+            })
+            .unwrap();
+        let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = Panes::new(pane_tx);
+        let mut model = FrameModel::default();
+        // Focus is on another pane, so the final is held and its text is observable.
+        drain(&mut voice, &mut panes, 2, &mut model, &waker);
+        assert_eq!(
+            voice.take_held_transcript().as_deref(),
+            Some("OpenCode now")
+        );
     }
 
     #[test]

@@ -17,6 +17,21 @@ config change clears it. Text is pasted without a newline and is never
 auto-submitted.
 Line breaks and control characters in a transcript are inserted as spaces.
 
+`[voice] replacements` is an ordered list of up to 200 find/replace rules applied
+to every final transcript, whether it came from the command, HTTP, or embedded
+provider. Each rule is a literal phrase, matched case-insensitively and only on
+word boundaries, so `open code` does not match inside `reopen code`:
+
+```toml
+[voice]
+replacements = [{ from = "open code", to = "OpenCode" }, { from = "um", to = "" }]
+```
+
+When phrases overlap, the longest match wins, then the earlier match, then the
+earlier rule. An empty `to` deletes the phrase and one adjacent space. Replacement
+does not change capitalisation or punctuation beyond that. Partial previews are
+not rewritten; only the final text is.
+
 Run `thegn voice setup --language en` to configure a provider and model. Use
 `--kind embedded` (the default), `--kind http`, or `--kind command`; setup saves
 voice as enabled for that kind. For a catalogue model in the store, embedded
@@ -107,5 +122,5 @@ verification marker and abandoned partial downloads, and succeeds if absent.
 
 All `[voice]` settings are in `config/config.toml.example`: `enabled`, `kind`,
 `capture_command`, `command`, `max_seconds`, `language`, `model`, `model_path`,
-`endpoint`, `credential`, `live_preview`, and `timeout_seconds`. Voice remains
+`endpoint`, `credential`, `live_preview`, `timeout_seconds`, and `replacements`. Voice remains
 experimental and disabled on the stable channel; use `THEGN_CHANNEL=dev`.
