@@ -969,7 +969,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "GITHUB_WORKSPACE": str(ROOT),
                 "GITHUB_OUTPUT": str(output),
                 "TAG": "v1.2.3",
-                "TAP_REPOSITORY": "o/homebrew-tap",
+                "TAP_REPOSITORY": "o/homebrew-thegn",
             }
             environment = os.environ.copy()
             environment.update(git_config)
@@ -996,7 +996,7 @@ class WorkflowPolicyTests(unittest.TestCase):
 
         for job_name, step_name, branch in publishers:
             url = (
-                "git@github.com:o/homebrew-tap.git"
+                "git@github.com:o/homebrew-thegn.git"
                 if job_name == "publish-homebrew"
                 else "ssh://aur@aur.archlinux.org/thegn-bin.git"
             )
