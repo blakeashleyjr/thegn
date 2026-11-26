@@ -901,6 +901,11 @@ mod tests {
             (false, Some("default".to_string()))
         );
 
+        // The second launch is an existing user's, which may also show the
+        // one-time agent-wiring offer when the host has unwired agents on PATH
+        // (a developer Mac usually does). Retire it so only the picker is
+        // under test.
+        db.set_ui_state("", WIRE_OFFER_KEY, "1").unwrap();
         let (ui, _) = startup(&mut cfg, &mut menu, Some(&db));
         assert!(ui.tour.is_none(), "a skipped tour never auto-opens again");
         assert!(

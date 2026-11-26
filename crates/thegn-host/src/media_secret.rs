@@ -185,7 +185,11 @@ mod tests {
         let mut cfg = MediaConfig::default();
         cfg.mpd.password = Some("env:TG_MPD_SECRET_DEFINITELY_UNSET".into());
         let opts = resolve_opts(&cfg).unwrap();
-        assert!(opts.mpd_socket.is_empty());
+        // Only Linux `auto` reaches MPD; elsewhere `auto` never resolves the
+        // MPD credential, so the socket setting passes through untouched.
+        if cfg!(target_os = "linux") {
+            assert!(opts.mpd_socket.is_empty());
+        }
         assert!(opts.mpd_password.is_none());
     }
 

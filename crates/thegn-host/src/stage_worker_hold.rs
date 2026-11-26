@@ -134,6 +134,10 @@ mod tests {
 
     #[test]
     fn stage_worker_hold_names_a_read_only_git_dir() {
+        // The hold is a bwrap-mount judgement; other platforms never hold.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let mounts = [rw("/work/tree", false), rw("/git/common", true)];
         let hold =
             linux_hold("plan", &facts(&mounts, Some(Path::new("/git/common")), &[])).unwrap();
@@ -149,6 +153,10 @@ mod tests {
 
     #[test]
     fn stage_worker_hold_names_a_read_only_worktree() {
+        // The hold is a bwrap-mount judgement; other platforms never hold.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let mounts = [rw("/work/tree", true), rw("/git/common", false)];
         let hold =
             linux_hold("plan", &facts(&mounts, Some(Path::new("/git/common")), &[])).unwrap();
@@ -163,6 +171,10 @@ mod tests {
 
     #[test]
     fn stage_worker_hold_names_a_stale_callback() {
+        // The hold is a bwrap-mount judgement; other platforms never hold.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let mounts = [rw("/work/tree", false)];
         let mut facts = facts(&mounts, None, &[]);
         facts.callback_ok = false;
@@ -176,6 +188,10 @@ mod tests {
 
     #[test]
     fn stage_worker_hold_names_a_missing_provider_home() {
+        // The hold is a bwrap-mount judgement; other platforms never hold.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("missing-home");
         let mounts = [rw("/work/tree", false), rw(home.to_str().unwrap(), false)];
