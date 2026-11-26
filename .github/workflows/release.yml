@@ -1201,12 +1201,12 @@ jobs:
           missing=()
           [ "$ENABLED" = true ] || missing+=("PACKAGE_PUBLICATION_ENABLED=true")
           [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
-            || missing+=("HOMEBREW_TAP_REPOSITORY=<owner>/homebrew-tap")
+            || missing+=("HOMEBREW_TAP_REPOSITORY=<owner>/homebrew-thegn")
           [ -n "$TAP_DEPLOY_KEY" ] || missing+=("HOMEBREW_TAP_DEPLOY_KEY")
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Homebrew publication pending::Nothing was pushed; missing: ${missing[*]}"
-            checklist="Setup checklist: (1) create public homebrew-tap;"
+            checklist="Setup checklist: (1) create public homebrew-thegn;"
             checklist+=" (2) add its write-scoped deploy key to package-publication-homebrew"
             checklist+=" with a required reviewer; (3) set HOMEBREW_TAP_REPOSITORY;"
             checklist+=" (4) set PACKAGE_PUBLICATION_ENABLED=true."

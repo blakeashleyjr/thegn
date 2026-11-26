@@ -228,11 +228,11 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    tap and copy the generated release asset into it:
 
    ```sh
-   brew tap-new blakeashleyjr/tap                     # scaffolds Formula/
+   brew tap-new blakeashleyjr/thegn                   # scaffolds Formula/
    cp thegn-v<version>-homebrew.rb \
-     "$(brew --repository blakeashleyjr/tap)/Formula/thegn.rb"
-   brew install blakeashleyjr/tap/thegn
-   brew uninstall thegn && brew untap blakeashleyjr/tap   # when done
+     "$(brew --repository blakeashleyjr/thegn)/Formula/thegn.rb"
+   brew install blakeashleyjr/thegn/thegn
+   brew uninstall thegn && brew untap blakeashleyjr/thegn   # when done
    ```
 
 ## Release notes template
