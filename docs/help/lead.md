@@ -67,7 +67,7 @@ the Lead's agent. Without `[lead]` there is no Lead section in the sidebar and
 On stable, `[lead]` is clamped off unless it carries `preview = true`. Not yet
 verified live.
 
-1. Install bubblewrap and `pasta` (or set `[lead] network = "host"`).
+1. Install bubblewrap and `pasta`; the Lead refuses to launch without both.
 2. Set `[daemon] enabled = true`, `[lead] agent = "claude"` and, on stable,
    `[lead] preview = true`.
 3. Run `thegn daemon stop`, then open thegn. Lead tabs end when the daemon

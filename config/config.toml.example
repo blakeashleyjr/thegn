@@ -5133,7 +5133,8 @@ poll_interval_secs = 3
 # mcp_profile = "lead"              # [mcp_proxy.profiles] entry exposing the Lead's own MCP servers
 # skill = "lead"                    # skill seeded into the notes dir
 # notes_dir = "~/.local/state/thegn/lead"  # the Lead's only writable directory (default $XDG_STATE_HOME/thegn/lead)
-# network = "isolated"             # "isolated" (own netns via pasta; no pasta = no Lead) or "host" (warns on every launch)
+# network = "isolated"             # own netns via pasta; no pasta = no Lead
+# Legacy network = "host" is refused because it exposes host loopback and abstract sockets.
 # token_ttl_secs = 43200            # Lead token lifetime (300..604800); slides on use, capped at 7 days from minting
 # outward_allow = []                # outward caps ("issues.comment", "issues.update") allowed without a per-call owner approval
 # preview = false                   # written by the in-app setup flow: keeps [lead] active on the stable channel (preview)

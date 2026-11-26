@@ -29,8 +29,14 @@ use thegn_core::lead_sandbox::{self, LeadMountPlan};
 const NO_BWRAP: &str = "the Lead needs bwrap (Linux); not available here";
 /// The refusal when the isolated network has no pasta. Fixed text: the docs
 /// and tests cite it.
-const NO_PASTA: &str = "the Lead's isolated network needs pasta (passt); install it or set \
-                        [lead] network = \"host\"";
+const NO_PASTA: &str = "the Lead's isolated network needs pasta (passt); install it before \
+                        launching the Lead";
+/// Shared-host networking defeats the Lead's loopback and abstract-socket
+/// boundary, so legacy configs are diagnosed but never admitted.
+const HOST_NETWORK_REFUSED: &str = concat!(
+    "[lead] network = \"host\" is refused because it exposes host loopback services and ",
+    "abstract unix sockets; use \"isolated\""
+);
 /// Where the isolated network's generated `resolv.conf` lives, relative to
 /// `$XDG_STATE_HOME`.
 const NET_DIR_REL: &str = "thegn/lead-net";
@@ -200,10 +206,11 @@ fn launch_spec_with(
     if !(host.bwrap_available)() {
         bail!(NO_BWRAP);
     }
-    // Same for the isolated network: no pasta, no Lead. Never the shared
-    // network unless `[lead] network = "host"` says so.
     let network = lead.network;
-    if network == LeadNetwork::Isolated && !(host.pasta_available)() {
+    if network == LeadNetwork::Host {
+        bail!(HOST_NETWORK_REFUSED);
+    }
+    if !(host.pasta_available)() {
         bail!(NO_PASTA);
     }
     if lead
@@ -397,14 +404,9 @@ fn launch_spec_with(
             }
             Some(addr.port())
         }
-        LeadNetwork::Host => {
-            tracing::warn!(
-                target: "thegn::lead",
-                "[lead] network = \"host\": the Lead shares the host network namespace and can \
-                 reach every host loopback service and abstract unix socket"
-            );
-            None
-        }
+        // Refused at the top of admission, before any filesystem state;
+        // kept as an error (never a panic) so the arm stays exhaustive.
+        LeadNetwork::Host => bail!(HOST_NETWORK_REFUSED),
     };
 
     let plan = LeadMountPlan {
@@ -420,7 +422,7 @@ fn launch_spec_with(
         die_with_parent: matches!(mode, LeadMode::Headless { .. }) || !host.daemon_owned,
         // pasta starts bwrap as uid 0 of its user namespace: map back to the
         // caller's ids (claude refuses to skip permissions as root, and host
-        // files would read as root-owned). Host mode keeps today's argv.
+        // files would read as root-owned). Host mode is refused above.
         sandbox_ids: match network {
             LeadNetwork::Isolated => crate::platform::current_ids(),
             LeadNetwork::Host => None,
@@ -1096,8 +1098,8 @@ mod tests {
             lead: Some(thegn_core::config_lead::LeadConfig {
                 agent: "lead-agent".into(),
                 notes_dir: Some(root.join("notes")),
-                // Today's argv by default; the isolated tests opt in.
-                network: LeadNetwork::Host,
+                // Synthetic launches use the admitted isolated policy.
+                network: LeadNetwork::Isolated,
                 ..Default::default()
             }),
             ..Config::default()
@@ -1107,7 +1109,7 @@ mod tests {
             root,
             cfg,
             pasta: true,
-            listener: None,
+            listener: Some("127.0.0.1:4242".parse().unwrap()),
             program: None,
             exe: None,
         }
@@ -1243,7 +1245,8 @@ mod tests {
         // Every mount, mask and unset of the tab is present in the wake argv.
         let mounts = |argv: &[String]| -> Vec<String> {
             let b = argv.iter().position(|a| a == "bwrap").unwrap();
-            let sep = argv.iter().position(|a| a == "--").unwrap();
+            // bwrap's own `--`, not pasta's (which precedes bwrap).
+            let sep = b + argv[b..].iter().position(|a| a == "--").unwrap();
             argv[b + 1..sep]
                 .iter()
                 .filter(|a| *a != "--die-with-parent")
@@ -1388,7 +1391,7 @@ mod tests {
             "a daemon-owned pane drops --die-with-parent like the terminal path"
         );
         let bwrap = spec.argv.iter().position(|a| a == "bwrap").expect("bwrap");
-        let sep = spec.argv.iter().position(|a| a == "--").unwrap();
+        let sep = bwrap + spec.argv[bwrap..].iter().position(|a| a == "--").unwrap();
         assert!(bwrap < sep && spec.argv[sep + 1..].iter().any(|a| a.contains("true")));
         assert!(
             spec.env
@@ -1487,7 +1490,6 @@ mod tests {
         fx.pasta = false;
         let err = run(&fx, true, vec![], vec![]).unwrap_err();
         assert_eq!(err.to_string(), NO_PASTA);
-        assert!(err.to_string().contains("network = \"host\""));
         assert!(
             !fx.root.join("notes").exists(),
             "a refused launch creates nothing"
@@ -1546,20 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn host_network_yields_the_plain_bwrap_argv() {
-        let fx = fixture();
-        let spec = run(&fx, true, vec![], vec![]).unwrap();
-        assert!(!spec.argv.iter().any(|a| a == "pasta"), "{:?}", spec.argv);
-        assert!(!spec.argv.iter().any(|a| a == "/etc/resolv.conf"));
-        assert!(spec.argv.iter().any(|a| a == "bwrap"));
-        assert!(
-            !spec.argv.iter().any(|a| a == "--uid"),
-            "host mode keeps the caller's ids"
-        );
-        // Host mode never consults the pasta probe.
+    fn shared_host_network_is_refused_before_creating_sandbox_state() {
         let mut fx = fixture();
-        fx.pasta = false;
-        assert!(run(&fx, true, vec![], vec![]).is_ok());
+        if let Some(lead) = fx.cfg.lead.as_mut() {
+            lead.network = LeadNetwork::Host;
+        }
+        let err = run(&fx, true, vec![], vec![]).unwrap_err();
+        assert_eq!(err.to_string(), HOST_NETWORK_REFUSED);
+        assert!(!fx.root.join("notes").exists());
     }
 
     #[test]
