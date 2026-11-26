@@ -373,6 +373,12 @@ impl Section {
 pub struct HelpPanelState {
     pub page: String,
     pub reg: Option<std::sync::Arc<thegn_core::help::HelpRegistry>>,
+    /// Query shown in the docked Help header. `searching` keeps the field
+    /// focused while the user types and browses matches.
+    pub query: String,
+    pub searching: bool,
+    pub hits: Vec<thegn_core::help::SearchHit>,
+    pub selected: usize,
 }
 
 /// Resolve `[panel] sections` into the live accordion order: config keys map
