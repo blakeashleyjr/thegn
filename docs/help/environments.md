@@ -921,6 +921,15 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
+`thegn doctor` preflights each `[env.<name>] placement = "ssh"` with its own
+ssh target over a short, bounded ssh probe: whether the host is reachable, and
+whether `mosh-server` (mosh transport only), `dtach`, `podman` and `docker` are
+present. If no container runtime is found, the launch halts and names the fix:
+install podman or docker there, or set `[env.<name>.sandbox] backend = "none"`
+to run bare on that host with no sandbox. The halt also offers
+`[h] run on host`, which runs that worktree bare on the ssh host (never on your
+machine) for this session only; nothing is remembered.
+
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —
 > see [[release-channels]].

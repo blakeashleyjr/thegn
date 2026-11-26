@@ -4359,8 +4359,11 @@ fn remote_sandbox_report(cfg: &Config) {
             );
         }
     }
-    ssh_env_report(cfg, &chain);
+    ssh_env_report(cfg);
 }
+
+/// Container runtimes probed on each ssh env's host.
+const SSH_ENV_RUNTIMES: [&str; 2] = ["podman", "docker"];
 
 /// Every `[env.X] placement = "ssh"` that carries its own ssh target (not
 /// pinned to a `[host.*]`, which the host probe above already covers), as
@@ -4449,7 +4452,7 @@ fn ssh_env_lines(
 
 /// Preflight each ssh env with a short bounded ssh probe per binary
 /// (`REMOTE_PROBE_TIMEOUT`); an unreachable host stops after the first probe.
-fn ssh_env_report(cfg: &Config, chain: &[String]) {
+fn ssh_env_report(cfg: &Config) {
     let envs = ssh_env_placements(cfg);
     if envs.is_empty() {
         return;
@@ -4468,11 +4471,12 @@ fn ssh_env_report(cfg: &Config, chain: &[String]) {
             } else {
                 RuntimeProbe::Absent
             };
-            let runtimes: Vec<(&str, RuntimeProbe)> = chain
+            // Only an OCI runtime holds a remote worktree; a host-toolchain
+            // backend (bwrap, nspawn) from the local `[sandbox]` chain is dropped
+            // on an ssh placement, so it is not probed here.
+            let runtimes: Vec<(&str, RuntimeProbe)> = SSH_ENV_RUNTIMES
                 .iter()
-                .filter_map(|n| Backend::parse(n))
-                .filter(|b| *b != Backend::None)
-                .map(|b| (b.binary(), placement.probe_runtime(b.binary())))
+                .map(|bin| (*bin, placement.probe_runtime(bin)))
                 .collect();
             (mosh, runtimes)
         };

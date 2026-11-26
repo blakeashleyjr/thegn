@@ -500,12 +500,15 @@ fn no_backend_halt_body(halt: &crate::agent::SandboxHalt) -> String {
 }
 
 /// Modal body for an ssh env whose host has no container runtime. The reason
-/// already names `backend = "none"` and its caveat. No `[h]` here: run-on-host
-/// would open a LOCAL shell, not the remote one the env points at.
+/// already names `backend = "none"`. `[h]` pins the worktree for this session;
+/// on an ssh placement that pin runs the pane bare on THAT ssh host (as if
+/// `backend = "none"` were set), never as a local shell.
 fn ssh_no_runtime_halt_body(halt: &crate::agent::SandboxHalt) -> String {
     format!(
-        "{} — failover is off, so thegn won't drop to the local host. `thegn doctor` \
-         lists each ssh env's runtime status. [r] retries after you install one.",
+        "{} — thegn will not silently drop to a bare shell. [h] runs this worktree on \
+         that ssh host for this session with NO sandbox: the pane can read and write \
+         everything that ssh user can. Nothing is remembered; `thegn doctor` lists each \
+         ssh env's runtime status. [r] retries after you install one.",
         halt.reason
     )
 }
@@ -539,7 +542,7 @@ pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOver
         .reason
         .starts_with(crate::remote_sync::SSH_NO_RUNTIME_MARKER)
     {
-        return menu::sandbox_halt_menu(title, ssh_no_runtime_halt_body(halt));
+        return menu::sandbox_ask_menu(title, ssh_no_runtime_halt_body(halt));
     }
     if halt.ask {
         // `failover = "ask"`: surface the real cause and offer an explicit host
@@ -3066,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_no_runtime_overlay_names_backend_none_without_run_on_host() {
+    fn ssh_no_runtime_overlay_names_backend_none_and_offers_one_key_bare_run() {
         let halt = crate::agent::SandboxHalt {
             env_name: "box".into(),
             placement: "ssh:dev@box".into(),
@@ -3083,11 +3086,14 @@ mod tests {
         let body = overlay.body().unwrap_or_default();
         assert!(body.contains("backend = \"none\""), "{body}");
         assert!(body.contains("NO sandbox"), "{body}");
+        assert!(body.contains("on that ssh host"), "{body}");
         assert!(
-            !overlay
+            overlay
                 .items()
                 .iter()
-                .any(|item| item.label.contains("run on host"))
+                .any(|item| item.key == Some('h')
+                    && item.choice == menu::MenuChoice::SandboxRunOnHost),
+            "the remote halt offers the same one-key run-without-sandbox as the local one"
         );
     }
 

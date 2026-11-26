@@ -56,6 +56,17 @@ host` with the caveat that the pane runs with no sandbox, the choice pins
 - **AND** `thegn doctor` reports the same missing-backend fix on its
   containment row
 
+#### Scenario: SSH env host without a container runtime names backend none
+
+- **WHEN** an `[env.<name>] placement = "ssh"` launch halts because no
+  container runtime was found on the remote host
+- **THEN** the halt names `[env.<name>.sandbox] backend = "none"` with the
+  caveat that the pane runs with no sandbox, the modal offers `[h] run on host`,
+  and that choice runs the pane bare on the ssh host (never as a local shell)
+  for the current session only, with nothing persisted
+- **AND** `thegn doctor` lists each such ssh env with bounded probes for
+  reachability, `mosh-server` (mosh transport), `dtach` and a container runtime
+
 #### Scenario: Chain without host refuses
 
 - **WHEN** no backend is runnable and the configured `backend_chain` does not name `host`

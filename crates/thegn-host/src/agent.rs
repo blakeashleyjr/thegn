@@ -856,9 +856,17 @@ pub fn prepare_sandbox_env_with_selection(
                     }
                     .into());
                 }
+                // The session `[h]` pin from the no-runtime halt (THE-2729) counts
+                // as an explicit `backend = "none"` here: the placement stays ssh,
+                // so the pane runs bare on that host, never as a local shell.
+                let configured_backend = if force_host_requested(worktree) {
+                    thegn_core::config::SandboxBackend::None
+                } else {
+                    sb.backend
+                };
                 ssh_none_guard(
                     &spec,
-                    sb.backend,
+                    configured_backend,
                     degrade_allowed,
                     ask,
                     &env_name,

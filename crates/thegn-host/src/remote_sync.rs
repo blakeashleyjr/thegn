@@ -91,7 +91,8 @@ pub(crate) const SSH_NO_RUNTIME_MARKER: &str = "no container runtime found on th
 /// SSH placement has no container to hold the synced worktree, so degrading to
 /// `none` would ship a `cd <local-worktree>` to a bare remote shell (the
 /// "cd: can't cd to …" fallback). Bail with a [`SandboxHalt`] — unless the user
-/// asked for `none` explicitly, or opted into `failover`. K8s/Provider `none` is
+/// asked for `none` explicitly (config, or the session `[h]` pin the caller maps
+/// to `configured = None`), or opted into `failover`. K8s/Provider `none` is
 /// legitimate (the placement itself is the boundary); an SSH env with a
 /// projection runs locally (`Local`) and never reaches here.
 ///
