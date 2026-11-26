@@ -41,7 +41,7 @@ Each task is a work item of workstream WS01 (wave W1) unless noted. Tick a task 
 ## 6. Persistence channels
 
 - [ ] 6.1 WS01-P6-01: sealed binds no shared read-write host cache
-- [ ] 6.2 WS01-P6-02: standard drops read-write `.keychain` and `.claude-profiles`; agent executable
+- [x] 6.2 WS01-P6-02: standard drops read-write `.keychain` and `.claude-profiles`; agent executable
       config pinned read-only
 
 ## 7. Close out

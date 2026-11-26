@@ -114,8 +114,6 @@ sibling repositories listed in [[sandboxing]], and keeps agent settings in
   abstract unix sockets and localhost TCP are reachable.
 - ⚠ Shared read-write toolchain caches that your host later executes (`.rustup`,
   the cargo registry and git caches, pre-commit caches).
-- ⚠ Writable `~/.keychain` (sourced by host login shells) and
-  `~/.claude-profiles` (agent settings, hooks and credentials).
 - ⚠ A shared `.git` that stays writable in some launches (see Git and landing).
 
 `sealed` lists the shared kernel as its limit. Its gaps:
