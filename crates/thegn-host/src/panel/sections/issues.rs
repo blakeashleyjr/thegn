@@ -335,12 +335,14 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         rows.push(row);
     }
+    // No `T team` here: the scope row above advertises `T` exactly when there
+    // are two or more teams to switch between, and the full set would
+    // overflow the 60-column view. Labels match the statusbar table.
     rows.push(hint_row(&[
         ("↵", "details"),
         ("l", "link"),
-        ("T", "team"),
-        ("o", "web"),
-        ("a", "assign"),
+        ("o", "browser"),
+        ("a", "assign me"),
         ("b", "branch"),
     ]));
     rows
