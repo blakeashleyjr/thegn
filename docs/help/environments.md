@@ -36,7 +36,13 @@ provider) appear in the panel's **system → environments** section — `↵`
 token (the outcome pops as a toast and is logged), `n` opens the add
 wizard (on the stable channel it offers `local`, `ssh`, `sprites` and `vercel`;
 the other kinds appear on the dev channel), and `x`
-removes it after a confirm (removal also forgets the stored token). On a
+removes it after a confirm (removal also forgets the stored token). The
+selected env expands into labelled rows: placement and provider, health and
+last check, what it is used for (this worktree and its jobs), target, data
+mode, sandbox overlay, failover, and the token state in words (`present` or
+`missing`, with the variable it resolves from). Sprites and Vercel envs also
+show how model credentials are handled. The footer names each action
+(`use for this worktree`, `test token`, `remove env`, `new env…`). On a
 [[vercel-sandbox]] env, `p` runs `thegn env pull` for the worktree (it may resume
 the sandbox) and the row shows `results not pulled` until a pull succeeds. An
 environment can keep a **warm spare pool** so new worktrees start

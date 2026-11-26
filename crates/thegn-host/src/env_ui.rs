@@ -84,6 +84,33 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 "placement",
                 format!("{}{mode}", e.placement.as_str()),
             );
+            if is_provider {
+                push_detail(&mut detail, "provider", kind.clone());
+            }
+            let health = match (is_provider, token) {
+                (true, Some(false)) => "needs a token before it can start sandboxes".to_string(),
+                (true, _) => "ready · token present".to_string(),
+                (false, _) => "no live check for this placement".to_string(),
+            };
+            push_detail(&mut detail, "health", health);
+            push_detail(
+                &mut detail,
+                "last check",
+                if is_provider {
+                    "not recorded · press t to test the token".to_string()
+                } else {
+                    "not applicable".to_string()
+                },
+            );
+            push_detail(
+                &mut detail,
+                "used for",
+                if bound == Some(name.as_str()) {
+                    "this worktree and its jobs".to_string()
+                } else {
+                    "not bound to this worktree · enter to use it here".to_string()
+                },
+            );
             push_detail(&mut detail, "host", e.host.clone());
             let target = match e.placement {
                 PlacementMode::Ssh => {
@@ -143,7 +170,7 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 "failover",
                 e.failover
                     .map(|value| value.as_str().to_string())
-                    .unwrap_or_else(|| "inherit".to_string()),
+                    .unwrap_or_else(|| "inherit · follows the default failover".to_string()),
             );
             let key = effective_token_env(&e.provider);
             if is_provider && !key.is_empty() {
@@ -151,7 +178,7 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                     &mut detail,
                     "token",
                     format!(
-                        "{key} {}",
+                        "{} · {key}",
                         if token == Some(true) {
                             "present"
                         } else {
@@ -873,7 +900,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             token.1.as_str(),
-            "THEGN_ENV_DETAIL_TEST_TOKEN_810 missing" | "THEGN_ENV_DETAIL_TEST_TOKEN_810 present"
+            "missing · THEGN_ENV_DETAIL_TEST_TOKEN_810"
+                | "present · THEGN_ENV_DETAIL_TEST_TOKEN_810"
         ));
         assert!(
             !ssh.detail
