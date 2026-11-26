@@ -526,6 +526,10 @@ mod unix {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Pay the first exec of the freshly written script (slow on macOS) before any
         // caller deadline starts.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only warm-up of a local fixture script, never on the event loop"
+        )]
         let warmed = std::process::Command::new(&script)
             .arg("--version")
             .output()
