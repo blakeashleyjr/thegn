@@ -1067,8 +1067,9 @@ The crate list covers every crate in `Cargo.lock`, including build-time and test
 ## Licence handling for dual-licensed and copyleft crates
 
 - Where a crate offers a choice (for example `r-efi` is `MIT OR Apache-2.0 OR LGPL-2.1-or-later` and `self_cell` is `Apache-2.0 OR GPL-2.0-only`), thegn takes it under the permissive option (MIT or Apache-2.0). No crate in the list requires thegn itself to be copyleft.
-- The three MPL-2.0 crates (`colored`, `option-ext`, `uluru`) are used unmodified. MPL-2.0 is file-level copyleft; their complete source is published on crates.io at the exact versions above, which satisfies the source-availability obligation.
+- The four MPL-2.0 crates (`attohttpc`, `colored`, `option-ext`, `uluru`) are used unmodified. MPL-2.0 is file-level copyleft; their complete source is published on crates.io at the exact versions above, which satisfies the source-availability obligation.
 - `ring` is `Apache-2.0 AND ISC` and carries OpenSSL-licensed code; `deny.toml` clarifies it as `MIT AND ISC AND OpenSSL`.
+- `inferno` (`CDDL-1.0`, file-level copyleft) comes only through `pprof`, the optional `profiling` feature of the host crate. It is not in release builds and is outside the `deny.toml` graph; if a profiling build were ever distributed, `inferno`'s source is on crates.io at the version above.
 - `webpki-roots` is `CDLA-Permissive-2.0` (Mozilla CA root data); `terminfo` is `WTFPL`; `notify` is `CC0-1.0`.
 
 ## Vendored source

@@ -204,5 +204,6 @@ class ThirdPartyNoticesTests(unittest.TestCase):
         self.assertEqual(by_name["serde"]["license"], "MIT OR Apache-2.0")
         self.assertEqual(by_name["ghost"]["license"], "UNKNOWN")
 
+
 if __name__ == "__main__":
     unittest.main()
