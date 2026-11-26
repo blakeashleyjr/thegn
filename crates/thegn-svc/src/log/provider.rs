@@ -194,27 +194,23 @@ fn watch_log_directory(
                 && event.paths.iter().any(|event_path| {
                     event_path == &parent_path || event_path == &canonical_parent
                 });
-            // FSEvents coalesces a file append into a directory-level data event (the
-            // event path is the watched directory itself), so a non-metadata `Modify`
-            // on the parent also counts as a change. Reads never produce one.
-            let is_dir_data_change = matches!(kind, EventKind::Modify(_))
-                && event.paths.iter().any(|event_path| {
-                    event_path == &parent_path || event_path == &canonical_parent
-                });
             let is_file_change = is_change
                 && !is_metadata
-                && (is_dir_data_change
-                    || file_name.as_deref().is_some_and(|name| {
-                        event
-                            .paths
-                            .iter()
-                            .any(|event_path| event_path.file_name() == Some(name))
-                    }));
+                && file_name.as_deref().is_some_and(|name| {
+                    event
+                        .paths
+                        .iter()
+                        .any(|event_path| event_path.file_name() == Some(name))
+                });
+            // Dropped events (FSEvents `MustScanSubDirs` on a loaded Mac, inotify queue
+            // overflow) arrive as an `EventKind::Other` rescan notice that names no
+            // file: the append may be among them, so re-read. A read never drops events.
+            let is_rescan = event.need_rescan();
             let signal = if is_parent_reset {
                 callback_reset.store(true, Ordering::Release);
                 true
             } else {
-                is_file_change
+                is_file_change || is_rescan
             };
             if signal {
                 // best-effort: a full queue records a pending read; a disconnected
