@@ -1961,6 +1961,19 @@ impl Span {
     }
 }
 
+/// Theme-slot names a [`Span::slot`] may carry. The host maps each name to one
+/// of its own foreground palette colors; a name outside this list falls back to
+/// the span's [`StyleRole`]. Background and border slots are deliberately absent.
+pub const SPAN_SLOTS: [&str; 7] = [
+    "text",
+    "dim",
+    "faint",
+    "accent",
+    "activity_active",
+    "activity_waiting",
+    "activity_done",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct View {
     /// The single-line content — the v0.2 compat path an older plugin keeps
