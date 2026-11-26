@@ -1673,10 +1673,27 @@ mod tests {
         // That liveness probe connected once; drain it from the backlog so the
         // round-trip below accepts the real client.
         let (probe, probe_info) = listener.accept_stream_with_info().await.unwrap();
-        assert_eq!(
-            probe_info.peer,
-            PeerIdentity::UnixEuid(effective_uid().unwrap())
-        );
+        // The probe already hung up. Linux keeps the peer credentials captured at
+        // connect time; macOS' getpeereid fails with ENOTCONN once the peer has
+        // closed, so there the identity is legitimately `Unavailable` (fail-closed).
+        if cfg!(target_os = "macos") {
+            assert!(
+                matches!(
+                    &probe_info.peer,
+                    PeerIdentity::Unavailable(_) | PeerIdentity::UnixEuid(_)
+                ),
+                "{:?}",
+                probe_info.peer
+            );
+            if let PeerIdentity::UnixEuid(uid) = probe_info.peer {
+                assert_eq!(uid, effective_uid().unwrap());
+            }
+        } else {
+            assert_eq!(
+                probe_info.peer,
+                PeerIdentity::UnixEuid(effective_uid().unwrap())
+            );
+        }
         drop(probe);
 
         // Round-trip a byte each way through connect/accept.
