@@ -1218,12 +1218,24 @@ impl PrivateDir {
             if append {
                 flags |= OFlag::O_APPEND;
             }
-            let fd = openat(
-                &self.fd,
-                name_path,
-                flags,
-                nix::sys::stat::Mode::from_bits_truncate(0o600),
-            )
+            // An `O_CREAT` open in a directory this handle still pins cannot
+            // legitimately see ENOENT; macOS reports it transiently while another
+            // thread mutates the directory, so retry briefly before reporting.
+            let mut attempts = 0u32;
+            let fd = loop {
+                match openat(
+                    &self.fd,
+                    name_path,
+                    flags,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                ) {
+                    Err(nix::errno::Errno::ENOENT) if attempts < 5 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    other => break other,
+                }
+            }
             .map_err(|error| {
                 if error == nix::errno::Errno::EISDIR {
                     std::io::Error::new(
@@ -2528,6 +2540,15 @@ fn restrict(path: &Path, unix_mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Skip a redundant chmod: concurrent writers all re-assert the same mode on
+        // a shared registry root, and on macOS a chmod racing an `openat(O_CREAT)`
+        // in that directory can make the open fail spuriously with ENOENT.
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.is_dir()
+            && meta.permissions().mode() & 0o7777 == unix_mode
+        {
+            return Ok(());
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(unix_mode))
     }
     #[cfg(windows)]

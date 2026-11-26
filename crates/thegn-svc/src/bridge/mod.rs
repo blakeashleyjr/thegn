@@ -2931,14 +2931,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
 
         std::fs::write(dir.join("hello.rs"), b"fn main(){}").unwrap();
-        let ev = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("an fs.event for the new file");
-        assert!(
-            ev.paths.iter().any(|p| p.ends_with("hello.rs")),
-            "event paths: {:?}",
-            ev.paths
-        );
+        // FSEvents (macOS) can replay setup events (the temp dir, `.git/`) ahead of the
+        // write, so skip events until the one naming the new file arrives.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        loop {
+            let ev = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("an fs.event for the new file; saw {seen:?}"));
+            if ev.paths.iter().any(|p| p.ends_with("hello.rs")) {
+                break;
+            }
+            seen.push(ev.paths);
+        }
     }
 
     #[test]

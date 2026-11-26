@@ -753,6 +753,26 @@ impl Leader {
             .expect("unreaped child ownership")
             .kill();
         kill_tracked(&tracked);
+        // macOS answers EPERM (not ESRCH) when signalling a group or pid whose only
+        // member is an exited-but-unreaped zombie. The leader is unreaped here, so
+        // a still-observable exit means there is nothing left to signal.
+        let saw_eperm = [&group_result, &leader_result]
+            .iter()
+            .any(|r| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EPERM)));
+        let leader_gone = cfg!(target_os = "macos")
+            && saw_eperm
+            && matches!(self.exited_without_reaping(), Ok(true));
+        let eperm_is_gone = |error: &io::Error| {
+            cfg!(target_os = "macos") && leader_gone && error.raw_os_error() == Some(libc::EPERM)
+        };
+        let group_result = match group_result {
+            Err(error) if eperm_is_gone(&error) => Ok(()),
+            other => other,
+        };
+        let leader_result = match leader_result {
+            Err(error) if eperm_is_gone(&error) => Ok(()),
+            other => other,
+        };
         match (group_result, leader_result) {
             (Ok(()), leader) => leader,
             (Err(group), leader) if group.raw_os_error() == Some(libc::ESRCH) => leader,
