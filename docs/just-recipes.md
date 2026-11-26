@@ -239,20 +239,21 @@ All A/B or machine-dependent; none are in CI. They refuse a stale or debug binar
 
 The actual release is driven by RELEASING.md and the personal `release-alpha.py`; these recipes are the local rehearsals.
 
-| Recipe                      | Params            | Purpose                                                         | Heavy              | Status  |
-| --------------------------- | ----------------- | --------------------------------------------------------------- | ------------------ | ------- |
-| `release-artifacts`         | `tag`             | Build the host archive and `.sha256` for this machine's target. | Mac                | OK      |
-| `release-verify`            | `tag [host_only]` | Validate that archive, check its interpreter, run it.           | light              | OK      |
-| `release-package-dry-run`   | `tag`             | Render package-manager inputs from synthetic archives.          | light              | OK      |
-| `release-package-validate`  | `tag assets`      | Validate and render a dir of real archives.                     | light              | OK      |
-| `rehearse-packages`         | `[deb rpm ...]`   | Rehearse deb/rpm in Debian, Ubuntu and Fedora containers.       | light (containers) | OK      |
-| `third-party-notices`       |                   | Regenerate THIRD_PARTY_NOTICES.md.                              | light              | OK      |
-| `third-party-notices-check` |                   | Fail when the notices are stale.                                | light              | OK      |
-| `macos-app`                 | `[bin dest]`      | Generate the macOS `thegn.app` launcher.                        | light              | OK      |
-| `icons`                     |                   | Re-render the owl icons from `owl.rs`.                          | light              | OK      |
-| `image-build`               |                   | Build the base sandbox image and load it into podman.           | Mac                | OK      |
-| `image-publish`             | `registry [tag]`  | Push the sandbox image for this arch to a registry.             | Mac                | OK      |
-| `fly-image-publish`         | `registry [tag]`  | Build and push the Fly boot image.                              | Mac                | UNCLEAR |
+| Recipe                          | Params            | Purpose                                                         | Heavy              | Status  |
+| ------------------------------- | ----------------- | --------------------------------------------------------------- | ------------------ | ------- |
+| `release-artifacts`             | `tag`             | Build the host archive and `.sha256` for this machine's target. | Mac                | OK      |
+| `release-verify`                | `tag [host_only]` | Validate that archive, check its interpreter, run it.           | light              | OK      |
+| `release-package-dry-run`       | `tag`             | Render package-manager inputs from synthetic archives.          | light              | OK      |
+| `release-package-validate`      | `tag assets`      | Validate and render a dir of real archives.                     | light              | OK      |
+| `rehearse-packages`             | `[deb rpm ...]`   | Rehearse deb/rpm in Debian, Ubuntu and Fedora containers.       | light (containers) | OK      |
+| `third-party-notices`           |                   | Regenerate THIRD_PARTY_NOTICES.md.                              | light              | OK      |
+| `third-party-notices-from-lock` |                   | Regenerate the notices from Cargo.lock without cargo.           | light              | OK      |
+| `third-party-notices-check`     |                   | Fail when the notices are stale.                                | light              | OK      |
+| `macos-app`                     | `[bin dest]`      | Generate the macOS `thegn.app` launcher.                        | light              | OK      |
+| `icons`                         |                   | Re-render the owl icons from `owl.rs`.                          | light              | OK      |
+| `image-build`                   |                   | Build the base sandbox image and load it into podman.           | Mac                | OK      |
+| `image-publish`                 | `registry [tag]`  | Push the sandbox image for this arch to a registry.             | Mac                | OK      |
+| `fly-image-publish`             | `registry [tag]`  | Build and push the Fly boot image.                              | Mac                | UNCLEAR |
 
 ## Live remote providers (real spend)
 
@@ -313,7 +314,7 @@ symbol was checked in the tree.
 - **`release`** only runs `cargo build --workspace --release`; the name reads as the release process (`release-artifacts`, `release-verify`).
 - **`verify-kani`**: its own comment says it does not compile (Kani's pinned nightly rejects `libsqlite3-sys`'s `cfg_select!`).
 - **`fly-image-publish`**, `image-build`, `image-publish`, `icons`: unreferenced by docs or CI; the Fly devbox was retired 2026-11-20 but the Fly provider image may still be wanted.
-- **Not wired into `test` or `ci`** (by design or by omission): `test-remote-selftest`, `macos-ondevice-selftest`, `plugin-conformance`, `third-party-notices-check`.
+- **Not wired into `test` or `ci`** (by design or by omission): `test-remote-selftest`, `macos-ondevice-selftest`, `plugin-conformance`, `third-party-notices-check`, `third-party-notices-from-lock`.
 
 ### Checked and fine
 
