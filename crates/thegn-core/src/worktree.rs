@@ -2489,7 +2489,11 @@ mod tests {
         let path = allocate_worktree_path(&repo, "feat/a", &cfg).unwrap();
         add_checked(&repo, "feat/a", "main", &path, &cfg).unwrap();
         let inspected = inspect_registered(&repo, &path).unwrap();
-        assert_eq!(inspected.registered_path().as_path(), path);
+        // Git records the realpath (macOS `/tmp` is `/private/tmp`).
+        assert_eq!(
+            inspected.registered_path().as_path(),
+            std::fs::canonicalize(&path).unwrap()
+        );
         assert_eq!(inspected.branch().unwrap().raw(), b"feat/a");
         assert!(inspected.common_dir().as_path().is_absolute());
         assert!(inspected.admin_dir().as_path().is_absolute());
@@ -2519,6 +2523,17 @@ mod tests {
         raw.extend_from_slice(b"/thegn-raw-\n");
         raw.push(0xff);
         let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        // APFS and HFS+ reject names that are not valid UTF-8 (EILSEQ), so
+        // there is no such worktree path to preserve on macOS: skip there.
+        match std::fs::create_dir(&path) {
+            Ok(()) => std::fs::remove_dir(&path).unwrap(),
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                eprintln!("skipping: filesystem rejects non-UTF-8 names: {error}");
+                let _ = std::fs::remove_dir_all(&repo);
+                return;
+            }
+            Err(error) => panic!("unexpected scratch collision: {error}"),
+        }
         assert!(
             util::git_cmd(&repo)
                 .args(["worktree", "add", "-q", "--detach"])
@@ -2531,7 +2546,7 @@ mod tests {
         let inspected = inspect_registered(&repo, &path).unwrap();
         assert_eq!(
             inspected.registered_path().as_bytes(),
-            path.as_os_str().as_bytes()
+            std::fs::canonicalize(&path).unwrap().as_os_str().as_bytes()
         );
         assert!(inspected.branch().is_none());
         let _ = util::git_cmd(&repo)
