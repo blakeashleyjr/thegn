@@ -1848,6 +1848,34 @@ fn plugin_view_is_host_rendered_with_semantic_roles() {
 }
 
 #[test]
+fn plugin_span_slots_resolve_through_palette_with_role_fallback() {
+    use thegn_core::plugin_api::{SPAN_SLOTS, Span, StyleRole};
+
+    // Every advertised slot name resolves on the host, so the schema list and
+    // the runtime cannot drift apart.
+    for name in SPAN_SLOTS {
+        assert!(plugin_span_slot(name).is_some(), "unmapped slot {name}");
+    }
+    // A known slot takes the palette color, not the role color.
+    let dim = Span::slotted("x", StyleRole::Default, "dim");
+    assert_eq!(plugin_span_color(&dim, theme::TEAL), col(S::Dim));
+    // The accent slot follows the per-worktree accent passed in, as the role does.
+    let accent = Span::slotted("x", StyleRole::Default, "accent");
+    assert_eq!(
+        plugin_span_color(&accent, theme::TEAL),
+        theme_color(theme::TEAL)
+    );
+    // Unknown names, background-ish names and missing slots keep the role color.
+    let unknown = Span::slotted("x", StyleRole::Warning, "bg0");
+    assert_eq!(
+        plugin_span_color(&unknown, theme::TEAL),
+        plugin_role_color(StyleRole::Warning, theme::TEAL)
+    );
+    let none = Span::styled("x", StyleRole::Faint);
+    assert_eq!(plugin_span_color(&none, theme::TEAL), col(S::Faint));
+}
+
+#[test]
 fn center_tabs_show_worktree_label_and_chips() {
     let mut s = Surface::new(80, 2);
     let model = FrameModel {

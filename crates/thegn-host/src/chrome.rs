@@ -281,12 +281,47 @@ pub fn draw_plugin_view(
         if x >= max_x {
             break;
         }
-        let fg = plugin_role_color(span.role, accent_rgb);
+        let fg = plugin_span_color(span, accent_rgb);
         let bg = col(S::Bg1);
         let max_cols = max_x.saturating_sub(x);
         let clipped = crate::seg::take_cols(&span.text, max_cols);
         draw_text(surface, x, rect.y, clipped, fg, bg, max_cols);
         x += crate::seg::cells(clipped);
+    }
+}
+
+/// Map a plugin span slot name (see `SPAN_SLOTS`) to a host foreground slot.
+/// Unknown names map to `None`, which the caller treats as the role fallback.
+fn plugin_span_slot(name: &str) -> Option<S> {
+    Some(match name {
+        "text" => S::Text,
+        "dim" => S::Dim,
+        "faint" => S::Faint,
+        "accent" => S::Accent,
+        "activity_active" => S::ActivityActive,
+        "activity_waiting" => S::ActivityWaiting,
+        "activity_done" => S::ActivityDone,
+        _ => return None,
+    })
+}
+
+/// Foreground color for one plugin span. A known slot resolves through the
+/// live palette, so it follows theme reloads and light/dark switches. A slot
+/// that resolves to the surface background would make the text invisible, so
+/// it falls back to the role color, as do unknown slots and spans with no slot.
+fn plugin_span_color(span: &thegn_core::plugin_api::Span, accent_rgb: &str) -> ColorAttribute {
+    let role_color = || plugin_role_color(span.role, accent_rgb);
+    let Some(slot) = span.slot.as_deref().and_then(plugin_span_slot) else {
+        return role_color();
+    };
+    let same_as_surface = with_palette(|p| slot_rgb(p, slot) == slot_rgb(p, S::Bg1));
+    if same_as_surface {
+        return role_color();
+    }
+    if slot == S::Accent {
+        theme_color(accent_rgb)
+    } else {
+        col(slot)
     }
 }
 
