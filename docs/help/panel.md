@@ -449,6 +449,18 @@ for two accounts stay separate. With
 its PR merges raises an `automation_failed` inbox notification with the error
 redacted; the same issue and error are reported once.
 
+The list is scoped to one team by default: the team of the issue linked to
+the active worktree, else the team with the most issues. The scope shows in
+the header (`[team THE]`) and `T` cycles each team, then all teams. A
+configured Linear `team_id` already limits what is fetched. `↵` opens a
+detail page for the issue: state, assignee, labels, priority, project,
+blockers and link, with the description and comments rendered as light
+markdown. The page shows the cached fields at once and fetches the full
+issue from the tracker; a failed fetch says so and keeps the cached fields.
+`↵` again returns to the list, and while the page is open `l`, `o` and `b`
+act on that issue. `l` links or unlinks the issue to the active worktree (a
+`◈` marks linked rows); `o` opens it in the browser.
+
 {{keys:issues}}
 
 ### problems — diagnostics

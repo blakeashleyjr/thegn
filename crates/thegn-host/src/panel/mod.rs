@@ -1259,6 +1259,15 @@ impl FilePreview {
     }
 }
 
+/// The tracker's full record for the open Issues detail page, fetched off-loop
+/// when `↵` opens it (`handlers::tracker::toggle_detail`). `detail` is
+/// `Err(message)` when the fetch failed.
+#[derive(Debug, Clone)]
+pub struct IssueDetailLoad {
+    pub id: String,
+    pub detail: Result<thegn_core::issue::IssueDetail, String>,
+}
+
 /// The panel's interactive state, owned by the event loop.
 ///
 /// Not `Clone`: `docs` carries an hour of telemetry history (~620 KiB), and this
@@ -1343,6 +1352,16 @@ pub struct PanelUi {
     pub issues_filter: String,
     /// Optional project/sprint ID filter for the Issues section (`f` key cycles).
     pub issues_project_filter: Option<String>,
+    /// Team-key scope for the Issues section (`T` key cycles). `None` = the
+    /// default scope (the active worktree's team, else the commonest team);
+    /// `Some("")` = every team; `Some(key)` = that team only.
+    pub issues_team: Option<String>,
+    /// Id of the issue whose detail page is open in the Issues section (`↵`
+    /// toggles). `None` = the list.
+    pub issues_detail: Option<String>,
+    /// The API fetch for `issues_detail` (description + comments). `None`
+    /// while it is in flight; a load for another id is ignored.
+    pub issues_detail_loaded: Option<IssueDetailLoad>,
     /// Row cursor within the Notifications section's list.
     pub notifications_cursor: usize,
     /// Expanded notification id in the compact inbox views.
@@ -1405,6 +1424,9 @@ impl Default for PanelUi {
             tasks_cursor: 0,
             issues_filter: String::new(),
             issues_project_filter: None,
+            issues_team: None,
+            issues_detail: None,
+            issues_detail_loaded: None,
             notifications_cursor: 0,
             notifications_expanded: None,
             notifications_show_read: false,

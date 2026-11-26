@@ -132,13 +132,15 @@ const FILES: &[SectionKey] = &[
     k('O', "O", "editor"),
     k('y', "y", "yazi"),
 ];
+// The strip fits six: `j/k`, `D` (dispatch) and `r` (refresh) still work; the
+// half and full views' hint rows list `D` and `r`.
 const ISSUES: &[SectionKey] = &[
-    nav("j/k", "row"),
-    nav("↵", "link"),
+    nav("↵", "details"),
+    k('l', "l", "link"),
+    k('T', "T", "team"),
     k('o', "o", "browser"),
     k('a', "a", "assign me"),
     k('b', "b", "branch"),
-    k('D', "D", "dispatch"),
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
