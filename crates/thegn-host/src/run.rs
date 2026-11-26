@@ -23502,43 +23502,34 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.help.hits.clear();
                                     panel_ui.help.selected = 0;
                                     panel_ui.scroll = 0;
+                                    // Land on the matched section's heading,
+                                    // rendered at the docked panel's width.
                                     if let Some(section) = hit.snippet.and_then(|sn| sn.section)
                                         && let Some(reg) = panel_ui.help.reg.as_ref()
                                     {
-                                        let page = panel_ui.help.page.as_str();
-                                        let blocks = crate::help::render::page_blocks(reg, page);
-                                        let width = panel_geom(&chrome, &model).0.saturating_sub(
+                                        let indent =
                                             if panel_ui.width == crate::layout::PanelWidth::Full {
                                                 2
                                             } else {
                                                 3
-                                            },
+                                            };
+                                        let width = panel_geom(&chrome, &model)
+                                            .0
+                                            .saturating_sub(indent)
+                                            .saturating_sub(1)
+                                            .max(8);
+                                        let blocks = crate::help::render::page_blocks(
+                                            reg,
+                                            &panel_ui.help.page,
                                         );
                                         let rendered =
                                             crate::help::render::render_page(&blocks, width, None);
-                                        if let Some(index) = rendered
+                                        if let Some((line, _)) = rendered
                                             .headings
                                             .iter()
-                                            .position(|(_, heading)| heading == &section)
+                                            .find(|(_, heading)| *heading == section)
                                         {
-                                            panel_ui.scroll =
-                                                crate::panel::sections::help::scroll_for_anchor(
-                                                    reg,
-                                                    page,
-                                                    panel_geom(&chrome, &model).0.saturating_sub(
-                                                        if panel_ui.width
-                                                            == crate::layout::PanelWidth::Full
-                                                        {
-                                                            2
-                                                        } else {
-                                                            3
-                                                        },
-                                                    ),
-                                                    Some(crate::help::HelpAnchor {
-                                                        heading: index,
-                                                        offset: 0,
-                                                    }),
-                                                );
+                                            panel_ui.scroll = *line;
                                         }
                                     }
                                 } else {
@@ -23546,7 +23537,9 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.help.query.clear();
                                 }
                             }
-                            (KeyCode::Char(c), Modifiers::NONE) => {
+                            (KeyCode::Char(c), m)
+                                if !m.intersects(Modifiers::CTRL | Modifiers::ALT) =>
+                            {
                                 panel_ui.help.query.push(*c);
                                 panel_ui.help.hits =
                                     panel_ui.help.reg.as_ref().map_or_else(Vec::new, |reg| {

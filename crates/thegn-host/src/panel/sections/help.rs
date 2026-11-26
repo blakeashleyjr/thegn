@@ -132,6 +132,10 @@ pub(crate) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 };
                 let mut text = format!("{marker}{}", hit.title);
                 if let Some(snippet) = &hit.snippet {
+                    if let Some(section) = &snippet.section {
+                        text.push_str(" › ");
+                        text.push_str(section);
+                    }
                     text.push_str(" — ");
                     text.push_str(&snippet.text);
                 }

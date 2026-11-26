@@ -24,6 +24,11 @@ Every bindable action id SHALL be claimed by some non-generated page's `actions:
 - **WHEN** an `ActionSpec` is added and no page claims its id
 - **THEN** the action-docs ratchet fails
 
+#### Scenario: Claimed but unwritten
+
+- **WHEN** a page claims an id its body never mentions
+- **THEN** the prose ratchet fails
+
 ### Requirement: Docked Help exposes corpus search
 
 The docked Help section SHALL show a right-aligned search field in its header.
@@ -36,8 +41,3 @@ through matches and open a result in the docked panel at its matched section.
 - **WHEN** the Help section has focus and the user presses `/`
 - **THEN** the header field accepts a query, displays matching pages, and Enter
   opens the selected match in the docked Help panel
-
-#### Scenario: Claimed but unwritten
-
-- **WHEN** a page claims an id its body never mentions
-- **THEN** the prose ratchet fails
