@@ -134,6 +134,11 @@ pub(crate) struct SidebarState {
     pub(crate) recently_deleted: std::collections::HashMap<String, Option<u64>>,
     /// THE-2463 Q1: the preview project row a pending create added: (seq, repo path).
     pub(crate) create_preview: Option<(u64, String)>,
+    /// THE-2737: the focused tab the user just marked unread. The loop's
+    /// focus-ack skips it so the filled dot is not re-read on the very next
+    /// frame; cleared once focus leaves the tab or its dot leaves `Waiting`,
+    /// so focusing it again reads it as normal. Loop-side only, never persisted.
+    pub(crate) unread_hold: Option<String>,
 }
 
 impl SidebarState {

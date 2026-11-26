@@ -108,8 +108,10 @@ checkout in it is not a live worktree, so it gets no row.
 - `p` — pin to top
 - `u` — mark unread: turn a hollow (seen) dot back to its filled amber/red
   state until you focus the tab again. Acts on every marked row, else the
-  cursor row; a row with no dot is left alone. Also in the row menu and the
-  palette ("Mark worktree unread").
+  cursor row (on a batch row, every member of the batch); a row with no dot
+  is left alone. Also in the row menu and the palette ("Mark worktree
+  unread"); from a pane the palette action marks the focused tab, which
+  stays filled until you leave it and come back.
 - `s` — sort menu: manual / name / recent / attention / live (live orders
   worktrees by most-recent process/agent activity, newest first). The
   active mode is always on screen: it is the quiet word at the right of

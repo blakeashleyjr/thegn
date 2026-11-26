@@ -15899,10 +15899,28 @@ async fn event_loop<T: Terminal>(
         // off-thread so the file write never stalls the loop. The
         // `last_acked_tab` guard only suppresses the redundant re-spawn in the
         // ~1s before hydration reflects the new `Read` state back into the model.
+        // A "mark unread" on the focused tab (THE-2737) holds it out of the ack
+        // until focus leaves it or its dot leaves the waiting/seen pair (work
+        // resumed). A stale `Read` from a hydration that predates the unread
+        // write must not drop the hold.
+        let release_hold = sb.unread_hold.as_deref().is_some_and(|hold| {
+            session.active_group().map(|g| g.name.as_str()) != Some(hold)
+                || !matches!(
+                    model.sidebar_status.activity.get(hold),
+                    Some(
+                        crate::sidebar::ActivityState::Waiting
+                            | crate::sidebar::ActivityState::Read
+                    )
+                )
+        });
+        if release_hold {
+            sb.unread_hold = None;
+        }
         if let Some(name) = session.active_group().map(|g| g.name.clone())
             && model.sidebar_status.activity.get(&name)
                 == Some(&crate::sidebar::ActivityState::Waiting)
             && last_acked_tab.as_deref() != Some(name.as_str())
+            && sb.unread_hold.as_deref() != Some(name.as_str())
         {
             last_acked_tab = Some(name.clone());
             task::spawn_blocking(move || thegn_core::activity::ack(&name));

@@ -1210,7 +1210,8 @@ impl SidebarState {
     }
 
     /// `u`: return seen (hollow) dots to unread on every marked worktree row
-    /// (batch members included), else the cursor row.
+    /// (batch members included), else the cursor row — or, on a batch row,
+    /// every member of the batch.
     pub(crate) fn mark_unread_selection(
         &mut self,
         model: &mut FrameModel,
@@ -1222,11 +1223,26 @@ impl SidebarState {
             .filter(|r| self.marked.contains(&r.pin_key))
             .filter_map(|r| Self::row_tab_name(r, session))
             .collect();
-        if tabs.is_empty() {
-            tabs.extend(
-                self.selected_row(model)
-                    .and_then(|r| Self::row_tab_name(r, session)),
-            );
+        if tabs.is_empty()
+            && let Some(row) = self.selected_row(model)
+        {
+            if row.kind == crate::sidebar::RowKind::BatchGroup {
+                // A batch row stands for its members: the following rows
+                // deeper than it (collapsed members included).
+                let depth = row.depth;
+                let key = row.pin_key.clone();
+                let rows = &model.sidebar_rows;
+                if let Some(h) = rows.iter().position(|r| r.pin_key == key) {
+                    tabs.extend(
+                        rows[h + 1..]
+                            .iter()
+                            .take_while(|r| r.depth > depth)
+                            .filter_map(|r| Self::row_tab_name(r, session)),
+                    );
+                }
+            } else {
+                tabs.extend(Self::row_tab_name(row, session));
+            }
         }
         self.mark_unread_tabs(tabs, model, session)
     }
@@ -1259,6 +1275,13 @@ impl SidebarState {
                 .insert(t.clone(), crate::sidebar::ActivityState::Waiting);
         }
         model.status = format!("Marked {} unread", flip.len());
+        // The focused tab would be re-acked by the loop on the next frame;
+        // hold it filled until the user leaves and focuses it again.
+        if let Some(active) = session.active_group().map(|g| g.name.as_str())
+            && flip.iter().any(|t| t == active)
+        {
+            self.unread_hold = Some(active.to_string());
+        }
         std::thread::spawn(move || {
             for t in &flip {
                 thegn_core::activity::mark_unread(t);
