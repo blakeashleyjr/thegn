@@ -134,8 +134,13 @@ pub fn is_hangup(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::BrokenPipe {
         return true;
     }
-    matches!(error.raw_os_error(), Some(libc::EIO | libc::EPIPE))
+    matches!(error.raw_os_error(), Some(ERRNO_EIO | ERRNO_EPIPE))
 }
+
+// `libc` is only a macOS dependency of this crate, so spell out the errnos.
+// EIO is 5 and EPIPE is 32 on Linux, macOS and the Windows CRT alike.
+const ERRNO_EIO: i32 = 5;
+const ERRNO_EPIPE: i32 = 32;
 
 #[cfg(test)]
 mod tests {
@@ -194,11 +199,11 @@ mod tests {
 
     impl std::io::Write for EioWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
+            Err(std::io::Error::from_raw_os_error(super::ERRNO_EIO))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
+            Err(std::io::Error::from_raw_os_error(super::ERRNO_EIO))
         }
     }
 
@@ -219,10 +224,10 @@ mod tests {
     #[test]
     fn is_hangup_recognises_terminal_loss_only() {
         assert!(super::is_hangup(&std::io::Error::from_raw_os_error(
-            libc::EIO
+            super::ERRNO_EIO
         )));
         assert!(super::is_hangup(&std::io::Error::from_raw_os_error(
-            libc::EPIPE
+            super::ERRNO_EPIPE
         )));
         assert!(super::is_hangup(&std::io::Error::from(
             std::io::ErrorKind::BrokenPipe
