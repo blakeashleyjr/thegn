@@ -75,6 +75,15 @@ crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
+# inferno (CDDL-1.0, weak copyleft) arrives only through `pprof`'s flamegraph
+# feature, behind thegn-host's off-by-default `profiling` feature. Release and
+# CI builds never enable it, so no CDDL code ships. Exit: drop this if
+# `profiling` is ever enabled in a shipped build, or move to pprof's protobuf
+# output.
+[[licenses.exceptions]]
+allow = ["CDDL-1.0"]
+crate = "inferno"
+
 [bans]
 # Duplicate versions stay a cargo-deny warning; Cargo.lock carries many
 # duplicated names (including dependencies across targets), pinned in
