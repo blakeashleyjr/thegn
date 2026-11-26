@@ -979,8 +979,18 @@ mod tests {
         assert!(cmd.contains("-E -z -r winch"));
         // Assert the raw command is in both the dtach execution and the fallback
         assert!(cmd.contains("exec echo hello"));
-        assert!(cmd.contains("; else printf '%s\\n' 'thegn: no usable dtach on this host"));
-        assert!(cmd.contains("; exec echo hello; fi"));
+        // The pane command is the script re-quoted as one `sh -lc` argument, so
+        // single quotes inside it appear escaped; assert the fallback on the
+        // unquoted script and that the pane command is exactly its quoting.
+        let raw = util::sh_join(&argv);
+        let script =
+            remote_launch_script(TransportKind::Ssh, &dtach_session_id("dev@box", &raw), &raw);
+        assert!(script.contains("; else printf '%s\\n' 'thegn: no usable dtach on this host"));
+        assert!(script.contains("; exec echo hello; fi"));
+        assert_eq!(
+            *cmd,
+            util::sh_join(&["/bin/sh".to_string(), "-lc".to_string(), script])
+        );
     }
 
     #[test]
