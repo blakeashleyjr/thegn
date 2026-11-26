@@ -3984,6 +3984,7 @@ pub fn run(
     outln!("  language      {}", cfg.voice.language);
     outln!("  model         {}", cfg.voice.model);
     outln!("  native build  {}", voice["native_compiled"]);
+    outln!("  Hex CLI       {}", voice["hex_found"]);
     outln!("  live preview  {}", voice["live_preview"]);
     outln!("  credential    {}", voice["credential_configured"]);
     let gate_quarantines = crate::integrate::gate_quarantines();

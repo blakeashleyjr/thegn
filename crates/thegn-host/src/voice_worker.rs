@@ -161,7 +161,9 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
                 &thegn_voice::wav(samples),
                 &flag,
             )?),
-            VoiceKind::Command => bail!("command transcription belongs to the parent adapter"),
+            VoiceKind::Command | VoiceKind::Hex => {
+                bail!("command transcription belongs to the parent adapter")
+            }
         }
     };
     loop {
@@ -173,7 +175,10 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         if stop.load(Ordering::Acquire) || closed {
             break;
         }
-        if cfg.live_preview && cfg.kind != VoiceKind::Command && end >= decoded_end + PREVIEW_STEP {
+        if cfg.live_preview
+            && !matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex)
+            && end >= decoded_end + PREVIEW_STEP
+        {
             let (start, samples, _) = capture.snapshot(Some(WINDOW_SAMPLES))?;
             let end = start + samples.len();
             let began = Instant::now();
@@ -201,7 +206,7 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
         }
     }
     capture.close()?;
-    if cfg.kind == VoiceKind::Command {
+    if matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex) {
         use base64::Engine;
         if cancel.load(Ordering::Acquire) {
             return Ok(());

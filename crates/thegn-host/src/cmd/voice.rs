@@ -20,7 +20,7 @@ pub enum Action {
         language: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, default_value="embedded", value_parser=["embedded","http","command"])]
+        #[arg(long, default_value="embedded", value_parser=["embedded","http","command","hex"])]
         kind: String,
         #[arg(long)]
         endpoint: Option<String>,
@@ -73,7 +73,12 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
         "model": cfg.model, "model_path": path.as_ref().map(|p|p.display().to_string()),
         "model_error": model_error,
         "model_present": path.is_some_and(|p|p.is_file()), "native_compiled": cfg!(feature="voice-native"),
-        "metal_compiled": cfg!(feature="voice-metal"), "live_preview": cfg.live_preview && cfg.kind != VoiceKind::Command && native_capture && cfg!(feature="voice-native"),
+        "metal_compiled": cfg!(feature="voice-metal"),
+        "live_preview": cfg.live_preview
+            && !matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex)
+            && native_capture
+            && cfg!(feature="voice-native"),
+        "hex_found": thegn_core::util::which_path("hex").is_some(),
         "credential_configured": cfg.credential.is_some(), "timeout_seconds": cfg.request_timeout().as_secs(),
         "setup": "thegn voice setup; experimental channel required; model presence does not prove microphone/inference readiness"
     })
@@ -186,7 +191,9 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             let provider = match kind.as_str() {
                 "embedded" => VoiceKind::Embedded,
                 "http" => VoiceKind::Http,
-                _ => VoiceKind::Command,
+                "command" => VoiceKind::Command,
+                "hex" => VoiceKind::Hex,
+                _ => unreachable!("clap validates voice provider kind"),
             };
             let mut voice = cfg.voice.clone();
             voice.enabled = true;
@@ -251,6 +258,16 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                     anyhow::ensure!(
                         cfg!(feature = "voice-native") || !voice.capture_command.is_empty(),
                         "command transcription needs native capture or [voice] capture_command"
+                    );
+                }
+                VoiceKind::Hex => {
+                    anyhow::ensure!(
+                        cfg!(feature = "voice-native") || !voice.capture_command.is_empty(),
+                        "Hex transcription needs native capture or [voice] capture_command"
+                    );
+                    anyhow::ensure!(
+                        thegn_core::util::which_path("hex").is_some(),
+                        "Hex CLI not found on PATH; install with `brew install --cask anomalyco/tap/hex`, `yay -S hex-bin`, `nix profile add github:anomalyco/hex`, or the Linux install script at https://anoma.ly/hex/install-linux.sh"
                     );
                 }
             }
@@ -342,6 +359,7 @@ mod tests {
             "native_compiled",
             "metal_compiled",
             "live_preview",
+            "hex_found",
             "credential_configured",
             "timeout_seconds",
             "setup",

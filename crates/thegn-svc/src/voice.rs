@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use thegn_core::config::VoiceConfig;
+use thegn_core::config::{VoiceConfig, VoiceKind};
 use thegn_core::seam::{Availability, Probe, ProbeReport};
 use thegn_core::voice::{VoiceCaps, VoiceError, VoiceProvider};
 
@@ -54,12 +54,23 @@ impl CommandVoiceProvider {
             Availability::Unavailable(format!("{label} executable not found: {program}"))
         }
     }
+
+    fn command_argv(cfg: &VoiceConfig) -> Vec<String> {
+        if !cfg.command.is_empty() {
+            cfg.command.clone()
+        } else if cfg.kind == VoiceKind::Hex {
+            vec!["hex".into(), "transcribe".into(), "{wav}".into()]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Probe for CommandVoiceProvider {
     fn probe(&self) -> ProbeReport {
         let capture = Self::availability(&self.cfg.capture_command, "capture command");
-        let transcriber = Self::availability(&self.cfg.command, "transcriber command");
+        let command = Self::command_argv(&self.cfg);
+        let transcriber = Self::availability(&command, "transcriber command");
         let availability = if self.cfg.capture_command.is_empty() && transcriber.is_ready() {
             Availability::Degraded(
                 "native capture selected; verify host native build status".into(),
@@ -81,7 +92,11 @@ impl Probe for CommandVoiceProvider {
                 cancellation: true,
                 ..VoiceCaps::default()
             })
-            .note("argv-only command adapter; no bundled STT in this adapter; optional native capture in host builds")
+            .note(if self.cfg.kind == VoiceKind::Hex {
+                "Hex uses `hex transcribe <temporary WAV>`; install Hex with Homebrew, AUR, Nix, or its Linux install script"
+            } else {
+                "argv-only command adapter; no bundled STT in this adapter; optional native capture in host builds"
+            })
     }
 }
 
@@ -138,10 +153,39 @@ impl CommandVoiceProvider {
                 "capture output is not a RIFF/WAVE file".into(),
             ));
         }
-        let Some(program) = self.cfg.command.first() else {
+        let command_argv = Self::command_argv(&self.cfg);
+        let Some(program) = command_argv.first() else {
             return Err(VoiceError::NotConfigured);
         };
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(self.cfg.command.clone());
+        let file_input = command_argv.iter().any(|arg| arg == "{wav}");
+        let wav_file = if file_input {
+            let mut file = tempfile::Builder::new()
+                .prefix("thegn-voice-")
+                .suffix(".wav")
+                .tempfile()
+                .map_err(|e| VoiceError::Failed(format!("create temporary WAV: {e}")))?;
+            file.write_all(wav)
+                .map_err(|e| VoiceError::Failed(format!("write temporary WAV: {e}")))?;
+            Some(file)
+        } else {
+            None
+        };
+        let command_argv = command_argv
+            .into_iter()
+            .map(|arg| {
+                if arg == "{wav}" {
+                    wav_file
+                        .as_ref()
+                        .expect("WAV placeholder creates a temporary file")
+                        .path()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    arg
+                }
+            })
+            .collect();
+        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(command_argv);
 
         if cancelled.load(Ordering::Acquire) {
             return Err(VoiceError::Failed("transcriber cancelled".into()));
@@ -153,18 +197,24 @@ impl CommandVoiceProvider {
         crate::plugin::proc::set_process_group(&mut command);
         let mut child = command
             .args(&argv[1..])
-            .stdin(Stdio::piped())
+            .stdin(if file_input { Stdio::null() } else { Stdio::piped() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| VoiceError::NotInstalled(format!("{program}: {e}")))?;
-        let mut stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                terminate_child(child, &on_reaped);
-                return Err(VoiceError::Failed("transcriber stdin unavailable".into()));
-            }
-        };
+            .map_err(|e| {
+                if self.cfg.kind == VoiceKind::Hex {
+                    VoiceError::NotInstalled(format!(
+                        "Hex CLI not found or could not start ({program}: {e}); install with `brew install --cask anomalyco/tap/hex`, `yay -S hex-bin`, `nix profile add github:anomalyco/hex`, or the Linux install script at https://anoma.ly/hex/install-linux.sh"
+                    ))
+                } else {
+                    VoiceError::NotInstalled(format!("{program}: {e}"))
+                }
+            })?;
+        let stdin = if file_input { None } else { child.stdin.take() };
+        if !file_input && stdin.is_none() {
+            terminate_child(child, &on_reaped);
+            return Err(VoiceError::Failed("transcriber stdin unavailable".into()));
+        }
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -197,8 +247,12 @@ impl CommandVoiceProvider {
         let (write_tx, write_rx) = mpsc::channel();
         let wav = wav.to_vec();
         let write_thread = thegn_core::thread_name::spawn_named("thegn-stt-wav", move || {
-            let result = stdin.write_all(&wav).map_err(|e| format!("write WAV: {e}"));
-            drop(stdin);
+            let result = match stdin {
+                Some(mut stdin) if !file_input => {
+                    stdin.write_all(&wav).map_err(|e| format!("write WAV: {e}"))
+                }
+                _ => Ok(()),
+            };
             let _ = write_tx.send(result);
         });
         let workers = TranscriberWorkers {
@@ -468,6 +522,58 @@ mod tests {
         let report = CommandVoiceProvider::new(VoiceConfig::default()).probe();
         assert!(report.availability.is_unavailable());
         assert!(report.notes.iter().any(|n| n.contains("no bundled STT")));
+    }
+
+    #[test]
+    fn hex_preset_resolves_to_file_based_cli_contract() {
+        let cfg = VoiceConfig {
+            kind: VoiceKind::Hex,
+            ..Default::default()
+        };
+        assert_eq!(
+            CommandVoiceProvider::command_argv(&cfg),
+            vec![
+                "hex".to_owned(),
+                "transcribe".to_owned(),
+                "{wav}".to_owned()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hex_cli_receives_temporary_wav_path_and_no_audio_on_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hex");
+        let used_path = dir.path().join("used-path");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = transcribe ] || exit 10\n[ \"$(wc -c < \"$2\")\" -eq 12 ] || exit 11\n[ ! -s /dev/stdin ] || exit 12\nprintf '%s' \"$2\" > '{}'\nprintf 'hex transcript'\n",
+                used_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cfg = VoiceConfig {
+            kind: VoiceKind::Hex,
+            command: vec![
+                script.to_string_lossy().into_owned(),
+                "transcribe".into(),
+                "{wav}".into(),
+            ],
+            ..Default::default()
+        };
+        let provider = CommandVoiceProvider::new(cfg);
+        assert_eq!(
+            provider.transcribe_push_to_talk(b"RIFF0000WAVE").unwrap(),
+            "hex transcript"
+        );
+        let used_path = std::fs::read_to_string(used_path).unwrap();
+        assert!(used_path.ends_with(".wav"));
+        assert!(!std::path::Path::new(&used_path).exists());
     }
 
     #[test]

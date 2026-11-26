@@ -18,7 +18,7 @@ auto-submitted.
 Line breaks and control characters in a transcript are inserted as spaces.
 
 Run `thegn voice setup --language en` to configure a provider and model. Use
-`--kind embedded` (the default), `--kind http`, or `--kind command`; setup saves
+`--kind embedded` (the default), `--kind http`, `--kind command`, or `--kind hex`; setup saves
 voice as enabled for that kind. For a catalogue model in the store, embedded
 setup verifies the installed model's size and SHA-256, or offers to download it.
 Setup shows download size
@@ -38,8 +38,9 @@ worker or audio device.
 Release tarball and flake builds omit `voice-native`. In those builds, default
 embedded setup stops with a native-voice build requirement; HTTP setup requires
 `[voice] capture_command`, while command setup requires `[voice] command` and
-also a capture command. Native dictation is available in source builds with
-`voice-native` (or `voice-metal` on Apple silicon).
+also a capture command. Hex setup requires `[voice] capture_command`. Native
+dictation is available in source builds with `voice-native` (or `voice-metal`
+on Apple silicon).
 
 Native embedded and HTTP providers show revisable text in the status line while
 recording. Only the final full-recording transcript reaches a pane. Stopping
@@ -90,6 +91,19 @@ transcription reads WAV on stdin and writes UTF-8 text on stdout. Leaving
 produce a final transcript only. External capture may also feed the HTTP
 provider. Inspect configured commands: they may send audio elsewhere.
 
+## Use Hex for faster local models
+
+Select Hex with `thegn voice setup --kind hex` or set `[voice] kind = "hex"`.
+The built-in Whisper provider remains the default. thegn captures audio using
+native capture or `[voice] capture_command`, writes the WAV to a private,
+short-lived temporary file, and runs `hex transcribe <file>`; Hex prints the
+transcript to stdout. Hex must be installed and available on `PATH`. Install it
+with Homebrew (`brew install --cask anomalyco/tap/hex`), AUR (`yay -S hex-bin`),
+Nix (`nix profile add github:anomalyco/hex`), or the [Linux install
+script](https://anoma.ly/hex/install-linux.sh). Hex may download its selected
+model on first use. Hex transcriptions are final-only and use the configured
+voice deadline.
+
 `thegn voice status` (or `thegn voice status --json`) and `thegn doctor`
 report build and configuration readiness without opening the microphone.
 `thegn voice model list [--json]`,
@@ -97,7 +111,8 @@ report build and configuration readiness without opening the microphone.
 `$XDG_DATA_HOME/thegn/voice/models` (default `~/.local/share/thegn/voice/models`).
 Pull verifies exact size and SHA-256 and installs atomically; Ctrl-C cancels,
 and rerunning retries. An interrupted or corrupt download never replaces an
-installed model. No recordings are stored in the database or on disk.
+installed model. Recordings are not retained in the database or on disk; Hex
+uses a private temporary WAV that is removed after transcription.
 Models come from a pinned whisper.cpp revision on Hugging Face; only model pull
 and embedded setup access that source. The catalogue is `tiny`, `tiny.en`,
 `base`, `base.en`, `small` and `small.en`, about 74, 141 and 465 MiB by size;
