@@ -242,6 +242,12 @@ pub enum Action {
     /// dispatching the configured headless agent on conflicts/red gates.
     DrainMergeQueue,
     OpenPalette,
+    /// Open the command palette already in its `>` mode: fuzzy file-path
+    /// search (the IDE "go to file" / quick open).
+    PaletteFiles,
+    /// Open the command palette already in its `/` mode: file-contents search
+    /// in the focused worktree (the IDE "find in path").
+    PaletteContent,
     /// The runtime launch menu: a dedicated picker of presets, then agents,
     /// tools, and `shell`, launched into the active worktree.
     LaunchMenu,
@@ -678,6 +684,8 @@ impl Action {
             Action::SweepMerged => "sweep-merged",
             Action::DrainMergeQueue => "merge-drain",
             Action::OpenPalette => "palette",
+            Action::PaletteFiles => "palette-files",
+            Action::PaletteContent => "palette-content",
             Action::LaunchMenu => "launch-menu",
             Action::Help => "help",
             Action::Lazygit => "lazygit",
@@ -845,6 +853,8 @@ impl Action {
             "sweep-merged" => Action::SweepMerged,
             "merge-drain" => Action::DrainMergeQueue,
             "palette" | "menu" => Action::OpenPalette,
+            "palette-files" | "go-to-file" => Action::PaletteFiles,
+            "palette-content" | "find-in-path" => Action::PaletteContent,
             "launch-menu" | "launch" => Action::LaunchMenu,
             "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
@@ -1820,17 +1830,18 @@ pub fn default_keymap_with_config(cfg: &thegn_core::config::Config) -> KeyMap {
 pub fn apply_keymap_preset(map: &mut KeyMap, preset: &str) {
     let binds: &[(&str, Action)] = match preset.trim().to_ascii_lowercase().as_str() {
         "vscode" | "vs-code" | "code" => &[
-            ("Ctrl p", Action::OpenPalette), // quick open; palette's All mode includes files
-            ("Ctrl Shift p", Action::OpenPalette), // command palette
-            ("Ctrl b", Action::ToggleSidebar), // toggle side bar
-            ("Ctrl Shift e", Action::FocusSidebar), // explorer focus
-            ("Ctrl Shift g", Action::FocusPanel), // source-control panel
+            ("Ctrl p", Action::PaletteFiles),         // quick open: go to file
+            ("Ctrl Shift p", Action::OpenPalette),    // command palette
+            ("Ctrl Shift f", Action::PaletteContent), // find in files
+            ("Ctrl b", Action::ToggleSidebar),        // toggle side bar
+            ("Ctrl Shift e", Action::FocusSidebar),   // explorer focus
+            ("Ctrl Shift g", Action::FocusPanel),     // source-control panel
         ],
         "jetbrains" | "intellij" | "idea" => &[
-            ("Ctrl Shift a", Action::OpenPalette),   // Find Action
-            ("Ctrl e", Action::OpenPalette),         // Recent Files via the palette
-            ("Ctrl Shift f", Action::SearchReplace), // Find in Path; workspace Search & Replace
-            ("Alt 1", Action::ToggleSidebar),        // Project tool window
+            ("Ctrl Shift a", Action::OpenPalette),    // Find Action
+            ("Ctrl e", Action::OpenPalette),          // Recent Files: All mode lists them first
+            ("Ctrl Shift f", Action::PaletteContent), // Find in Path: palette content mode
+            ("Alt 1", Action::ToggleSidebar),         // Project tool window
         ],
         _ => return,
     };
@@ -2823,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_preset_ctrl_p_opens_the_palette() {
+    fn vscode_preset_ctrl_p_opens_file_search() {
         let cfg = thegn_core::config::Config {
             keymap_preset: "vscode".into(),
             ..Default::default()
@@ -2831,7 +2842,7 @@ mod tests {
         let mut map = default_keymap_for(&cfg, None, None);
         assert_eq!(
             map.dispatch(Mode::Normal, Key::ctrl('p')),
-            MatchResult::Matched(Action::OpenPalette)
+            MatchResult::Matched(Action::PaletteFiles)
         );
         assert_eq!(
             map.dispatch(Mode::Normal, Key::ctrl('b')),
@@ -2886,7 +2897,7 @@ mod tests {
     }
 
     #[test]
-    fn jetbrains_preset_find_in_path_opens_search_replace() {
+    fn jetbrains_preset_find_in_path_opens_content_search() {
         let cfg = thegn_core::config::Config {
             keymap_preset: "jetbrains".into(),
             ..Default::default()
@@ -2897,7 +2908,23 @@ mod tests {
                 Mode::Normal,
                 Key::modified(KeyCode::Char('f'), Modifiers::CTRL | Modifiers::SHIFT)
             ),
-            MatchResult::Matched(Action::SearchReplace)
+            MatchResult::Matched(Action::PaletteContent)
+        );
+    }
+
+    #[test]
+    fn vscode_preset_find_in_files_opens_content_search() {
+        let cfg = thegn_core::config::Config {
+            keymap_preset: "vscode".into(),
+            ..Default::default()
+        };
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('f'), Modifiers::CTRL | Modifiers::SHIFT)
+            ),
+            MatchResult::Matched(Action::PaletteContent)
         );
     }
 
@@ -2907,7 +2934,7 @@ mod tests {
             keymap_preset: "vscode".into(),
             ..Default::default()
         };
-        // A user rebind of Ctrl+p must win over the preset's SearchGlobal.
+        // A user rebind of Ctrl+p must win over the preset's PaletteFiles.
         cfg.keybinds.insert("toggle-panel".into(), "Ctrl p".into());
         let mut map = default_keymap_for(&cfg, None, None);
         assert_eq!(

@@ -26712,7 +26712,9 @@ async fn event_loop<T: Terminal>(
                                     &panel_ui,
                                 );
                             }
-                            Action::OpenPalette => {
+                            action @ (Action::OpenPalette
+                            | Action::PaletteFiles
+                            | Action::PaletteContent) => {
                                 let key = run_palette_db::PaletteKey {
                                     kind: run_palette_db::PaletteKind::Main,
                                     context: session.id.clone(),
@@ -26735,6 +26737,28 @@ async fn event_loop<T: Terminal>(
                                 let mut open_palette =
                                     crate::search_everywhere::PaletteSession::new(items);
                                 open_palette.mark_db_pending(key.cache_id(), generation);
+                                // File and content palette actions open the palette
+                                // already in that mode: typing the mode prefix is
+                                // what switches it, so the query starts empty.
+                                let seed_prefix = match action {
+                                    Action::PaletteFiles => Some('>'),
+                                    Action::PaletteContent => Some('/'),
+                                    _ => None,
+                                };
+                                if let Some(prefix) = seed_prefix {
+                                    let (mode, _query) = open_palette.push_char(prefix);
+                                    crate::search_everywhere::kick_palette_search(
+                                        &mut open_palette,
+                                        mode,
+                                        file_index.as_ref(),
+                                        active_tab_path(&session),
+                                        &current_config,
+                                        lsp_supervisor.handle(),
+                                        &model.panel,
+                                        &panel_ui.tests,
+                                        &waker,
+                                    );
+                                }
                                 palette = Some(open_palette);
                                 let worker_session = session.clone_for_hydrate();
                                 run_palette_db::spawn_load(

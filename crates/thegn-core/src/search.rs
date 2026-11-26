@@ -44,8 +44,6 @@ pub enum SearchScope {
     Worktree,
     /// All worktrees in the active workspace.
     Workspace,
-    /// Every worktree in every open workspace (the entire profile).
-    Profile,
 }
 
 impl SearchScope {
@@ -56,19 +54,17 @@ impl SearchScope {
             SearchScope::Tab => "tab",
             SearchScope::Worktree => "worktree",
             SearchScope::Workspace => "workspace",
-            SearchScope::Profile => "profile",
         }
     }
 
-    /// Cycle to the next wider scope (wraps from Workspace → Pane). `Profile`
-    /// is not part of the cycle (the variant stays; a stray one re-enters at Pane).
+    /// Cycle to the next wider scope (wraps from Workspace → Pane).
     #[must_use]
     pub fn widen(self, pane_id: u32) -> SearchScope {
         match self {
             SearchScope::Pane(_) => SearchScope::Tab,
             SearchScope::Tab => SearchScope::Worktree,
             SearchScope::Worktree => SearchScope::Workspace,
-            SearchScope::Workspace | SearchScope::Profile => SearchScope::Pane(pane_id),
+            SearchScope::Workspace => SearchScope::Pane(pane_id),
         }
     }
 
@@ -80,7 +76,6 @@ impl SearchScope {
             SearchScope::Tab => SearchScope::Pane(pane_id),
             SearchScope::Worktree => SearchScope::Tab,
             SearchScope::Workspace => SearchScope::Worktree,
-            SearchScope::Profile => SearchScope::Workspace,
         }
     }
 }
@@ -753,7 +748,7 @@ mod tests {
         assert_eq!(SearchScope::Pane(id).widen(id), SearchScope::Tab);
         assert_eq!(SearchScope::Tab.widen(id), SearchScope::Worktree);
         assert_eq!(SearchScope::Worktree.widen(id), SearchScope::Workspace);
-        // Profile is skipped: Workspace wraps to Pane.
+        // Workspace wraps to Pane; there is no separate profile scope.
         assert_eq!(SearchScope::Workspace.widen(id), SearchScope::Pane(id));
     }
 
@@ -767,15 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn scope_labels_are_non_empty() {
-        for scope in [
-            SearchScope::Pane(0),
-            SearchScope::Tab,
-            SearchScope::Worktree,
-            SearchScope::Workspace,
-            SearchScope::Profile,
+    fn scopes_have_the_user_facing_labels() {
+        for (scope, label) in [
+            (SearchScope::Pane(0), "pane"),
+            (SearchScope::Tab, "tab"),
+            (SearchScope::Worktree, "worktree"),
+            (SearchScope::Workspace, "workspace"),
         ] {
-            assert!(!scope.label().is_empty());
+            assert_eq!(scope.label(), label);
         }
     }
 
@@ -1222,17 +1216,17 @@ mod tests {
     }
 
     #[test]
-    fn scope_cycle_has_no_profile() {
+    fn scope_cycle_wraps_without_a_profile_scope() {
         let mut s = SearchScope::Pane(1);
-        for _ in 0..8 {
+        for _ in 0..4 {
             s = s.widen(1);
-            assert_ne!(s, SearchScope::Profile);
         }
+        assert_eq!(s, SearchScope::Pane(1));
         let mut s = SearchScope::Pane(1);
-        for _ in 0..8 {
+        for _ in 0..4 {
             s = s.narrow(1);
-            assert_ne!(s, SearchScope::Profile);
         }
+        assert_eq!(s, SearchScope::Pane(1));
     }
 
     #[test]
