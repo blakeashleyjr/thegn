@@ -398,6 +398,7 @@ self: {
     ui.confirm_delete_project = cfg.uiConfirmDeleteProject;
     ui.confirm_quit = cfg.uiConfirmQuit;
     ui.full_mode_chip = cfg.uiFullModeChip;
+    ui.tab_title_from_terminal = cfg.uiTabTitleFromTerminal;
     ui.dismiss_overlay_on_click_outside = cfg.uiDismissOverlayOnClickOutside;
     ui.sidebar_freeze_sort = cfg.uiSidebarFreezeSort;
     ui.sidebar_nav_skips_collapsed = cfg.uiSidebarNavSkipsCollapsed;
@@ -874,6 +875,12 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Whether to display the full word for the mode chip. Unset (null) = the binary's default.";
+    };
+
+    uiTabTitleFromTerminal = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Label tabs with the focused pane's terminal title instead of a number. Unset (null) = the binary's default (true).";
     };
 
     uiDismissOverlayOnClickOutside = lib.mkOption {
