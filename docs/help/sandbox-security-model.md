@@ -115,6 +115,10 @@ sibling repositories listed in [[sandboxing]], and keeps agent settings in
 - ⚠ Shared read-write toolchain caches that your host later executes (`.rustup`,
   the cargo registry and git caches, pre-commit caches).
 - ⚠ A shared `.git` that stays writable in some launches (see Git and landing).
+- ⚠ On bwrap, a bind source is resolved by path when the pane starts, not
+  when thegn checks it. A writable mount that contains another mount's source
+  lets a sandbox redirect that bind. podman and docker re-attest bind sources
+  after creation.
 
 `sealed` lists the shared kernel as its limit. Its gaps:
 
@@ -124,6 +128,10 @@ sibling repositories listed in [[sandboxing]], and keeps agent settings in
   and not private.
 - ⚠ In linked mode a sandbox can rewrite the shared object store.
 - ⚠ There is no private copy of the workspace yet.
+- ⚠ On bwrap, a bind source is resolved by path when the pane starts, not
+  when thegn checks it. A writable mount that contains another mount's source
+  lets a sandbox redirect that bind. podman and docker re-attest bind sources
+  after creation.
 
 Process limits and privilege locking vary by backend:
 
