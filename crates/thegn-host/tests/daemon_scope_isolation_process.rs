@@ -9,6 +9,11 @@ use thegn_core::config::DaemonConfig;
 use thegn_core::testenv::state_env_all;
 
 const CAPTURE_LIMIT: u64 = 64 * 1024;
+/// A cold daemon opens and migrates its state database before it binds. On a
+/// loaded macOS host the first exec of a freshly linked binary also waits on
+/// the system's code-signature scan, which alone can exceed ten seconds.
+const DAEMON_BIND_DEADLINE: Duration =
+    Duration::from_secs(if cfg!(target_os = "macos") { 60 } else { 10 });
 
 struct Scope {
     root: tempfile::TempDir,
@@ -126,7 +131,7 @@ fn start_daemon(mut command: Command, socket: &Path) -> OwnedDaemon {
         .spawn()
         .expect("spawn isolated pane daemon");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DAEMON_BIND_DEADLINE;
     while !socket.exists() && Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(status)) => {
