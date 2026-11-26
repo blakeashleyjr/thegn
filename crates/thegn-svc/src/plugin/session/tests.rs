@@ -33,7 +33,11 @@ impl FixtureSupervisor {
 }
 impl Drop for FixtureSupervisor {
     fn drop(&mut self) {
-        assert!(self.shutdown().is_settled(), "fixture left owned resources");
+        let settled = self.shutdown().is_settled();
+        // A second panic while unwinding aborts the whole test binary (SIGABRT).
+        if !std::thread::panicking() {
+            assert!(settled, "fixture left owned resources");
+        }
     }
 }
 use super::*;
