@@ -4600,25 +4600,56 @@ fn stderr_with_timeout_stdin_redacts_payload_and_reports_child_failure() {
     );
 }
 
+/// Spawn a live process whose command line carries the REAL remote OCI create
+/// argv (as `sh` positional parameters) while the real secret payload goes to
+/// its stdin, then read that command line back from `ps`: the canary must be
+/// absent from the live argv, and the argv must still be what `ps` printed.
 #[cfg(unix)]
 #[test]
-fn stderr_with_timeout_stdin_keeps_canary_out_of_live_process_argv() {
-    let argv = vec!["sh".into(), "-c".into(), "ps -o command= -p $$ >&2".into()];
-    let (success, stderr) = stderr_with_timeout_stdin(
-        &argv,
-        Duration::from_secs(2),
-        b"GH_TOKEN=live-process-canary\n".to_vec(),
-    )
-    .expect("process listing completes");
+fn remote_oci_create_keeps_canary_out_of_live_process_argv() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("live-process-canary")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Podman);
+    s.env = vec![("GH_TOKEN".into(), "live-process-canary".into())];
+    s.placement = Placement::Ssh(SshPlacement::plain(
+        "box".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let secret_env = remote_stdin_oci_secret_env(&s);
+    let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
+    let (create, input) = oci_create_argv_and_stdin(&s, opts, &secret_env).unwrap();
+    let input = input.expect("SSH host secret stdin");
+    assert!(
+        String::from_utf8_lossy(&input).contains("live-process-canary"),
+        "precondition: the payload carries the canary"
+    );
+    // `; :` keeps `sh` from exec-ing `ps` in place, so `$$` still names the
+    // process whose argv holds the create command.
+    let mut argv: Vec<String> = vec![
+        "sh".into(),
+        "-c".into(),
+        "ps -ww -o command= -p $$ >&2; :".into(),
+        "sh".into(),
+    ];
+    argv.extend(create);
+    let (success, stderr) = stderr_with_timeout_stdin(&argv, Duration::from_secs(5), input)
+        .expect("process listing completes");
 
     assert!(success, "process listing failed: {stderr}");
     assert!(
-        !stderr.contains("live-process-canary"),
-        "stdin secret appeared in live process argv: {stderr}"
+        stderr.contains("/dev/stdin"),
+        "ps must print the live create argv: {stderr}"
     );
     assert!(
-        !stderr.contains("[REDACTED]"),
-        "process argv output was redacted, so raw argv secrecy was not verified: {stderr}"
+        !stderr.contains("live-process-canary") && !stderr.contains("[REDACTED]"),
+        "secret appeared in live process argv: {stderr}"
     );
 }
 
