@@ -107,9 +107,7 @@ impl Plan {
     }
 
     fn decode(s: &str) -> Option<Plan> {
-        let mut it = s.rsplitn(2, '|');
-        let restarted = it.next()?;
-        let agent = it.next()?;
+        let (agent, restarted) = s.rsplit_once('|')?;
         Some(Plan {
             agent: agent.to_string(),
             restarted: restarted == "1",

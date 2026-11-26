@@ -778,7 +778,7 @@ mod tests {
             false,
             "remote",
             "ssh:builder",
-            thegn_core::config::SandboxProfile::Standard,
+            thegn_core::config::SandboxProfile::Hardened,
         )
         .unwrap_err();
         let halt = error.downcast_ref::<crate::agent::SandboxHalt>().unwrap();
