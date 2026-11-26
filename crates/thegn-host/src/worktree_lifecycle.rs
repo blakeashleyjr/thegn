@@ -13,7 +13,7 @@ use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
 use thegn_core::git_run::GitOutcome;
 use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode, ResolvedHooks};
-use thegn_core::store::{RepoTrustStore, WorkspaceStore};
+use thegn_core::store::{NotificationStore, RepoTrustStore, WorkspaceStore};
 
 static NOTIFY_STATE: OnceLock<Arc<crate::notify::NotifyState>> = OnceLock::new();
 static REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>> =
@@ -1708,6 +1708,14 @@ static REMOVED_WORKTREES: OnceLock<Mutex<std::collections::VecDeque<String>>> = 
 /// made by another process (e.g. the CLI landing) is not covered.
 fn note_worktree_removed(worktree: &Path) {
     crate::agent::forget_provider_sync(&worktree.to_string_lossy());
+    if let Ok(db) = Db::open()
+        && let Err(error) = db.mark_kind_read_for_worktree(
+            thegn_core::notification::NotificationKind::AgentAttention.as_str(),
+            &worktree.to_string_lossy(),
+        )
+    {
+        tracing::debug!(target: "thegn::db", %error, "could not resolve removed worktree attention notifications");
+    }
     // Resolve the canonical alias BEFORE taking the mutex (filesystem work).
     let raw = worktree.to_string_lossy().into_owned();
     let canonical = destroy_key(worktree).to_string_lossy().into_owned();

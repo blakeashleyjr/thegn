@@ -6,6 +6,25 @@ The aggregated notification and event bus: user-defined routing rules, DND / qui
 
 ## Requirements
 
+### Requirement: Notification age classification
+
+The notification model SHALL expose `is_stale(now)` using Unix seconds. Info
+notifications older than 24 hours SHALL be stale. `agent_attention`
+notifications older than 24 hours SHALL be stale only when their source is a
+non-interactive pipeline or batch lane; interactive agent attention SHALL not
+age out by time alone.
+
+#### Scenario: Old informational notification
+
+- **WHEN** an Info notification is more than 24 hours old
+- **THEN** `is_stale(now)` returns true
+
+#### Scenario: Old lane attention and interactive attention
+
+- **WHEN** pipeline or batch lane attention is more than 24 hours old
+- **THEN** `is_stale(now)` returns true, while an equally old interactive
+  agent attention returns false
+
 ### Requirement: User-defined action rules route notifications
 
 Notification delivery SHALL be governed by an ordered list of user rules

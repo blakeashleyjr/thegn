@@ -31,6 +31,30 @@ pub struct Notification {
     pub worktree_path: String,
 }
 
+impl Notification {
+    /// Whether this inbox row has aged out of the active notification surface.
+    /// `now` and `created_at_ms` use Unix seconds despite the legacy field name.
+    /// Pipeline and batch attention rows are recognized by their durable source
+    /// identity (with message fallbacks for rows written by older versions).
+    pub fn is_stale(&self, now: i64) -> bool {
+        const DAY_SECS: i64 = 24 * 60 * 60;
+        let age = now.saturating_sub(self.created_at_ms);
+        if age <= DAY_SECS {
+            return false;
+        }
+        if self.kind.default_priority() == Priority::Info {
+            true
+        } else if self.kind == NotificationKind::AgentAttention {
+            self.source_ref.starts_with("escalation:")
+                || self.source_ref.starts_with("batch:")
+                || self.message.starts_with("Pipeline lane needs you:")
+                || self.message.starts_with("Batch lane needs you:")
+        } else {
+            false
+        }
+    }
+}
+
 /// What triggered the notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -628,6 +652,64 @@ mod tests {
         assert!(Priority::Notice.rank() > Priority::Info.rank());
         // Ord matches rank (used for >= threshold comparisons).
         assert!(Priority::Alert > Priority::Notice && Priority::Notice > Priority::Info);
+    }
+
+    fn stale_test_row(
+        kind: NotificationKind,
+        source_ref: &str,
+        message: &str,
+        at: i64,
+    ) -> Notification {
+        Notification {
+            id: 1,
+            kind,
+            source_ref: source_ref.into(),
+            message: message.into(),
+            created_at_ms: at,
+            read: false,
+            worktree_path: "/repo/wt".into(),
+        }
+    }
+
+    #[test]
+    fn info_notifications_age_out_after_one_day() {
+        let now = 200_000;
+        let row = stale_test_row(NotificationKind::WorktreeCreated, "", "ready", now - 86_400);
+        assert!(!row.is_stale(now));
+        let old = stale_test_row(NotificationKind::WorktreeCreated, "", "ready", now - 86_401);
+        assert!(old.is_stale(now));
+    }
+
+    #[test]
+    fn only_noninteractive_agent_attention_ages_out() {
+        let now = 200_000;
+        let old_interactive = stale_test_row(
+            NotificationKind::AgentAttention,
+            "session-7",
+            "needs input",
+            now - 90_000,
+        );
+        assert!(!old_interactive.is_stale(now));
+        let old_pipeline = stale_test_row(
+            NotificationKind::AgentAttention,
+            "escalation:42@abcdefg:awaiting-approval",
+            "Pipeline lane needs you: THE-1 stage plan",
+            now - 90_000,
+        );
+        assert!(old_pipeline.is_stale(now));
+        let recent_batch = stale_test_row(
+            NotificationKind::AgentAttention,
+            "batch:9",
+            "needs input",
+            now - 10,
+        );
+        assert!(!recent_batch.is_stale(now));
+    }
+
+    #[test]
+    fn other_old_notifications_are_not_stale() {
+        let old = stale_test_row(NotificationKind::AgentFailed, "run-1", "failed", 1);
+        assert!(!old.is_stale(200_000));
     }
 
     #[test]
