@@ -64,6 +64,7 @@ struct Facts<'a> {
     native_compiled: bool,
     model_present: bool,
     model_error: Option<&'a str>,
+    hex_found: bool,
 }
 
 /// One-line verdict: `None` when dictation can start, else the next step a user
@@ -105,6 +106,12 @@ fn readiness(cfg: &VoiceConfig, facts: &Facts) -> Option<String> {
         VoiceKind::Command if cfg.command.is_empty() => {
             return Some("no [voice] command configured for kind = \"command\"".into());
         }
+        VoiceKind::Hex if !facts.hex_found => {
+            return Some(
+                "Hex CLI not found on PATH; install `hex`, then run `thegn voice setup --kind hex`"
+                    .into(),
+            );
+        }
         _ => {}
     }
     None
@@ -122,6 +129,7 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
     let native_capture = cfg.capture_command.is_empty() || cfg.kind == VoiceKind::Embedded;
     let model_present = path.as_ref().is_some_and(|p| p.is_file());
     let channel_allowed = crate::channel_state::allows(thegn_core::channel::Feature::Voice);
+    let hex_found = thegn_core::util::which_path("hex").is_some();
     let next_step = readiness(
         cfg,
         &Facts {
@@ -129,6 +137,7 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
             native_compiled: cfg!(feature = "voice-native"),
             model_present,
             model_error: model_error.as_deref(),
+            hex_found,
         },
     );
     serde_json::json!({
@@ -144,7 +153,7 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
             && !matches!(cfg.kind, VoiceKind::Command | VoiceKind::Hex)
             && native_capture
             && cfg!(feature="voice-native"),
-        "hex_found": thegn_core::util::which_path("hex").is_some(),
+        "hex_found": hex_found,
         "credential_configured": cfg.credential.is_some(), "timeout_seconds": cfg.request_timeout().as_secs(),
         "setup": "thegn voice setup; experimental channel required; ready means configuration is complete, not that the microphone works (macOS: allow Microphone for your terminal)"
     })
@@ -454,6 +463,7 @@ mod tests {
             native_compiled: native,
             model_present: model,
             model_error: None,
+            hex_found: true,
         }
     }
 
@@ -504,6 +514,17 @@ mod tests {
                 .unwrap()
                 .contains("no [voice] command")
         );
+        cfg.kind = VoiceKind::Hex;
+        let missing = Facts {
+            hex_found: false,
+            ..facts(true, false, false)
+        };
+        assert!(
+            readiness(&cfg, &missing)
+                .unwrap()
+                .contains("Hex CLI not found")
+        );
+        assert_eq!(readiness(&cfg, &facts(true, false, false)), None);
     }
 
     #[test]

@@ -317,10 +317,15 @@ pub fn process(rules: &[VoiceReplacement], text: String) -> String {
 }
 
 /// The whole final-transcript pipeline, in order: strip annotations and credits,
-/// drop a vocabulary-prompt echo, then apply the replacement rules.
+/// drop a vocabulary-prompt echo, then apply the replacement rules. The echo
+/// check only applies to the embedded and HTTP kinds, the only ones that send
+/// the vocabulary prompt.
 pub fn finalize(cfg: &crate::config_voice::VoiceConfig, text: &str) -> String {
+    use crate::config_voice::VoiceKind;
     let mut text = strip_non_speech(text, &cfg.language);
-    if let Some(prompt) = cfg.vocabulary_prompt() {
+    if matches!(cfg.kind, VoiceKind::Embedded | VoiceKind::Http)
+        && let Some(prompt) = cfg.vocabulary_prompt()
+    {
         text = crate::voice::drop_prompt_echo(&text, &prompt);
     }
     process(&cfg.replacements, text)
@@ -396,6 +401,27 @@ mod tests {
     fn phrase_inside_cjk_text_matches() {
         let rules = [rule("open code", "OpenCode")];
         assert_eq!(run(&rules, "请用open code编辑"), "请用OpenCode编辑");
+    }
+
+    #[test]
+    fn finalize_strips_then_drops_echo_then_replaces() {
+        use crate::config_voice::{VoiceConfig, VoiceKind};
+        let mut cfg = VoiceConfig {
+            kind: VoiceKind::Embedded,
+            language: "en".into(),
+            vocabulary: vec!["T3 Code".into(), "Ottobit".into()],
+            replacements: vec![rule("open code", "OpenCode")],
+            ..VoiceConfig::default()
+        };
+        // The echo is only visible once the annotation is stripped.
+        assert_eq!(finalize(&cfg, "[BLANK_AUDIO] T3 Code, Ottobit"), "");
+        assert_eq!(
+            finalize(&cfg, "use open code [Music] Thanks for watching!"),
+            "use OpenCode"
+        );
+        // Command providers never send the prompt, so an identical phrase stays.
+        cfg.kind = VoiceKind::Command;
+        assert_eq!(finalize(&cfg, "T3 Code, Ottobit"), "T3 Code, Ottobit");
     }
 
     #[test]

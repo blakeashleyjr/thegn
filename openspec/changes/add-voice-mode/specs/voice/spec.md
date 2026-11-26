@@ -127,3 +127,15 @@ Foreign-language credits SHALL apply only when the configured language is not `e
 - **WHEN** a final transcript is `Ship it. Thanks for watching!`
 - **THEN** insert `Ship it.`
 - **AND** `hello [Music] world` becomes `hello world`, and `see (above)` is unchanged
+
+### Requirement: Final transcript pipeline order
+
+Every final transcript SHALL pass through the same cleanup in this order: strip
+non-speech annotations and credits, then drop a transcript that only echoes the
+vocabulary prompt (embedded and HTTP kinds only), then apply `[voice]
+replacements`. Partial previews SHALL NOT be rewritten.
+
+#### Scenario: Annotation hides a prompt echo
+
+- **WHEN** vocabulary is `["T3 Code", "Ottobit"]` and the final transcript is `[BLANK_AUDIO] T3 Code, Ottobit`
+- **THEN** nothing is inserted
