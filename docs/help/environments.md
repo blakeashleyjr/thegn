@@ -925,9 +925,18 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 detach only if the remote has `dtach` (plain ssh panes) or `mosh-server` (mosh
 panes). Without either, the remote shell ends when the client detaches or is
 killed, and relaunching opens a fresh shell. thegn prints a one-line warning
-in the pane at launch when `dtach` is missing (or unusable) over ssh;
-`thegn doctor` does not yet probe remotes for it. Fix: `brew install
+in the pane at launch when `dtach` is missing (or unusable) over ssh,
+and `thegn doctor` reports it (below). Fix: `brew install
 dtach` (macOS) or `apt install dtach` (Debian/Ubuntu), or install mosh.
+
+`thegn doctor` preflights each `[env.<name>] placement = "ssh"` with its own
+ssh target over a short, bounded ssh probe: whether the host is reachable, and
+whether `mosh-server` (mosh transport only), `dtach`, `podman` and `docker` are
+present. If no container runtime is found, the launch halts and names the fix:
+install podman or docker there, or set `[env.<name>.sandbox] backend = "none"`
+to run bare on that host with no sandbox. The halt also offers
+`[h] run on host`, which runs that worktree bare on the ssh host (never on your
+machine) for this session only; nothing is remembered.
 
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —

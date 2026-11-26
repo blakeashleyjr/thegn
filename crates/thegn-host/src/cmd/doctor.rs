@@ -4341,7 +4341,6 @@ fn remote_sandbox_report(cfg: &Config) {
     let hosts = remote_ssh_placements(cfg);
     if hosts.is_empty() {
         outln!("  (no ssh [host.*] configured)");
-        return;
     }
     let chain = shell_chain(cfg);
     for (name, placement) in hosts {
@@ -4358,6 +4357,131 @@ fn remote_sandbox_report(cfg: &Config) {
                 bname,
                 probe_word(placement.probe_runtime(b.binary()))
             );
+        }
+    }
+    ssh_env_report(cfg);
+}
+
+/// Container runtimes probed on each ssh env's host.
+const SSH_ENV_RUNTIMES: [&str; 2] = ["podman", "docker"];
+
+/// Every `[env.X] placement = "ssh"` that carries its own ssh target (not
+/// pinned to a `[host.*]`, which the host probe above already covers), as
+/// `(name, placement, mosh wanted)`. `thegn host` is dev-gated on stable, so
+/// without this an ssh env got no preflight at all.
+fn ssh_env_placements(cfg: &Config) -> Vec<(String, thegn_core::placement::SshPlacement, bool)> {
+    use thegn_core::placement::{SshPlacement, TransportKind};
+    let mut names: Vec<&String> = cfg.env.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let e = &cfg.env[name];
+            if e.placement != thegn_core::config::PlacementMode::Ssh || !e.host.trim().is_empty() {
+                return None;
+            }
+            let host = e.ssh.host.trim();
+            if host.is_empty() {
+                return None;
+            }
+            let opt = |s: &str| {
+                let t = s.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            };
+            let mosh = e.ssh.transport == thegn_core::config::RemoteTransport::Mosh;
+            Some((
+                name.clone(),
+                SshPlacement {
+                    host: host.to_string(),
+                    port: if e.ssh.port == 0 { 22 } else { e.ssh.port },
+                    forward_agent: e.ssh.forward_agent,
+                    kind: if mosh {
+                        TransportKind::Mosh
+                    } else {
+                        TransportKind::Ssh
+                    },
+                    ssh_config: opt(&e.ssh.ssh_config),
+                    jump_host: opt(&e.ssh.jump_host),
+                    identity: opt(&e.ssh.identity),
+                    extra_args: e.ssh.extra_args.clone(),
+                },
+                mosh,
+            ))
+        })
+        .collect()
+}
+
+/// Doctor lines for one ssh env from already-gathered probe answers (pure, so
+/// the wording is unit-tested without ssh). `dtach` doubles as the reachability
+/// probe: when it is `Unreachable` the other probes are skipped (they would only
+/// repeat the same bounded timeout) and the single line says so.
+fn ssh_env_lines(
+    name: &str,
+    mosh_wanted: bool,
+    none_backend: bool,
+    dtach: RuntimeProbe,
+    mosh: RuntimeProbe,
+    runtimes: &[(&str, RuntimeProbe)],
+) -> Vec<String> {
+    let mut out = vec![format!("  env {name}")];
+    if dtach == RuntimeProbe::Unreachable {
+        out.push(
+            "    reachable   NO (ssh probe failed or timed out) — check the host, key and network"
+                .into(),
+        );
+        return out;
+    }
+    out.push("    reachable   yes".into());
+    if mosh_wanted {
+        out.push(format!("    mosh-server {}", probe_word(mosh)));
+    }
+    out.push(format!("    dtach       {}", probe_word(dtach)));
+    for (bin, probe) in runtimes {
+        out.push(format!("    {bin:<11} {}", probe_word(*probe)));
+    }
+    let any_runtime = runtimes.iter().any(|(_, p)| *p == RuntimeProbe::Present);
+    if !any_runtime && !none_backend {
+        out.push(
+            "    no container runtime found: install podman or docker there, or set \
+             [env.NAME.sandbox] backend = \"none\" (runs bare on that host, no sandbox)"
+                .replace("NAME", name),
+        );
+    }
+    out
+}
+
+/// Preflight each ssh env with a short bounded ssh probe per binary
+/// (`REMOTE_PROBE_TIMEOUT`); an unreachable host stops after the first probe.
+fn ssh_env_report(cfg: &Config) {
+    let envs = ssh_env_placements(cfg);
+    if envs.is_empty() {
+        return;
+    }
+    outln!("Remote sandbox runtime — ssh envs ([env.*] placement = \"ssh\")");
+    for (name, ssh, mosh_wanted) in envs {
+        let placement = Placement::Ssh(ssh);
+        let none_backend =
+            cfg.env[&name].sandbox.backend == Some(thegn_core::config::SandboxBackend::None);
+        let dtach = placement.probe_runtime("dtach");
+        let (mosh, runtimes) = if dtach == RuntimeProbe::Unreachable {
+            (RuntimeProbe::Unreachable, Vec::new())
+        } else {
+            let mosh = if mosh_wanted {
+                placement.probe_runtime("mosh-server")
+            } else {
+                RuntimeProbe::Absent
+            };
+            // Only an OCI runtime holds a remote worktree; a host-toolchain
+            // backend (bwrap, nspawn) from the local `[sandbox]` chain is dropped
+            // on an ssh placement, so it is not probed here.
+            let runtimes: Vec<(&str, RuntimeProbe)> = SSH_ENV_RUNTIMES
+                .iter()
+                .map(|bin| (*bin, placement.probe_runtime(bin)))
+                .collect();
+            (mosh, runtimes)
+        };
+        for line in ssh_env_lines(&name, mosh_wanted, none_backend, dtach, mosh, &runtimes) {
+            outln!("{line}");
         }
     }
 }
@@ -6903,6 +7027,66 @@ mod pins;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_env_lines_unreachable_stops_after_one_line() {
+        let lines = ssh_env_lines(
+            "box",
+            true,
+            false,
+            RuntimeProbe::Unreachable,
+            RuntimeProbe::Unreachable,
+            &[],
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("reachable   NO"), "{lines:?}");
+    }
+
+    #[test]
+    fn ssh_env_lines_without_runtime_names_backend_none() {
+        let lines = ssh_env_lines(
+            "box",
+            true,
+            false,
+            RuntimeProbe::Present,
+            RuntimeProbe::Absent,
+            &[
+                ("podman", RuntimeProbe::Absent),
+                ("docker", RuntimeProbe::Absent),
+            ],
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("reachable   yes"), "{text}");
+        assert!(text.contains("mosh-server absent"), "{text}");
+        assert!(text.contains("dtach       present"), "{text}");
+        assert!(
+            text.contains("[env.box.sandbox] backend = \"none\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn ssh_env_lines_with_runtime_or_none_backend_has_no_hint() {
+        let ok = ssh_env_lines(
+            "box",
+            false,
+            false,
+            RuntimeProbe::Present,
+            RuntimeProbe::Absent,
+            &[("podman", RuntimeProbe::Present)],
+        );
+        assert!(!ok.join("\n").contains("no container runtime"));
+        assert!(!ok.join("\n").contains("mosh-server"));
+        let none = ssh_env_lines(
+            "box",
+            false,
+            true,
+            RuntimeProbe::Present,
+            RuntimeProbe::Absent,
+            &[],
+        );
+        assert!(!none.join("\n").contains("no container runtime"));
+    }
     use thegn_core::notification::{Notification, NotificationKind};
 
     #[test]
