@@ -80,7 +80,7 @@ pub fn info(s: &str) {
     if crate::log_trace::ready() || tui_active() {
         tracing::info!("{s}");
     } else {
-        eprintln!("{} {s}", tag(theme::DIM));
+        write_stderr_line(&format!("{} {s}", tag(theme::DIM)));
     }
 }
 
@@ -89,7 +89,7 @@ pub fn warn(s: &str) {
     if crate::log_trace::ready() || tui_active() {
         tracing::warn!("{s}");
     } else {
-        eprintln!("{} {s}", tag(theme::AMBER));
+        write_stderr_line(&format!("{} {s}", tag(theme::AMBER)));
     }
 }
 
@@ -98,7 +98,7 @@ pub fn error(s: &str) {
     if crate::log_trace::ready() || tui_active() {
         tracing::error!("{s}");
     } else {
-        eprintln!("{} {s}", tag(theme::RED));
+        write_stderr_line(&format!("{} {s}", tag(theme::RED)));
     }
 }
 
@@ -106,8 +106,35 @@ pub fn error(s: &str) {
 /// regardless of the subscriber or level filter — a fatal must be seen.
 pub fn die(s: &str) -> ! {
     let s = terminal_safe(s);
-    eprintln!("{} {s}", tag(theme::RED));
+    write_stderr_line(&format!("{} {s}", tag(theme::RED)));
     std::process::exit(1);
+}
+
+/// Write one line to stderr without panicking. `eprintln!` panics when the
+/// write fails, which is what a vanished terminal (EIO, EPIPE) does on a
+/// shutdown or error path; here the failure is dropped instead, so the caller
+/// exits on its own terms rather than with a crash report.
+pub fn write_stderr_line(line: &str) {
+    // best-effort: the terminal may already be gone, so a failed write is dropped
+    let _ = write_line_to(&mut std::io::stderr().lock(), line);
+}
+
+/// Write `line` and a newline to `writer`, returning the first failure.
+pub fn write_line_to<W: std::io::Write + ?Sized>(
+    writer: &mut W,
+    line: &str,
+) -> std::io::Result<()> {
+    writer.write_all(line.as_bytes())?;
+    writer.write_all(b"\n")
+}
+
+/// True when an I/O error means the controlling terminal or its pipe has gone
+/// away (a hangup): `EIO` from a torn-down tty, or a broken pipe.
+pub fn is_hangup(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    matches!(error.raw_os_error(), Some(libc::EIO | libc::EPIPE))
 }
 
 #[cfg(test)]
@@ -160,5 +187,48 @@ mod tests {
         }
 
         assert!(failures.is_empty(), "controls not handled: {failures:?}");
+    }
+
+    /// A writer whose every write fails with `EIO`, like a torn-down tty.
+    struct EioWriter;
+
+    impl std::io::Write for EioWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+
+    #[test]
+    fn write_line_to_eio_writer_returns_error_without_panicking() {
+        let result = super::write_line_to(&mut EioWriter, "gone");
+        let error = result.expect_err("EIO must surface as an error, not a panic");
+        assert!(super::is_hangup(&error));
+    }
+
+    #[test]
+    fn write_line_to_vec_appends_newline() {
+        let mut out: Vec<u8> = Vec::new();
+        super::write_line_to(&mut out, "hello").expect("vec write");
+        assert_eq!(out, b"hello\n");
+    }
+
+    #[test]
+    fn is_hangup_recognises_terminal_loss_only() {
+        assert!(super::is_hangup(&std::io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+        assert!(super::is_hangup(&std::io::Error::from_raw_os_error(
+            libc::EPIPE
+        )));
+        assert!(super::is_hangup(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        assert!(!super::is_hangup(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
     }
 }

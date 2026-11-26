@@ -1057,40 +1057,48 @@ fn parse_hold_duration(raw: &str) -> Result<std::time::Duration, String> {
 
 /// The quit-detached exit line. Printed AFTER the compositor tore down the
 /// alt screen (a raw-mode UI can't print an exit line) — stderr is the only
-/// sink that reaches the user, hence the local allow. Daemon-backed panes
-/// live in the daemon's process group, so the process::exit doesn't touch
-/// them.
-#[allow(clippy::disallowed_macros)]
+/// sink that reaches the user. Daemon-backed panes live in the daemon's process
+/// group, so the process::exit doesn't touch them. Non-panicking: if the
+/// terminal has already hung up, the line is dropped rather than crashing.
 fn report_kept_sessions(kept: usize) {
     if kept > 0 {
-        eprintln!(
+        thegn_core::msg::write_stderr_line(&format!(
             "kept {kept} session{} running — run `thegn` to reattach, `thegn session list` to inspect",
             if kept == 1 { "" } else { "s" }
-        );
+        ));
     }
 }
 
 /// Report DB writes still pending or dropped at shutdown after the compositor
-/// has restored the terminal.
-#[allow(clippy::disallowed_macros)]
+/// has restored the terminal. Non-panicking: the terminal may already be gone.
 fn report_db_shutdown(notice: &str) {
-    eprintln!("{notice}");
+    thegn_core::msg::write_stderr_line(notice);
 }
 
 /// Report the one-time brand migration. Runs before any tracing subscriber
 /// exists (and before the compositor takes the terminal), so stderr is the
-/// only sink that reaches the user — hence the local allow.
-#[allow(clippy::disallowed_macros)]
+/// only sink that reaches the user. Non-panicking, like the other reporters.
 fn report_migration(migration: &thegn_core::migrate_brand::MigrationReport) {
     for w in &migration.warnings {
-        eprintln!("thegn migrate: {w}");
+        thegn_core::msg::write_stderr_line(&format!("thegn migrate: {w}"));
     }
     if migration.migrated_anything() {
-        eprintln!(
+        thegn_core::msg::write_stderr_line(&format!(
             "thegn: migrated superzej state to its new home ({} path(s) renamed)",
             migration.moved.len()
-        );
+        ));
     }
+}
+
+/// True when the error chain bottoms out in a terminal hangup (`EIO` from a
+/// torn-down tty, or a broken pipe). That is the user closing the terminal
+/// that hosts thegn, not a failure to report.
+fn is_terminal_hangup(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(thegn_core::msg::is_hangup)
+    })
 }
 
 fn main() -> std::process::ExitCode {
@@ -1113,6 +1121,11 @@ fn main() -> std::process::ExitCode {
                         std::process::ExitCode::from(cmd::EXIT_ERROR as u8)
                     }
                 };
+            }
+            if is_terminal_hangup(&error) {
+                // The terminal is gone, so there is nobody to tell and no
+                // crash to report: exit cleanly.
+                return std::process::ExitCode::from(cmd::EXIT_OK as u8);
             }
             thegn_core::msg::error(&format!("{error:#}"));
             std::process::ExitCode::from(code as u8)
