@@ -217,8 +217,11 @@ fn watch_log_directory(
             }
         }
     })?;
-    watcher.watch(parent, notify::RecursiveMode::NonRecursive)?;
-    if let Some(grandparent) = parent.parent()
+    // Watch the canonical spelling: FSEvents handed a symlinked path (`/var/..` ->
+    // `/private/var/..`) can silently deliver nothing for it.
+    let watch_parent = canonical_parent.as_path();
+    watcher.watch(watch_parent, notify::RecursiveMode::NonRecursive)?;
+    if let Some(grandparent) = watch_parent.parent()
         && grandparent.is_dir()
     {
         watcher.watch(grandparent, notify::RecursiveMode::NonRecursive)?;

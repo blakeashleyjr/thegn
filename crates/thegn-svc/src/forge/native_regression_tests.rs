@@ -760,14 +760,26 @@ fn cancelling_token_future_terminates_owned_group() {
     let mut command = shell("echo $$ > parent.pid; sleep 30 & echo $! > descendant.pid; wait");
     command.current_dir(dir.path());
     runtime().block_on(async {
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(200),
-                token_command_async(command, Duration::from_secs(30))
-            )
-            .await
-            .is_err()
-        );
+        // Cancel only once the helper has recorded both pids: a loaded host (macOS) can
+        // take longer than a fixed 200ms to start `sh`, and a pid file never written
+        // cannot be checked after cancellation.
+        let descendant = dir.path().join("descendant.pid");
+        let ready = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while tokio::time::Instant::now() < deadline {
+                if std::fs::read_to_string(&descendant).is_ok_and(|text| text.ends_with('\n')) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("helper never recorded its pids");
+        };
+        tokio::select! {
+            _ = ready => {}
+            _ = token_command_async(command, Duration::from_secs(30)) => {
+                panic!("token helper finished before cancellation");
+            }
+        }
     });
     for file in ["parent.pid", "descendant.pid"] {
         let pid = std::fs::read_to_string(dir.path().join(file)).unwrap();

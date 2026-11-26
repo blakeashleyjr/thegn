@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use thegn_core::testenv::state_env_all;
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+// Daemon cold start under a loaded macOS host (dyld, codesign checks) exceeds 5s.
+const BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[expect(
     clippy::disallowed_methods,
@@ -12,7 +14,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 )]
 fn signal_at_socket_bind(mut command: Command, socket: &Path) -> (ExitStatus, bool) {
     let mut child: Child = command.spawn().expect("spawn isolated daemon");
-    let bind_deadline = Instant::now() + EXIT_TIMEOUT;
+    let bind_deadline = Instant::now() + BIND_TIMEOUT;
     while !socket.exists() && Instant::now() < bind_deadline {
         std::thread::sleep(Duration::from_millis(2));
     }

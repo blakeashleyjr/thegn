@@ -524,6 +524,15 @@ mod unix {
         let digest = super::super::super::config_digest(&config).unwrap();
         std::fs::write(&script, format!("#!{}\nif [ \"$1\" = --version ]; then printf 'fixture 1\\n'; exit 0; fi\n[ \"$#\" = 5 ] && [ \"$1\" = up ] && [ \"$2\" = --workspace-folder ] && [ \"$4\" = --config ] || exit 91\n[ -f \"$5\" ] || exit 92\nprintf 'up\\n' >> \"$3/starts\"\n{body}\n", tool("sh").display())).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The first exec of a freshly written script is slow on macOS (Gatekeeper/XProtect
+        // scan). Production refuses a late spawn once the caller deadline has passed, so a
+        // slow first `--version` probe would turn the short-deadline fixtures into
+        // never-spawned ones. Pay that cost here, before any deadline starts.
+        let warmed = std::process::Command::new(&script)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(warmed.status.success());
         let env = vec![
             ("FIXTURE_RELEASE".into(), release.display().to_string()),
             ("FIXTURE_SLEEP".into(), tool("sleep").display().to_string()),
@@ -915,7 +924,7 @@ mod unix {
             let mut warnings = Vec::new();
             let result =
                 h.fixture
-                    .agent_decision(Duration::from_millis(400), &fallback, &mut warnings);
+                    .agent_decision(Duration::from_millis(1000), &fallback, &mut warnings);
             assert!(matches!(result, Err(StartFailure::HeldUnknown(_, _))));
             assert_eq!(fallback.load(Ordering::Acquire), 0);
             assert!(warnings.is_empty());
