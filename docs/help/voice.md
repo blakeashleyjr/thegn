@@ -183,4 +183,5 @@ terms), it is discarded.
 All `[voice]` settings are in `config/config.toml.example`: `enabled`, `kind`,
 `capture_command`, `command`, `max_seconds`, `language`, `model`, `model_path`,
 `endpoint`, `credential`, `live_preview`, `timeout_seconds`, `replacements`, and
-`vocabulary`. Voice is available on the stable channel and stays off until you enable it.
+`vocabulary`. Voice is available on the stable channel and stays off until you
+enable it.

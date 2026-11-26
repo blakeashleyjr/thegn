@@ -126,9 +126,10 @@ persist_registers = true` opts in to keeping it across restarts; turning it
 - **Sharing and serving — `thegn serve`, `[share]`, and dev-channel settings:**
   running `thegn serve` listens on loopback by default; `[share] provider` is
   `"none"` by default, and a configured tunnel connects to other machines.
-  Remote, provider, placement and voice features require their respective
-  settings and are experimental and off in the stable channel; voice model
-  downloads require your size confirmation. See [[daemon-and-sessions]],
+  Remote, provider and placement features require their respective settings
+  and are experimental and off in the stable channel. Voice is available on
+  stable but off until you enable it; voice model downloads require your size
+  confirmation. See [[daemon-and-sessions]],
   [[mobile-access]] and [[release-channels]].
 
 ## How to check for yourself
