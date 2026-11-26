@@ -13,6 +13,7 @@ FILES = [
     "KNOWN_ISSUES.md",
     "docs/help/known-limitations.md",
     "docs/help/upgrading-and-uninstalling.md",
+    "docs/launch/launch-day.md",
     ".github/workflows/release.yml",
     "packaging/homebrew/thegn.rb.tmpl",
     "packaging/release.py",
