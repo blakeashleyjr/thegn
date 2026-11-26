@@ -921,10 +921,11 @@ work (git reads, container lifecycle) always uses ssh; the interactive
 pane uses mosh by default, so it survives network changes. `[remote]`
 tunes keepalives, timeouts, and retry backoff for flaky links.
 
-If mosh reports that `mosh-server` is missing on the remote host, the pane
-shows the diagnostic and tells you to install mosh on that host, then continues
-over ssh. Repeated shell-start failures show the last diagnostic line and skip
-SSH login banners.
+If the remote host has no `mosh-server`, the pane prints mosh's error and a
+one-line notice saying how to install mosh (or set `transport = "ssh"`), then
+continues over plain ssh. The same happens when mosh cannot start a server for
+another reason. A pane that keeps crashing reports its last real error line,
+not the ssh login banner.
 
 > Remote worktrees over SSH/mosh are supported on the stable channel. Kubernetes
 > and cloud providers other than Sprites and Vercel are **dev-channel only** —

@@ -107,37 +107,6 @@ fn should_skip_mosh(marker_present: bool) -> bool {
     marker_present
 }
 
-/// Identify the mosh bootstrap failure that has a direct installation fix.
-fn classify_mosh_failure(output: &str) -> MoshFailure {
-    let output = output.to_ascii_lowercase();
-    if output.contains("mosh-server: command not found")
-        || output.contains("did not find mosh server startup message")
-    {
-        MoshFailure::ServerMissing
-    } else {
-        MoshFailure::Other
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MoshFailure {
-    ServerMissing,
-    Other,
-}
-
-fn mosh_fallback_notice(failure: MoshFailure) -> &'static str {
-    match failure {
-        MoshFailure::ServerMissing => {
-            "mosh-server is missing on the remote host; install mosh there. Falling back to ssh."
-        }
-        MoshFailure::Other => "mosh failed; falling back to ssh.",
-    }
-}
-
-fn should_fallback_to_ssh(mosh_succeeded: bool) -> bool {
-    !mosh_succeeded
-}
-
 fn nomosh_present(name: &str) -> bool {
     nomosh_path(name).exists()
 }
@@ -245,6 +214,24 @@ fn local_mosh_ok() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the VM has `mosh-server` (a cheap ssh probe over the multiplexed
+/// master — the mosh `--ssh` bootstrap reuses the same connection).
+// Bridge subprocess (off the event loop); `.output()` captures the probe's stdio.
+#[expect(clippy::disallowed_methods)]
+fn mosh_server_present(shim: &ssh_shim::SshShim) -> bool {
+    let Ok(mut argv) = shim.base_argv() else {
+        return false;
+    };
+    argv.push("--".into());
+    argv.push("command -v mosh-server >/dev/null 2>&1".into());
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Build the `mosh` argv for an interactive pane: `mosh --ssh="<ssh opts>"
 /// user@ip [-- cmd]` — the inner ssh carries the managed key + pinned host key +
 /// multiplex options (all but the trailing `user@ip`, which becomes mosh's host).
@@ -321,13 +308,13 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     shim.prepare_known_hosts()
         .context("machine0-ssh: prepare the per-instance known_hosts pin")?;
 
-    // Interactive pane over mosh (default) when the local client is present and
-    // mosh isn't already known-bad for this VM. Let mosh report a missing remote
-    // server so we can show its concrete cause before falling back to ssh.
+    // Interactive pane over mosh (default) when the local client + the VM's
+    // mosh-server are both present AND mosh isn't already known-bad for this VM.
     let try_mosh = interactive
         && transport == RemoteTransport::Mosh
         && !should_skip_mosh(nomosh_present(name))
-        && local_mosh_ok();
+        && local_mosh_ok()
+        && mosh_server_present(&shim);
 
     if try_mosh {
         let margv = mosh_argv(&shim, cmd)?;
@@ -339,48 +326,25 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
             reason = "off-loop CLI bridge: block on the mosh child so a UDP-blocked \
                       timeout falls back to ssh instead of killing the pane"
         )]
-        let result = std::process::Command::new(&margv[0])
+        let status = std::process::Command::new(&margv[0])
             .args(&margv[1..])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .spawn()
-            .and_then(|child| child.wait_with_output());
-        match result {
+            .status();
+        match status {
             // Clean mosh session (incl. a normal logout) → mosh works here; drop
             // any stale marker and close the pane as usual.
-            Ok(output) if !should_fallback_to_ssh(output.status.success()) => {
+            Ok(s) if s.success() => {
                 clear_nomosh(name);
                 return Ok(());
             }
-            // Non-zero exit (including missing mosh-server) or a spawn error →
-            // remember mosh is bad for this VM, show captured diagnostics and a
-            // one-line fix/fallback notice, then exec plain ssh in this pane.
-            result => {
-                let (failure, stderr) = match result {
-                    Ok(output) => (
-                        classify_mosh_failure(&String::from_utf8_lossy(&output.stderr)),
-                        output.stderr,
-                    ),
-                    Err(_) => (MoshFailure::Other, Vec::new()),
-                };
-                if !stderr.is_empty() {
-                    use std::io::Write;
-                    let _ = std::io::stderr().write_all(&stderr); // best-effort: preserve mosh output
-                    if !stderr.ends_with(b"\n") {
-                        eprintln!();
-                    }
-                }
-                eprintln!("{}", mosh_fallback_notice(failure));
+            // Non-zero exit (the UDP-blocked "Timed out waiting for server" case
+            // exits non-zero after ~18s) or a spawn error → remember mosh is bad
+            // for this VM, reset the terminal mosh may have dirtied, and fall
+            // through to the plain-ssh exec below.
+            _ => {
                 note_nomosh(name);
                 reset_terminal();
             }
         }
-    } else if interactive
-        && transport == RemoteTransport::Mosh
-        && should_skip_mosh(nomosh_present(name))
-    {
-        eprintln!("mosh previously failed for this host; falling back to ssh.");
     }
 
     // Plain ssh: chosen up front (non-mosh transport, mosh-less image, or a
@@ -430,36 +394,6 @@ mod tests {
         // unlike the down-marker's freshness window.
         assert!(should_skip_mosh(true), "marker present ⇒ skip mosh");
         assert!(!should_skip_mosh(false), "no marker ⇒ attempt mosh");
-    }
-
-    #[test]
-    fn mosh_server_missing_output_is_classified_case_insensitively() {
-        assert_eq!(
-            classify_mosh_failure("mosh-server: command not found"),
-            MoshFailure::ServerMissing
-        );
-        assert_eq!(
-            classify_mosh_failure("Did not find mosh server startup message"),
-            MoshFailure::ServerMissing
-        );
-        assert_eq!(
-            classify_mosh_failure("Timed out waiting for server"),
-            MoshFailure::Other
-        );
-    }
-
-    #[test]
-    fn failed_mosh_falls_back_to_ssh_with_actionable_notice() {
-        assert!(should_fallback_to_ssh(false));
-        assert!(!should_fallback_to_ssh(true));
-        assert_eq!(
-            mosh_fallback_notice(MoshFailure::ServerMissing),
-            "mosh-server is missing on the remote host; install mosh there. Falling back to ssh."
-        );
-        assert_eq!(
-            mosh_fallback_notice(MoshFailure::Other),
-            "mosh failed; falling back to ssh."
-        );
     }
 
     #[test]
