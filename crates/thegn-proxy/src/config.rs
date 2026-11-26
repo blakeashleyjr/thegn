@@ -317,6 +317,7 @@ mod tests {
         assert_eq!(lanes[0].api_key, "secret-value");
         assert_eq!(lanes[0].wire, Wire::OpenAi);
         assert_eq!(pc.auto_tiers.len(), 1);
+        // SAFETY: serialized within this test; no other test reads BUILD_K1.
         unsafe { std::env::remove_var("BUILD_K1") };
     }
 
@@ -380,10 +381,12 @@ mod tests {
 
     #[test]
     fn resolve_ref_env_and_file() {
+        // SAFETY: nextest runs each test in its own process; RR_ENV is read only here.
         unsafe { std::env::set_var("RR_ENV", "v") };
         assert_eq!(resolve_ref("env:RR_ENV").as_deref(), Some("v"));
         assert_eq!(resolve_ref("env:MISSING_VAR_XYZ"), None);
         assert_eq!(resolve_ref("sk-literal"), None); // raw literal ignored
+        // SAFETY: nextest runs each test in its own process; RR_ENV is read only here.
         unsafe { std::env::remove_var("RR_ENV") };
     }
 }
