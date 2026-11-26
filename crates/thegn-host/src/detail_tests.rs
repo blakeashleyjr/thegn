@@ -2419,7 +2419,8 @@ fn memory_popup_breakdown_has_available_then_optional_free() {
         })
         .expect("memory breakdown");
     let keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
-    assert_eq!(keys, ["used", "total", "available", "free"]);
+    assert_eq!(keys, ["used", "available", "free"]);
+    assert_eq!(rows[0].1, "8.0G of 32G");
 }
 
 fn mq_test_row(status: &str) -> thegn_core::db::MergeQueueRow {

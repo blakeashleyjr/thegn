@@ -140,7 +140,7 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
             .map(|(used, _)| (f64::from(used.max(0.0)) * GIB) as u64),
     );
     let scopes = summary.map(|s| scope_usage(&s.scopes)).unwrap_or_default();
-    let mut tree = cpu_attrib::build(
+    cpu_attrib::build_compact(
         &AttribInputs {
             owners: &model.pane_owners,
             panes: panes.as_deref(),
@@ -152,65 +152,8 @@ fn tree(model: &FrameModel, sort: SortKey) -> cpu_attrib::AttribTree {
         },
         sort,
         cpu_attrib::TOP_PER_PANE,
-    );
-    tree.rows = compact(std::mem::take(&mut tree.rows));
-    tree
-}
-
-/// Most live worktrees one popup lists; the rest fold into the summary row.
-pub(crate) const TOP_WORKTREES: usize = 8;
-
-/// Keep only worktrees with live figures (the builder already sorts heaviest
-/// first), cap them at [`TOP_WORKTREES`], and stand the dropped ones in for
-/// with one "N idle worktrees" summary row ahead of thegn's own rows.
-pub(crate) fn compact(rows: Vec<AttribRow>) -> Vec<AttribRow> {
-    let mut out: Vec<AttribRow> = Vec::with_capacity(rows.len());
-    let (mut live, mut idle, mut hidden) = (0usize, 0usize, 0usize);
-    let mut skipping: Option<u8> = None;
-    let mut summary_at: Option<usize> = None;
-    for r in rows {
-        if let Some(depth) = skipping {
-            if r.depth > depth {
-                continue;
-            }
-            skipping = None;
-        }
-        if r.kind == RowKind::Worktree {
-            if r.cpu_pct.is_none() && r.rss.is_none() {
-                idle += 1;
-                skipping = Some(r.depth);
-                continue;
-            }
-            live += 1;
-            if live > TOP_WORKTREES {
-                hidden += 1;
-                skipping = Some(r.depth);
-                continue;
-            }
-        } else if r.depth == 0 && r.kind != RowKind::Workspace && summary_at.is_none() {
-            summary_at = Some(out.len());
-        }
-        out.push(r);
-    }
-    if idle + hidden > 0 {
-        let idle_text = format!("{idle} idle worktree{}", if idle == 1 { "" } else { "s" });
-        let label = match (hidden, idle) {
-            (0, _) => idle_text,
-            (h, 0) => format!("+{h} more worktrees"),
-            (h, _) => format!("+{h} more · {idle_text}"),
-        };
-        let row = AttribRow {
-            depth: 1,
-            kind: RowKind::More,
-            label,
-            cpu_pct: None,
-            share_of_total: None,
-            rss: None,
-            target: None,
-        };
-        out.insert(summary_at.unwrap_or(out.len()), row);
-    }
-    out
+        cpu_attrib::TOP_WORKTREES,
+    )
 }
 
 /// The one-line status under the heading: what the figures are and whether
@@ -825,60 +768,6 @@ mod tests {
         );
     }
 
-    fn wt_row(label: &str, cpu: Option<f32>) -> AttribRow {
-        AttribRow {
-            depth: 1,
-            kind: RowKind::Worktree,
-            label: label.into(),
-            cpu_pct: cpu,
-            share_of_total: None,
-            rss: cpu.map(|_| 1 << 20),
-            target: None,
-        }
-    }
-
-    #[test]
-    fn compact_keeps_live_rows_caps_them_and_summarises_idle() {
-        let mut rows = vec![AttribRow {
-            depth: 0,
-            kind: RowKind::Workspace,
-            label: "ws".into(),
-            cpu_pct: Some(90.0),
-            share_of_total: None,
-            rss: None,
-            target: None,
-        }];
-        for i in 0..12 {
-            rows.push(wt_row(&format!("live{i}"), Some(50.0 - i as f32)));
-        }
-        for i in 0..300 {
-            rows.push(wt_row(&format!("idle{i}"), None));
-        }
-        let mut thegn = wt_row("thegn", Some(1.0));
-        thegn.depth = 0;
-        thegn.kind = RowKind::Thegn;
-        rows.push(thegn);
-        let out = super::compact(rows);
-        let worktrees = out.iter().filter(|r| r.kind == RowKind::Worktree).count();
-        assert_eq!(worktrees, super::TOP_WORKTREES);
-        assert!(out.len() < 14, "{}", out.len());
-        let more = out.iter().position(|r| r.kind == RowKind::More).unwrap();
-        assert_eq!(out[more].label, "+4 more · 300 idle worktrees");
-        assert_eq!(
-            out[more + 1].kind,
-            RowKind::Thegn,
-            "summary sits before thegn"
-        );
-    }
-
-    #[test]
-    fn compact_is_a_no_op_without_idle_rows_and_singular_for_one() {
-        let rows = vec![wt_row("a", Some(1.0))];
-        assert_eq!(super::compact(rows.clone()), rows);
-        let out = super::compact(vec![wt_row("a", Some(1.0)), wt_row("b", None)]);
-        assert_eq!(out.last().unwrap().label, "1 idle worktree");
-    }
-
     #[test]
     fn monitor_popovers_anchor_to_their_chip_at_small_and_large_sizes() {
         let hist = TelemetryHistory::default();
@@ -902,10 +791,8 @@ mod tests {
             }]
             .into();
             for widget in ["cpu", "mem", "disk"] {
-                let Some(ov) = open_detail_for(&BarItemId::Widget(widget.into()), item, &m, &ctx)
-                else {
-                    continue;
-                };
+                let ov = open_detail_for(&BarItemId::Widget(widget.into()), item, &m, &ctx)
+                    .unwrap_or_else(|| panic!("{widget} opens a popup"));
                 assert!(
                     matches!(ov.placement, Placement::NearBelow(_)),
                     "{widget} at {screen:?}"
