@@ -2073,10 +2073,15 @@ fn git_policy_mounts(
         mounts.push(path_mount(&config, true));
     }
     for path in &plan.ro_after {
-        // The parent too: a repo without `objects/info/` would otherwise skip
-        // the alternates pin and leave the sandbox free to create the file
-        // under the writable `objects/` (THE-2148).
+        // Pins directly in the common dir (`hooks`, `config`, `info`) sit
+        // under its read-only bind, so a missing one cannot be planted from
+        // the sandbox; never create them (a `hooks`/`info` FILE would break
+        // host git). Other pins are created so their pin applies; the
+        // alternates parent too: a repo without `objects/info/` would
+        // otherwise leave the sandbox free to create the file under the
+        // writable `objects/` (THE-2148).
         if !path.exists()
+            && path.parent() != Some(common)
             && let Err(error) = path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)

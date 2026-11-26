@@ -207,6 +207,64 @@ pub struct GitMountPlan {
     pub credential_wanted: bool,
 }
 
+/// Filesystem facts used to validate one git control pin without making the
+/// policy planner perform I/O.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinTargetFacts {
+    pub directory: bool,
+    pub regular_file: bool,
+    pub symlink: bool,
+    pub inside_common: bool,
+}
+
+/// Whether a git control pin target is safe to bind read-only.
+pub fn pin_target_ok(path: &Path, common: &Path, facts: PinTargetFacts) -> bool {
+    if facts.symlink {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    match name {
+        "hooks" | "info" => facts.directory,
+        "config.worktree" => facts.regular_file && facts.inside_common,
+        "config" | "commondir" | "gitdir" | ".git" => {
+            facts.regular_file || (name == ".git" && path == common && facts.directory)
+        }
+        _ => false,
+    }
+}
+
+/// Git control paths that must be re-pinned read-only after git carve-outs.
+///
+/// When `admin` is the common dir itself (read-only mode, a main checkout or
+/// any structural fallback) there is no per-worktree admin dir: the
+/// `commondir`/`gitdir`/`config.worktree` pins are skipped, because the common
+/// dir is bound read-only already and a caller that creates missing pin
+/// targets must never plant an empty `commondir` in the main git dir (git
+/// refuses to run on an unreadable one). A main checkout's `<worktree>/.git`
+/// is the common dir itself and is skipped too.
+pub fn control_pins(common: &Path, admin: &Path, worktree: &Path) -> Vec<PathBuf> {
+    let gitfile = worktree.join(".git");
+    let mut pins = vec![
+        common.join("hooks"),
+        common.join("config"),
+        common.join("info"),
+    ];
+    if admin != common {
+        pins.extend(
+            ["config.worktree", "commondir", "gitdir"]
+                .iter()
+                .map(|name| admin.join(name)),
+        );
+    }
+    if gitfile != common {
+        pins.push(gitfile);
+    }
+    pins
+}
+
 /// The directory under `refs/heads/` holding `branch`'s loose ref, or an error
 /// for a branch that cannot be confined (top level, malformed).
 fn branch_parent(branch: &str) -> Result<&str, String> {
@@ -294,9 +352,11 @@ fn carve_out_conflict(
 /// - the object store is rw, so existing object files (including main's
 ///   blobs) can be rewritten in place.
 ///
-/// Every mode re-pins `<worktree>/.git` read-only first in `ro_after`: a
-/// writable gitfile could be pointed at a planted git dir whose `config` runs
-/// `core.fsmonitor`/`core.hooksPath` on the next host `git -C <worktree>`.
+/// Every mode re-pins git control paths read-only in `ro_after`, including the
+/// shared hooks/config/info and the per-worktree gitfile and control files.
+/// Callers validate pin targets without following symlinks; if any target is
+/// unsafe or cannot be created, they fail closed by keeping the common dir
+/// read-only.
 ///
 /// A top-level branch (no `/`) is refused: its loose ref lives directly in
 /// `refs/heads/`, so the carve-out would expose every top-level branch. The
@@ -315,11 +375,10 @@ pub fn plan_git_mounts(
     target_branch: Option<&str>,
     default_branch: Option<&str>,
 ) -> Result<GitMountPlan, String> {
-    let gitfile = worktree.join(".git");
     if cfg.mode == SandboxGitMode::ReadOnly {
         return Ok(GitMountPlan {
             ro: vec![common_dir.to_path_buf()],
-            ro_after: vec![gitfile],
+            ro_after: control_pins(common_dir, admin_dir, worktree),
             worktree_ro: true,
             ..GitMountPlan::default()
         });
@@ -341,12 +400,8 @@ pub fn plan_git_mounts(
             heads.clone(),
             logs.clone(),
         ],
-        ro_after: std::iter::once(gitfile)
-            .chain(
-                ["commondir", "gitdir", "config.worktree"]
-                    .iter()
-                    .map(|name| admin_dir.join(name)),
-            )
+        ro_after: control_pins(common_dir, admin_dir, worktree)
+            .into_iter()
             .chain(
                 ["alternates", "http-alternates"]
                     .iter()
@@ -633,10 +688,122 @@ mod tests {
             plan_for(&mode_cfg(SandboxGitMode::ReadOnly), "main", Some("main")).expect("plan");
         assert_eq!(plan.ro, [common]);
         assert!(plan.rw.is_empty());
-        assert_eq!(plan.ro_after, [PathBuf::from("/wt/.git")]);
+        assert_eq!(
+            plan.ro_after,
+            [
+                PathBuf::from("/repo/.git/hooks"),
+                PathBuf::from("/repo/.git/config"),
+                PathBuf::from("/repo/.git/info"),
+                PathBuf::from("/repo/.git/worktrees/lane/config.worktree"),
+                PathBuf::from("/repo/.git/worktrees/lane/commondir"),
+                PathBuf::from("/repo/.git/worktrees/lane/gitdir"),
+                PathBuf::from("/wt/.git"),
+            ]
+        );
         assert!(plan.mkdirs.is_empty());
         assert!(plan.worktree_ro);
         assert!(!plan.credential_wanted);
+    }
+
+    #[test]
+    fn legacy_mounts_pin_hooks_and_config_worktree() {
+        let (common, admin) = fixture();
+        let pins = control_pins(&common, &admin, Path::new("/wt"));
+        assert!(pins.contains(&common.join("hooks")));
+        assert!(pins.contains(&common.join("config")));
+        assert!(pins.contains(&admin.join("config.worktree")));
+    }
+
+    #[test]
+    fn full_fallback_pins_hooks() {
+        let (common, admin) = fixture();
+        let plan = plan_git_mounts(
+            &mode_cfg(SandboxGitMode::Full),
+            &common,
+            &admin,
+            Path::new("/wt"),
+            "tg/lane",
+            Some("main"),
+            None,
+        )
+        .expect("plan");
+        assert!(plan.ro_after.contains(&common.join("hooks")));
+    }
+
+    #[test]
+    fn remote_placement_pins_hooks() {
+        let common = Path::new("/remote/repo/.git");
+        let admin = common.join("worktrees/lane");
+        let pins = control_pins(common, &admin, Path::new("/remote/repo/wt"));
+        assert!(pins.contains(&common.join("hooks")));
+    }
+
+    #[test]
+    fn read_only_mode_pins_info() {
+        let (common, admin) = fixture();
+        let plan = plan_git_mounts(
+            &mode_cfg(SandboxGitMode::ReadOnly),
+            &common,
+            &admin,
+            Path::new("/wt"),
+            "tg/lane",
+            None,
+            None,
+        )
+        .expect("plan");
+        assert!(plan.ro_after.contains(&common.join("info")));
+    }
+
+    #[test]
+    fn control_pins_skip_admin_files_without_an_admin_dir() {
+        let common = Path::new("/repo/.git");
+        // Read-only mode / structural fallback: admin is the common dir.
+        let pins = control_pins(common, common, Path::new("/wt"));
+        assert_eq!(
+            pins,
+            [
+                common.join("hooks"),
+                common.join("config"),
+                common.join("info"),
+                PathBuf::from("/wt/.git"),
+            ]
+        );
+        // Main checkout: `<worktree>/.git` is the common dir, not re-bound.
+        let pins = control_pins(common, common, Path::new("/repo"));
+        assert!(!pins.iter().any(|p| p == common), "{pins:?}");
+        assert!(!pins.iter().any(|p| p.ends_with("commondir")), "{pins:?}");
+    }
+
+    #[test]
+    fn pin_target_requires_real_type_and_containment() {
+        let common = Path::new("/repo/.git");
+        let hooks = common.join("hooks");
+        assert!(pin_target_ok(
+            &hooks,
+            common,
+            PinTargetFacts {
+                directory: true,
+                ..PinTargetFacts::default()
+            }
+        ));
+        assert!(!pin_target_ok(
+            &hooks,
+            common,
+            PinTargetFacts {
+                directory: true,
+                symlink: true,
+                ..PinTargetFacts::default()
+            }
+        ));
+        assert!(!pin_target_ok(
+            &common.join("worktrees/lane/config.worktree"),
+            common,
+            PinTargetFacts {
+                regular_file: true,
+                inside_common: false,
+                ..PinTargetFacts::default()
+            }
+        ));
     }
 
     #[test]
@@ -667,10 +834,13 @@ mod tests {
             assert_eq!(
                 plan.ro_after,
                 [
-                    PathBuf::from("/wt/.git"),
+                    common.join("hooks"),
+                    common.join("config"),
+                    common.join("info"),
+                    admin.join("config.worktree"),
                     admin.join("commondir"),
                     admin.join("gitdir"),
-                    admin.join("config.worktree"),
+                    PathBuf::from("/wt/.git"),
                     PathBuf::from("/repo/.git/objects/info/alternates"),
                     PathBuf::from("/repo/.git/objects/info/http-alternates"),
                 ],
