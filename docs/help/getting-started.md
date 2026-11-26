@@ -94,8 +94,12 @@ and the network but shares toolchain caches read-only. Only interactive panes
 are sandboxed: headless agent runs, the queue, the merge gate, tests and
 language servers run on the host. Native plugins run unsandboxed. If no
 sandbox backend is usable, the launch is refused; set `[sandbox] enabled = false`
-to opt out. See [[sandboxing]], and [[sandbox-profiles]] to choose a profile
-per worktree.
+to opt out. On a clean Mac with no backend (Apple `container`, podman or docker),
+the refusal and `thegn doctor` name the missing backend and the fix, for example
+`brew install podman && podman machine init && podman machine start`. The refusal
+prompt also offers `[h] run on host`, which runs that worktree with no sandbox
+for this session only; nothing is remembered. See [[sandboxing]], and
+[[sandbox-profiles]] to choose a profile per worktree.
 
 ## When you're stuck
 

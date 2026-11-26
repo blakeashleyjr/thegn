@@ -488,6 +488,17 @@ fn sealed_halt_body(halt: &crate::agent::SandboxHalt) -> String {
     )
 }
 
+/// Modal body for a local halt whose reason carries the no-backend fix.
+fn no_backend_halt_body(halt: &crate::agent::SandboxHalt) -> String {
+    format!(
+        "{} — thegn will not silently run this pane on the host. [h] runs this worktree \
+         on the host for this session with NO sandbox: the pane can read and write \
+         everything your user can. Nothing is remembered; `thegn doctor` shows the \
+         backend status. [r] retries after you install or start one.",
+        halt.reason
+    )
+}
+
 pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
     if halt.sealed_home {
         let title = format!("⚠ {} unavailable", halt.placement);
@@ -502,6 +513,15 @@ pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOver
             halt.reason
         );
         return menu::sandbox_dormant_menu(title, body, &rt.name, rt.start_display().as_deref());
+    }
+    // THE-2644: no backend is ready on this host (a clean Mac). The reason
+    // already names the backends and their install fix; offer the one-key host
+    // escape with its caveat, pinned for this session only.
+    if halt
+        .reason
+        .contains(thegn_core::sandbox_floor::NO_BACKEND_MARKER)
+    {
+        return menu::sandbox_ask_menu("⚠ no sandbox backend", no_backend_halt_body(halt));
     }
     let title = format!("⚠ {} unavailable", halt.placement);
     if halt.ask {
@@ -3070,6 +3090,39 @@ mod tests {
             1,
             "the sealed hint appears once"
         );
+    }
+
+    #[test]
+    fn no_backend_halt_offers_one_key_run_on_host_with_install_fix() {
+        // A clean-Mac stub: the launch path appends the per-OS fix to the reason.
+        let halt = crate::agent::SandboxHalt {
+            env_name: "local".into(),
+            placement: "local".into(),
+            reason: format!(
+                "no usable backend produced a runnable sandbox; {}",
+                thegn_core::sandbox_floor::no_backend_fix(true)
+            ),
+            ask: true,
+            dormant: None,
+            sealed_home: false,
+        };
+        let overlay = sandbox_halt_overlay(&halt);
+        let keyed = |key: char, choice: &menu::MenuChoice| {
+            overlay
+                .items()
+                .iter()
+                .any(|item| item.key == Some(key) && &item.choice == choice)
+        };
+        assert!(keyed('h', &menu::MenuChoice::SandboxRunOnHost));
+        assert!(keyed('r', &menu::MenuChoice::SandboxRetry));
+        assert!(keyed('n', &menu::MenuChoice::Dismiss));
+        assert_eq!(overlay.title, "⚠ no sandbox backend");
+        let body = no_backend_halt_body(&halt);
+        assert!(body.contains("Apple `container`"), "{body}");
+        assert!(body.contains("brew install podman"), "{body}");
+        assert!(body.contains("NO sandbox"), "{body}");
+        assert!(body.contains("Nothing is remembered"), "{body}");
+        assert!(!body.contains("failover"), "{body}");
     }
 
     #[test]
