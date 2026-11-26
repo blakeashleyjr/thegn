@@ -9048,7 +9048,7 @@ args = ["--verbose"]
         assert!(containment_line(Containment::Disabled).contains("enabled = false"));
         let uncontained = containment_line(Containment::Uncontained);
         assert!(uncontained.contains("NOT CONTAINED"));
-        assert!(uncontained.contains("no sandbox backend found"));
+        assert!(uncontained.contains(thegn_core::sandbox_floor::NO_BACKEND_MARKER));
         assert!(uncontained.contains("run on host"));
         assert_eq!(
             containment_line(Containment::Contained(IsolationClass::SharedKernel)),

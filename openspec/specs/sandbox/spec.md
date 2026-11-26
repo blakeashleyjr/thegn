@@ -43,6 +43,19 @@ entered, never what was requested.
   the opt-outs named: `isolation_floor = "off"`, `enabled = false`,
   `backend = "none"`, or run on host
 
+#### Scenario: Clean host with no backend names the fix and offers run on host
+
+- **WHEN** a local launch halts because no backend is ready on the host (for
+  example a fresh Mac without Apple `container`, podman or docker), under any
+  `failover` mode
+- **THEN** the halt names the backends thegn can use and the install/start
+  command for each (on macOS `brew install podman && podman machine init &&
+podman machine start`, or Apple `container`), the modal offers `[h] run on
+host` with the caveat that the pane runs with no sandbox, the choice pins
+  only that worktree for the current session, and nothing is persisted
+- **AND** `thegn doctor` reports the same missing-backend fix on its
+  containment row
+
 #### Scenario: Chain without host refuses
 
 - **WHEN** no backend is runnable and the configured `backend_chain` does not name `host`

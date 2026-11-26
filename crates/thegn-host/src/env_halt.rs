@@ -398,16 +398,12 @@ mod tests {
         let text = halt("local", "no runtime", false).to_string();
         assert_eq!(
             text,
-            format!(
-                "environment 'box' (local) could not be brought up: no runtime — thegn will not \
-                 silently fall back to the host. Fix the env, retry, explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
-                 set `isolation_floor = \"off\"`, or choose \"run on host\"), \
-                 or install/start a container runtime (`thegn doctor` shows which): {} ([sandbox] or \
-                 [env.box]) to allow it.",
-                thegn_core::sandbox_floor::no_backend_fix_here()
-            )
+            "environment 'box' (local) could not be brought up: no runtime — thegn will not \
+             silently fall back to the host. Fix the env, retry, explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
+             set `isolation_floor = \"off\"`, or choose \"run on host\"), \
+             or install/start a container runtime (`thegn doctor` shows which) ([sandbox] or \
+             [env.box]) to allow it."
         );
-        assert!(text.contains("no sandbox backend found"));
     }
 
     #[test]

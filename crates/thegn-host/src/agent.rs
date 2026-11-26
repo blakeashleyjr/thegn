@@ -329,17 +329,12 @@ impl std::fmt::Display for SandboxHalt {
                 remedy_text_for(class, &self.env_name, &self.reason)
             )
         } else if self.ask {
-            format!(
-                "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which): {}",
-                thegn_core::sandbox_floor::no_backend_fix_here()
-            )
+            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)".to_string()
         } else {
-            format!(
-                "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
-                 set `isolation_floor = \"off\"`, or choose \"run on host\"), \
-                 or install/start a container runtime (`thegn doctor` shows which): {}",
-                thegn_core::sandbox_floor::no_backend_fix_here()
-            )
+            "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
+             set `isolation_floor = \"off\"`, or choose \"run on host\"), \
+             or install/start a container runtime (`thegn doctor` shows which)"
+                .to_string()
         };
         write!(
             f,
@@ -1236,11 +1231,23 @@ pub fn prepare_sandbox_env_with_selection(
     // a fallback preference; the floor admission below still applies.
     if !degrade_allowed && !(placement.is_local() && auto_chain_names_host(&sb)) {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
+        let mut reason = crate::remote_sync::no_backend_reason(reachable, &warnings);
+        // THE-2644: a local host with no ready backend (a clean Mac) names the
+        // backends and their install/start fix, and always offers the explicit,
+        // session-only `[h] run on host` choice — the same doctrine as the
+        // dormant-runtime modal. Nothing is degraded until the user picks it.
+        let local_no_backend = placement.is_local() && reachable;
+        if local_no_backend {
+            reason = format!(
+                "{reason}; {}",
+                thegn_core::sandbox_floor::no_backend_fix_here()
+            );
+        }
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
-            ask,
+            reason,
+            ask: ask || local_no_backend,
             dormant: None,
             sealed_home: false,
         }

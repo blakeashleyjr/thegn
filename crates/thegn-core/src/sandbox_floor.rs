@@ -151,19 +151,26 @@ impl Containment {
     }
 }
 
+/// Leading phrase of [`no_backend_fix`]. The launch path appends that fix to a
+/// local no-backend halt reason, and the halt modal keys its one-key "run on
+/// host" offer on this phrase, so both must use the constant.
+pub const NO_BACKEND_MARKER: &str = "no sandbox backend is ready";
+
 /// The fix to show when no sandbox backend is usable on this host: names the
-/// missing backend and the install command per backend. Pure so the doctor
-/// row, the launch refusal text and the tests share one wording.
+/// backends thegn can use and the install/start command per backend. Pure so
+/// the doctor row, the launch refusal text and the tests share one wording.
 pub fn no_backend_fix(macos: bool) -> String {
     if macos {
-        "no sandbox backend found (Apple `container`, podman, docker): install one, e.g. \
-         `brew install podman && podman machine init && podman machine start`, or Apple \
-         `container` (`brew install container && container system start`)"
-            .to_string()
+        format!(
+            "{NO_BACKEND_MARKER} (Apple `container`, podman or docker): install or start one, \
+             e.g. `brew install podman && podman machine init && podman machine start`, or \
+             Apple `container` (`brew install container && container system start`)"
+        )
     } else {
-        "no sandbox backend found (podman, docker, bwrap): install one, e.g. \
-         `sudo apt-get install bubblewrap` or `sudo apt-get install podman`"
-            .to_string()
+        format!(
+            "{NO_BACKEND_MARKER} (podman, docker or bwrap): install or start one, e.g. \
+             bubblewrap (`bwrap`) or podman from your distribution's packages"
+        )
     }
 }
 
@@ -654,17 +661,23 @@ pub fn queue_agent_gate(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn no_backend_fix_names_backends_and_install_commands_per_os() {
         let mac = no_backend_fix(true);
+        assert!(mac.starts_with(NO_BACKEND_MARKER), "{mac}");
         assert!(mac.contains("Apple `container`") && mac.contains("brew install podman"));
         assert!(mac.contains("podman machine init") && mac.contains("podman machine start"));
+        assert!(mac.contains("container system start"), "{mac}");
         let linux = no_backend_fix(false);
-        assert!(linux.contains("bwrap") && linux.contains("apt-get install podman"));
-        assert!(!linux.contains("brew"));
+        assert!(linux.starts_with(NO_BACKEND_MARKER), "{linux}");
+        assert!(
+            linux.contains("bwrap") && linux.contains("podman"),
+            "{linux}"
+        );
+        assert!(!linux.contains("brew"), "{linux}");
     }
-
-    use super::*;
 
     fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
         use crate::config::Network;
