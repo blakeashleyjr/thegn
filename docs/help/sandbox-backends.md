@@ -172,6 +172,15 @@ resulting isolation class. When an unprobed engine still rejects the runtime at
 create, the failure names the runtime and the placement instead of a generic
 container error.
 
+## Agents dying on ssh disconnect
+
+On the first connect to an ssh host, thegn checks `loginctl show-user $USER -p
+Linger`. If systemd lingering is off, it shows a one-time notice, because
+systemd may kill the host's processes (your agents) when the session ends, for
+example when the laptop sleeps. Fix it on the host with
+`sudo loginctl enable-linger $USER`. Hosts without systemd, or where the probe
+fails or times out, show nothing and never block the connect.
+
 ## Isolation floor
 
 `backend_chain` expresses a _preference_; the isolation floor is a _demand_.
