@@ -167,7 +167,10 @@ fn reset_lead_group(
     if let Some(i) = existing {
         session.worktrees.remove(i);
         crate::handlers::terminal::push_terminal_group(session, panes, choice);
-        let fresh = session.worktrees.pop().expect("the Lead group was just pushed");
+        let fresh = session
+            .worktrees
+            .pop()
+            .expect("the Lead group was just pushed");
         session.worktrees.insert(i, fresh);
         session.active = i;
     } else {

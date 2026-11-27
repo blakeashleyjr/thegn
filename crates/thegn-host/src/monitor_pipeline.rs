@@ -394,10 +394,9 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
 }
 
 fn selected_backend_from_note(note: Option<&str>) -> Option<String> {
-    note?.lines().find_map(|line| {
-        line.strip_prefix("backend selected: ")
-            .map(display_label)
-    })
+    note?
+        .lines()
+        .find_map(|line| line.strip_prefix("backend selected: ").map(display_label))
 }
 
 /// Sanitize labels that enter board and sidebar text rendering. Keep the raw
