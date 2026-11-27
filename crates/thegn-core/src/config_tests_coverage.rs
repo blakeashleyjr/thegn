@@ -1793,19 +1793,13 @@ fn keybind_config_iter_and_into_iter_and_get() {
 
 #[test]
 fn config_path_uses_xdg_config_home() {
-    // A second instance (a dev build beside the stable one) relocates the whole
-    // config dir with THEGN_CONFIG_DIR, so both outcomes are correct here. The
-    // test used to assert only the default and failed for anyone running the
-    // suite inside that instance's own pane.
-    match std::env::var_os("THEGN_CONFIG_DIR") {
-        Some(dir) if std::path::Path::new(&dir).is_absolute() => {
-            assert_eq!(
-                Config::path(),
-                std::path::Path::new(&dir).join("config.toml")
-            );
-        }
-        _ => assert!(Config::path().ends_with("thegn/config.toml")),
-    }
+    let _env = crate::testenv::EnvGuard::unset(&[crate::util::THEGN_CONFIG_DIR_ENV]);
+    assert_eq!(
+        Config::path(),
+        crate::util::xdg_config_home()
+            .join("thegn")
+            .join("config.toml")
+    );
 }
 
 #[test]

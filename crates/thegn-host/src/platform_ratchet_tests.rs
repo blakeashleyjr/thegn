@@ -329,6 +329,83 @@ fn thread_names_fit_the_comm_limit_ratchet() {
     );
 }
 
+/// Keep names behind spawn wrappers in the same namespace as literal names.
+/// Match-returned names are covered by mapping tests; this also catches wrapper
+/// literals and names passed directly through constants.
+#[test]
+fn indirect_thread_names_fit_the_comm_limit() {
+    fn rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let workspace = std::path::Path::new(MANIFEST).join("../..");
+    let crates = workspace.join("crates");
+    let mut files = Vec::new();
+    rust_files(&crates, &mut files);
+    let constant =
+        regex::Regex::new(r#"\bconst\s+([A-Z0-9_]+)\s*:\s*&(?:'static\s+)?str\s*=\s*"([^"]*)""#)
+            .unwrap();
+    let named_call =
+        regex::Regex::new(r#"(?:(?:try_)?spawn_named|\.thread_name)\s*\(\s*([A-Z][A-Z0-9_]*)"#)
+            .unwrap();
+    let named_wrapper = regex::Regex::new(
+        r#"(?:Lane::new|subscribe_thread|spawn_pass|spawn_reader|Worker::new|spawn)\s*\(\s*"(thegn-[^"\\]*)""#,
+    )
+    .unwrap();
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut uses = Vec::new();
+    let mut names = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).unwrap();
+        for captures in constant.captures_iter(&source) {
+            if let (Some(key), Some(value)) = (captures.get(1), captures.get(2)) {
+                if value.as_str().starts_with("thegn-") {
+                    // Validate every named thread constant, including ones
+                    // passed through a helper or injected spawner rather than
+                    // directly to a spawn_named call.
+                    names.push((path.clone(), value.as_str().to_owned()));
+                }
+                definitions.insert(
+                    key.as_str().to_owned(),
+                    (path.clone(), value.as_str().to_owned()),
+                );
+            }
+        }
+        uses.extend(
+            named_call
+                .captures_iter(&source)
+                .filter_map(|captures| captures.get(1).map(|name| name.as_str().to_owned())),
+        );
+        names.extend(named_wrapper.captures_iter(&source).filter_map(|captures| {
+            captures
+                .get(1)
+                .map(|name| (path.clone(), name.as_str().to_owned()))
+        }));
+    }
+
+    for name in uses {
+        let (path, value) = definitions
+            .get(&name)
+            .unwrap_or_else(|| panic!("spawn_named constant {name} has no literal definition"));
+        names.push((path.clone(), value.clone()));
+    }
+    assert!(!names.is_empty(), "expected to find thread-name constants");
+    for (path, name) in names {
+        assert!(
+            name.starts_with("thegn-") && name.len() <= 15,
+            "thread-name constant in {} violates Linux comm limit: {name}",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn burned_down_builder_files_use_spawn_named_with_entry_qos() {
     // THE-931 slice f: these files left thread-builder-host-ratchet.txt; keep them there.

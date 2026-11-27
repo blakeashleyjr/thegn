@@ -194,6 +194,9 @@ impl UnixTty for TtyWriteHandle {
     }
 }
 
+/// How long a split `ESC [` prefix is held waiting for the rest of the sequence.
+const CSI_HOLD: Duration = Duration::from_millis(40);
+
 /// A unix style terminal
 pub struct UnixTerminal {
     read: TtyReadHandle,
@@ -202,6 +205,8 @@ pub struct UnixTerminal {
     renderer: TerminfoRenderer,
     input_parser: InputParser,
     input_queue: VecDeque<InputEvent>,
+    /// When a partial CSI was first held by the parser (THE-2753b).
+    csi_hold_since: Option<std::time::Instant>,
     sigwinch_id: SigId,
     sigwinch_pipe: UnixStream,
     wake_pipe: UnixStream,
@@ -229,7 +234,8 @@ impl UnixTerminal {
         let mut write = TtyWriteHandle::new(FileDescriptor::dup(write)?);
         let saved_termios = write.get_termios()?;
         let renderer = TerminfoRenderer::new(caps.clone());
-        let input_parser = InputParser::new();
+        let mut input_parser = InputParser::new();
+        input_parser.set_hold_partial_csi(true);
         let input_queue = VecDeque::new();
 
         let (sigwinch_pipe, sigwinch_pipe_write) = UnixStream::pair()?;
@@ -250,6 +256,7 @@ impl UnixTerminal {
             renderer,
             input_parser,
             input_queue,
+            csi_hold_since: None,
             sigwinch_pipe,
             sigwinch_id,
             wake_pipe,
@@ -423,6 +430,19 @@ impl Terminal for UnixTerminal {
         // we opt to take on the complexity here to make things overall easier to
         // integrate.
 
+        // THE-2753b: a held partial CSI (`ESC [` split from the rest of a mouse
+        // report) is flushed after a short wait so a real Alt+[ is not lost.
+        // Under load this call can come long after the hold ran out while the
+        // rest of the report already sits in the tty buffer, so an expired hold
+        // polls without blocking first and only flushes when nothing is readable.
+        let mut wait = wait;
+        let mut hold_expired = false;
+        if let Some(since) = self.csi_hold_since {
+            let left = CSI_HOLD.saturating_sub(since.elapsed());
+            hold_expired = left.is_zero();
+            wait = Some(wait.map_or(left, |w| w.min(left)));
+        }
+
         let mut pfd = [
             pollfd {
                 fd: self.sigwinch_pipe.as_raw_fd(),
@@ -465,6 +485,16 @@ impl Terminal for UnixTerminal {
             };
         };
 
+        if hold_expired && pfd[1].revents == 0 {
+            self.csi_hold_since = None;
+            let input_queue = &mut self.input_queue;
+            self.input_parser
+                .flush_pending(|evt| input_queue.push_back(evt));
+            if let Some(event) = self.input_queue.pop_front() {
+                return Ok(Some(event));
+            }
+        }
+
         if pfd[0].revents != 0 {
             // SIGWINCH received via our pipe?
             if let Some(resize) = self.caught_sigwinch()? {
@@ -482,6 +512,11 @@ impl Terminal for UnixTerminal {
                         |evt| input_queue.push_back(evt),
                         n == buf.len(),
                     );
+                    if self.input_parser.has_pending_csi() {
+                        self.csi_hold_since.get_or_insert_with(std::time::Instant::now);
+                    } else {
+                        self.csi_hold_since = None;
+                    }
                     return Ok(self.input_queue.pop_front());
                 }
                 Err(ref e)

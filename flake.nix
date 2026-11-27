@@ -442,15 +442,24 @@
           # repository manipulation tests. Strip them via `env -u` so tests run in
           # a clean git environment. Likewise drop THEGN_SANDBOX: committing from a
           # shell running inside a live thegn bwrap sandbox leaks the =1 marker
-          # into the runner and false-fails the sandbox argv tests. `just test`
-          # runs cargo-nextest — one source of truth with CI. The doctest pass
+          # into the runner and false-fails the sandbox argv tests.
+          #
+          # The same reasoning covers the instance identity a dev pane exports:
+          # THEGN_CONFIG_DIR (=~/.config/thegn-dev), THEGN_DIR, THEGN_CHANNEL,
+          # THEGN_CONTROL_SOCKET, THEGN_SESSION_ID, THEGN_BIN, THEGN_WORKTREE and
+          # THEGN_NO_MIGRATE. Inheriting them made config-path tests assert the
+          # dev instance's layout instead of the default one, which failed the
+          # alpha.139 push for anyone pushing from inside such a pane. A hook is
+          # the user's own gate, never a pane's identity, so scrub them too.
+          #
+          # `just test` runs cargo-nextest — one source of truth with CI. The doctest pass
           # is `just test-doc`, deliberately CI-only: it is a third
           # full-workspace compile and the repo has no runnable doctests, so
           # paying for it on every push bought nothing.
           cargo-test = {
             enable = true;
             name = "cargo test";
-            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just test";
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX -u THEGN_CONFIG_DIR -u THEGN_DIR -u THEGN_CHANNEL -u THEGN_CONTROL_SOCKET -u THEGN_SESSION_ID -u THEGN_BIN -u THEGN_WORKTREE -u THEGN_NO_MIGRATE just test";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
@@ -478,7 +487,7 @@
             #   fatal: GIT_WORK_TREE not allowed without specifying GIT_DIR
             #
             # — which is exactly what a partial fix produced here.
-            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just smoke";
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX -u THEGN_CONFIG_DIR -u THEGN_DIR -u THEGN_CHANNEL -u THEGN_CONTROL_SOCKET -u THEGN_SESSION_ID -u THEGN_BIN -u THEGN_WORKTREE -u THEGN_NO_MIGRATE just smoke";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
