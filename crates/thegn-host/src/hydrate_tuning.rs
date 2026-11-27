@@ -124,7 +124,7 @@ fn glyph_fingerprints()
 /// 500ms base that divides `PR_REFRESH_INTERVAL` so the ticker keeps emitting
 /// `RefreshKind::Pr` (see the cadence-invariant test).
 pub(crate) const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
-const DEFAULT_BG_BUSY_GLYPH_TTL_MS: u64 = 10_000;
+const DEFAULT_BG_BUSY_GLYPH_TTL_MS: u64 = 30_000;
 const DEFAULT_BG_SAFETY_GLYPH_TTL_MS: u64 = 600_000;
 /// Only the focused or recently used worktrees need live git status. Older
 /// rows keep their last-known glyphs until selected again.
@@ -181,7 +181,7 @@ pub(crate) fn glyph_ttls_from(
     }
 }
 
-/// Current policy. `THEGN_BG_MODEL_REFRESH_MS` defaults to 10s (`0` always
+/// Current policy. `THEGN_BG_MODEL_REFRESH_MS` defaults to 30s (`0` always
 /// rescans background rows); `THEGN_BG_SAFETY_GLYPH_TTL_MS` defaults to 10m.
 /// Both are env-only knobs.
 pub(crate) fn glyph_ttls() -> GlyphTtls {
@@ -704,6 +704,7 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(ttls.safety, Duration::from_secs(600));
+        assert_eq!(ttls.busy, Duration::from_secs(30));
         let path = Path::new("/worktrees/warm");
         let stamp = warm_stamp(now, path, &ttls);
         let age = now.duration_since(stamp);

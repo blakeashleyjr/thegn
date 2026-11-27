@@ -304,6 +304,15 @@ pub(crate) fn snapshot_live_agents() -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Worktrees that currently own at least one live pane, including panes in
+/// parked workspaces. Used to keep their background glyphs on the busy cadence.
+pub(crate) fn snapshot_live_pane_worktrees() -> std::collections::BTreeSet<String> {
+    cell()
+        .lock()
+        .map(|reg| reg.pane_wt.values().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// The current per-pane agent attribution (`pane id → agent CLI name`), for
 /// reporting per-pane semantic state. Empty until the next [`publish`].
 // Consumed by the forthcoming `agent_states` control endpoint (B‑3 exposure);
