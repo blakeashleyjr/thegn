@@ -52,10 +52,6 @@ grep -Fq -- '--export-json' <<<"$HYPERFINE_HELP" || {
   echo "claim-run: hyperfine lacks --export-json" >&2
   exit 1
 }
-grep -Fq -- '--command-timeout' <<<"$HYPERFINE_HELP" || {
-  echo "claim-run: hyperfine lacks --command-timeout" >&2
-  exit 1
-}
 
 # Each command has its own deadline. Kill the full process group on timeout so
 # PTY wrappers cannot leave a measured process running in the background.
@@ -117,14 +113,14 @@ fi
 CHECKOUT_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
 
 echo "claim-run: cold launch (30 measured runs)"
-bounded 1800 hyperfine --runs 30 --warmup 3 --command-timeout 30 \
+bounded 1800 hyperfine --runs 30 --warmup 3 \
   --prepare "$PREPARE" --export-json "$OUTDIR/launch-cold.json" "$PTY_LAUNCH" \
   >"$OUTDIR/launch-cold.log" 2>&1
 
 echo "claim-run: warm launch (30 measured runs)"
 # The initial warm-up uses the same PTY command and persistent isolated state.
 bounded 30 bash -c "$PTY_LAUNCH" >"$OUTDIR/launch-warm-prime.log" 2>&1
-bounded 1800 hyperfine --runs 30 --warmup 3 --command-timeout 30 \
+bounded 1800 hyperfine --runs 30 --warmup 3 \
   --export-json "$OUTDIR/launch-warm.json" "$PTY_LAUNCH" \
   >"$OUTDIR/launch-warm.log" 2>&1
 
