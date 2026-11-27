@@ -276,6 +276,24 @@ class DevTests(Base):
         self.assertTrue(argv[2].endswith("scripts/dev_live.py"))
         self.assertEqual(argv[-2:], ["--level", "debug"])
 
+    def test_latest_release_refuses_to_downgrade_dev(self):
+        script_binary(self.home / ".thegn-devel/bin/thegn", "0.1.0-alpha.139")
+        release = make_release(self.root, "v0.1.0-alpha.138", "0.1.0-alpha.138")
+        ctx = self.ctx(tags=("v0.1.0-alpha.138",), release_dir=release)
+        with self.assertRaisesRegex(upd.Refusal, r"installed dev version 0\.1\.0-alpha\.139.*--force"):
+            upd.cmd_dev(ctx, ["release"])
+        self.assertFalse([c for c in ctx.calls if c[0] in ("download", "inherit")])
+
+    def test_same_dev_release_is_a_noop_and_force_reinstalls(self):
+        script_binary(self.home / ".thegn-devel/bin/thegn", "0.1.0-alpha.138")
+        release = make_release(self.root, "v0.1.0-alpha.138", "0.1.0-alpha.138")
+        ctx = self.ctx(tags=("v0.1.0-alpha.138",), release_dir=release)
+        self.assertEqual(upd.cmd_dev(ctx, ["release"]), 0)
+        self.assertIn("dev is already at 0.1.0-alpha.138", ctx.out.getvalue())
+        self.assertFalse([c for c in ctx.calls if c[0] == "download"])
+        self.assertEqual(upd.cmd_dev(ctx, ["release", "--force"]), 0)
+        self.assertTrue([c for c in ctx.calls if c[0] == "download"])
+
     def test_release_dry_run_does_not_download(self):
         ctx = self.ctx()
         self.assertEqual(upd.cmd_dev(ctx, ["release=0.1.0-alpha.101", "--dry-run"]), 0)

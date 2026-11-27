@@ -226,11 +226,19 @@ fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> R
 /// Open the state DB to find daemons. When an older daemon blocks migration (the
 /// upgrade case this verb exists to fix), read the registry without migrating.
 fn open_for_discovery() -> Result<thegn_core::db::Db> {
-    match thegn_core::db::Db::open() {
+    open_for_discovery_with(thegn_core::db::Db::open, || {
+        thegn_core::db::Db::open_read_only_wal_at(&thegn_core::db::state_db_path())
+    })
+}
+
+fn open_for_discovery_with(
+    open: impl FnOnce() -> Result<thegn_core::db::Db>,
+    open_read_only: impl FnOnce() -> Result<Option<thegn_core::db::Db>>,
+) -> Result<thegn_core::db::Db> {
+    match open() {
         Ok(db) => Ok(db),
         Err(error) if crate::stale_daemon::detect(&error).is_some() => {
-            thegn_core::db::Db::open_read_only_wal_at(&thegn_core::db::state_db_path())?
-                .ok_or(error)
+            open_read_only()?.ok_or(error)
         }
         Err(error) => Err(error),
     }
@@ -404,6 +412,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use thegn_core::config::{Config, DaemonConfig};
+
+    #[test]
+    fn stop_discovery_falls_back_to_read_only_when_schema_migration_is_blocked() {
+        let fallback_called = std::cell::Cell::new(false);
+        let db = super::open_for_discovery_with(
+            || {
+                Err(thegn_core::db::MigrationAccessError::OldSchemaInUse {
+                    database: PathBuf::from("/tmp/thegn.db"),
+                }
+                .into())
+            },
+            || {
+                fallback_called.set(true);
+                Ok(Some(thegn_core::db::Db::open_memory()?))
+            },
+        )
+        .expect("the old-schema registry should remain readable");
+        drop(db);
+        assert!(fallback_called.get());
+    }
 
     #[test]
     fn stop_reports_an_unverified_listener_as_unknown_and_fails() {

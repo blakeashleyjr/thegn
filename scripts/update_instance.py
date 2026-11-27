@@ -561,30 +561,44 @@ def confirm_local_build(ctx: Ctx, reason: str) -> bool:
 
 def cmd_dev(ctx: Ctx, args: list[str]) -> int:
     args = list(args)
-    yes, no_launch = False, False
-    for flag in ("--yes", "-y", "--no-launch", "--restart-daemon"):
+    yes, no_launch, force = False, False, False
+    for flag in ("--yes", "-y", "--no-launch", "--restart-daemon", "--force"):
         while flag in args:
             args.remove(flag)
             yes |= flag in ("--yes", "-y", "--restart-daemon")
             no_launch |= flag == "--no-launch"
+            force |= flag == "--force"
     if "--here" in args:
         args.remove("--here")
         ctx.warn("--here is ignored: just update dev relaunches the dev instance in its own window")
     target, dry_run, no_attest, passthrough = split_dev_args(args)
-    code = _install_dev(ctx, target, dry_run, no_attest, passthrough)
+    code = _install_dev(ctx, target, dry_run, no_attest, passthrough, force)
     if code != 0 or dry_run:
         return code
     return restart_after_update(ctx, "dev", yes, no_launch)
 
 
-def _install_dev(ctx: Ctx, target: str, dry_run: bool, no_attest: bool, passthrough: list[str]) -> int:
+def _install_dev(ctx: Ctx, target: str, dry_run: bool, no_attest: bool, passthrough: list[str],
+                 force: bool = False) -> int:
     if target == "release" or target.startswith("release="):
         want = target.partition("=")[2] or None
         tag = resolve_tag(ctx, want)
-        if (not dry_run and binary_version(ctx, ctx.dev_bin) == version_of_tag(tag)
-                and any(p.replaced for p in instance_procs_of(ctx, instance(ctx, "dev")))):
-            ctx.say(f"dev binary is already at {version_of_tag(tag)}; only restarting the stale daemon")
-            return 0
+        installed = binary_version(ctx, ctx.dev_bin)
+        target_version = version_of_tag(tag)
+        if installed is not None:
+            target_key, installed_key = parse_version(target_version), parse_version(installed)
+            order = (target_key > installed_key) - (target_key < installed_key)
+            if order < 0 and not force:
+                raise Refusal(
+                    f"{tag} is older than the installed dev version {installed}; refusing to "
+                    "downgrade (use --force to reinstall an older release)"
+                )
+            if order == 0 and not force:
+                if (not dry_run and any(p.replaced for p in instance_procs_of(ctx, instance(ctx, "dev")))):
+                    ctx.say(f"dev binary is already at {installed}; only restarting the stale daemon")
+                    return 0
+                ctx.say(f"dev is already at {installed}; nothing to install (--force reinstalls)")
+                return 0 if dry_run else restart_after_update(ctx, "dev", False, False)
         ctx.say(f"dev <- release {tag}: download+verify, then scripts/dev_live.py --prebuilt")
         if dry_run:
             ctx.say("dry-run: " + " ".join(dev_live_argv(ctx, Path("<verified-binary>"), passthrough)))

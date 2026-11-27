@@ -324,6 +324,11 @@ callers MUST present an admin-scoped token.
 - **WHEN** `thegn daemon stop` runs against a live daemon
 - **THEN** the daemon shuts down gracefully and the command reports it
 
+#### Scenario: An operator stops a daemon while an upgrade is waiting on its schema lease
+
+- **WHEN** `thegn daemon stop` runs while an older daemon holds the state database on an older schema
+- **THEN** registry discovery reads the existing database without migration and can still stop the daemon
+
 #### Scenario: A non-admin token cannot stop the daemon
 
 - **WHEN** a TCP client whose token lacks `admin` calls

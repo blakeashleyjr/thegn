@@ -160,9 +160,10 @@ database on the old schema, and the new build refuses to migrate under it. thegn
 detects this, explains it, and offers a one-step fix:
 
 - On a terminal, thegn asks "Stop it now?" and runs `thegn daemon stop` if you
-  answer `y`. **This ends that instance's panes**, so it never does it unasked.
+  answer `y`. **This ends that instance's panes**; then it reruns your original
+  command so the migration and launch can finish.
 - In a script or pipe, thegn prints the exact command and changes nothing:
-  `thegn daemon stop`, then run thegn again.
+  `thegn daemon stop`; rerun the original command afterward.
 - In a running host the banner reads `OLD DAEMON: an older thegn is still
 running`. Quit, run `thegn daemon stop`, and restart.
 
