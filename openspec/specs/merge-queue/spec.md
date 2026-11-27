@@ -12,6 +12,31 @@ The whole queue is drivable from a `merge` CLI namespace.
 
 ## Requirements
 
+### Requirement: Candidate gate commands require an isolated runner
+
+The merge queue SHALL run gate setup, gate, and lockfile regeneration
+commands only inside the admitted sealed sandbox. The runner SHALL resolve and
+preflight the same local isolation backend before setup, run each command with
+an isolated process environment and bounded captured output, and accept a
+result only after the command has exited and its output receipt has been
+collected. If the sealed mode is disabled or the backend cannot be admitted,
+started, or preflighted, the queue SHALL record an infrastructure hold and
+SHALL NOT report a trusted green result or auto-land the candidate.
+
+#### Scenario: Missing isolation backend holds the candidate
+
+- **WHEN** a gate is requested with `gate_sandbox = "off"` or the sealed
+  backend is unavailable
+- **THEN** setup and gate commands do not run, the result is an infrastructure
+  hold, and no trusted green verdict is emitted
+
+#### Scenario: Sealed gate output is received before verdict
+
+- **WHEN** setup and gate complete in the sealed runner
+- **THEN** the queue waits for captured output and child reap, validates the
+  immutable gate workspace, and only then maps the received exit status to a
+  candidate verdict
+
 ### Requirement: Worktree branches can be assigned to the merge queue
 
 thegn SHALL let a user assign worktree branches to a per-repo merge queue,

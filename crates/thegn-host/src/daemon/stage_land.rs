@@ -439,8 +439,8 @@ async fn gather_unattended(
 /// gate would run worker-written code (justfile, build.rs, tests) on the host
 /// with no human involved, so the land asks the owner with this reason.
 async fn merge_gate_isolated(cfg: &Arc<Config>, repo_root: &Path) -> Result<(), String> {
-    // Off resolves to the host at once (no sandbox ensure, no preflight);
-    // the overlay read and a sealed resolve are blocking, so both run here.
+    // Off refuses without a sandbox ensure; the overlay read and a sealed
+    // resolve are blocking, so both run here.
     let full = Arc::clone(cfg);
     let root = repo_root.to_path_buf();
     let resolved = tokio::task::spawn_blocking(move || crate::gate_sandbox::resolve(&full, &root))
