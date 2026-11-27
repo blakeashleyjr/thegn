@@ -2,7 +2,7 @@ use crate::{
     BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, LeaderExit, Limits,
     POLL_INTERVAL, Run, StdinHandoff, Stream, StreamConsumer, Which, aggregate_fit,
 };
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 use nix::errno::Errno;
 use nix::{
     sys::signal::{Signal, killpg},
@@ -538,6 +538,14 @@ fn macos_group_has_live_members(
             )
         };
         if got != want {
+            // libproc can return a PID that exited after enumeration. ESRCH
+            // means that member is gone; other failures remain live/unknown
+            // so an inaccessible process cannot be mistaken for an empty group.
+            if got == 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return false;
+            }
             // The member may have raced with exit or may be unobservable. Either
             // way, another bounded poll is safer than proving emptiness.
             true
