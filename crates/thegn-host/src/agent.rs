@@ -820,6 +820,12 @@ pub fn prepare_sandbox_env_with_selection(
     };
     let loc = provider_loc.as_ref().unwrap_or(loc);
     for candidate in thegn_core::launch_backend::candidates(&sb) {
+        // A Compose policy refusal is global to this requested launch. Do not
+        // reinterpret the same request as an uncontained host launch after an
+        // OCI candidate rejected it.
+        if compose_miss.is_some() && candidate.backend == thegn_core::config::SandboxBackend::None {
+            break;
+        }
         // `resolve_placed_exact`, not `resolve_placed`: `launch_backend::candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
         // resolver that degrades into the chain on a miss makes each candidate
@@ -994,7 +1000,15 @@ pub fn prepare_sandbox_env_with_selection(
             }
             if let Some(m) = thegn_core::sandbox::compose_policy_refusal(&spec) {
                 if explicit_choice {
-                    anyhow::bail!("{m} for {worktree}");
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!("{m} for {worktree}"),
+                        ask,
+                        dormant: None,
+                        sealed_home: sb.profile.hides_home(),
+                    }
+                    .into());
                 }
                 thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
                 compose_miss = Some(m);

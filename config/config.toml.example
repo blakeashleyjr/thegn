@@ -1559,6 +1559,15 @@ command = "yazi"
 name = "editor"
 command = "${EDITOR:-vi} ."
 
+# Tools may also expose ordered launch backends, using the same fields and
+# validation as [[agents.backends]].
+# [[tools.backends]]
+# name = "codex-work"
+# harness = "codex"
+# model = "gpt-6-luna"
+# env = { CODEX_HOME = "~/.codex-work" }
+# account = "~/.codex-work"
+
 [[tools]]
 name = "diff"
 command = "git diff"

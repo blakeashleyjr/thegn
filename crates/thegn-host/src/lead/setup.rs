@@ -528,18 +528,18 @@ pub(crate) fn spawn_job(
                 let result = tokio::task::spawn_blocking(|| {
                     let exe = thegn_core::util::self_exe_path()
                         .ok_or_else(|| "cannot find the thegn executable".to_string())?;
-                    let status = std::process::Command::new(exe)
+                    let output = std::process::Command::new(exe)
                         .args(["daemon", "stop"])
                         .env("THEGN_CHANNEL", crate::channel_state::current().as_str())
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .status()
+                        .output()
                         .map_err(|error| format!("could not run `thegn daemon stop`: {error}"))?;
-                    if status.success() {
+                    if output.status.success() {
                         Ok(())
                     } else {
-                        Err(format!("`thegn daemon stop` exited with {status}"))
+                        Err(format!("`thegn daemon stop` exited with {}", output.status))
                     }
                 })
                 .await

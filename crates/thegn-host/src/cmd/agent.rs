@@ -281,7 +281,7 @@ fn backend_status_rows_for_accounts(
         .filter(|entry| agent_filter.is_none_or(|name| name == entry.name))
         .flat_map(|entry| {
             entry.backends.iter().map(|backend| {
-                let headroom = backend_headroom(backend, &accounts);
+                let headroom = backend_headroom(backend, accounts);
                 let reset = accounts
                     .iter()
                     .filter(|account| {
@@ -429,10 +429,7 @@ fn backend_cooldown_until_in(
     let Some(value) = db.get_ui_state(BACKEND_COOLDOWN_SCOPE, &key)? else {
         return Ok(None);
     };
-    let reset = match value.parse::<i64>() {
-        Ok(reset) => Some(reset),
-        Err(_) => None,
-    };
+    let reset = value.parse::<i64>().ok();
     if reset.is_none_or(|reset| reset <= thegn_core::util::now_ms() / 1000) {
         db.del_ui_state(BACKEND_COOLDOWN_SCOPE, &key)?;
         return Ok(None);

@@ -2383,7 +2383,7 @@ pub fn draw_panel(
         return;
     }
     if let Some(error) = &model.panel_error {
-        let red = theme_color(&theme::RED);
+        let red = theme_color(theme::RED);
         let wrapped = crate::detail::wrap_full_text(error, rect.cols.saturating_sub(4).max(1));
         // Keep the final row for the retry instruction so it cannot overwrite
         // the last visible line of a long panel error.
@@ -2401,9 +2401,9 @@ pub fn draw_panel(
             );
         }
         let hint = if error.contains("Alt i") {
-            "Press Alt i to retry Lead setup"
+            "Alt i: retry setup"
         } else {
-            "Switch away and back to retry"
+            "Switch to retry"
         };
         draw_text(
             surface,

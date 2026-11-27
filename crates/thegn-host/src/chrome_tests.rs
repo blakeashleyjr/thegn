@@ -2963,7 +2963,6 @@ fn panel_renders_accordion_sections_and_open_content() {
 
 #[test]
 fn focused_panel_reveals_navigation_footer_from_live_keyhints() {
-    use crate::panel::PanelUi;
     let rect = Rect {
         x: 0,
         y: 0,
@@ -2990,7 +2989,6 @@ fn focused_panel_reveals_navigation_footer_from_live_keyhints() {
 
 #[test]
 fn unfocused_panel_hides_navigation_footer() {
-    use crate::panel::PanelUi;
     let rect = Rect {
         x: 0,
         y: 0,
@@ -3011,7 +3009,6 @@ fn unfocused_panel_hides_navigation_footer() {
 
 #[test]
 fn dense_panel_shows_no_navigation_footer() {
-    use crate::panel::PanelUi;
     // A short rect the accordion fills leaves no blank tail space, so the
     // footer stays hidden (mirrors the sidebar's "full list shows no hints").
     let rect = Rect {
@@ -3043,7 +3040,6 @@ fn layout_hint_model() -> FrameModel {
 
 #[test]
 fn panel_shows_layout_keys_block_and_follows_a_rebind() {
-    use crate::panel::PanelUi;
     let rect = Rect {
         x: 0,
         y: 0,
@@ -3068,7 +3064,6 @@ fn panel_shows_layout_keys_block_and_follows_a_rebind() {
 
 #[test]
 fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
-    use crate::panel::PanelUi;
     let rect = Rect {
         x: 0,
         y: 0,
@@ -3173,7 +3168,6 @@ fn pane_key_hints_render_theme_keycaps_and_keep_keys_at_narrow_widths() {
 
 #[test]
 fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
-    use crate::panel::PanelUi;
     let mut model = layout_hint_model();
     model.layout_hints_off = true;
     let rect = Rect {

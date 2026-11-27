@@ -61,6 +61,11 @@ its restart confirm SHALL state how many live daemon sessions would end.
 - **WHEN** the Lead row is clicked while `[lead]` is absent or the Lead is not ready
 - **THEN** the guided setup opens instead of activating a project worktree
 
+#### Scenario: Activate a configured Lead row by keyboard
+
+- **WHEN** the user presses Enter on a configured Lead sidebar row
+- **THEN** the row uses the Lead readiness path and opens setup when the Lead is unavailable
+
 #### Scenario: Counted restart
 
 - **WHEN** the user chooses to restart the daemon with 3 live sessions
@@ -68,19 +73,23 @@ its restart confirm SHALL state how many live daemon sessions would end.
 
 ### Requirement: Lead startup failures remain readable and recoverable
 
-The Lead startup screen SHALL wrap the complete failure detail at narrow widths. A cold-switch
-panel load SHALL replace its skeleton with panel content or an explicit error and retry instruction;
+The Lead startup screen SHALL wrap the complete failure detail at narrow widths in a fixed reserve
+after the step rows, so the remaining step rows keep their positions as the cursor advances. A
+cold-switch panel load SHALL replace its skeleton with panel content or an explicit error and retry
+instruction;
 it SHALL NOT leave a skeleton after its worker exits without a panel result.
 Jumping to an existing Lead whose listener is unavailable SHALL open the setup flow, which offers
 the documented daemon restart path. Confirming SHALL run `thegn daemon stop` off the event loop,
-wait for the stop to finish, and reopen the Lead so its next attach starts a daemon with the listener.
+wait for the stop to finish, and reopen the Lead so its next attach starts a daemon with the
+listener.
 When the current channel or host prerequisites prevent launch, the sidebar Lead entry SHALL show a
 one-line reason and route to setup rather than launching a failing Lead.
 
 #### Scenario: Narrow startup error
 
 - **WHEN** the Lead startup screen has a failure message wider than its subline at a narrow terminal
-- **THEN** the complete message, including its recovery instructions, is wrapped below the failed step
+- **THEN** the complete message, including its recovery instructions, is
+  wrapped in the reserved detail rows
 
 #### Scenario: Panel hydration fails
 

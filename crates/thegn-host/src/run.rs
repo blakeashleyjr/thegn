@@ -9066,6 +9066,16 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                SidebarOutcome::Activate(target)
+                    if crate::lead::group::is_lead_target(&target, &session) =>
+                {
+                    // Configured Lead rows share the jump path too, so an
+                    // unavailable listener opens setup instead of restoring a
+                    // stale tab through generic sidebar activation.
+                    jump_lead!();
+                    dirty = true;
+                    continue;
+                }
                 SidebarOutcome::Activate(target) => {
                     let kind = crate::handlers::sidebar_activate::switch_kind(&target, &session.id);
                     switch_at = Some((std::time::Instant::now(), kind));

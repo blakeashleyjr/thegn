@@ -541,9 +541,10 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("session open", "vars", SourceKind::Structural),
-    // `agent run` (THE-2005): the brief is a path (clap's path completer),
-    // the bindings and the tracked issue id are free-form, the timeout a
-    // number; the task text itself has no source.
+    slot("agent backends", "agent", SourceKind::Structural),
+    // `agent run` (THE-2005): backend, brief, bindings, tracked issue id and
+    // timeout are structural; task text itself has no value source.
+    slot("agent run", "backend", SourceKind::Structural),
     slot("agent run", "brief_file", SourceKind::Structural),
     slot("agent run", "var", SourceKind::Structural),
     slot("agent run", "track", SourceKind::Structural),

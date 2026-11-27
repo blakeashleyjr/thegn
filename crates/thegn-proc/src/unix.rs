@@ -454,7 +454,10 @@ fn group_has_live_members_in(proc_root: &Path, pid: libc::pid_t) -> bool {
     group_live_with_scan(proc_root, pid, &mut scan)
 }
 
-#[cfg(any(test, all(not(target_os = "linux"), not(target_os = "macos"))))]
+#[cfg(any(
+    all(test, not(target_os = "macos")),
+    all(not(target_os = "linux"), not(target_os = "macos"))
+))]
 fn group_live(pid: libc::pid_t) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -464,6 +467,13 @@ fn group_live(pid: libc::pid_t) -> bool {
     {
         group_exists(pid)
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn group_live(pid: libc::pid_t) -> bool {
+    // `killpg(pgid, 0)` counts zombie-only groups as live on macOS. Use libproc
+    // so process-group cleanup tests distinguish exited descendants from work.
+    macos_group_has_live_members(pid, None)
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
