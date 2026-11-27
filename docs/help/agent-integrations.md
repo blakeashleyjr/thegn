@@ -104,8 +104,9 @@ See [[environments]].
 ## Ordered backends
 
 An agent role can document ordered alternatives under `[[agents.backends]]`.
-Each entry selects a harness, optional model and harness-specific environment
-overlay; `account` can bind the choice to a usage key or credential-home path.
-The `agent list` command shows names and non-secret launch metadata. Usage
-headroom is considered known only when an account snapshot has at least one
-window below its limit.
+Each entry describes a harness, optional model and harness-specific environment
+overlay; `account` can bind it to a usage key or credential-home path. The
+`agent list` command shows names and non-secret launch metadata, while
+`agent backends` reports current usage headroom and reset time. These definitions
+are not yet consumed by agent launches; `agent run` and pipeline stages continue
+to use the entry's existing single backend.

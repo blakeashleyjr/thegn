@@ -753,6 +753,12 @@ which are protected from redispatch but no
 longer hold a stage slot). The `dispatch list --json` `liveness` field also
 uses the `parked` token for those rows. Both are terse by default and take
 `--json`.
+
+`thegn agent backends [--agent <role>]` reports each configured backend's
+current usage headroom (`available`, `exhausted` or `unknown`) and the earliest
+reported reset time. `--json` emits a JSON array. Account paths are used for
+matching but are not included in the output. This is an inspection command;
+agent launches still use the role's existing single-backend fields.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.
