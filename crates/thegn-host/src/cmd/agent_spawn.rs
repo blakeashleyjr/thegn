@@ -626,19 +626,26 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             && harness.is_some_and(|harness| {
                 thegn_core::agent_error::is_quota_error(harness, &output_tail(&observed.1))
             });
+        if quota_hit {
+            let (cfg_for_cooldown, agent_for_cooldown) = (cfg.clone(), agent.clone());
+            let current_backend = current.to_string();
+            let cooldown = tokio::task::spawn_blocking(move || {
+                super::agent::remember_quota_reset(
+                    &cfg_for_cooldown,
+                    &agent_for_cooldown,
+                    &current_backend,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("agent quota cooldown task failed: {e}"))?;
+            if let Err(error) = cooldown {
+                tracing::warn!(%error, "could not persist agent backend quota cooldown");
+            }
+        }
         if quota_hit && pinned_backend.is_none() {
             let attempted = vec![current.to_string()];
-            let current_backend = current.to_string();
             let (cfg_for_select, agent_for_select) = (cfg.clone(), agent.clone());
             let next = tokio::task::spawn_blocking(move || {
-                // The usage service remains the source of the reset deadline.
-                // Persist that provider-reported boundary so later runs do not
-                // immediately select an account whose tracker snapshot lags.
-                let _ = super::agent::remember_quota_reset(
-                    &cfg_for_select,
-                    &agent_for_select,
-                    &current_backend,
-                );
                 super::agent::choose_backend_excluding(
                     &cfg_for_select,
                     &agent_for_select,
