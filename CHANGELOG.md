@@ -7,6 +7,18 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.142] — 2026-11-27
+
+Idle hosts use much less CPU across many worktrees.
+
+### Changed
+
+- Background sidebar status refreshes cover only worktrees that are visible, recently used, or have a live pane or agent. Other worktrees refresh on the quiet safety interval. The busy refresh interval default rises from 10 s to 30 s. On a host with 1,500 registered worktrees, the scan pool previously used most of a CPU core at idle.
+
+### Added
+
+- `test/perf/claim-run.sh` measures a published release binary (startup, idle CPU, flood latency and memory at 1, 8 and 32 worktrees) without rebuilding it, and `docs/performance-results.md` documents the protocol.
+
 ## [0.1.0-alpha.141] — 2026-11-27
 
 Agent launches can fail over between accounts and harnesses, and Lead, the pane keys hint and idle CPU use are fixed.
