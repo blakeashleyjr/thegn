@@ -429,7 +429,10 @@ fn backend_cooldown_until_in(
     let Some(value) = db.get_ui_state(BACKEND_COOLDOWN_SCOPE, &key)? else {
         return Ok(None);
     };
-    let reset = value.parse::<i64>().ok();
+    let reset = match value.parse::<i64>() {
+        Ok(reset) => Some(reset),
+        Err(_) => None,
+    };
     if reset.is_none_or(|reset| reset <= thegn_core::util::now_ms() / 1000) {
         db.del_ui_state(BACKEND_COOLDOWN_SCOPE, &key)?;
         return Ok(None);
@@ -895,8 +898,8 @@ mod hook_tests {
         assert_eq!(rows[0].headroom, "exhausted");
         assert_eq!(rows[0].resets_at, Some(10_000));
         assert_eq!(rows[1].headroom, "available");
-        let json = serde_json::to_string(&rows).expect("serialize status rows");
-        assert!(!json.contains("/accounts/a"));
+        let json = serde_json::to_value(&rows).expect("serialize status rows");
+        assert!(!json.to_string().contains("/accounts/a"));
     }
 
     #[test]
