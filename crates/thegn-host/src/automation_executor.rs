@@ -75,6 +75,7 @@ pub async fn execute(
                     worktree: event.worktree.clone(),
                     agent: Some(AgentLaunch {
                         agent,
+                        backend: None,
                         prompt: prompt.clone(),
                         headless: Some(!prompt.is_empty()),
                         bind_worktree: false,

@@ -1365,6 +1365,22 @@ command = "claude"
 # Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
 # drawer_cwd = "."
 
+# A role may offer ordered harness/account/model alternatives. `agent run`
+# selects the first one with known usage headroom; `--backend <name>` pins one.
+# Credentials stay in each harness home (the account path is only a selector).
+# [[agents.backends]]
+# name = "pi-local"
+# harness = "pi"
+# model = "opencode-go/sonnet"
+# env = { PI_CODING_AGENT_DIR = "~/.pi" }
+# account = "~/.pi"
+# [[agents.backends]]
+# name = "codex-pro"
+# harness = "codex"
+# model = "gpt-6-luna"
+# env = { CODEX_HOME = "~/.codex-pro" }
+# account = "~/.codex-pro"
+
 [[agents]]
 name = "aider"
 command = "aider --model sonnet"

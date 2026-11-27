@@ -83,6 +83,9 @@ pub enum Action {
         /// `codex`) when no entry is named that.
         #[arg(long)]
         agent: String,
+        /// Pin a named backend configured on this role.
+        #[arg(long)]
+        backend: Option<String>,
         /// The worktree to launch into (path). The agent runs here.
         #[arg(long)]
         worktree: String,
@@ -180,6 +183,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => sessions(cfg, worktree.as_deref(), harness.as_deref(), json),
         Action::Run {
             agent,
+            backend,
             worktree,
             env,
             brief_file,
@@ -195,6 +199,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             cfg,
             super::agent_spawn::RunArgs {
                 agent,
+                backend,
                 worktree,
                 env,
                 brief_file,
@@ -291,6 +296,62 @@ fn backend_status_rows_for_accounts(
             })
         })
         .collect()
+}
+
+/// Resolve `agent run`'s selected backend from one fresh per-account snapshot.
+/// Runs on the caller's blocking pool because usage gathering may read files
+/// and make bounded provider requests.
+pub(crate) fn choose_backend(
+    cfg: &Config,
+    agent: &str,
+    pinned: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(role) = cfg.agents.iter().find(|entry| entry.name == agent) else {
+        anyhow::ensure!(
+            pinned.is_none(),
+            "--backend requires a configured agent role"
+        );
+        return Ok(None);
+    };
+    if role.backends.is_empty() {
+        anyhow::ensure!(
+            pinned.is_none(),
+            "agent role {agent:?} has no configured backends"
+        );
+        return Ok(None);
+    }
+    if let Some(name) = pinned {
+        anyhow::ensure!(
+            role.backends.iter().any(|backend| backend.name == name),
+            "unknown backend {name:?} for agent role {agent:?}"
+        );
+        return Ok(Some(name.to_string()));
+    }
+    let configured_homes = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            let identity = backend.account.as_deref()?;
+            let path = std::path::PathBuf::from(thegn_core::util::expand_tilde(identity));
+            path.is_absolute()
+                .then_some(thegn_core::usage::HomeCandidate {
+                    provider: backend.harness.clone(),
+                    dir: path,
+                    origin: thegn_core::usage::HomeOrigin::Configured,
+                    label: Some(backend.name.clone()),
+                    enabled: true,
+                })
+        })
+        .collect::<Vec<_>>();
+    let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
+    thegn_core::usage::select_backend(&role.backends, &accounts)
+        .map(|backend| Some(backend.name.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent role {agent:?} has no backend with known usage headroom; \
+                 pin one with --backend to override"
+            )
+        })
 }
 
 fn backends(cfg: &Config, agent_filter: Option<&str>, json: bool) -> Result<()> {

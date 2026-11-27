@@ -33,6 +33,7 @@ pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 /// Parsed `agent run` flags (the clap variant's fields, moved in).
 pub(crate) struct RunArgs {
     pub agent: String,
+    pub backend: Option<String>,
     pub worktree: String,
     pub env: Option<String>,
     pub brief_file: Option<String>,
@@ -488,6 +489,7 @@ pub(crate) fn run(cfg: &Config, args: RunArgs) -> Result<()> {
 async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let RunArgs {
         agent,
+        backend,
         worktree,
         env,
         brief_file,
@@ -510,6 +512,14 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     if prompt.trim().is_empty() {
         anyhow::bail!("agent run needs a task: give a non-empty --prompt or --brief-file");
     }
+    let backend = {
+        let (cfg, agent) = (cfg.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || {
+            super::agent::choose_backend(&cfg, &agent, backend.as_deref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("agent backend selection task failed: {e}"))??
+    };
     crate::cmd::session::open_preflight(
         cfg,
         None,
@@ -558,6 +568,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         &client,
         crate::cmd::session::PlainOpen {
             agent: Some(agent),
+            backend: backend.clone(),
             stage: None,
             worktree: Some(worktree),
             prompt,
@@ -577,9 +588,13 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
                 "row": row,
                 "env": pinned,
                 "provision": provision.as_str(),
+                "backend": backend,
             }))?;
         } else {
             outln!("{}", display_cell(&info.id));
+            if let Some(backend) = backend.as_deref() {
+                outln!("backend {backend}");
+            }
             if let Some(row) = row {
                 outln!("dispatch {row} tracked");
             }
@@ -651,6 +666,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             "exit_code": status.exit_code(),
             "output_tail": tail,
             "duration_ms": duration_ms,
+            "backend": backend,
         });
         if let (Some(hint), Some(map)) = (hint, obj.as_object_mut()) {
             map.insert("exit_hint".to_string(), serde_json::json!(hint));
@@ -682,6 +698,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         if let Some(hint) = hint {
             outln!("[agent run: hint: {hint}]");
+        }
+        if let Some(backend) = backend.as_deref() {
+            outln!("[agent run: backend {backend}]");
         }
         if let Some(row) = row {
             outln!("dispatch {row} tracked");
@@ -1697,6 +1716,29 @@ mod tests {
         assert_eq!(track, None);
         assert!(!wait && !json);
         assert_eq!(timeout, DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn agent_run_accepts_a_named_backend_pin() {
+        let action = parse(&[
+            "thegn",
+            "agent",
+            "run",
+            "--agent",
+            "pipeline-coder",
+            "--backend",
+            "codex-pro",
+            "--worktree",
+            "/tmp/wt",
+            "--prompt",
+            "fix it",
+        ])
+        .expect("parse");
+        let crate::cmd::agent::Action::Run { agent, backend, .. } = action else {
+            panic!("expected agent run");
+        };
+        assert_eq!(agent, "pipeline-coder");
+        assert_eq!(backend.as_deref(), Some("codex-pro"));
     }
 
     #[test]

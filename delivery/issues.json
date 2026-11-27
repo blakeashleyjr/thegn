@@ -814,6 +814,13 @@
       "changes": [
         "sidebar-finished-pipelines-age-out"
       ]
+    },
+    {
+      "issue": "THE-2769",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "agent-account-failover"
+      ]
     }
   ]
 }

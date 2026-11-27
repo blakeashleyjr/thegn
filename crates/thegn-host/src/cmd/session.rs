@@ -759,6 +759,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     &client,
                     PlainOpen {
                         agent,
+                        backend: None,
                         stage,
                         worktree,
                         prompt: launch_prompt,
@@ -1172,6 +1173,8 @@ pub(crate) fn policy_admission(cfg: &Config, agent: &str, stage: &str) -> Result
 pub(crate) struct PlainOpen<'a> {
     /// `--agent`; `None` defaults to `stage`'s configured agent.
     pub agent: Option<String>,
+    /// A configured backend on `agent`, for callers such as `agent run`.
+    pub backend: Option<String>,
     /// `--stage` without `--issue`: layers the stage's model/env/permissions.
     pub stage: Option<String>,
     /// `--worktree` (resolved to an absolute path here).
@@ -1207,6 +1210,7 @@ pub(crate) async fn open_plain(
     use thegn_svc::control::{AgentLaunch, OpenSpec};
     let PlainOpen {
         agent,
+        backend,
         stage,
         worktree,
         prompt: launch_prompt,
@@ -1248,6 +1252,7 @@ pub(crate) async fn open_plain(
         worktree: Some(wt.clone()),
         agent: Some(AgentLaunch {
             agent: agent.clone(),
+            backend,
             prompt: launch_prompt,
             // A plain `--headless` forces headless; absent leaves the
             // default (headless exactly when a prompt was given).
@@ -1893,6 +1898,7 @@ pub(crate) async fn open_stage_dispatch(
             worktree: Some(wt.clone()),
             agent: Some(AgentLaunch {
                 agent: agent_name,
+                backend: None,
                 prompt,
                 // A stage dispatch is always headless — an interactive
                 // worker is a pane that sits there forever.
@@ -2370,6 +2376,7 @@ async fn resume_work(
             worktree: Some(wt.clone()),
             agent: Some(AgentLaunch {
                 agent: agent_name,
+                backend: None,
                 prompt,
                 // A resume is always headless — an interactive worker is a
                 // pane that sits there forever, same as a fresh dispatch.

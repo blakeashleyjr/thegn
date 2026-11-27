@@ -692,6 +692,7 @@ fn retry_open_spec(row: &AgentDispatch, prompt: String, resume: Option<String>) 
         worktree: Some(row.worktree_path.clone()),
         agent: Some(AgentLaunch {
             agent: row.agent_name.clone(),
+            backend: None,
             prompt,
             // A retry is always headless — same as the dispatch it retries.
             headless: Some(true),

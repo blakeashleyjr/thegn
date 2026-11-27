@@ -757,8 +757,9 @@ uses the `parked` token for those rows. Both are terse by default and take
 `thegn agent backends [--agent <role>]` reports each configured backend's
 current usage headroom (`available`, `exhausted` or `unknown`) and the earliest
 reported reset time. `--json` emits a JSON array. Account paths are used for
-matching but are not included in the output. This is an inspection command;
-agent launches still use the role's existing single-backend fields.
+matching but are not included in the output. `thegn agent run --agent <role>`
+selects the first backend with known headroom; `--backend <name>` pins a backend
+for that run. Pipeline stages continue to use their configured backend.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.
@@ -855,3 +856,7 @@ does not run this prune.
 
 `thegn open <repo>` takes a path anywhere inside a repo, or a unique repo
 basename, and raises it in a running instance — the remote control.
+`thegn agent run --agent <role> --backend <name>` pins a configured backend
+for one run. Without `--backend`, a role with ordered backends uses the first
+one whose account has known usage headroom. See [[agent-integrations]] and
+[[configuration]].

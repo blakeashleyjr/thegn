@@ -436,8 +436,9 @@ credential-home path. `thegn agent list` shows backend names, harnesses,
 models and environment variable names; it does not print environment values.
 `thegn agent backends` reports the current headroom and reset time using the
 per-account usage tracker. Unknown or unavailable usage is not considered
-headroom. Backend definitions are currently informational; `agent run` and
-pipeline launches still use the entry's existing single-backend fields.
+headroom. `thegn agent run --agent reviewer` selects the first backend with
+known headroom; `--backend codex-pro` pins a named backend. Pipeline launches
+continue to use the stage's configured single-backend fields.
 
 - **`harness`** decides the headless form (`claude -p …`, `codex exec …`,
   `pi -p …`, `aider --message …`) and the model flag. Unset, it is inferred
