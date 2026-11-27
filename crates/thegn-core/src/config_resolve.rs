@@ -699,14 +699,11 @@ pub fn classify_repo_overlay(
             }
             if granted.is_empty() {
                 // Every requested host was outside the trusted ceiling, so the
-                // intersection is empty. An empty `network_allow` means "allow
-                // everything" (DnsPolicy treats [] as universe and the filter is
-                // never even started), which would *widen* egress to the full
-                // internet — the opposite of the deny we just logged. Encode the
+                // intersection is empty. Leaving `out.network_allow` = None
+                // here would instead inherit the trusted ceiling; encode this
                 // empty intersection as deny-all, exactly like the empty-request
-                // branch above. Leaving `out.network_allow` = None here would
-                // instead inherit the trusted ceiling; deny-all is the stricter,
-                // safer reading of "you may narrow but asked only for the denied".
+                // branch above. That is the stricter, safer reading of "you may
+                // narrow but asked only for the denied".
                 extra_block.push("*".to_string());
                 events.push(ClampEvent {
                     layer,
