@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use thegn_core::store::AutomationStore;
@@ -26,39 +27,104 @@ fn fixture(kind: &str) -> String {
     .to_string()
 }
 
+fn isolate_thegn_environment(
+    command: &mut Command,
+    home: &Path,
+    config_home: &Path,
+    state_home: &Path,
+    runtime_dir: &Path,
+) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("THEGN_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", state_home)
+        .env("XDG_RUNTIME_DIR", runtime_dir);
+}
+
 #[test]
 fn automation_dry_run_leaves_an_empty_state_home_empty() {
     let state = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let config_home = home.path().join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
     #[expect(
         clippy::disallowed_methods,
         reason = "process integration test synchronously waits for the isolated CLI under test"
     )]
-    let output = Command::new(env!("CARGO_BIN_EXE_thegn"))
-        .args([
-            "automations",
-            "test",
-            "missing",
-            "--event",
-            &fixture("notification"),
-        ])
-        .env("XDG_STATE_HOME", state.path())
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env_remove("THEGN_LOG")
-        // Launcher overrides must not leak into a spawned test binary: `just
-        // live` exports THEGN_DATABASE_MIGRATION_EXECUTABLE, which pins the
-        // migration controller to the release build and makes this test's own
-        // isolated database unmigratable. Same rule as XDG_STATE_HOME above —
-        // a test that spawns thegn owns its whole environment.
-        .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
-        .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
-        .output()
-        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
+    command.args([
+        "automations",
+        "test",
+        "missing",
+        "--event",
+        &fixture("notification"),
+    ]);
+    isolate_thegn_environment(
+        &mut command,
+        home.path(),
+        &config_home,
+        state.path(),
+        runtime.path(),
+    );
+    let output = command.output().unwrap();
     assert!(!output.status.success());
     assert!(
         std::fs::read_dir(state.path()).unwrap().next().is_none(),
         "dry-run created state: {:?}",
         std::fs::read_dir(state.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+
+    // Logging and usage are enabled in a real config to ensure the pure test
+    // command still returns before installing file logging or starting usage
+    // collection. The config file itself lives outside the state home.
+    let configured_state = tempfile::tempdir().unwrap();
+    let configured_runtime = tempfile::tempdir().unwrap();
+    let config = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        config.path(),
+        "[log]\nfile = true\n\n[usage]\nenabled = true\n",
+    )
+    .unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "process integration test synchronously waits for the isolated CLI under test"
+    )]
+    let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
+    command.args([
+        "--config",
+        config.path().to_str().unwrap(),
+        "automations",
+        "test",
+        "missing",
+        "--event",
+        &fixture("notification"),
+    ]);
+    isolate_thegn_environment(
+        &mut command,
+        home.path(),
+        &config_home,
+        configured_state.path(),
+        configured_runtime.path(),
+    );
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        std::fs::read_dir(configured_state.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "configured dry-run created state: {:?}",
+        std::fs::read_dir(configured_state.path())
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
