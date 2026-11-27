@@ -190,7 +190,7 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
         id: "tests-gates",
         route: "Tests/discovery",
         status: RouteStatus::HostCapped,
-        path: "host commands under the shared resource ceiling (integrate_gate when [merge_queue] gate_sandbox = off)",
+        path: "Tests panel and command-based discovery run host commands under the shared resource ceiling",
         anchor: Some((
             "integrate_gate.rs",
             "thegn_core::sandbox_cpucap::wrap_background_argv_tagged_reporting(",

@@ -40,7 +40,8 @@ pub(crate) const REQUIRE_SEALED_ENV: &str = "THEGN_GATE_REQUIRE_SEALED";
 
 /// How a gate command is executed.
 pub(crate) enum GateExec {
-    /// On the host (the `off` default).
+    /// Test-only host executor for exercising gate logic; production resolvers
+    /// never return this variant.
     Host,
     /// Inside this sealed sandbox.
     Sealed(Box<SandboxSpec>),
