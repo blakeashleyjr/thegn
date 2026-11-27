@@ -197,6 +197,51 @@ impl Drop for XdgGuard {
         }
     }
 }
+
+/// Isolate config and launcher overrides for a test that loads the host model.
+/// The caller holds `ENV_LOCK` for this guard's lifetime.
+struct HydrationEnvironment(Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>);
+impl HydrationEnvironment {
+    fn new(home: &std::path::Path, config_home: &std::path::Path) -> Self {
+        let mut keys: Vec<std::ffi::OsString> = std::env::vars_os()
+            .filter_map(|(key, _)| {
+                key.to_str()
+                    .is_some_and(|key| key.starts_with("THEGN_"))
+                    .then_some(key)
+            })
+            .collect();
+        keys.extend(["HOME", "XDG_CONFIG_HOME"].map(std::ffi::OsString::from));
+        keys.sort();
+        keys.dedup();
+
+        let mut restore = Vec::with_capacity(keys.len());
+        for key in keys {
+            let previous = std::env::var_os(&key);
+            // SAFETY: the caller holds ENV_LOCK, serializing this process-wide environment update.
+            unsafe { std::env::remove_var(&key) };
+            restore.push((key, previous));
+        }
+        // SAFETY: the caller holds ENV_LOCK for this guard's whole lifetime.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CONFIG_HOME", config_home);
+        }
+        Self(restore)
+    }
+}
+impl Drop for HydrationEnvironment {
+    fn drop(&mut self) {
+        // SAFETY: ENV_LOCK remains held until this guard has been dropped.
+        unsafe {
+            for (key, previous) in self.0.drain(..) {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 use crate::center::CenterTree;
 use crate::drawer_state::DrawerPool;
 use crate::hydrate::build_model;
@@ -2255,6 +2300,9 @@ fn load_or_seed_session_reports_fresh_seed() {
 #[test]
 fn hydration_worker_loads_real_workspaces_into_sidebar() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let config_home = home.path().join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
     let state_home =
         std::env::temp_dir().join(format!("test_db_sidebar_{}_state", std::process::id()));
     let db_path = state_home.join("thegn/thegn.db");
@@ -2266,7 +2314,8 @@ fn hydration_worker_loads_real_workspaces_into_sidebar() {
     std::thread::sleep(std::time::Duration::from_millis(10));
     let _ = db.put_workspace("/tmp/repo2", "repo2", "repo"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
-    // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+    let _config = HydrationEnvironment::new(home.path(), &config_home);
+    // SAFETY: test holds ENV_LOCK; sets/restores XDG_STATE_HOME around calls.
     let _xdg = XdgGuard::set(&state_home);
 
     let (session, _) =
