@@ -203,13 +203,13 @@ impl ScanPool {
     }
 }
 
-/// Aggregate scan-thread cap: enough to overlap I/O-bound `git status` reads,
-/// small enough not to compete with the render loop or the build-slot budget.
+/// Aggregate scan-thread cap: enough to overlap an interactive status read,
+/// small enough that many dirty worktrees cannot fan out into CPU contention.
 fn default_cap() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get() / 2)
         .unwrap_or(2)
-        .clamp(2, 6)
+        .clamp(1, 2)
 }
 
 #[cfg(test)]
@@ -227,6 +227,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         false
+    }
+
+    #[test]
+    fn production_scan_cap_is_independent_of_worktree_count() {
+        assert!((1..=2).contains(&default_cap()));
     }
 
     fn jobs(

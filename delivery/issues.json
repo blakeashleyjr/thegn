@@ -814,6 +814,7 @@
       "changes": [
         "sidebar-finished-pipelines-age-out"
       ]
+<<<<<<< HEAD
     },
     {
       "issue": "THE-2769",
@@ -822,5 +823,17 @@
         "agent-account-failover"
       ]
     }
+||||||| 4b3669b23c
+    }
+=======
+    },
+    {
+      "issue": "THE-2773",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "bound-idle-worktree-refresh"
+      ]
+    }
+>>>>>>> tg/b314-the-2773
   ]
 }

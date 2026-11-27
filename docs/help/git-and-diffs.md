@@ -257,6 +257,10 @@ for that repository's checked-out worktrees; their status and diff counts are
 left alone when the row can be patched (a detached or unmatched checkout is
 rescanned instead).
 
+Live sidebar git status is refreshed for the focused worktree and worktrees
+active in the last fifteen minutes. Older rows keep their last-known status
+until focused again, which keeps large worktree registries quiet while idle.
+
 ## Rollback
 
 `rollback` restores a worktree to a prior snapshot when a run goes wrong

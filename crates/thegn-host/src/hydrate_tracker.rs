@@ -668,6 +668,12 @@ fn refresh_repo_inner(
         }
         return summary;
     }
+    if report.is_none()
+        && plugin_accounts.is_empty()
+        && issue_caches_are_fresh(&cwd, &accounts, cfg.ttl_secs, thegn_core::util::now())
+    {
+        return summary;
+    }
     // Repo scope for GitHub (other providers scope by team/project and
     // ignore `repo`). Mirrors `spawn_my_work_refresh`.
     let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
@@ -914,6 +920,27 @@ fn refresh_repo_inner(
         send_refresh_report(report, &failures, None, any_success);
     }
     summary
+}
+
+fn issue_caches_are_fresh(
+    cwd: &std::path::Path,
+    accounts: &[thegn_core::config::IssueAccount],
+    ttl_secs: u64,
+    now: i64,
+) -> bool {
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return false;
+    };
+    let repo_key = cwd.to_string_lossy();
+    accounts.iter().all(|account| {
+        db.get_issue_cache(&repo_key, account.provider.as_str(), &account.name)
+            .ok()
+            .flatten()
+            .is_some_and(|(_, fetched_at)| {
+                now.saturating_sub(fetched_at)
+                    < thegn_core::time_policy::saturating_i64(u128::from(ttl_secs))
+            })
+    })
 }
 
 const MAX_REPORT_ENTRIES: usize = 3;
