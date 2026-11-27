@@ -13,13 +13,13 @@ mod platform_ratchet_tests;
 #[cfg(unix)]
 mod unix;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub use unix::group_has_live_members;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 /// Return whether the process group has a live member.
 ///
-/// Platforms without a process-group liveness probe conservatively report
+/// Platforms without the Linux `/proc` liveness probe conservatively report
 /// that the group is live.
 pub fn group_has_live_members(_pgid: u32) -> bool {
     true

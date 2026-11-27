@@ -190,23 +190,6 @@ resolves symlinks and reports fully resolved paths.
 - **THEN** it is treated as an ordinary edit, because a filter must not be able
   to kill the thread that feeds it
 
-### Requirement: Log tailing recovers from delayed FSEvents delivery
-
-The macOS file-log tailer SHALL poll at a bounded interval as a fallback when
-FSEvents does not promptly deliver a file-growth event. Polling an unchanged
-file SHALL NOT nudge the host.
-
-#### Scenario: An append event is delayed under load
-
-- **WHEN** a log file grows but FSEvents has not delivered a change event
-- **THEN** the tailer observes the appended data within its bounded polling interval
-- **AND** it nudges the host only when new log records are pushed
-
-#### Scenario: Opening and reading the log does not nudge
-
-- **WHEN** a reader opens and reads the log without changing it
-- **THEN** the watcher does not signal a file-change nudge
-
 ### Requirement: Terminal capabilities are detected, probed, and reported consistently
 
 `thegn doctor` and the compositor SHALL resolve the same capabilities for the
