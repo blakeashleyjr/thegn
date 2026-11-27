@@ -21,11 +21,25 @@ pub(crate) fn step_notification(
     match status {
         MqStatus::Landed => Some((
             NotificationKind::QueueLanded,
-            format!("merge queue: {branch} landed"),
+            if detail.contains(crate::integrate::UNTRUSTED_GATE_LABEL) {
+                format!(
+                    "merge queue: {branch} landed — {}",
+                    crate::integrate::UNTRUSTED_GATE_LABEL
+                )
+            } else {
+                format!("merge queue: {branch} landed")
+            },
         )),
         MqStatus::Ready => Some((
             NotificationKind::QueueReady,
-            format!("merge queue: {branch} ready to land"),
+            if detail.contains(crate::integrate::UNTRUSTED_GATE_LABEL) {
+                format!(
+                    "merge queue: {branch} ready to land — {}",
+                    crate::integrate::UNTRUSTED_GATE_LABEL
+                )
+            } else {
+                format!("merge queue: {branch} ready to land")
+            },
         )),
         MqStatus::NeedsHuman => Some((
             NotificationKind::QueueNeedsHuman,

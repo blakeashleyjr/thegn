@@ -1220,7 +1220,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             if json {
                 let mut out = merge_driver::DriveOutcome::default();
                 out.warnings.push(warning);
-                super::emit_json(&drain_json(&target, &out))?;
+                super::emit_json(&drain_json(&target, &out, None))?;
             } else {
                 outln!("Warning: {warning}");
                 outln!("Nothing to drain.");
@@ -1228,7 +1228,11 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             anyhow::bail!("merge drain completed with pipeline worktree refusals");
         }
         if json {
-            return super::emit_json(&drain_json(&target, &merge_driver::DriveOutcome::default()));
+            return super::emit_json(&drain_json(
+                &target,
+                &merge_driver::DriveOutcome::default(),
+                None,
+            ));
         }
         outln!("Nothing to drain.");
         return Ok(());
@@ -1347,7 +1351,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     }
 
     if json {
-        let mut doc = drain_json(&target, &out);
+        let gate_result = !out.ready.is_empty()
+            || !out.landed.is_empty()
+            || !out.deferred.is_empty()
+            || !out.gate_error.is_empty();
+        let isolated = (gate_result && !integrate::gate_isolated(mq.gate_sandbox)).then_some(false);
+        let mut doc = drain_json(&target, &out, isolated);
         if push_mode {
             doc["pushed"] = serde_json::json!(pushed);
         }
@@ -1412,9 +1421,14 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
 
 /// The `drain --json` document. One shape for every exit path, including the
 /// empty queue — scripts must not have to special-case the common no-op.
-fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Value {
+fn drain_json(
+    target: &str,
+    out: &merge_driver::DriveOutcome,
+    isolated: Option<bool>,
+) -> serde_json::Value {
     serde_json::json!({
         "target": target,
+        "isolated": isolated,
         "landed": out.landed,
         "ready": out.ready,
         "deferred": out.deferred,
@@ -1501,6 +1515,10 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
+    let mq = cfg.repo_merge_queue(&root);
+    let gate_untrusted = mq.gate_on
+        && !mq.gate_command.trim().is_empty()
+        && !integrate::gate_isolated(mq.gate_sandbox);
     let guard_db = Db::open().context("remote-target guard database unavailable")?;
     if let Some(msg) = crate::merge_ops::remote_target_guard(&guard_db, &root)? {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
@@ -1567,7 +1585,15 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
                 &branch,
                 &commit,
             );
-            outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
+            outln!(
+                "✓ landed {branch} → {}{}",
+                &commit[..commit.len().min(12)],
+                if gate_untrusted {
+                    format!(" — {}", integrate::UNTRUSTED_GATE_LABEL)
+                } else {
+                    String::new()
+                }
+            );
             integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate { commit } => {
@@ -1608,7 +1634,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
         AttemptOutcome::GateFailed { .. } => {
             lifecycle(LifecycleEvent::Failed);
-            outln!("✗ {branch} breaks the build (gate red).");
+            outln!(
+                "✗ {branch} breaks the build (gate red){}.",
+                if gate_untrusted {
+                    format!(" — {}", integrate::UNTRUSTED_GATE_LABEL)
+                } else {
+                    String::new()
+                }
+            );
             failure = Some(format!("land failed: {branch} gate red"));
         }
         AttemptOutcome::GateError { reason, log, .. } => {
@@ -1843,7 +1876,7 @@ mod gate_verdict_tests {
             }],
             ..Default::default()
         };
-        let json = drain_json("main", &outcome);
+        let json = drain_json("main", &outcome, None);
         assert_eq!(json["gate_error"][0], "feature");
         assert_eq!(json["gate_verdicts"][0]["branch"], "feature");
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
@@ -1944,6 +1977,24 @@ mod list_claim_tests {
             claim_json(Some(&claim_view("unclaimed", Some(200))), 100),
             None
         );
+    }
+
+    #[test]
+    fn merge_queue_json_marks_host_gate_results_untrusted() {
+        let mut host = row();
+        host.error_detail = Some(crate::integrate::UNTRUSTED_GATE_LABEL.to_owned());
+        let host_json = serde_json::to_value(host).unwrap();
+        assert_eq!(host_json["isolated"], false);
+        assert!(
+            host_json["error_detail"]
+                .as_str()
+                .unwrap()
+                .contains(crate::integrate::UNTRUSTED_GATE_LABEL)
+        );
+
+        let sealed_json = serde_json::to_value(row()).unwrap();
+        assert!(sealed_json["isolated"].is_null());
+        assert!(sealed_json["error_detail"].is_null());
     }
 
     #[test]

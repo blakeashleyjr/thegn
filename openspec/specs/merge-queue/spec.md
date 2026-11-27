@@ -71,6 +71,24 @@ clobbering uncommitted work.
 - **THEN** the target ref is not advanced and the row is marked `ready` for a
   later explicit land
 
+### Requirement: Host-run merge gate results are labeled untrusted
+
+When a merge gate runs without an isolated runner, user-facing gate results
+SHALL include `untrusted: ran on host, not isolated`. Results from a sealed
+runner SHALL remain unlabelled. The merge queue SHALL continue to run host
+gates when `gate_sandbox` is off or unset.
+
+#### Scenario: Host-run gate result is labeled
+
+- **WHEN** a merge gate runs on the host and reaches a user-facing result
+- **THEN** the result includes `untrusted: ran on host, not isolated` and JSON
+  includes `isolated: false`
+
+#### Scenario: Sealed gate result is not labeled
+
+- **WHEN** a merge gate runs in the sealed runner and reaches a user-facing result
+- **THEN** no untrusted label is shown
+
 ### Requirement: Gate output, deadlines, and cancellation preserve infrastructure holds
 
 The merge gate SHALL stream stdout and stderr into independent fixed-capacity
