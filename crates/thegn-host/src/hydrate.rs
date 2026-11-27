@@ -4593,6 +4593,7 @@ pub(crate) fn spawn_panel_prefetch(
                 loc,
                 disk,
                 successful: true,
+                error: None,
             })
             .is_ok()
         {
@@ -4628,6 +4629,7 @@ impl Drop for PanelPrefetchCompletion {
                 loc: None,
                 disk: None,
                 successful: false,
+                error: Some("Panel prefetch failed. Switch away and back to retry.".into()),
             })
             .is_ok()
             && let Some(waker) = &self.waker

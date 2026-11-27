@@ -40,7 +40,9 @@ agents chapter (`l`) open the same flow.
    file, keeping the rest of it.
 5. **Daemon.** The daemon must restart to carry the Lead's control listener.
    The flow counts the daemon's live sessions and confirms first, saying how
-   many would end (terminals, agent runs and Lead tabs it hosts).
+   many would end (terminals, agent runs and Lead tabs it hosts). If an
+   existing Lead tab has lost its listener, selecting Lead routes here and
+   offers **restart the daemon and retry the Lead**.
 6. **Login.** Opens a tab running `thegn lead login` (see "Log in"), so it keeps
    every isolation guarantee of that verb. Type `/login` there, exit, then press
    `Alt i` again.

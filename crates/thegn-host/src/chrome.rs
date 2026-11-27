@@ -585,6 +585,8 @@ pub struct FrameModel {
     /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,
     /// cleared by the next model swap); never part of `hydration_eq`.
     pub panel_pending: bool,
+    /// A cold-switch panel read failed; shown in place of a permanent skeleton.
+    pub panel_error: Option<String>,
     /// Data carriers populated by the hydration thread and consumed by the
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
@@ -2378,6 +2380,32 @@ pub fn draw_panel(
         // Cold-switch skeleton: dim placeholder bars while hydration is in
         // flight (static — no animation, so no timer wakes).
         crate::panel::skeleton::draw(surface, rect);
+        return;
+    }
+    if let Some(error) = &model.panel_error {
+        let red = theme_color(&theme::RED);
+        let wrapped = crate::detail::wrap_full_text(error, rect.cols.saturating_sub(4).max(1));
+        for (i, line) in wrapped.iter().take(rect.rows.saturating_sub(2)).enumerate() {
+            draw_text(
+                surface,
+                rect.x + 2,
+                rect.y + 1 + i,
+                line,
+                red,
+                col(S::Panel),
+                rect.cols.saturating_sub(4),
+            );
+        }
+        let hint = "Switch away and back to retry";
+        draw_text(
+            surface,
+            rect.x + 2,
+            rect.y + 1 + wrapped.len().min(rect.rows.saturating_sub(3)),
+            hint,
+            col(S::Dim),
+            col(S::Panel),
+            rect.cols.saturating_sub(4),
+        );
         return;
     }
     let foot = lead_foot(model, rect);

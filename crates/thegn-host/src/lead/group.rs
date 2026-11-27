@@ -55,6 +55,31 @@ pub(crate) fn plan(
     if !super::enabled(cfg) {
         return JumpPlan::Disabled;
     }
+    let host = super::setup::RealHost { cfg };
+    plan_with_facts(
+        cfg,
+        session,
+        db_terminals,
+        &super::setup::Host::facts(&host),
+    )
+}
+
+fn plan_with_facts(
+    cfg: &thegn_core::config::Config,
+    session: &crate::session::Session,
+    db_terminals: &[TerminalRow],
+    facts: &super::setup::Facts,
+) -> JumpPlan {
+    if !super::enabled(cfg) {
+        return JumpPlan::Disabled;
+    }
+    // A registered or already-open Lead can outlive the daemon listener it
+    // needs (for example after `[lead]` was added to an already-running
+    // daemon). Route the jump through setup before activating a tab that can
+    // only fail at its MCP sandbox step.
+    if super::setup::incomplete(facts) {
+        return JumpPlan::Disabled;
+    }
     if let Some(i) = session
         .worktrees
         .iter()
@@ -158,7 +183,53 @@ mod tests {
             worktrees: vec![],
             active: 0,
         };
-        assert_eq!(plan(&cfg, &session, &[]), JumpPlan::Disabled);
+        let facts = super::setup::Facts {
+            dev_channel: true,
+            file_preview: true,
+            agents: vec![],
+            file_agent: Some("claude".into()),
+            file_host_network: false,
+            daemon_enabled: true,
+            bwrap: true,
+            pasta: true,
+            listener_up: false,
+            logged_in: true,
+            mcp_servers: vec![],
+        };
+        assert_eq!(
+            plan_with_facts(&cfg, &session, &[], &facts),
+            JumpPlan::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_routes_an_existing_lead_without_a_listener_to_setup() {
+        let cfg = thegn_core::config::Config {
+            lead: Some(thegn_core::config_lead::LeadConfig::default()),
+            ..Default::default()
+        };
+        let session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![crate::session::WorktreeGroup::terminal("lead")],
+            active: 0,
+        };
+        let facts = super::setup::Facts {
+            dev_channel: true,
+            file_preview: true,
+            agents: vec![],
+            file_agent: Some("claude".into()),
+            file_host_network: false,
+            daemon_enabled: true,
+            bwrap: true,
+            pasta: true,
+            listener_up: false,
+            logged_in: true,
+            mcp_servers: vec![],
+        };
+        assert_eq!(
+            plan_with_facts(&cfg, &session, &[], &facts),
+            JumpPlan::Disabled
+        );
     }
 
     #[test]

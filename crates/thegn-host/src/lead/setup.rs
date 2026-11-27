@@ -327,7 +327,11 @@ pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
              The next screen says how many sessions would end.",
             TAG,
             vec![
-                row('y', "restart the daemon", arg("restartask", plan, "")),
+                row(
+                    'y',
+                    "restart the daemon and retry the Lead",
+                    arg("restartask", plan, ""),
+                ),
                 row('s', "skip: I will restart it later", arg("skip", plan, "")),
                 cancel(),
             ],

@@ -59,3 +59,26 @@ its restart confirm SHALL state how many live daemon sessions would end.
 
 - **WHEN** the user chooses to restart the daemon with 3 live sessions
 - **THEN** the confirm says 3 live daemon sessions would end before anything is stopped
+
+### Requirement: Lead startup failures remain readable and recoverable
+
+The Lead startup screen SHALL wrap the complete failure detail at narrow widths. A cold-switch
+panel load SHALL replace its skeleton with panel content or an explicit error and retry instruction;
+it SHALL NOT leave a skeleton after its worker exits without a panel result.
+Jumping to an existing Lead whose listener is unavailable SHALL open the setup flow, which offers
+the documented daemon restart path.
+
+#### Scenario: Narrow startup error
+
+- **WHEN** the Lead startup screen has a failure message wider than its subline at a narrow terminal
+- **THEN** the complete message, including its recovery instructions, is wrapped below the failed step
+
+#### Scenario: Panel hydration fails
+
+- **WHEN** a cold-switch panel worker cannot load the selected path or database
+- **THEN** the panel replaces its skeleton with an error and tells the user how to retry
+
+#### Scenario: Existing Lead lost its listener
+
+- **WHEN** the user jumps to an existing Lead whose daemon has no Lead listener
+- **THEN** the setup flow offers to restart the daemon and retry the Lead
