@@ -4772,9 +4772,7 @@ fn pr_refresh_blocking_fenced(
         // `(json, fetched_at)` row is kept as the CAS expectation for the
         // definitive write below (THE-2214 lease handover).
         let old_row: Option<(String, i64)> = db.get_pr_cache(&cache_key).ok().flatten();
-        if site == PrSite::Ui
-            && thegn_core::connectivity::current()
-                != thegn_core::connectivity::Connectivity::Offline
+        if thegn_core::connectivity::current() != thegn_core::connectivity::Connectivity::Offline
             && old_row.as_ref().is_some_and(|(_, fetched_at)| {
                 cache_ttl_is_fresh(*fetched_at, thegn_core::util::now(), cfg.pr.ttl_secs)
             })
