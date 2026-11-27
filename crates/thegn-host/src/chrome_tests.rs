@@ -3074,6 +3074,66 @@ fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
 }
 
 #[test]
+fn pane_key_hints_render_theme_keycaps_and_keep_keys_at_narrow_widths() {
+    let original = palette_snapshot();
+    for name in ["prism", "light"] {
+        let mut palette = theme::preset(name).expect("shipped theme preset");
+        theme::extend_palette(&mut palette);
+        set_palette(palette.clone());
+
+        for cols in [24, 44] {
+            let model = FrameModel {
+                center_focused: true,
+                keyhints: vec![("Alt-n".into(), "very long pane action".into())],
+                ..Default::default()
+            };
+            // Keep a long action so the narrow render proves the keycap wins
+            // its width and the action gets the ellipsis.
+            let pairs = crate::panel::context_hints::rows(&model, cols, 3, &[]);
+            assert_eq!(pairs.len(), 1);
+            let mut surface = Surface::new(cols, 2);
+            draw_panel_hints(
+                &mut surface,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols,
+                    rows: 2,
+                },
+                " PANE KEYS ",
+                &pairs,
+            );
+            let rendered = lines(&surface);
+            assert!(
+                rendered[1].contains("Alt-n"),
+                "{name} / {cols}: {rendered:?}"
+            );
+            if cols == 24 {
+                assert!(
+                    rendered[1].contains("…"),
+                    "action should truncate: {rendered:?}"
+                );
+            } else {
+                assert!(
+                    rendered[1].contains("very long pane action"),
+                    "{rendered:?}"
+                );
+            }
+
+            let cells = surface.screen_cells();
+            let action = &cells[1][1];
+            assert_eq!(action.attrs().foreground(), theme_color(&palette.dim));
+            assert_eq!(action.attrs().background(), theme_color(&palette.panel));
+            let cap_x = cols - (" Alt-n ".len());
+            let key = &cells[1][cap_x + 1];
+            assert_eq!(key.attrs().foreground(), theme_color(&palette.text));
+            assert_eq!(key.attrs().background(), theme_color(&palette.raise));
+        }
+    }
+    set_palette(original);
+}
+
+#[test]
 fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
     use crate::panel::PanelUi;
     let mut model = layout_hint_model();

@@ -2516,44 +2516,35 @@ fn draw_panel_hints(surface: &mut Surface, rect: Rect, title: &str, pairs: &[(St
         rect.x + 1,
         rect.y,
         title,
-        col(S::Dim),
+        col(S::Accent),
         col(S::Panel),
         rect.cols.saturating_sub(1),
     );
 
-    let chord_w = pairs
-        .iter()
-        .map(|(c, _)| c.chars().count())
-        .max()
-        .unwrap_or(0);
     let max_y = rect.y + rect.rows;
-    let right = rect.x + rect.cols;
     for (i, (chord, label)) in pairs.iter().enumerate() {
         let y = rect.y + 1 + i;
         if y >= max_y {
             break;
         }
-        draw_text(
-            surface,
-            rect.x + 1,
-            y,
-            chord,
-            col(S::Faint),
-            col(S::Panel),
-            rect.cols.saturating_sub(1),
-        );
-        let lx = rect.x + 1 + chord_w + 1;
-        if lx < right {
-            draw_text(
+        let inner = rect.cols.saturating_sub(1);
+        let chord_w = unicode_width::UnicodeWidthStr::width(chord.as_str());
+        let cap_w = chord_w.saturating_add(2).min(inner);
+        let action_w = inner.saturating_sub(cap_w + 1);
+        let cap_x = rect.x + rect.cols.saturating_sub(cap_w);
+        let cap = format!(" {chord} ");
+        if action_w > 0 {
+            draw_text_bold(
                 surface,
-                lx,
+                rect.x + 1,
                 y,
                 label,
-                col(S::Ghost),
+                col(S::Dim),
                 col(S::Panel),
-                right - lx,
+                action_w,
             );
         }
+        draw_text_bold(surface, cap_x, y, &cap, col(S::Text), col(S::Raise), cap_w);
     }
 }
 
