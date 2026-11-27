@@ -3121,13 +3121,25 @@ fn pane_key_hints_render_theme_keycaps_and_keep_keys_at_narrow_widths() {
             }
 
             let cells = surface.screen_cells();
+            let title = &cells[0][1];
+            assert_eq!(title.attrs().foreground(), theme_color(&palette.accent));
             let action = &cells[1][1];
             assert_eq!(action.attrs().foreground(), theme_color(&palette.dim));
             assert_eq!(action.attrs().background(), theme_color(&palette.panel));
+            assert_eq!(
+                action.attrs().intensity(),
+                termwiz::cell::Intensity::Bold,
+                "{name} / {cols}: action should be bold"
+            );
             let cap_x = cols - (" Alt-n ".len());
             let key = &cells[1][cap_x + 1];
             assert_eq!(key.attrs().foreground(), theme_color(&palette.text));
             assert_eq!(key.attrs().background(), theme_color(&palette.raise));
+            assert_eq!(
+                key.attrs().intensity(),
+                termwiz::cell::Intensity::Bold,
+                "{name} / {cols}: keycap should match the Keys view"
+            );
         }
     }
     set_palette(original);
