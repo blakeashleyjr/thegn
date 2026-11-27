@@ -402,7 +402,7 @@ and current harness capabilities; it has no additional TOML setting.
 
 ## Agents, models and accounts
 
-An `[[agents]]` entry is _what runs_; four optional keys say _how_:
+An `[[agents]]` entry is _what runs_; optional keys say _how_:
 
 ```toml
 [[agents]]
@@ -412,7 +412,33 @@ harness = "claude"            # the launch shape: claude | codex | pi | aider
 model = "claude-opus-5"       # → `claude --model claude-opus-5` on every launch
 env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/review" }   # pin an account
 permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-list
+
+# Optional ordered alternatives for this role. Existing entries with no
+# `backends` continue to use the single harness/account above.
+[[agents.backends]]
+name = "pi-local"
+harness = "pi"
+model = "opencode-go/sonnet"
+env = { PI_CODING_AGENT_DIR = "~/.pi" }
+account = "~/.pi"             # usage key or credential-home path, when known
+
+[[agents.backends]]
+name = "codex-pro"
+harness = "codex"
+model = "gpt-6-luna"
+env = { CODEX_HOME = "~/.codex-pro" }
+account = "~/.codex-pro"
 ```
+
+`[[agents.backends]]` entries are kept in order. A backend names its harness,
+optional model, optional environment overlay and optional usage-account key or
+credential-home path. `thegn agent list` shows backend names, harnesses,
+models and environment variable names; it does not print environment values.
+`thegn agent backends` reports the current headroom and reset time using the
+per-account usage tracker. Unknown or unavailable usage is not considered
+headroom. `thegn agent run --agent reviewer` selects the first backend with
+known headroom; `--backend codex-pro` pins a named backend. Pipeline launches
+continue to use the stage's configured single-backend fields.
 
 - **`harness`** decides the headless form (`claude -p …`, `codex exec …`,
   `pi -p …`, `aider --message …`) and the model flag. Unset, it is inferred

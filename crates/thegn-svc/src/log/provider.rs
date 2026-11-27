@@ -552,7 +552,7 @@ mod tests {
             .unwrap();
         // FSEvents coalesces and delays delivery on a loaded Mac; keep appending until
         // one lands (any one append must nudge) instead of betting on a single write.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             file.write_all(b"appended\n").unwrap();
             file.flush().unwrap();

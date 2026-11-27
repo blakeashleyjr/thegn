@@ -1118,6 +1118,7 @@ mod tests {
             ..Default::default()
         };
         app_cfg.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "test-agent".into(),
             command: "unused".into(),
             hints: vec![],

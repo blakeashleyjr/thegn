@@ -820,6 +820,12 @@ pub fn prepare_sandbox_env_with_selection(
     };
     let loc = provider_loc.as_ref().unwrap_or(loc);
     for candidate in thegn_core::launch_backend::candidates(&sb) {
+        // A Compose policy refusal is global to this requested launch. Do not
+        // reinterpret the same request as an uncontained host launch after an
+        // OCI candidate rejected it.
+        if compose_miss.is_some() && candidate.backend == thegn_core::config::SandboxBackend::None {
+            break;
+        }
         // `resolve_placed_exact`, not `resolve_placed`: `launch_backend::candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
         // resolver that degrades into the chain on a miss makes each candidate
@@ -949,6 +955,25 @@ pub fn prepare_sandbox_env_with_selection(
             // A malformed named-volume source is terminal for this launch, not
             // an ordinary backend miss that may fall through to host execution.
             admit_final_sandbox_spec(&spec)?;
+            // Compose cannot enforce several requested sandbox restrictions.
+            // Refuse that launch before candidate admission can turn it into a
+            // generic miss and before any host or container entry path.
+            if let Some(m) = thegn_core::sandbox::compose_policy_refusal(&spec) {
+                if explicit_choice {
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!("{m} for {worktree}"),
+                        ask,
+                        dormant: None,
+                        sealed_home: sb.profile.hides_home(),
+                    }
+                    .into());
+                }
+                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                compose_miss = Some(m);
+                continue;
+            }
             // Isolation floor: compare the HONEST class of what this launch would
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
@@ -966,7 +991,15 @@ pub fn prepare_sandbox_env_with_selection(
                     // remember the miss and try a stronger candidate. The
                     // end-of-loop halt fires only if no candidate meets the floor.
                     if explicit_choice {
-                        anyhow::bail!("{} for {worktree}", miss.refusal());
+                        return Err(SandboxHalt {
+                            env_name: env_name.clone(),
+                            placement: placement_label.clone(),
+                            reason: format!("{} for {worktree}", miss.refusal()),
+                            ask,
+                            dormant: None,
+                            sealed_home: sb.profile.hides_home(),
+                        }
+                        .into());
                     }
                     floor_miss = Some(miss);
                     continue;
@@ -978,7 +1011,15 @@ pub fn prepare_sandbox_env_with_selection(
             // backend/config that would expose it — same doctrine as the floor.
             if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
                 if explicit_choice {
-                    anyhow::bail!("{m} for {worktree}");
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!("{m} for {worktree}"),
+                        ask,
+                        dormant: None,
+                        sealed_home: sb.profile.hides_home(),
+                    }
+                    .into());
                 }
                 thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
                 home_miss = Some(m);
@@ -986,18 +1027,18 @@ pub fn prepare_sandbox_env_with_selection(
             }
             if let Some(m) = thegn_core::sandbox_floor::strict_gate(&spec) {
                 if explicit_choice {
-                    anyhow::bail!("{m} for {worktree}");
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!("{m} for {worktree}"),
+                        ask,
+                        dormant: None,
+                        sealed_home: sb.profile.hides_home(),
+                    }
+                    .into());
                 }
                 thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
                 home_miss = Some(m);
-                continue;
-            }
-            if let Some(m) = thegn_core::sandbox::compose_policy_refusal(&spec) {
-                if explicit_choice {
-                    anyhow::bail!("{m} for {worktree}");
-                }
-                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
-                compose_miss = Some(m);
                 continue;
             }
             if !spec.backend.is_oci() && spec.compose.is_some() {

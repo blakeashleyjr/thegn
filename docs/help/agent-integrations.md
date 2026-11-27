@@ -100,3 +100,19 @@ or the `thegn` that the connection pushes there, and report plainly when
 neither exists. Re-provisioning or restoring a snapshot changes nothing that is
 already in place, and an entry or skill you wrote yourself is never replaced.
 See [[environments]].
+
+## Ordered backends
+
+An agent role can document ordered alternatives under `[[agents.backends]]`.
+Each entry describes a harness, optional model and harness-specific environment
+overlay; `account` can bind it to a usage key or credential-home path. The
+`agent list` command shows names and non-secret launch metadata, while
+`agent backends` reports current usage headroom and reset time. `agent run`
+selects the first backend with known headroom; `--backend <name>` pins one.
+With `agent run --wait`, a recognized Claude, Codex or Pi quota response
+retries once on the next configured backend with known headroom. When the usage
+tracker reports a reset time for the account that hit the limit, later
+automatic runs skip that backend until the reset; `agent backends` labels it
+`cooldown`. A pinned backend is never switched. Tracked runs record the backend
+that ultimately ran in dispatch history, and the pipeline board shows it on the
+dispatch row.

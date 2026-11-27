@@ -395,6 +395,11 @@ _perf-guard:
 bench-idle: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario idle
 
+# Worktree-count regression for idle CPU. The same harness and fixed idle
+# ceiling run against a 1,000-linked-worktree fixture.
+bench-idle-many-worktrees: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario idle --worktrees 1000 --dirty 0 --settle-ms 10000 --window-ms 8000 --ceiling 0.12
+
 # Record the current idle reading as this machine's baseline (machine-scoped).
 bench-idle-record: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario idle --record
@@ -990,7 +995,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro test-remote-parity-tui test-update-instance
+test: test-bootstrap test-dev-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging test-cargo-provenance test-third-party-notices test-changelog-lint demo-script-check test-net-trace test-devel-launch test-sprites-exec-repro test-remote-parity-tui test-update-instance
     #!/usr/bin/env bash
     set -euo pipefail
     if ! cargo nextest run --workspace; then
@@ -1476,6 +1481,11 @@ update target="" *args:
 # `just update` helper tests; no network, no real home.
 test-update-instance:
     python3 -B test/update_instance_test.py
+
+# Offline checks for authenticated CI and contributor bootstrap artifacts.
+test-bootstrap:
+    bash test/ci-runner-setup-test.sh
+    bash test/setup-macos-test.sh
 
 # Live Vercel Sandbox run (spends money; plan-only without flags). Not in ci/smoke.
 [positional-arguments]

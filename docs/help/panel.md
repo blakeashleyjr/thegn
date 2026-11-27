@@ -58,7 +58,9 @@ KEYS** for the drawer, **BAR KEYS** for the masthead or statusbar, and
 **NAVIGATE** while the panel itself has focus. They are the same keys the
 statusbar lists, as many as fit (up to 12), and a chord already in the Layout
 keys block is not repeated. The block shrinks as panel content grows and
-hides when there is no room. The sidebar keeps its own footer. Set
+hides when there is no room. Each row puts a bold action on the left and its
+keybind in a right-aligned keycap; at narrow widths the action shortens first.
+The colors follow the active theme. The sidebar keeps its own footer. Set
 `[panel] context_hints = false` to show only the panel's NAVIGATE block.
 
 ## Keys

@@ -119,7 +119,7 @@ pub(crate) fn can_honor_sandbox(sb: &thegn_core::config::SandboxConfig) -> bool 
     sb.enabled
         && sb.backend == SandboxBackend::Auto
         && sb.profile == SandboxProfile::Open
-        && sb.network == Network::Nat
+        && sb.network.resolved() == Network::Nat
         && sb.network_allow.is_empty()
         && sb.network_block.is_empty()
         && !sb.network_audit

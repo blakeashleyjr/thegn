@@ -745,11 +745,25 @@ terminal escape sequences.
 `thegn agent list` is the one-screen answer to "what will actually run": one
 line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
 model, env keys (never values), permission count — resolved the way a launch
-resolves them. `thegn dispatch list --active` is the roster reduced to active rows (including
-`waiting_human`/`pr_open` rows, which are protected from redispatch but no
+resolves them. Entries with `[[agents.backends]]` also show the ordered
+backend names; `--json` includes each backend's harness, model and env key
+names, never environment values or account paths. `thegn dispatch list --active`
+is the roster reduced to active rows (including `waiting_human`/`pr_open` rows,
+which are protected from redispatch but no
 longer hold a stage slot). The `dispatch list --json` `liveness` field also
 uses the `parked` token for those rows. Both are terse by default and take
 `--json`.
+
+`thegn agent backends [--agent <role>]` reports each configured backend's
+current usage headroom (`available`, `exhausted` or `unknown`) and the earliest
+reported reset time. `--json` emits a JSON array. Account paths are used for
+matching but are not included in the output. `thegn agent run --agent <role>`
+selects the first backend with known headroom; `--backend <name>` pins a backend
+for that run. With `--wait`, a recognized Claude, Codex or Pi quota response
+retries once on the next configured backend with known headroom; explicit pins
+are never switched. Runs without `--wait` return the session immediately and
+cannot observe a later quota failure. Pipeline stages continue to use their
+configured backend.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.
@@ -846,3 +860,8 @@ does not run this prune.
 
 `thegn open <repo>` takes a path anywhere inside a repo, or a unique repo
 basename, and raises it in a running instance — the remote control.
+`thegn agent run --agent <role> --backend <name>` pins a configured backend
+for one run. Without `--backend`, a role with ordered backends uses the first
+one whose account has known usage headroom. `--wait` retries a recognized quota
+response once on the next eligible backend. See [[agent-integrations]] and
+[[configuration]].

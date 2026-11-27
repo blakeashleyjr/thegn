@@ -4,6 +4,7 @@ use thegn_core::config::{Config, NamedCommand};
 fn configured_agent() -> Config {
     Config {
         agents: vec![NamedCommand {
+            backends: Vec::new(),
             name: "claude".into(),
             command: "claude".into(),
             hints: Vec::new(),

@@ -3,6 +3,43 @@
 # execute as the isolated, non-login thegn-ci account.
 set -euo pipefail
 
+# shellcheck source=scripts/lib/bootstrap-artifacts.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/bootstrap-artifacts.sh"
+
+# ── Reviewed bootstrap identities ───────────────────────────────────────────
+# Every executable byte this script introduces is pinned here by release, exact
+# size, and SHA-256. "latest" is never resolved at run time, so a mutable
+# upstream response cannot silently change what runs as root. Refreshing a pin is
+# an explicit reviewed edit: bump the version, size, digest, and byte caps
+# together from the provenance recorded beside each pin, then re-run this script.
+# A cached artifact is re-authenticated on every run; an existing file is never
+# evidence of integrity. See docs/self-hosted-ci.md for the update procedure.
+#
+# The only origins a pinned download may end on are GitHub's release hosts; a
+# redirect anywhere else is refused before the body is authenticated.
+GITHUB_RELEASE_HOSTS="github.com objects.githubusercontent.com release-assets.githubusercontent.com"
+#
+# Determinate Nix installer, x86_64-linux. Provenance: the GitHub release asset
+# metadata for DeterminateSystems/nix-installer, re-hashed on download here.
+NIX_INSTALLER_VERSION="v3.24.2"
+NIX_INSTALLER_URL="https://github.com/DeterminateSystems/nix-installer/releases/download/${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux"
+NIX_INSTALLER_SHA256="22ed14ee1b24d100d388f1fc245e3062bd5982433d159cffa6dec34c0eb15dab"
+NIX_INSTALLER_SIZE=78449072
+NIX_INSTALLER_MAX_BYTES=100663296
+# GitHub Actions runner, linux-x64. Provenance: the GitHub release asset `digest`
+# for actions/runner's pinned tag, re-hashed on download here. The reviewed tree
+# expands to 684215259 bytes across 11556 members; the caps leave headroom for a
+# reviewed refresh without letting an unbounded archive through.
+RUNNER_VERSION="2.338.2"
+RUNNER_TARBALL="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TARBALL}"
+RUNNER_SHA256="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40"
+RUNNER_SIZE=228071396
+RUNNER_MAX_BYTES=268435456
+RUNNER_MAX_EXPANDED_BYTES=805306368
+RUNNER_MAX_MEMBERS=32768
+RUNNER_REQUIRED_MEMBERS="run.sh config.sh bin/Runner.Listener"
+
 GH_REPO="${GH_REPO:-blakeashleyjr/thegn}"
 RUNNER_USER="${RUNNER_USER:-thegn-ci}"
 RUNNER_COUNT="${RUNNER_COUNT:-4}"
@@ -12,15 +49,9 @@ RUNNER_BASE="${RUNNER_BASE:-/var/lib/thegn-ci/runners}"
 RUNNER_TOKEN_FILE="${RUNNER_TOKEN_FILE:-/etc/thegn-ci/registration.token}"
 RUNNER_LOOP_FILE="${RUNNER_LOOP_FILE:-/usr/local/libexec/thegn-ci/runner-loop}"
 RUNNER_UNIT_FILE="${RUNNER_UNIT_FILE:-/etc/systemd/system/thegn-ci-runner@.service}"
-RUNNER_ARCHIVE_FILE="${RUNNER_ARCHIVE_FILE:-$RUNNER_BASE/actions-runner-linux-x64.tar.gz}"
+RUNNER_ARCHIVE_FILE="${RUNNER_ARCHIVE_FILE:-$RUNNER_BASE/$RUNNER_TARBALL}"
 NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}"
 GH_PAT="${GH_PAT:-}"
-NIX_INSTALLER_VERSION="v3.24.2"
-NIX_INSTALLER_URL="https://github.com/DeterminateSystems/nix-installer/releases/download/${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux"
-# Reviewed official release asset identity; update version, size, and digest together.
-NIX_INSTALLER_SHA256="22ed14ee1b24d100d388f1fc245e3062bd5982433d159cffa6dec34c0eb15dab"
-NIX_INSTALLER_SIZE=78449072
-NIX_INSTALLER_MAX_BYTES=100663296
 
 log() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 die() {
@@ -358,55 +389,266 @@ install_nix_if_missing() {
   fi
 }
 
-download_verified_executable() {
-  local url="$1" expected_sha256="$2" expected_size="$3" destination="$4"
-  local actual_sha256 actual_size
-  [[ $expected_sha256 =~ ^[a-f0-9]{64}$ && $expected_size =~ ^[0-9]+$ && $expected_size -le $NIX_INSTALLER_MAX_BYTES ]] || {
-    die 'invalid pinned installer identity'
-    return 1
-  }
-  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --tlsv1.2 --max-time 180 --max-filesize "$NIX_INSTALLER_MAX_BYTES" \
-    -o "$destination" "$url" || {
-    die 'could not download the pinned Nix installer'
-    return 1
-  }
-  actual_size="$(wc -c <"$destination")"
-  if [[ ! $actual_size =~ ^[0-9]+$ || $actual_size -gt $NIX_INSTALLER_MAX_BYTES || $actual_size != "$expected_size" ]]; then
-    die "pinned installer size mismatch: expected $expected_size bytes, got ${actual_size:-invalid}"
-    return 1
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual_sha256="$(sha256sum "$destination")"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual_sha256="$(shasum -a 256 "$destination")"
-  else
-    die 'sha256sum or shasum is required to verify the Nix installer'
-    return 1
-  fi
-  actual_sha256="${actual_sha256%% *}"
-  if [[ $actual_sha256 != "$expected_sha256" ]]; then
-    die "pinned installer SHA-256 mismatch: expected $expected_sha256, got $actual_sha256"
-    return 1
-  fi
-  chmod 0700 "$destination"
-}
-
 run_verified_installer() {
-  local url="$1" expected_sha256="$2" expected_size="$3" status=0 installer
+  local url="$1" expected_sha256="$2" expected_size="$3" status=0 staging installer
   shift 3
-  installer="$(mktemp)"
-  if ! download_verified_executable "$url" "$expected_sha256" "$expected_size" "$installer"; then
-    rm -f -- "$installer"
+  if ! staging="$(bootstrap_staging_dir)"; then
+    die 'cannot create a private staging directory for the pinned Nix installer'
     return 1
   fi
-  "$installer" "$@" || status=$?
-  rm -f -- "$installer"
+  installer="$staging/nix-installer"
+  if bootstrap_download_pinned "$url" "$expected_sha256" "$expected_size" \
+    "$NIX_INSTALLER_MAX_BYTES" 180 "$installer" 'Nix installer' "$GITHUB_RELEASE_HOSTS"; then
+    if ! chmod 0700 "$installer"; then
+      rm -rf -- "$staging"
+      die 'cannot mark the authenticated Nix installer executable'
+      return 1
+    fi
+    "$installer" "$@" || status=$?
+  else
+    status=1
+  fi
+  rm -rf -- "$staging"
   return "$status"
 }
 
+# Refuse an archive whose members could escape the extraction root, collide with
+# each other, or expand without bound. The digest above proves these bytes are the
+# reviewed release; this proves the release layout is still the one reviewed. It
+# runs before a single member is extracted.
+validate_runner_archive() {
+  local archive="$1" names verbose facts key value
+  local archived_members expanded member_count refused name
+  if [ -L "$archive" ] || [ ! -f "$archive" ]; then
+    die "runner archive is missing or a symlink: $archive"
+    return 1
+  fi
+  names="$(mktemp)" || {
+    die 'cannot create a listing file for the runner archive'
+    return 1
+  }
+  verbose="$(mktemp)" || {
+    rm -f -- "$names"
+    die 'cannot create a listing file for the runner archive'
+    return 1
+  }
+  if ! tar -tzf "$archive" >"$names" 2>/dev/null; then
+    rm -f -- "$names" "$verbose"
+    die 'runner archive is malformed, truncated, or unreadable'
+    return 1
+  fi
+  refused=''
+  while IFS= read -r name; do
+    case "$name" in
+    '') refused='an empty member name' ;;
+    /*) refused="absolute member path: $name" ;;
+    *[[:space:]]* | *[[:cntrl:]]* | *\\*)
+      refused="member name with whitespace, control, or backslash characters: $name"
+      ;;
+    .. | ../* | */.. | */../*)
+      refused="traversal component in member path: $name"
+      ;;
+    esac
+    [ -z "$refused" ] || break
+  done <"$names"
+  if [ -n "$refused" ]; then
+    rm -f -- "$names" "$verbose"
+    die "runner archive refused: $refused"
+    return 1
+  fi
+  member_count="$(wc -l <"$names")" || member_count=0
+  member_count="${member_count//[[:space:]]/}"
+  if [ "${member_count:-0}" -eq 0 ]; then
+    rm -f -- "$names" "$verbose"
+    die 'runner archive is empty'
+    return 1
+  fi
+  if [ "$member_count" -gt "$RUNNER_MAX_MEMBERS" ]; then
+    rm -f -- "$names" "$verbose"
+    die "runner archive has $member_count members, above the $RUNNER_MAX_MEMBERS cap"
+    return 1
+  fi
+  if [ -n "$(sort <"$names" | uniq -d)" ]; then
+    rm -f -- "$names" "$verbose"
+    die 'runner archive contains duplicate member destinations'
+    return 1
+  fi
+  if ! tar -tvzf "$archive" >"$verbose" 2>/dev/null; then
+    rm -f -- "$names" "$verbose"
+    die 'runner archive member metadata is unreadable'
+    return 1
+  fi
+  # Member names are already known to be whitespace-free, so the verbose listing
+  # parses exactly: $1 mode, $3 size, $6 member name, then " -> " for a symlink.
+  if ! facts="$(
+    awk '
+      function contained(base, target,    parts, count, i, part, depth) {
+        if (target ~ /^\//) return 0
+        depth = 0
+        count = split(base "/" target, parts, "/")
+        for (i = 1; i <= count; i++) {
+          part = parts[i]
+          if (part == "" || part == ".") continue
+          if (part == "..") {
+            if (depth == 0) return 0
+            depth--
+            continue
+          }
+          depth++
+        }
+        return 1
+      }
+      {
+        kind = substr($1, 1, 1)
+        name = $6
+        size = $3
+        if (kind != "-" && kind != "d" && kind != "l") {
+          printf "refused member type %s: %s\n", kind, name
+          bad = 1
+          next
+        }
+        if (size !~ /^[0-9]+$/) {
+          printf "refused unreadable member size: %s\n", name
+          bad = 1
+          next
+        }
+        total += size
+        members++
+        if (kind == "l") {
+          split_at = index($0, " -> ")
+          target = (split_at > 0) ? substr($0, split_at + 4) : ""
+          base = name
+          if (sub(/\/[^\/]*$/, "", base) == 0) base = "."
+          if (target == "" || !contained(base, target)) {
+            printf "refused escaping symlink %s -> %s\n", name, target
+            bad = 1
+          }
+        }
+      }
+      END {
+        printf "members %d\ntotal %d\n", members, total
+        exit bad ? 1 : 0
+      }
+    ' "$verbose"
+  )"; then
+    printf '%s\n' "$facts" >&2
+    rm -f -- "$names" "$verbose"
+    die 'runner archive has members this script refuses to extract'
+    return 1
+  fi
+  rm -f -- "$names" "$verbose"
+  archived_members=''
+  expanded=''
+  while read -r key value; do
+    case "$key" in
+    members) archived_members="$value" ;;
+    total) expanded="$value" ;;
+    esac
+  done <<<"$facts"
+  if [[ ! $archived_members =~ ^[0-9]+$ || ! $expanded =~ ^[0-9]+$ ]]; then
+    die 'runner archive metadata could not be audited'
+    return 1
+  fi
+  if [ "$archived_members" != "$member_count" ]; then
+    die "runner archive listings disagree: $member_count names, $archived_members entries"
+    return 1
+  fi
+  if [ "$expanded" -gt "$RUNNER_MAX_EXPANDED_BYTES" ]; then
+    die "runner archive expands to $expanded bytes, above the $RUNNER_MAX_EXPANDED_BYTES-byte cap"
+    return 1
+  fi
+  return 0
+}
+
+# Extract a validated archive into a fresh private directory with no privilege and
+# no pre-existing path to write through, then prove the staged release is whole.
+extract_runner_archive() {
+  local archive="$1" destination="$2" required stray
+  local -a required_members
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    die "runner extraction target already exists: $destination"
+    return 1
+  fi
+  if ! mkdir -m 0700 "$destination"; then
+    die "cannot create the runner extraction staging directory: $destination"
+    return 1
+  fi
+  IFS=' ' read -r -a required_members <<<"$RUNNER_REQUIRED_MEMBERS"
+  # No -P and no sudo: tar strips a leading "/" and refuses ".." members itself,
+  # and nothing exists yet for a member to be written through.
+  if ! tar -xzf "$archive" -C "$destination" --no-same-owner --no-same-permissions 2>/dev/null; then
+    die 'runner archive did not extract completely'
+    return 1
+  fi
+  for required in "${required_members[@]}"; do
+    if [ -L "$destination/$required" ] || [ ! -f "$destination/$required" ]; then
+      die "authenticated runner archive is missing $required"
+      return 1
+    fi
+  done
+  stray="$(find "$destination" ! -type f ! -type d ! -type l -print 2>/dev/null | head -n 1)"
+  if [ -n "$stray" ]; then
+    die "runner archive extracted a non-file entry: $stray"
+    return 1
+  fi
+  return 0
+}
+
+# A cached archive is re-authenticated on every run: existence alone never
+# confers trust, and a tampered or rolled-back cache is a refusal, not a repair.
+authenticate_cached_runner_archive() {
+  local archive="$1"
+  if bootstrap_verify_bytes "$archive" "$RUNNER_SHA256" "$RUNNER_SIZE" &&
+    validate_runner_archive "$archive"; then
+    return 0
+  fi
+  printf '\033[1;31m✗ %s\033[0m\n' "cached runner archive is not the pinned actions-runner v$RUNNER_VERSION release; remove it with 'sudo rm -- $archive' and rerun so the pinned bytes are downloaded again" >&2
+  return 1
+}
+
+# Download, authenticate, validate, extract and only then promote the payload
+# atomically into the root-owned runner base.
+stage_runner_archive() {
+  local staging archive tree promoted
+  if ! staging="$(bootstrap_staging_dir)"; then
+    die 'cannot create a private staging directory for the runner archive'
+    return 1
+  fi
+  archive="$staging/$RUNNER_TARBALL"
+  if ! bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE" \
+    "$RUNNER_MAX_BYTES" 1800 "$archive" 'Actions runner archive' "$GITHUB_RELEASE_HOSTS"; then
+    rm -rf -- "$staging"
+    return 1
+  fi
+  if ! validate_runner_archive "$archive"; then
+    rm -rf -- "$staging"
+    return 1
+  fi
+  tree="$staging/tree"
+  if ! extract_runner_archive "$archive" "$tree"; then
+    rm -rf -- "$staging"
+    return 1
+  fi
+  rm -rf -- "$tree"
+  promoted="$RUNNER_BASE/.$RUNNER_TARBALL.$$.partial"
+  if ! sudo install -m 0644 -o root -g root "$archive" "$promoted"; then
+    sudo rm -f -- "$promoted"
+    rm -rf -- "$staging"
+    die "cannot stage the authenticated runner archive under $RUNNER_BASE"
+    return 1
+  fi
+  if ! sudo mv -f -- "$promoted" "$RUNNER_BASE/$RUNNER_TARBALL"; then
+    sudo rm -f -- "$promoted"
+    rm -rf -- "$staging"
+    die 'cannot atomically promote the authenticated runner archive'
+    return 1
+  fi
+  rm -rf -- "$staging"
+  log "installed authenticated actions-runner v$RUNNER_VERSION payload"
+}
+
 install_runner_payload() {
-  local version tarball cache_tarball tmp_archive tmp_env base_owner base_mode
+  local cache_tarball tmp_env base_owner base_mode
   if sudo test -L "$RUNNER_BASE"; then
     die "runner base is a symlink: $RUNNER_BASE"
     return 1
@@ -422,17 +664,18 @@ install_runner_payload() {
   render_runner_env >"$tmp_env"
   sudo install -m 0644 -o root -g root "$tmp_env" "$RUNNER_BASE/runner.env"
   rm -f "$tmp_env"
-  version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')"
-  tarball="actions-runner-linux-x64-${version}.tar.gz"
-  cache_tarball="$RUNNER_BASE/$tarball"
-  RUNNER_ARCHIVE_FILE="$cache_tarball"
-  if ! sudo test -f "$cache_tarball"; then
-    log "downloading actions-runner v$version…"
-    tmp_archive="$(mktemp)"
-    curl -fsSL -o "$tmp_archive" "https://github.com/actions/runner/releases/download/v${version}/${tarball}"
-    sudo install -D -m 0644 -o root -g root "$tmp_archive" "$cache_tarball"
-    rm -f "$tmp_archive"
+  cache_tarball="$RUNNER_BASE/$RUNNER_TARBALL"
+  if sudo test -L "$cache_tarball"; then
+    die "cached runner archive is a symlink: $cache_tarball"
+    return 1
   fi
+  if sudo test -f "$cache_tarball"; then
+    authenticate_cached_runner_archive "$cache_tarball" || return 1
+  else
+    log "installing actions-runner v$RUNNER_VERSION (pinned size and digest)…"
+    stage_runner_archive || return 1
+  fi
+  RUNNER_ARCHIVE_FILE="$cache_tarball"
 }
 
 main() {

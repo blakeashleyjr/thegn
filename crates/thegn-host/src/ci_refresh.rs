@@ -1,6 +1,5 @@
 //! CI run-history refresh machinery (AV group): the ttl-guarded refresh of the
-//! active worktree, a round-robin background-worktree sweep that keeps the
-//! cross-worktree Across excerpts honest, exponential backoff after fetch
+//! active worktree, exponential backoff after fetch
 //! failures, and the per-worktree fetch-health note the panel surfaces
 //! ("CI provider API rate limited", …). The ticker cadence and the
 //! `RefreshKind` plumbing stay in [`crate::hydrate`]; everything here runs off
@@ -14,15 +13,14 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
-use thegn_core::store::WorkspaceStore;
 
 use crate::ci_flight::{CiFlight, FlightAdmission, FlightKey, FlightKind, FlightToken};
 
-/// One request's aggregate cap across active and background worktrees, including run lists.
+/// One request's aggregate cap for the focused worktree, including run lists.
 const MAX_LOG_INGEST_CALLS: usize = 32;
-/// Log bytes ingested by one refresh request (active worktree plus the background sweep).
+/// Log bytes ingested by one focused-worktree refresh request.
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
-/// One request's aggregate cap across active and background worktrees, including run lists.
+/// One focused-worktree request's aggregate wall-clock cap, including run lists.
 pub(crate) const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
 const MAX_INGEST_MEMO_ENTRIES: usize = 512;
 
@@ -172,7 +170,6 @@ impl CallBudget {
 
 #[derive(Clone)]
 struct RefreshRequest {
-    session: crate::session::Session,
     full: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
     token: FlightToken,
@@ -838,8 +835,8 @@ fn backoff_active(worktree: &str, now: i64) -> bool {
 // --- the refresh itself -----------------------------------------------------
 
 /// Everything the loop does on a CI tick, in one call (keeps `run.rs` lean):
-/// kick the off-loop cache refresh (+ the background sweep it carries) and
-/// re-poll an open live drill on a still-running run so it updates in place.
+/// kick the off-loop active-worktree cache refresh and re-poll an open live
+/// drill on a still-running run so it updates in place.
 pub(crate) fn on_ci_tick(
     session: &crate::session::Session,
     full: &thegn_core::config::Config,
@@ -861,9 +858,7 @@ pub(crate) fn on_ci_tick(
     }
 }
 
-/// Refresh the CI run-history cache for the active worktree (AV group), then
-/// sweep one stale background worktree (round-robin) so the Across section
-/// converges instead of freezing at last-visit state. Off the event loop:
+/// Refresh the CI run-history cache for the active worktree (AV group). Off the event loop:
 /// resolves the provider from `[ci]` config + the git remote, fetches recent
 /// runs for the current branch via the async `CiProvider`, writes
 /// `ci_runs_cache`, and pulses the waker so the panel rehydrates. Non-`force`
@@ -897,7 +892,6 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
         cancel: Arc::new(AtomicBool::new(false)),
     };
     let request = RefreshRequest {
-        session,
         full,
         waker,
         token,
@@ -980,20 +974,6 @@ fn run_ci_refresh_request(request: &RefreshRequest) {
             },
         );
     }
-    if !budget.exhausted() {
-        sweep_one_background(
-            &request.session,
-            cwd,
-            &cfg,
-            &request.full,
-            request.waker.as_ref(),
-            RefreshContext {
-                generation: request.generation.clone(),
-                cancel: Arc::clone(&request.token.cancel),
-                budget: &mut budget,
-            },
-        );
-    }
     if budget.exhausted() {
         tracing::info!(
             target: "thegn::ci",
@@ -1001,67 +981,6 @@ fn run_ci_refresh_request(request: &RefreshRequest) {
             bytes_remaining = budget.bytes_remaining,
             "CI refresh budget exhausted; remaining CI work waits for the next refresh"
         );
-    }
-}
-
-/// Round-robin cursor over background worktrees, advanced once per sweep so
-/// every worktree gets a turn even when several are stale.
-static SWEEP_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Refresh at most ONE stale background worktree's CI cache, or none when the
-/// request's budget is exhausted (the ttl guard decides staleness), starting
-/// from the rotating cursor. Blocking; must run on the bg lane.
-fn sweep_one_background(
-    session: &crate::session::Session,
-    active: &std::path::Path,
-    cfg: &thegn_core::config::CiConfig,
-    full: &thegn_core::config::Config,
-    waker: Option<&TerminalWaker>,
-    context: RefreshContext<'_>,
-) {
-    let others: Vec<&str> = session
-        .worktrees
-        .iter()
-        .map(|g| g.path.as_str())
-        .filter(|p| std::path::Path::new(p) != active)
-        .collect();
-    if others.is_empty() {
-        return;
-    }
-    let locations = thegn_core::db::Db::open()
-        .and_then(|db| db.worktrees())
-        .map(|rows| thegn_core::remote::WorktreeLocations::from_rows(&rows))
-        .unwrap_or_default();
-    let start = SWEEP_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for i in 0..others.len() {
-        let p = std::path::Path::new(others[(start + i) % others.len()]);
-        if !p.is_dir() {
-            continue;
-        }
-        let loc = locations.loc(p);
-        // First worktree that actually fetched (fresh ones are skipped by the
-        // guard) ends the sweep — one provider subprocess per tick, max.
-        if context.cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        if context.budget.exhausted() {
-            return;
-        }
-        if refresh_ci_cache_for(
-            p,
-            &loc,
-            cfg,
-            full,
-            waker,
-            false,
-            RefreshContext {
-                generation: context.generation.clone(),
-                cancel: Arc::clone(&context.cancel),
-                budget: &mut *context.budget,
-            },
-        ) {
-            return;
-        }
     }
 }
 
@@ -2795,7 +2714,6 @@ mod tests {
             assert_eq!(coordinator.flight.submit(running), FlightAdmission::Started);
             coordinator.flight.queued = Some(queued.clone());
             coordinator.queued = Some(RefreshRequest {
-                session: crate::session::Session::default(),
                 full: thegn_core::config::Config::default(),
                 waker: None,
                 token: queued.clone(),
@@ -2806,7 +2724,6 @@ mod tests {
             assert!(coordinator.queued.is_none());
             assert!(coordinator.flight.queued.is_none());
             assert!(!coordinator.submit(RefreshRequest {
-                session: crate::session::Session::default(),
                 full: thegn_core::config::Config::default(),
                 waker: None,
                 token: flight_token("/later", None, false),

@@ -1953,6 +1953,7 @@ mod tests {
 
         let mut cfg = thegn_core::config::Config::default();
         cfg.agents.push(NamedCommand {
+            backends: Vec::new(),
             name: "codex".into(),
             command: "codex".into(),
             hints: Vec::new(),

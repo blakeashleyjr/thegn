@@ -7552,6 +7552,7 @@ async fn event_loop<T: Terminal>(
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
     sb.view.lead_enabled = crate::lead::enabled(keymap.config());
     sb.view.lead_setup_row = !sb.view.lead_enabled;
+    sb.view.lead_disabled_reason = crate::lead::disabled_reason(keymap.config());
     sb.freeze_sort = keymap.config().ui.sidebar_freeze_sort;
     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
@@ -8911,24 +8912,52 @@ async fn event_loop<T: Terminal>(
     }
 
     macro_rules! jump_lead {
-        () => {{
-            match crate::lead::group::jump(
-                keymap.config(),
-                &mut session,
-                &mut panes,
-                &model.sidebar_db_terminals,
-                &pending_db_tx,
-                &waker,
-            ) {
+        () => {
+            jump_lead!(false);
+        };
+        (after_restart) => {
+            jump_lead!(true);
+        };
+        ($after_restart:expr) => {{
+            let outcome = if $after_restart {
+                crate::lead::group::jump_after_restart(
+                    keymap.config(),
+                    &mut session,
+                    &mut panes,
+                    &pending_db_tx,
+                    &waker,
+                )
+            } else {
+                crate::lead::group::jump(
+                    keymap.config(),
+                    &mut session,
+                    &mut panes,
+                    &model.sidebar_db_terminals,
+                    &pending_db_tx,
+                    &waker,
+                )
+            };
+            match outcome {
                 crate::lead::group::JumpOutcome::Setup => {
                     // Not configured or not ready: the guided in-app setup.
                     active_menu = Some(crate::lead::setup::begin(&crate::lead::setup::RealHost {
                         cfg: keymap.config(),
                     }));
+                    focus.zone = crate::focus::Zone::Center;
                 }
                 crate::lead::group::JumpOutcome::Activate(t) => {
+                    // Lead clicks used to pass through the sidebar activation
+                    // arm, which stamps the center switch for the renderer.
+                    // Keep that damage signal when routing them through the
+                    // shared jump path so the old worktree cannot remain on
+                    // screen after session focus changes.
+                    switch_at = Some((
+                        std::time::Instant::now(),
+                        crate::handlers::sidebar_activate::switch_kind(&t, &session.id),
+                    ));
                     let (hydrate, _pending) = activate_row!(t);
                     sb.focus_active_row(&mut model);
+                    focus.zone = crate::focus::Zone::Center;
                     if hydrate {
                         kick_model_hydration!();
                     }
@@ -9033,6 +9062,16 @@ async fn event_loop<T: Terminal>(
                     if crate::lead::group::is_setup_target(&target, keymap.config()) =>
                 {
                     // The "Lead — set up" row: open the guided setup, never a Lead.
+                    jump_lead!();
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::Activate(target)
+                    if crate::lead::group::is_lead_target(&target, &session) =>
+                {
+                    // Configured Lead rows share the jump path too, so an
+                    // unavailable listener opens setup instead of restoring a
+                    // stale tab through generic sidebar activation.
                     jump_lead!();
                     dirty = true;
                     continue;
@@ -9985,7 +10024,11 @@ async fn event_loop<T: Terminal>(
                 // A terminal has no worktree to fast-fill from: blank only (the
                 // hydration kicked below paints its env chips).
                 None if crate::hydrate::active_is_terminal(&session) => {
-                    crate::handlers::switch_cache::WorktreeSlice::clear(&mut model)
+                    let name = session
+                        .active_group()
+                        .map(|group| group.name.as_str())
+                        .unwrap_or_default();
+                    crate::handlers::switch_cache::WorktreeSlice::clear_terminal(&mut model, name)
                 }
                 None => crate::handlers::switch_cache::clear_and_fill(
                     &mut model,
@@ -15493,12 +15536,38 @@ async fn event_loop<T: Terminal>(
                 }
                 // A Lead-setup background job finished: reopen the flow's menu.
                 RefreshKind::LeadSetup(done) => {
-                    active_menu = Some(crate::lead::setup::async_menu(
-                        &crate::lead::setup::RealHost {
-                            cfg: keymap.config(),
+                    match *done {
+                        crate::lead::setup::Async::Restarted { result, .. } => match result {
+                            Ok(()) => {
+                                let host = crate::lead::setup::RealHost {
+                                    cfg: keymap.config(),
+                                };
+                                if !crate::lead::setup::Host::facts(&host).logged_in {
+                                    active_menu = Some(crate::lead::setup::after_restart(&host));
+                                } else {
+                                    active_menu = None;
+                                    model.status = "daemon stopped; reopening the Lead".into();
+                                    jump_lead!(after_restart);
+                                }
+                            }
+                            Err(error) => {
+                                model.status = format!("daemon not restarted: {error}");
+                                active_menu = Some(crate::lead::setup::begin(
+                                    &crate::lead::setup::RealHost {
+                                        cfg: keymap.config(),
+                                    },
+                                ));
+                            }
                         },
-                        *done,
-                    ));
+                        done => {
+                            active_menu = Some(crate::lead::setup::async_menu(
+                                &crate::lead::setup::RealHost {
+                                    cfg: keymap.config(),
+                                },
+                                done,
+                            ));
+                        }
+                    }
                     dirty = true;
                 }
                 // The daemon's answer to the status modal's session probe.
@@ -19091,31 +19160,37 @@ async fn event_loop<T: Terminal>(
                                 target,
                                 force_center,
                             } => {
-                                // Stamp the switch like the keyboard `Activate`
-                                // arm: it is the render plan's `switch` damage
-                                // bit. An in-workspace hop is a pure focus move
-                                // that dirties nothing else, so without it this
-                                // arm's sidebar-only damage repainted the
-                                // highlight but left the center on the previous
-                                // worktree's panes.
-                                switch_at = Some((
-                                    std::time::Instant::now(),
-                                    crate::handlers::sidebar_activate::switch_kind(
-                                        &target,
-                                        &session.id,
-                                    ),
-                                ));
-                                let hydrate = activate_row!(target).0;
-                                // A switch from the sidebar keeps the user in
-                                // the center terminal if that's where they were
-                                // typing (matching keyboard NextTab/PrevTab);
-                                // a double-click commits focus to the center
-                                // regardless.
-                                if was_center || force_center {
+                                if crate::lead::group::is_lead_target(&target, &session) {
+                                    // Lead clicks share the jump key's readiness
+                                    // check and focus transition. Generic terminal
+                                    // activation can start a lazy restore without
+                                    // opening setup, and does not own the Lead's
+                                    // global entry semantics.
+                                    jump_lead!();
                                     focus.zone = crate::focus::Zone::Center;
-                                }
-                                if hydrate {
-                                    kick_model_hydration!();
+                                } else {
+                                    // Stamp the switch like the keyboard
+                                    // `Activate` arm: it is the render plan's
+                                    // `switch` damage bit. An in-workspace hop is
+                                    // a pure focus move that dirties nothing else.
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::handlers::sidebar_activate::switch_kind(
+                                            &target,
+                                            &session.id,
+                                        ),
+                                    ));
+                                    let hydrate = activate_row!(target).0;
+                                    // A switch from the sidebar keeps the user
+                                    // in the center terminal if that's where they
+                                    // were typing; a double-click always commits
+                                    // focus to the center.
+                                    if was_center || force_center {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    if hydrate {
+                                        kick_model_hydration!();
+                                    }
                                 }
                             }
                             crate::handlers::sidebar_mouse::PressOut::Outcome(out) => {

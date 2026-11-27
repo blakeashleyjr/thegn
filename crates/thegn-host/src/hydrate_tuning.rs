@@ -126,6 +126,20 @@ fn glyph_fingerprints()
 pub(crate) const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
 const DEFAULT_BG_BUSY_GLYPH_TTL_MS: u64 = 10_000;
 const DEFAULT_BG_SAFETY_GLYPH_TTL_MS: u64 = 600_000;
+/// Only the focused or recently used worktrees need live git status. Older
+/// rows keep their last-known glyphs until selected again.
+pub(crate) const RECENT_GLYPH_ACTIVITY: Duration = Duration::from_secs(15 * 60);
+
+pub(crate) fn include_glyph_path(
+    path: &str,
+    active_path: Option<&str>,
+    since_active: &std::collections::HashMap<String, Duration>,
+) -> bool {
+    active_path == Some(path)
+        || since_active
+            .get(path)
+            .is_some_and(|age| *age <= RECENT_GLYPH_ACTIVITY)
+}
 
 /// Background glyph policy windows and the cadence used to interpret hints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,6 +439,28 @@ pub(crate) fn resync_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_focused_or_recently_active_glyph_paths_are_live_candidates() {
+        let active = "/wt/active";
+        let recent = "/wt/recent";
+        let old = "/wt/old";
+        let since_active = std::collections::HashMap::from([
+            (recent.to_owned(), Duration::from_secs(60)),
+            (
+                old.to_owned(),
+                RECENT_GLYPH_ACTIVITY + Duration::from_secs(1),
+            ),
+        ]);
+        assert!(include_glyph_path(active, Some(active), &since_active));
+        assert!(include_glyph_path(recent, Some(active), &since_active));
+        assert!(!include_glyph_path(old, Some(active), &since_active));
+        assert!(!include_glyph_path(
+            "/wt/unknown",
+            Some(active),
+            &since_active
+        ));
+    }
 
     #[test]
     fn busy_ttl_is_strictly_greater_than_the_tick_and_zero_still_opts_out() {

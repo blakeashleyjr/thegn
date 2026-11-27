@@ -1,0 +1,7 @@
+- [x] Pin and authenticate the Determinate Nix installer before execution.
+- [x] Pin and authenticate the Actions runner archive before extraction and installation.
+- [x] Re-authenticate cached runner archives and validate archive members before extraction.
+- [x] Replace the mutable macOS rustup shell bootstrap with pinned, verified rustup-init binaries.
+- [x] Document the reviewed bootstrap pin refresh procedure.
+- [x] Add offline refusal and authenticated execution fixtures for CI and macOS bootstrap paths.
+- [ ] Run the offline bootstrap fixtures in the remote verification environment.

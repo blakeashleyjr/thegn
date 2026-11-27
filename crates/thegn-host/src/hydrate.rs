@@ -1983,6 +1983,7 @@ fn collect_sidebar_status(
     // cached glyph row until it goes stale. The remaining scans still fan out
     // across scoped threads; DB-keyed inserts (agent, PR counts) stay on this
     // thread since `Db` isn't `Send`.
+    let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
     let mut seen = std::collections::HashSet::new();
     let paths: Vec<String> = session
         .worktrees
@@ -1990,6 +1991,9 @@ fn collect_sidebar_status(
         .filter(|g| !g.path.is_empty())
         .map(|g| g.path.clone())
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
+        .filter(|p| {
+            crate::hydrate_tuning::include_glyph_path(p, active_path.as_deref(), &since_active)
+        })
         .collect();
     // All registered worktree paths (every workspace) PLUS every known repo
     // root: the retain + seed passes below use them to keep/serve other
@@ -2006,7 +2010,6 @@ fn collect_sidebar_status(
     );
 
     // Partition into paths that must be rescanned now vs. served from cache.
-    let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
     // Read before any scan: a watcher event during the scan must leave this mark stale.
     let active_print = active_path
         .as_deref()
@@ -4593,6 +4596,7 @@ pub(crate) fn spawn_panel_prefetch(
                 loc,
                 disk,
                 successful: true,
+                error: None,
             })
             .is_ok()
         {
@@ -4628,6 +4632,7 @@ impl Drop for PanelPrefetchCompletion {
                 loc: None,
                 disk: None,
                 successful: false,
+                error: Some("Panel prefetch failed. Switch away and back to retry.".into()),
             })
             .is_ok()
             && let Some(waker) = &self.waker
@@ -4769,6 +4774,13 @@ fn pr_refresh_blocking_fenced(
         // `(json, fetched_at)` row is kept as the CAS expectation for the
         // definitive write below (THE-2214 lease handover).
         let old_row: Option<(String, i64)> = db.get_pr_cache(&cache_key).ok().flatten();
+        if thegn_core::connectivity::current() != thegn_core::connectivity::Connectivity::Offline
+            && old_row.as_ref().is_some_and(|(_, fetched_at)| {
+                cache_ttl_is_fresh(*fetched_at, thegn_core::util::now(), cfg.pr.ttl_secs)
+            })
+        {
+            return PrRefreshOutcome::Skipped;
+        }
         let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = old_row
             .as_ref()
             .and_then(|(json, _)| {
@@ -5044,6 +5056,22 @@ fn pr_refresh_blocking_fenced(
         }
 
         PrRefreshOutcome::Fetched
+    }
+}
+
+fn cache_ttl_is_fresh(fetched_at: i64, now: i64, ttl_secs: u64) -> bool {
+    now.saturating_sub(fetched_at) < thegn_core::time_policy::saturating_i64(u128::from(ttl_secs))
+}
+
+#[cfg(test)]
+mod cache_ttl_tests {
+    use super::cache_ttl_is_fresh;
+
+    #[test]
+    fn provider_cache_ttl_bounds_repeated_refreshes() {
+        assert!(cache_ttl_is_fresh(100, 129, 30));
+        assert!(!cache_ttl_is_fresh(100, 130, 30));
+        assert!(!cache_ttl_is_fresh(100, 101, 0));
     }
 }
 

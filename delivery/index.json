@@ -14,6 +14,7 @@
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
     "Sandbox & Remote 01: Truth and fixes",
+    "Sandbox & Remote 04",
     "Sandbox & Remote 05: macOS",
     "Sandbox & Remote 06: Windows"
   ],
@@ -306,6 +307,19 @@
         }
       ],
       "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
+    },
+    {
+      "change": "add-network-allowlist-fail-closed",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2119",
+          "project": "Sandbox & Remote 04"
+        }
+      ],
+      "summary": "`network = \"allowlist\"` parses and fails closed as `none` until an egress datapath exists; the spec records the request.",
+      "delivered_at": "2026-11-26"
     },
     {
       "change": "add-observability-dashboards",
@@ -616,7 +630,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "First-party worker dictation adds embedded Whisper, rolling previews, pinned models and HTTP. THE-1510 parents THE-1511–THE-1515; THE-148 owns reconciliation. Locked Linux native build, HTTP and synthetic worker evidence is in docs/voice-verification.md; real-platform latency, routing, permissions and release gates remain open."
+      "summary": "First-party worker dictation adds embedded Whisper, rolling previews, pinned models and HTTP. THE-1510 parents THE-1511\u2013THE-1515; THE-148 owns reconciliation. Locked Linux native build, HTTP and synthetic worker evidence is in docs/voice-verification.md; real-platform latency, routing, permissions and release gates remain open."
     },
     {
       "change": "add-vps-providers",
@@ -749,6 +763,19 @@
       "summary": "Admit only bounded complete clipboard sets with generation-fenced pending ownership."
     },
     {
+      "change": "agent-account-failover",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2769",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Route agent-run roles through ordered harness/account/model backends using per-account usage headroom, quota cooldowns and dispatch attribution.",
+      "delivered_at": "2026-11-26"
+    },
+    {
       "change": "agent-integrations-out-of-box",
       "lifecycle": "delivered-awaiting-archive",
       "delivered_at": "2026-11-25",
@@ -839,6 +866,18 @@
       ],
       "summary": "Bound duration and cadence conversion while retaining security policy and quarantining unknown destructive ages.",
       "archive_path": "openspec/changes/archive/2026-09-30-bound-duration-and-refresh-policy/"
+    },
+    {
+      "change": "bound-idle-worktree-refresh",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2773",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Bound idle git status refresh and focus CI polling for large worktree registries."
     },
     {
       "change": "bound-public-share-output",
@@ -1457,6 +1496,18 @@
         }
       ],
       "summary": "Per-tab zoom renders as a pane stack with one-row bars; keyboard, mouse and narrow-width geometry share one drawn layout."
+    },
+    {
+      "change": "pin-ci-bootstrap-inputs",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-413",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Pin and authenticate CI runner and installer artifacts and the bare macOS rustup bootstrap before execution or extraction; offline fixture execution remains for remote verification."
     },
     {
       "change": "pin-git-alternates-read-only",

@@ -641,6 +641,9 @@ pub struct ViewState {
     /// in-app setup flow; mirrored from `!crate::lead::enabled` like
     /// `lead_enabled`, on both channels.
     pub lead_setup_row: bool,
+    /// Reason the Lead row cannot launch, if the current channel or host is
+    /// missing a requirement. The row remains available to open setup.
+    pub lead_disabled_reason: Option<String>,
     /// Flat cross-workspace layout (`g`): drop per-repo grouping and show one
     /// recency-ordered list of every worktree, each tagged with its repo.
     /// Persisted as the `sidebar_flat` ui_state key; independent of `sort`.
@@ -965,6 +968,7 @@ fn push_lead_section(
     session: &Session,
     db_terminals: &[thegn_core::models::TerminalRow],
     lead: Option<&thegn_core::lead_bar::LeadBar>,
+    disabled_reason: Option<&str>,
 ) {
     use crate::lead::group::LEAD_GROUP_NAME;
     rows.push(SidebarRow::base(RowKind::SectionHeading, 0, "LEAD", "lead"));
@@ -1002,16 +1006,26 @@ fn push_lead_section(
         )
         .expect("writing to String cannot fail");
     }
+    if let Some(reason) = disabled_reason {
+        write!(label, " — {reason}").expect("writing to String cannot fail");
+    }
     let active = live.is_some_and(|i| i == session.active);
     rows.push(SidebarRow {
-        tab_target: Some(match live {
-            Some(i) => RowTarget::Tab(i, session.worktrees[i].active_tab),
-            None => RowTarget::Workspace {
+        tab_target: Some(if disabled_reason.is_some() {
+            RowTarget::Workspace {
                 repo_path: "terminal".into(),
                 group: Some(LEAD_GROUP_NAME.into()),
-            },
+            }
+        } else {
+            match live {
+                Some(i) => RowTarget::Tab(i, session.worktrees[i].active_tab),
+                None => RowTarget::Workspace {
+                    repo_path: "terminal".into(),
+                    group: Some(LEAD_GROUP_NAME.into()),
+                },
+            }
         }),
-        active,
+        active: active && disabled_reason.is_none(),
         worktree_path: Some(LEAD_GROUP_NAME.into()),
         terminal_connection: Some(String::new()),
         ..SidebarRow::base(RowKind::Terminal, 1, label, "lead/row")
@@ -1023,8 +1037,12 @@ pub(crate) const LEAD_SETUP_LABEL: &str = "Lead \u{2014} set up";
 
 /// The `LEAD` section while no `[lead]` is configured: one row whose activation
 /// the loop turns into the in-app setup flow (never a Lead launch).
-fn push_lead_setup_section(rows: &mut Vec<SidebarRow>) {
+fn push_lead_setup_section(rows: &mut Vec<SidebarRow>, disabled_reason: Option<&str>) {
     use crate::lead::group::LEAD_GROUP_NAME;
+    let label = disabled_reason.map_or_else(
+        || LEAD_SETUP_LABEL.to_string(),
+        |reason| format!("Lead — {reason}"),
+    );
     rows.push(SidebarRow::base(RowKind::SectionHeading, 0, "LEAD", "lead"));
     rows.push(SidebarRow {
         tab_target: Some(RowTarget::Workspace {
@@ -1033,7 +1051,7 @@ fn push_lead_setup_section(rows: &mut Vec<SidebarRow>) {
         }),
         worktree_path: Some(LEAD_GROUP_NAME.into()),
         terminal_connection: Some(String::new()),
-        ..SidebarRow::base(RowKind::Terminal, 1, LEAD_SETUP_LABEL, "lead/row")
+        ..SidebarRow::base(RowKind::Terminal, 1, label, "lead/row")
     });
 }
 
@@ -1092,9 +1110,15 @@ pub fn build_rows(
 
     // The Lead is pinned at the very top: outside workspace ordering/reorder.
     if view.lead_enabled {
-        push_lead_section(&mut rows, session, db_terminals, status.lead.as_ref());
+        push_lead_section(
+            &mut rows,
+            session,
+            db_terminals,
+            status.lead.as_ref(),
+            view.lead_disabled_reason.as_deref(),
+        );
     } else if view.lead_setup_row {
-        push_lead_setup_section(&mut rows);
+        push_lead_setup_section(&mut rows, view.lead_disabled_reason.as_deref());
     }
 
     // Every ordering key the computed sorts read, in one place: the live status
@@ -4436,6 +4460,19 @@ mod tests {
         status.lead = Some(bar_with(thegn_core::lead_bar::LeadState::Idle));
         let rows = build_rows(&session, &[], &view, &status, &[], &[], &[]);
         assert_eq!(rows[1].label, "Lead (1 tab)");
+    }
+
+    #[test]
+    fn lead_row_shows_a_disabled_reason_without_hiding_setup_access() {
+        let session = session(vec![WorktreeGroup::terminal("lead")], 0);
+        let view = ViewState {
+            lead_enabled: true,
+            lead_disabled_reason: Some("disabled: install bubblewrap, then press Alt i".into()),
+            ..Default::default()
+        };
+        let rows = build_rows(&session, &[], &view, &no_activity(), &[], &[], &[]);
+        assert!(rows[1].label.contains("disabled: install bubblewrap"));
+        assert!(rows[1].tab_target.is_some());
     }
 
     #[test]

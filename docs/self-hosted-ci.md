@@ -75,15 +75,57 @@ argv of the `thegn-ci`-owned runner process.
 
 The Nix multi-user daemon and `/nix/store` remain shared. There is no shared
 writable Cargo registry or sccache, no runner cache bin directory on PATH, and
-each job's HOME is wiped before use. The setup script verifies the exact
-Determinate Nix installer v3.24.2 Linux x86_64 release asset by its pinned
-size and SHA-256 before execution. Its digest is taken from GitHub's official
-release asset metadata, so this check still depends on GitHub's release
-metadata and HTTPS delivery. The Actions runner archive remains selected from
-the mutable `releases/latest` endpoint and is not authenticated against a
-reviewed pinned digest (THE-413). Untrusted-event rejection, task-bound
+each job's HOME is wiped before use. Untrusted-event rejection, task-bound
 short-lived credentials for protected jobs, authenticated shared caches, and
 canary jobs also remain open on THE-414.
+
+## Bootstrap artifacts are authenticated before execution
+
+Setup executes no artifact it has not authenticated. The Nix multi-user daemon
+comes from the exact Determinate Nix installer v3.24.2 Linux x86_64 release
+asset; the Actions runner comes from the pinned
+`actions-runner-linux-x64-2.338.2.tar.gz` release asset, not from
+`releases/latest`. The version, exact byte size, SHA-256, and byte/time caps for
+both live in `scripts/ci/ageless-runner-setup.sh` as reviewed data, shared with
+`setup-macos.sh` through `scripts/lib/bootstrap-artifacts.sh`.
+
+Each artifact is downloaded into a private staging directory over HTTPS with a
+connect timeout, a stalled-transfer abort, a total time budget, and a hard byte
+cap. Redirects are limited to HTTPS and their final origin must be an approved
+GitHub release host, so a redirect cannot silently move the transfer elsewhere.
+The pinned digest, not the host, decides what may execute: downloaded bytes are
+checked against the reviewed size and SHA-256 before they run or are promoted
+into a root-owned path. A runner archive already on disk is re-authenticated on
+every run, so existence never substitutes for integrity. Before extraction, the
+archive's member list is validated: paths must stay inside the tree, symlinks
+must not escape it, and hardlinks, device nodes, duplicate destinations, empty
+or malformed archives, and oversized expansions are refused.
+
+The bare (no-Nix) macOS path in `setup-macos.sh` authenticates rustup the same
+way: the pinned `rustup-init` 1.29.3 binary for the host architecture from
+`static.rust-lang.org`, verified by size and SHA-256, then run. It no longer
+pipes a remote shell script into `sh`, so the executable that runs cannot
+change between review and use.
+
+## Refresh a pinned bootstrap artifact
+
+Pins are reviewed repository data, never fetched at run time. To move one:
+
+1. Choose the exact release tag or tool version; never use a mutable
+   `latest` endpoint.
+2. Download the asset, record its byte size, and record its SHA-256. Cross-check
+   the digest against a second source when the publisher provides one (for
+   rustup, the official `rustup-init.sha256` next to the binary). The pins in
+   this repository come from the GitHub release asset `digest` for the pinned
+   tag (Determinate Nix installer, `actions/runner`) and from
+   `https://static.rust-lang.org/rustup/archive/<version>/<target>/rustup-init.sha256`
+   (rustup).
+3. Update the version, size, digest, and any new byte/time cap together in one
+   reviewed commit, so a partially refreshed pin can never validate.
+4. If the artifact legitimately moves to a new origin host, extend the
+   `GITHUB_RELEASE_HOSTS` / `RUSTUP_INIT_HOSTS` allowlist in the same commit.
+5. Run `just test-bootstrap`, which exercises the pins, the origin allowlist,
+   archive validation, and every refusal without touching the network or sudo.
 
 Two isolation gaps remain open: all concurrent jobs use the same `thegn-ci`
 UID, so one job may inspect or modify another job's processes and files; and

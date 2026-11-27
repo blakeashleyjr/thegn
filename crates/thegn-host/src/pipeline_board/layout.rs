@@ -389,6 +389,7 @@ mod tests {
         model: Option<&str>,
     ) -> thegn_core::config::NamedCommand {
         thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: harness.unwrap_or("claude").into(),
             hints: Vec::new(),

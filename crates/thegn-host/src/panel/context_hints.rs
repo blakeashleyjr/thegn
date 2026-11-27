@@ -76,18 +76,19 @@ pub(crate) fn rows(
         .filter(|(c, l)| !c.is_empty() && !l.is_empty() && !skip.contains(&chord_key(c)))
         .take(cap.min(max_rows - 1))
         .collect();
-    // 1 col left margin, chord, 1 col gap, label.
+    // Keep a padded keycap intact at the right; the left action takes the
+    // remaining width and is the first text to truncate.
     let inner = cols.saturating_sub(1);
     let chord_w = pairs
         .iter()
-        .map(|(c, _)| c.chars().count())
+        .map(|(c, _)| unicode_width::UnicodeWidthStr::width(c.as_str()))
         .max()
         .unwrap_or(0)
-        .min(inner / 2);
-    let label_w = inner.saturating_sub(chord_w + 1);
+        .min(inner.saturating_sub(2));
+    let action_w = inner.saturating_sub(chord_w + 3);
     pairs
         .into_iter()
-        .map(|(c, l)| (clip(c, chord_w), clip(l, label_w)))
+        .map(|(c, l)| (clip(c, chord_w), clip(l, action_w)))
         .collect()
 }
 

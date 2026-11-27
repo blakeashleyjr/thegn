@@ -534,6 +534,7 @@ mod tests {
         let mut c = Config::default();
         for (name, resume) in agents {
             c.agents.push(thegn_core::config::NamedCommand {
+                backends: Vec::new(),
                 name: (*name).into(),
                 command: (*name).into(),
                 hints: Vec::new(),
@@ -626,6 +627,7 @@ mod tests {
         with_state("remembered-agent", |_| {
             let mut cfg = cfg_with(&[("claude", false)]);
             cfg.tools.push(thegn_core::config::NamedCommand {
+                backends: Vec::new(),
                 name: "yazi".into(),
                 command: "yazi".into(),
                 hints: Vec::new(),
@@ -659,6 +661,7 @@ mod tests {
         with_state("tool-record", |_| {
             let mut cfg = cfg_with(&[("claude", false)]);
             cfg.tools.push(thegn_core::config::NamedCommand {
+                backends: Vec::new(),
                 name: "yazi".into(),
                 command: "yazi".into(),
                 hints: Vec::new(),

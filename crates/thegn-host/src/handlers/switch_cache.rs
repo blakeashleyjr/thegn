@@ -73,6 +73,8 @@ impl WorktreeSlice {
         let media = model.panel.media.take();
         model.panel = self.panel.clone();
         model.panel.media = media;
+        model.panel_pending = false;
+        model.panel_error = None;
         model.active_sandbox_backend = self.sandbox_backend.clone();
         model.sidebar_status.devcontainer_status = self.devcontainer_status.clone();
         model.active_container_name = self.container_name.clone();
@@ -98,6 +100,21 @@ impl WorktreeSlice {
     pub(crate) fn clear(model: &mut FrameModel) {
         WorktreeSlice::default().apply(model);
         model.panel_pending = true;
+        model.panel_error = None;
+    }
+
+    /// A terminal has no worktree path from which to build the worktree panel.
+    /// Resolve its cold-switch placeholder immediately instead of waiting for
+    /// a panel worker that cannot be started.
+    pub(crate) fn clear_terminal(model: &mut FrameModel, name: &str) {
+        WorktreeSlice::default().apply(model);
+        model.panel_pending = false;
+        model.panel_error = Some(if crate::lead::group::is_lead_group(name) {
+            "The Lead has no worktree panel. Press Alt i to check setup and restart the daemon."
+                .into()
+        } else {
+            "Terminal tabs have no worktree panel. Switch to a worktree to see its changes.".into()
+        });
     }
 }
 
@@ -114,6 +131,7 @@ pub(crate) struct PrefetchResult {
     pub loc: Option<thegn_core::loc::LocReport>,
     pub disk: Option<u64>,
     pub successful: bool,
+    pub error: Option<String>,
 }
 
 /// The two cached measurements for `cwd`, as cheap indexed reads. Both scans own
@@ -168,18 +186,33 @@ pub(crate) fn clear_and_fill(
     WorktreeSlice::clear(model);
     let (tx, cwd, hints, waker) = (tx.clone(), cwd.to_path_buf(), hints.clone(), waker.clone());
     tokio::task::spawn_blocking(move || {
-        if !cwd.is_dir() {
-            return;
-        }
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
+        let mut error = None;
+        let db = if !cwd.is_dir() {
+            error = Some(format!(
+                "Cannot load panel for {}: this tab has no worktree directory.",
+                cwd.display()
+            ));
+            None
+        } else {
+            match thegn_core::db::Db::open() {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    error = Some(format!("Cannot load panel: database unavailable: {e}"));
+                    None
+                }
+            }
         };
-        let cfg = crate::hydrate::load_hydration_config();
-        let panel = {
-            let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
-            crate::hydrate::build_panel(&cwd, &db, &hints, &cfg)
+        let (panel, loc, disk) = if let Some(db) = db {
+            let cfg = crate::hydrate::load_hydration_config();
+            let panel = {
+                let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
+                crate::hydrate::build_panel(&cwd, &db, &hints, &cfg)
+            };
+            let (loc, disk) = cached_measurements(&db, &cwd, &cfg);
+            (panel, loc, disk)
+        } else {
+            (crate::panel::PanelData::default(), None, None)
         };
-        let (loc, disk) = cached_measurements(&db, &cwd, &cfg);
         if tx
             .send(PrefetchResult {
                 path: cwd,
@@ -187,7 +220,8 @@ pub(crate) fn clear_and_fill(
                 panel,
                 loc,
                 disk,
-                successful: true,
+                successful: error.is_none(),
+                error,
             })
             .is_ok()
         {
@@ -218,9 +252,22 @@ pub(crate) fn drain_prefetch_results(
             loc,
             disk,
             successful,
+            error,
         } = res;
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
         if !successful {
+            if generation.is_none()
+                && path == crate::hydrate::active_slice_key(session)
+                && model.panel_pending
+            {
+                apply_panel_failure(
+                    model,
+                    error.unwrap_or_else(|| {
+                        "Cannot load this panel. Switch away and back to retry.".into()
+                    }),
+                );
+                painted = true;
+            }
             // Failed workers release only their own generation; a replacement
             // request remains protected from an older completion.
             if let Some(generation) = generation {
@@ -265,15 +312,50 @@ pub(crate) fn drain_prefetch_results(
             model.loc = loc;
             model.active_worktree_disk = disk;
             model.panel_pending = false;
+            model.panel_error = None;
             painted = true;
         }
     }
     painted
 }
 
+fn apply_panel_failure(model: &mut FrameModel, error: String) {
+    model.panel_pending = false;
+    model.panel_error = Some(error);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_panel_hydration_replaces_the_skeleton_with_an_error() {
+        let mut model = FrameModel {
+            panel_pending: true,
+            ..Default::default()
+        };
+        apply_panel_failure(
+            &mut model,
+            "this tab has no worktree directory; switch away and back to retry".into(),
+        );
+        assert!(!model.panel_pending);
+        assert!(model.panel_error.as_deref().unwrap().contains("retry"));
+    }
+
+    #[test]
+    fn lead_terminal_resolves_the_panel_skeleton_to_a_recovery_error() {
+        let mut model = FrameModel {
+            panel_pending: true,
+            ..Default::default()
+        };
+
+        WorktreeSlice::clear_terminal(&mut model, crate::lead::group::LEAD_GROUP_NAME);
+
+        assert!(!model.panel_pending);
+        let error = model.panel_error.as_deref().expect("Lead panel error");
+        assert!(error.contains("Alt i"));
+        assert!(error.contains("restart the daemon"));
+    }
 
     fn model_with(backend: &str, kind: Option<&str>, disk: Option<u64>) -> FrameModel {
         FrameModel {

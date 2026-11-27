@@ -33,6 +33,7 @@ pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 /// Parsed `agent run` flags (the clap variant's fields, moved in).
 pub(crate) struct RunArgs {
     pub agent: String,
+    pub backend: Option<String>,
     pub worktree: String,
     pub env: Option<String>,
     pub brief_file: Option<String>,
@@ -488,6 +489,7 @@ pub(crate) fn run(cfg: &Config, args: RunArgs) -> Result<()> {
 async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let RunArgs {
         agent,
+        backend,
         worktree,
         env,
         brief_file,
@@ -510,6 +512,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     if prompt.trim().is_empty() {
         anyhow::bail!("agent run needs a task: give a non-empty --prompt or --brief-file");
     }
+    let pinned_backend = backend.clone();
+    let mut backend = {
+        let (cfg, agent) = (cfg.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || {
+            super::agent::choose_backend(&cfg, &agent, backend.as_deref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("agent backend selection task failed: {e}"))??
+    };
     crate::cmd::session::open_preflight(
         cfg,
         None,
@@ -553,14 +564,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         thegn_core::msg::warn(&w);
     }
     let started = Instant::now();
-    let (info, row) = crate::cmd::session::open_plain(
+    let (mut info, row) = crate::cmd::session::open_plain(
         cfg,
         &client,
         crate::cmd::session::PlainOpen {
-            agent: Some(agent),
+            agent: Some(agent.clone()),
+            backend: backend.clone(),
             stage: None,
-            worktree: Some(worktree),
-            prompt,
+            worktree: Some(worktree.clone()),
+            prompt: prompt.clone(),
             headless: true,
             bind: true,
             adopt: false,
@@ -577,25 +589,130 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
                 "row": row,
                 "env": pinned,
                 "provision": provision.as_str(),
+                "backend": backend,
             }))?;
         } else {
             outln!("{}", display_cell(&info.id));
+            if let Some(backend) = backend.as_deref() {
+                outln!("backend {backend}");
+            }
             if let Some(row) = row {
                 outln!("dispatch {row} tracked");
             }
         }
         return Ok(crate::cmd::EXIT_OK);
     }
-    let (status, raw) = observe_until_exit(
+    let tracked_session = info.id.clone();
+    let mut observed = observe_until_exit(
         &client,
         &info.id,
         Duration::from_secs(timeout_secs),
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     )
     .await?;
+    // A quota response is the only failure that triggers an automatic retry.
+    // Retry at most once and only on a distinct backend with known headroom;
+    // operator pins are authoritative and never silently switched.
+    if let (Some(current), Some(role)) = (
+        backend.as_deref(),
+        cfg.agents.iter().find(|entry| entry.name == agent),
+    ) {
+        let harness = role
+            .backends
+            .iter()
+            .find(|candidate| candidate.name == current)
+            .map(|candidate| candidate.harness.as_str());
+        let quota_hit = matches!(observed.0, WaitStatus::Exited(Some(code)) if code != 0)
+            && harness.is_some_and(|harness| {
+                thegn_core::agent_error::is_quota_error(harness, &output_tail(&observed.1))
+            });
+        if quota_hit {
+            let (cfg_for_cooldown, agent_for_cooldown) = (cfg.clone(), agent.clone());
+            let current_backend = current.to_string();
+            let cooldown = tokio::task::spawn_blocking(move || {
+                super::agent::remember_quota_reset(
+                    &cfg_for_cooldown,
+                    &agent_for_cooldown,
+                    &current_backend,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("agent quota cooldown task failed: {e}"))?;
+            if let Err(error) = cooldown {
+                tracing::warn!(%error, "could not persist agent backend quota cooldown");
+            }
+        }
+        if quota_hit && pinned_backend.is_none() {
+            let attempted = vec![current.to_string()];
+            let (cfg_for_select, agent_for_select) = (cfg.clone(), agent.clone());
+            let next = tokio::task::spawn_blocking(move || {
+                super::agent::choose_backend_excluding(
+                    &cfg_for_select,
+                    &agent_for_select,
+                    None,
+                    &attempted,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("agent failover selection task failed: {e}"))??;
+            if let Some(next_backend) = next {
+                thegn_core::msg::info(&format!(
+                    "agent run: quota limit on backend {current}; retrying once on {next_backend}"
+                ));
+                let (retry_info, _) = crate::cmd::session::open_plain(
+                    cfg,
+                    &client,
+                    crate::cmd::session::PlainOpen {
+                        agent: Some(agent),
+                        backend: Some(next_backend.clone()),
+                        stage: None,
+                        worktree: Some(worktree),
+                        prompt,
+                        headless: true,
+                        bind: true,
+                        adopt: false,
+                        track: None,
+                        permissions: Vec::new(),
+                        widen_permissions: false,
+                    },
+                )
+                .await?;
+                info = retry_info;
+                backend = Some(next_backend);
+                observed = observe_until_exit(
+                    &client,
+                    &info.id,
+                    Duration::from_secs(timeout_secs),
+                    std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                )
+                .await?;
+            }
+        }
+    }
+    let (status, raw) = observed;
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
     let hint = exit_hint(status.exit_code());
+    if let (Some(row), Some(backend)) = (row, backend.as_deref()) {
+        // Dispatch status and lane history already surface progress notes; use
+        // that durable channel to retain the backend that ultimately ran.
+        let backend = backend.to_string();
+        let db_result = tokio::task::spawn_blocking(move || {
+            let db = Db::open()?;
+            db.append_dispatch_note(row, &format!("backend selected: {backend}"))?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match db_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "could not record agent backend attribution");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not record agent backend attribution");
+            }
+        }
+    }
     // A tracked `--wait` owns its row's verdict (THE-2681): once the agent
     // actually exited, close the row here — `done` on exit 0, `failed` for
     // any other exit — instead of leaving it `running` for a supervisor that
@@ -605,7 +722,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     // agent's exit code.
     let row_close = match (row, status) {
         (Some(row), WaitStatus::Exited(code)) => {
-            let session = info.id.clone();
+            let session = tracked_session.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let db = Db::open()?;
                 close_tracked_row(&db, row, &session, code)
@@ -651,6 +768,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             "exit_code": status.exit_code(),
             "output_tail": tail,
             "duration_ms": duration_ms,
+            "backend": backend,
         });
         if let (Some(hint), Some(map)) = (hint, obj.as_object_mut()) {
             map.insert("exit_hint".to_string(), serde_json::json!(hint));
@@ -682,6 +800,9 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         if let Some(hint) = hint {
             outln!("[agent run: hint: {hint}]");
+        }
+        if let Some(backend) = backend.as_deref() {
+            outln!("[agent run: backend {backend}]");
         }
         if let Some(row) = row {
             outln!("dispatch {row} tracked");
@@ -1697,6 +1818,29 @@ mod tests {
         assert_eq!(track, None);
         assert!(!wait && !json);
         assert_eq!(timeout, DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn agent_run_accepts_a_named_backend_pin() {
+        let action = parse(&[
+            "thegn",
+            "agent",
+            "run",
+            "--agent",
+            "pipeline-coder",
+            "--backend",
+            "codex-pro",
+            "--worktree",
+            "/tmp/wt",
+            "--prompt",
+            "fix it",
+        ])
+        .expect("parse");
+        let crate::cmd::agent::Action::Run { agent, backend, .. } = action else {
+            panic!("expected agent run");
+        };
+        assert_eq!(agent, "pipeline-coder");
+        assert_eq!(backend.as_deref(), Some("codex-pro"));
     }
 
     #[test]

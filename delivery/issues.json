@@ -326,6 +326,13 @@
       ]
     },
     {
+      "issue": "THE-413",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "pin-ci-bootstrap-inputs"
+      ]
+    },
+    {
       "issue": "THE-416",
       "project": "Distribution & Release Readiness",
       "changes": [
@@ -531,6 +538,13 @@
       "project": "Sandbox & Remote 00: Shared contracts",
       "changes": [
         "add-bounded-argv-template-tokenizer"
+      ]
+    },
+    {
+      "issue": "THE-2119",
+      "project": "Sandbox & Remote 04",
+      "changes": [
+        "add-network-allowlist-fail-closed"
       ]
     },
     {
@@ -806,6 +820,20 @@
       "project": "Workspace Product & Observability",
       "changes": [
         "sidebar-finished-pipelines-age-out"
+      ]
+    },
+    {
+      "issue": "THE-2769",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "agent-account-failover"
+      ]
+    },
+    {
+      "issue": "THE-2773",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "bound-idle-worktree-refresh"
       ]
     }
   ]

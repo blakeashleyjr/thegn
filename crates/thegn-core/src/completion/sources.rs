@@ -710,6 +710,7 @@ mod tests {
         cfg.profiles.insert("work".into(), Default::default());
         cfg.mcp_servers.insert("git".into(), Default::default());
         let named = |name: &str, command: &str| crate::config::NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: command.into(),
             hints: Vec::new(),

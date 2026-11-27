@@ -12,6 +12,41 @@ pub enum AgentErrorKind {
     HarnessBanner,
 }
 
+/// Recognize a quota response emitted by a supported coding-agent harness.
+/// This deliberately matches only provider quota/limit language: connection,
+/// authentication, and ordinary tool errors must not trigger another paid run.
+pub fn is_quota_error(harness: &str, output: &str) -> bool {
+    let harness = harness.trim().to_ascii_lowercase();
+    let output = output.to_ascii_lowercase();
+    let signatures: &[&str] = match harness.as_str() {
+        "claude" => &[
+            "you've hit your weekly limit",
+            "you've hit your limit",
+            "usage limit reached",
+            "rate limit exceeded",
+            "out of extra usage",
+        ],
+        "codex" => &[
+            "rate_limit_exceeded",
+            "you've hit your usage limit",
+            "usage limit reached",
+            "quota exceeded",
+            "insufficient_quota",
+        ],
+        "pi" => &[
+            "quota exceeded",
+            "rate limit exceeded",
+            "usage limit reached",
+            "insufficient_quota",
+            "out of credits",
+        ],
+        _ => return false,
+    };
+    signatures
+        .iter()
+        .any(|signature| output.contains(signature))
+}
+
 /// Config-listed substrings that classify as agent-level errors.
 /// Case-insensitive matching.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,6 +154,20 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!signatures.is_empty());
+    }
+
+    #[test]
+    fn quota_detection_is_harness_specific_and_ignores_generic_failures() {
+        assert!(is_quota_error("claude", "You've hit your weekly limit"));
+        assert!(is_quota_error("codex", "HTTP 429 rate_limit_exceeded"));
+        assert!(is_quota_error("pi", "provider error: insufficient_quota"));
+        assert!(!is_quota_error("claude", "connection refused"));
+        assert!(!is_quota_error("codex", "authentication failed"));
+        assert!(!is_quota_error(
+            "pi",
+            "tool call failed without a provider response"
+        ));
+        assert!(!is_quota_error("unknown", "quota exceeded"));
     }
 
     #[test]

@@ -64,11 +64,28 @@ pub fn spawn_dispatch_sample(
 fn read_roster(
     db: &thegn_core::db::Db,
 ) -> Result<(Vec<thegn_core::issue::AgentDispatch>, bool), String> {
-    db.list_dispatch_roster_window(
-        thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
-        thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
-    )
-    .map_err(|e| format!("read: {e}"))
+    let (mut rows, truncated) = db
+        .list_dispatch_roster_window(
+            thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+            thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+        )
+        .map_err(|e| format!("read: {e}"))?;
+    for row in &mut rows {
+        if let Ok(notes) = db.newest_dispatch_notes(row.id, None, 20)
+            && let Some(backend) = notes.iter().rev().find_map(|note| {
+                note.text
+                    .strip_prefix("backend selected: ")
+                    .map(str::to_owned)
+            })
+        {
+            let attribution = format!("backend selected: {backend}");
+            row.note = Some(match row.note.take() {
+                Some(note) if !note.is_empty() => format!("{note}\n{attribution}"),
+                _ => attribution,
+            });
+        }
+    }
+    Ok((rows, truncated))
 }
 
 /// Resolve a board-row jump into a sidebar row target.
@@ -254,6 +271,8 @@ mod tests {
             .unwrap();
         db.set_dispatch_report(id, "report body").unwrap();
         db.stamp_dispatch_note(id, "note body").unwrap();
+        db.append_dispatch_note(id, "backend selected: codex-pro")
+            .unwrap();
 
         let full = db.list_dispatches().unwrap();
         let (roster, truncated) = read_roster(&db).unwrap();
@@ -262,7 +281,10 @@ mod tests {
         assert_eq!(roster[0].id, full[0].id);
         assert_eq!(roster[0].status, full[0].status);
         assert_eq!(roster[0].id, id);
-        assert!(roster[0].note.is_none());
+        assert_eq!(
+            roster[0].note.as_deref(),
+            Some("backend selected: codex-pro")
+        );
         assert!(roster[0].report.is_none());
         assert_eq!(full[0].note.as_deref(), Some("note body"));
         assert_eq!(full[0].report.as_deref(), Some("report body"));

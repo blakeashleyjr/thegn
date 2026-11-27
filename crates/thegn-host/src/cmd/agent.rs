@@ -23,6 +23,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use thegn_core::config::Config;
+use thegn_core::db::Db;
 use thegn_core::outln;
 
 #[derive(clap::Subcommand, Clone)]
@@ -50,6 +51,15 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Show configured backend headroom and provider reset times.
+    Backends {
+        /// Restrict output to one configured agent role.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List discovered coding-agent sessions (harness, id, worktree, summary).
     Sessions {
         /// Only sessions whose recorded working dir is this worktree.
@@ -74,6 +84,9 @@ pub enum Action {
         /// `codex`) when no entry is named that.
         #[arg(long)]
         agent: String,
+        /// Pin a named backend configured on this role.
+        #[arg(long)]
+        backend: Option<String>,
         /// The worktree to launch into (path). The agent runs here.
         #[arg(long)]
         worktree: String,
@@ -163,6 +176,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             Ok(())
         }
         Action::List { json } => list(cfg, json),
+        Action::Backends { agent, json } => backends(cfg, agent.as_deref(), json),
         Action::Sessions {
             worktree,
             harness,
@@ -170,6 +184,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => sessions(cfg, worktree.as_deref(), harness.as_deref(), json),
         Action::Run {
             agent,
+            backend,
             worktree,
             env,
             brief_file,
@@ -185,6 +200,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             cfg,
             super::agent_spawn::RunArgs {
                 agent,
+                backend,
                 worktree,
                 env,
                 brief_file,
@@ -202,6 +218,318 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             super::agent_spawn::result(cfg, super::agent_spawn::ResultArgs { row, session, json })
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct BackendStatusRow {
+    agent: String,
+    backend: String,
+    harness: String,
+    model: Option<String>,
+    headroom: String,
+    resets_at: Option<i64>,
+}
+
+fn backend_status_rows(cfg: &Config, agent_filter: Option<&str>) -> Vec<BackendStatusRow> {
+    use std::path::PathBuf;
+
+    // `gather` owns the credential discovery and provider-specific reads. It
+    // runs synchronously here on the CLI thread, never on the host event loop.
+    let configured_homes = cfg
+        .agents
+        .iter()
+        .filter(|entry| agent_filter.is_none_or(|name| name == entry.name))
+        .flat_map(|entry| entry.backends.iter())
+        .filter_map(|backend| {
+            let identity = backend.account.as_deref()?;
+            let path = PathBuf::from(thegn_core::util::expand_tilde(identity));
+            (path.is_absolute()).then_some(thegn_core::usage::HomeCandidate {
+                provider: backend.harness.clone(),
+                dir: path,
+                origin: thegn_core::usage::HomeOrigin::Configured,
+                label: Some(backend.name.clone()),
+                enabled: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
+    let cooldowns = cfg
+        .agents
+        .iter()
+        .filter(|entry| agent_filter.is_none_or(|name| name == entry.name))
+        .flat_map(|entry| {
+            entry.backends.iter().filter_map(|backend| {
+                backend_cooldown_until(&entry.name, backend)
+                    .ok()
+                    .flatten()
+                    .map(|reset| ((entry.name.clone(), backend.name.clone()), reset))
+            })
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    backend_status_rows_for_accounts(cfg, agent_filter, &accounts, &cooldowns)
+}
+
+fn backend_status_rows_for_accounts(
+    cfg: &Config,
+    agent_filter: Option<&str>,
+    accounts: &[thegn_core::usage::AccountUsage],
+    cooldowns: &std::collections::HashMap<(String, String), i64>,
+) -> Vec<BackendStatusRow> {
+    use thegn_core::usage::{BackendHeadroom, backend_headroom};
+    cfg.agents
+        .iter()
+        .filter(|entry| agent_filter.is_none_or(|name| name == entry.name))
+        .flat_map(|entry| {
+            entry.backends.iter().map(|backend| {
+                let headroom = backend_headroom(backend, accounts);
+                let reset = accounts
+                    .iter()
+                    .filter(|account| {
+                        account.provider == backend.harness
+                            && backend.account.as_deref().is_none_or(|identity| {
+                                let identity = thegn_core::util::expand_tilde(identity);
+                                account.key == identity
+                                    || account.home.as_ref().is_some_and(|home| {
+                                        home.to_string_lossy().as_ref() == identity
+                                    })
+                            })
+                    })
+                    .flat_map(|account| account.windows.iter().filter_map(|w| w.resets_at))
+                    .min();
+                let cooldown = cooldowns
+                    .get(&(entry.name.clone(), backend.name.clone()))
+                    .copied()
+                    .filter(|reset| *reset > thegn_core::util::now_ms() / 1000);
+                BackendStatusRow {
+                    agent: entry.name.clone(),
+                    backend: backend.name.clone(),
+                    harness: backend.harness.clone(),
+                    model: backend.model.clone(),
+                    headroom: if cooldown.is_some() {
+                        "cooldown".to_string()
+                    } else {
+                        match headroom {
+                            BackendHeadroom::Available => "available",
+                            BackendHeadroom::Exhausted => "exhausted",
+                            BackendHeadroom::Unknown => "unknown",
+                        }
+                        .to_string()
+                    },
+                    resets_at: cooldown.or(reset),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Resolve `agent run`'s selected backend from one fresh per-account snapshot.
+/// Runs on the caller's blocking pool because usage gathering may read files
+/// and make bounded provider requests.
+pub(crate) fn choose_backend(
+    cfg: &Config,
+    agent: &str,
+    pinned: Option<&str>,
+) -> Result<Option<String>> {
+    choose_backend_excluding(cfg, agent, pinned, &[])
+}
+
+/// Choose the first headroom backend not already attempted by this run.
+pub(crate) fn choose_backend_excluding(
+    cfg: &Config,
+    agent: &str,
+    pinned: Option<&str>,
+    excluded: &[String],
+) -> Result<Option<String>> {
+    let Some(role) = cfg.agents.iter().find(|entry| entry.name == agent) else {
+        anyhow::ensure!(
+            pinned.is_none(),
+            "--backend requires a configured agent role"
+        );
+        return Ok(None);
+    };
+    if role.backends.is_empty() {
+        anyhow::ensure!(
+            pinned.is_none(),
+            "agent role {agent:?} has no configured backends"
+        );
+        return Ok(None);
+    }
+    if let Some(name) = pinned {
+        anyhow::ensure!(
+            role.backends.iter().any(|backend| backend.name == name),
+            "unknown backend {name:?} for agent role {agent:?}"
+        );
+        return Ok(Some(name.to_string()));
+    }
+    let configured_homes = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            let identity = backend.account.as_deref()?;
+            let path = std::path::PathBuf::from(thegn_core::util::expand_tilde(identity));
+            path.is_absolute()
+                .then_some(thegn_core::usage::HomeCandidate {
+                    provider: backend.harness.clone(),
+                    dir: path,
+                    origin: thegn_core::usage::HomeOrigin::Configured,
+                    label: Some(backend.name.clone()),
+                    enabled: true,
+                })
+        })
+        .collect::<Vec<_>>();
+    let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
+    let cooling = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            backend_cooldown_until(agent, backend)
+                .ok()
+                .flatten()
+                .filter(|reset| *reset > thegn_core::util::now_ms() / 1000)
+                .map(|_| backend.name.clone())
+        })
+        .collect::<Vec<_>>();
+    let excluded = excluded.iter().cloned().chain(cooling).collect::<Vec<_>>();
+    thegn_core::usage::select_backend_excluding(&role.backends, &accounts, &excluded)
+        .map(|backend| Some(backend.name.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent role {agent:?} has no backend with known usage headroom; \
+                 pin one with --backend to override"
+            )
+        })
+}
+
+const BACKEND_COOLDOWN_SCOPE: &str = "agent-backend-quota";
+
+fn backend_cooldown_key(agent: &str, backend: &thegn_core::config::AgentBackend) -> String {
+    let account = backend
+        .account
+        .as_deref()
+        .map(thegn_core::util::expand_tilde)
+        .unwrap_or_else(|| backend.name.clone());
+    format!("{agent}:{}:{account}", backend.harness)
+}
+
+fn backend_cooldown_until(
+    agent: &str,
+    backend: &thegn_core::config::AgentBackend,
+) -> Result<Option<i64>> {
+    let db = Db::open()?;
+    backend_cooldown_until_in(&db, agent, backend)
+}
+
+fn backend_cooldown_until_in(
+    db: &Db,
+    agent: &str,
+    backend: &thegn_core::config::AgentBackend,
+) -> Result<Option<i64>> {
+    use thegn_core::store::WorkspaceStore;
+    let key = backend_cooldown_key(agent, backend);
+    let Some(value) = db.get_ui_state(BACKEND_COOLDOWN_SCOPE, &key)? else {
+        return Ok(None);
+    };
+    #[expect(clippy::manual_ok_err, reason = "the ignored-result ratchet rejects a bare `.ok()` here")]
+    let reset = match value.parse::<i64>() {
+        Ok(reset) => Some(reset),
+        Err(_) => None,
+    };
+    if reset.is_none_or(|reset| reset <= thegn_core::util::now_ms() / 1000) {
+        db.del_ui_state(BACKEND_COOLDOWN_SCOPE, &key)?;
+        return Ok(None);
+    }
+    Ok(reset)
+}
+
+pub(crate) fn remember_quota_reset(
+    cfg: &Config,
+    agent: &str,
+    backend_name: &str,
+) -> Result<Option<i64>> {
+    use thegn_core::store::WorkspaceStore;
+    let Some(role) = cfg.agents.iter().find(|entry| entry.name == agent) else {
+        return Ok(None);
+    };
+    let Some(backend) = role
+        .backends
+        .iter()
+        .find(|backend| backend.name == backend_name)
+    else {
+        return Ok(None);
+    };
+    let configured_homes = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            let identity = backend.account.as_deref()?;
+            let path = std::path::PathBuf::from(thegn_core::util::expand_tilde(identity));
+            path.is_absolute()
+                .then_some(thegn_core::usage::HomeCandidate {
+                    provider: backend.harness.clone(),
+                    dir: path,
+                    origin: thegn_core::usage::HomeOrigin::Configured,
+                    label: Some(backend.name.clone()),
+                    enabled: true,
+                })
+        })
+        .collect::<Vec<_>>();
+    let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
+    let identity = backend
+        .account
+        .as_deref()
+        .map(thegn_core::util::expand_tilde);
+    let reset = accounts
+        .iter()
+        .filter(|account| {
+            account.provider == backend.harness
+                && identity.as_deref().is_none_or(|identity| {
+                    account.key == identity
+                        || account
+                            .home
+                            .as_ref()
+                            .is_some_and(|home| home.to_string_lossy().as_ref() == identity)
+                })
+        })
+        .flat_map(|account| account.windows.iter().filter_map(|window| window.resets_at))
+        .filter(|reset| *reset > thegn_core::util::now_ms() / 1000)
+        .min();
+    if let Some(reset) = reset {
+        let db = Db::open()?;
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key(agent, backend),
+            &reset.to_string(),
+        )?;
+    }
+    Ok(reset)
+}
+
+fn backends(cfg: &Config, agent_filter: Option<&str>, json: bool) -> Result<()> {
+    if let Some(agent) = agent_filter {
+        anyhow::ensure!(
+            cfg.agents.iter().any(|entry| entry.name == agent),
+            "unknown agent role {agent:?}"
+        );
+    }
+    let rows = backend_status_rows(cfg, agent_filter);
+    if json {
+        return super::emit_json(&rows);
+    }
+    if rows.is_empty() {
+        outln!("no configured agent backends");
+        return Ok(());
+    }
+    for row in rows {
+        outln!(
+            "{}  {}  {}  {}  resets_at:{}",
+            row.agent,
+            row.backend,
+            row.harness,
+            row.headroom,
+            row.resets_at.map_or_else(|| "-".into(), |t| t.to_string())
+        );
+    }
+    Ok(())
 }
 
 /// The notification a hook event becomes: `(title, urgency)`; `None` for an
@@ -307,8 +635,17 @@ pub(crate) struct EffectiveRow {
     model: Option<String>,
     env_keys: Vec<String>,
     permissions: usize,
+    backends: Vec<BackendRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BackendRow {
+    name: String,
+    harness: String,
+    model: Option<String>,
+    env_keys: Vec<String>,
 }
 
 /// Pure: the rows `agent list` prints, from config alone.
@@ -316,6 +653,24 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
     use thegn_core::agent_task::effective_agent;
     let row = |name: &str, agent: Option<&str>, stage: Option<&str>| {
         let target = agent.unwrap_or(name);
+        let backends = cfg
+            .agents
+            .iter()
+            .chain(cfg.tools.iter())
+            .find(|entry| entry.name == target)
+            .map(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .map(|backend| BackendRow {
+                        name: backend.name.clone(),
+                        harness: backend.harness.clone(),
+                        model: backend.model.clone(),
+                        env_keys: backend.env.keys().cloned().collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         match effective_agent(cfg, target, stage) {
             Ok(e) => EffectiveRow {
                 name: name.to_string(),
@@ -324,6 +679,7 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
                 model: e.model,
                 env_keys: e.env.keys().cloned().collect(),
                 permissions: e.permissions.len(),
+                backends,
                 error: None,
             },
             Err(why) => EffectiveRow {
@@ -333,6 +689,7 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
                 model: None,
                 env_keys: Vec::new(),
                 permissions: 0,
+                backends,
                 error: Some(why),
             },
         }
@@ -377,6 +734,14 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         }
         if r.permissions > 0 {
             write!(s, "  perms:{}", r.permissions).expect("writing to String cannot fail");
+        }
+        if !r.backends.is_empty() {
+            let names = r
+                .backends
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>();
+            write!(s, "  backends:{}", names.join(",")).expect("writing to String cannot fail");
         }
         s
     };
@@ -463,5 +828,114 @@ mod hook_tests {
     #[test]
     fn source_carries_the_worktree_after_the_at() {
         assert_eq!(hook_source("claude", "/w/a"), "agent-hook:claude@/w/a");
+    }
+
+    #[test]
+    fn backend_status_lists_ordered_headroom_without_exposing_account_paths() {
+        let mut cfg = Config::default();
+        let mut role = thegn_core::config::NamedCommand {
+            backends: Vec::new(),
+            name: "coder".into(),
+            command: "claude".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Default::default(),
+            drawer_cwd: None,
+        };
+        role.backends = vec![
+            thegn_core::config::AgentBackend {
+                name: "claude-a".into(),
+                harness: "claude".into(),
+                model: None,
+                env: Default::default(),
+                account: Some("/accounts/a".into()),
+            },
+            thegn_core::config::AgentBackend {
+                name: "codex".into(),
+                harness: "codex".into(),
+                model: Some("gpt-6-luna".into()),
+                env: Default::default(),
+                account: None,
+            },
+        ];
+        cfg.agents.push(role);
+        let accounts = vec![
+            thegn_core::usage::AccountUsage::ok(
+                "claude",
+                "Claude A",
+                None,
+                vec![thegn_core::usage::UsageWindow::new(
+                    "weekly",
+                    100.0,
+                    Some(10_000),
+                )],
+            )
+            .with_home("/accounts/a"),
+            thegn_core::usage::AccountUsage::ok(
+                "codex",
+                "Codex",
+                None,
+                vec![thegn_core::usage::UsageWindow::new(
+                    "weekly",
+                    70.0,
+                    Some(11_000),
+                )],
+            ),
+        ];
+        let rows = backend_status_rows_for_accounts(
+            &cfg,
+            Some("coder"),
+            &accounts,
+            &std::collections::HashMap::new(),
+        );
+        let names = rows.iter().map(|r| r.backend.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["claude-a", "codex"]);
+        assert_eq!(rows[0].headroom, "exhausted");
+        assert_eq!(rows[0].resets_at, Some(10_000));
+        assert_eq!(rows[1].headroom, "available");
+        let json = serde_json::to_value(&rows).expect("serialize status rows");
+        assert!(!json.to_string().contains("/accounts/a"));
+    }
+
+    #[test]
+    fn backend_quota_cooldown_persists_until_the_provider_reset() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = Db::open_memory().expect("in-memory db");
+        let backend = thegn_core::config::AgentBackend {
+            name: "claude-a".into(),
+            harness: "claude".into(),
+            model: None,
+            env: Default::default(),
+            account: Some("/accounts/a".into()),
+        };
+        let reset = thegn_core::util::now_ms() / 1000 + 60;
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key("coder", &backend),
+            &reset.to_string(),
+        )
+        .expect("save provider reset");
+
+        assert_eq!(
+            backend_cooldown_until_in(&db, "coder", &backend).expect("read cooldown"),
+            Some(reset)
+        );
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key("coder", &backend),
+            &(thegn_core::util::now_ms() / 1000 - 1).to_string(),
+        )
+        .expect("expire provider reset");
+        assert_eq!(
+            backend_cooldown_until_in(&db, "coder", &backend).expect("read expired cooldown"),
+            None
+        );
     }
 }

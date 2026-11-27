@@ -250,6 +250,7 @@ mod tests {
 
     fn named(name: &str) -> NamedCommand {
         NamedCommand {
+            backends: Vec::new(),
             name: name.to_string(),
             command: format!("{name} --run"),
             hints: Vec::new(),

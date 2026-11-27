@@ -1649,6 +1649,7 @@ mod tests {
     fn drawer_palette_keeps_files_first_and_uses_pending_keys() {
         let mut cfg = thegn_core::config::Config::default();
         cfg.tools.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "atac".into(),
             command: "atac".into(),
             hints: Vec::new(),
@@ -1663,6 +1664,7 @@ mod tests {
             drawer_cwd: None,
         });
         cfg.tools.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "db".into(),
             command: "psql".into(),
             hints: Vec::new(),

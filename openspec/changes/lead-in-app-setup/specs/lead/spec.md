@@ -4,8 +4,9 @@
 
 ### Requirement: The Lead is set up from inside the app
 
-When the Lead jump key is pressed and `[lead]` is absent, or the Lead is not logged in, or the
-daemon's Lead listener is not up, thegn SHALL open a guided setup instead of opening the Lead. The
+When the Lead jump key is pressed or its sidebar row is clicked and `[lead]` is absent, or the Lead
+is not logged in, or the daemon's Lead listener is not up, thegn SHALL open a guided setup instead
+of opening the Lead. The
 setup SHALL check bubblewrap and pasta (both required; a missing pasta shows install hints and never
 a host-network option), preview the `[lead]` and `[daemon] enabled` lines before writing them with
 the config writer, confirm before restarting the daemon, run the agent and MCP logins by running
@@ -55,7 +56,57 @@ its restart confirm SHALL state how many live daemon sessions would end.
 - **WHEN** no `[lead]` is configured and the sidebar row is activated
 - **THEN** the setup flow opens and no Lead terminal is created
 
+#### Scenario: Click the Lead row while setup is needed
+
+- **WHEN** the Lead row is clicked while `[lead]` is absent or the Lead is not ready
+- **THEN** the guided setup opens instead of activating a project worktree
+
+#### Scenario: Activate a configured Lead row by keyboard
+
+- **WHEN** the user presses Enter on a configured Lead sidebar row
+- **THEN** the row uses the Lead readiness path and opens setup when the Lead is unavailable
+
 #### Scenario: Counted restart
 
 - **WHEN** the user chooses to restart the daemon with 3 live sessions
 - **THEN** the confirm says 3 live daemon sessions would end before anything is stopped
+
+### Requirement: Lead startup failures remain readable and recoverable
+
+The Lead startup screen SHALL wrap the complete failure detail at narrow widths in a fixed reserve
+after the step rows, so the remaining step rows keep their positions as the cursor advances. A
+cold-switch panel load SHALL replace its skeleton with panel content or an explicit error and retry
+instruction;
+it SHALL NOT leave a skeleton after its worker exits without a panel result.
+Jumping to an existing Lead whose listener is unavailable SHALL open the setup flow, which offers
+the documented daemon restart path. Confirming SHALL run `thegn daemon stop` off the event loop,
+wait for the stop to finish, and reopen the Lead so its next attach starts a daemon with the
+listener.
+When the current channel or host prerequisites prevent launch, the sidebar Lead entry SHALL show a
+one-line reason and route to setup rather than launching a failing Lead.
+
+#### Scenario: Narrow startup error
+
+- **WHEN** the Lead startup screen has a failure message wider than its subline at a narrow terminal
+- **THEN** the complete message, including its recovery instructions, is
+  wrapped in the reserved detail rows
+
+#### Scenario: Panel hydration fails
+
+- **WHEN** a cold-switch panel worker cannot load the selected path or database
+- **THEN** the panel replaces its skeleton with an error and tells the user how to retry
+
+#### Scenario: Existing Lead lost its listener
+
+- **WHEN** the user jumps to an existing Lead whose daemon has no Lead listener
+- **THEN** the setup flow offers to restart the daemon and retry the Lead
+
+#### Scenario: Restart retries Lead
+
+- **WHEN** the user confirms restart from the setup flow
+- **THEN** the UI waits for `thegn daemon stop` to finish and reopens the Lead
+
+#### Scenario: Lead launch is unavailable
+
+- **WHEN** the current channel or host lacks a Lead requirement
+- **THEN** the sidebar entry shows the reason and opens setup instead of launching Lead

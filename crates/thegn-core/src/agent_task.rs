@@ -1077,6 +1077,48 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
                     ));
                 }
             }
+            let mut backend_names = std::collections::HashSet::new();
+            for backend in &e.backends {
+                if backend.name.trim().is_empty() || !backend_names.insert(backend.name.trim()) {
+                    out.push(format!(
+                        "[[{section}]] {:?}.backends: backend names must be non-empty and unique \
+                         ({:?})",
+                        e.name, backend.name
+                    ));
+                }
+                for k in backend.env.keys() {
+                    if !env_key_ok(k) {
+                        out.push(format!(
+                            "[[{section}]] {:?}.backends.{:?}.env: {k:?} is not an \
+                             environment variable name",
+                            e.name, backend.name
+                        ));
+                    }
+                }
+                let harness = backend.harness.trim();
+                let Some(adapter) = crate::harness::harness(harness)
+                    .filter(|adapter| adapter.headless_template().is_some())
+                else {
+                    out.push(format!(
+                        "[[{section}]] {:?}.backends.{:?}.harness: unknown or unlaunchable \
+                         harness {harness:?}",
+                        e.name, backend.name
+                    ));
+                    continue;
+                };
+                if backend
+                    .model
+                    .as_deref()
+                    .is_some_and(|m| !m.trim().is_empty())
+                    && adapter.model_flag().is_none()
+                {
+                    out.push(format!(
+                        "[[{section}]] {:?}.backends.{:?}.model: harness {harness:?} has no \
+                         model flag thegn knows",
+                        e.name, backend.name
+                    ));
+                }
+            }
         }
     }
     for (i, s) in cfg.pipeline.stages.iter().enumerate() {
@@ -1222,6 +1264,7 @@ mod tests {
 
     fn entry(name: &str, command: &str) -> crate::config::NamedCommand {
         crate::config::NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: command.into(),
             hints: Vec::new(),
@@ -2169,6 +2212,7 @@ mod tests {
             agents: entries
                 .iter()
                 .map(|(name, command, provider)| crate::config::NamedCommand {
+                    backends: Vec::new(),
                     name: (*name).to_string(),
                     command: (*command).to_string(),
                     hints: Vec::new(),
@@ -2254,6 +2298,7 @@ mod tests {
     fn a_tools_entry_resolves_too() {
         let mut cfg = cfg_with_agents(&[]);
         cfg.tools = vec![crate::config::NamedCommand {
+            backends: Vec::new(),
             name: "codex".into(),
             command: "codex".into(),
             hints: Vec::new(),
@@ -2288,6 +2333,7 @@ mod tests {
     fn cfg_with_resume(name: &str, command: &str, resume: bool) -> Config {
         Config {
             agents: vec![crate::config::NamedCommand {
+                backends: Vec::new(),
                 name: name.to_string(),
                 command: command.to_string(),
                 hints: Vec::new(),
@@ -2462,5 +2508,30 @@ mod tests {
             ),
             Err(TemplateError::UnknownVar { .. })
         ));
+    }
+
+    #[test]
+    fn backend_validation_checks_names_harnesses_models_and_env_keys() {
+        let mut cfg = cfg_with_agents(&[("worker", "claude", None)]);
+        cfg.agents[0].backends = vec![
+            crate::config::AgentBackend {
+                name: "pi".into(),
+                harness: "pi".into(),
+                model: Some("provider/model".into()),
+                env: BTreeMap::from([("PI_CODING_AGENT_DIR".into(), "~/.pi".into())]),
+                account: Some("/accounts/pi".into()),
+            },
+            crate::config::AgentBackend {
+                name: "pi".into(),
+                harness: "unknown".into(),
+                model: Some("x".into()),
+                env: BTreeMap::from([("not valid".into(), "x".into())]),
+                account: None,
+            },
+        ];
+        let errors = validate_agent_models(&cfg).join("\n");
+        assert!(errors.contains("backend names must be non-empty and unique"));
+        assert!(errors.contains("unknown or unlaunchable harness"));
+        assert!(errors.contains("is not an environment variable name"));
     }
 }

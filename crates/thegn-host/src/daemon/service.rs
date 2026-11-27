@@ -4750,6 +4750,7 @@ mod tests {
             worktree: Some(worktree.into()),
             agent: Some(thegn_svc::control::AgentLaunch {
                 agent: "coder".into(),
+                backend: None,
                 prompt: "review".into(),
                 headless: None,
                 bind_worktree: false,
@@ -10163,6 +10164,7 @@ mod tests {
         let mut boot = thegn_core::config::Config::default();
         boot.sandbox.enabled = false;
         boot.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),
@@ -10189,6 +10191,7 @@ mod tests {
                 cols: 80,
                 agent: Some(thegn_svc::control::AgentLaunch {
                     agent: "worker".into(),
+                    backend: None,
                     prompt: String::new(),
                     headless: Some(false),
                     bind_worktree: false,

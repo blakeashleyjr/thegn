@@ -411,11 +411,8 @@ fn remote_compose_refusal_never_creates_or_execs_a_container() {
     let halt = error
         .downcast_ref::<crate::agent::SandboxHalt>()
         .expect("the chain refusal must surface as SandboxHalt");
-    // Auto-chain records the Compose policy refusal, then its remote-none guard
-    // supplies the returned halt reason after there are no more candidates.
     assert!(
-        halt.reason
-            .contains("no container runtime found on the remote host"),
+        halt.reason.contains("Compose cannot enforce"),
         "{}",
         halt.reason
     );
@@ -1557,6 +1554,7 @@ fn env_halt_reason_halts_on_a_selected_env_with_no_table() {
 fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
     let mut cfg = Config::default();
     let mk = |(n, c): &(&str, &str)| thegn_core::config::NamedCommand {
+        backends: Vec::new(),
         name: n.to_string(),
         command: c.to_string(),
         hints: Vec::new(),
@@ -1741,6 +1739,7 @@ fn resolve_command_maps_agent_tool_and_shell() {
     // …and a list the harness cannot grant REFUSES this path too, instead of
     // quietly launching the raw command under an unrequested policy.
     cfg.agents.push(thegn_core::config::NamedCommand {
+        backends: Vec::new(),
         permissions: vec!["Read".into()],
         ..cfg_with(&[("coder", "pi")], &[]).agents.remove(0)
     });

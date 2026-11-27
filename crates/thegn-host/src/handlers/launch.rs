@@ -420,6 +420,7 @@ mod tests {
     fn first_agent_finds_first_agent_command_only() {
         let mut cfg = Config::default();
         cfg.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "claude".into(),
             command: "claude".into(),
             hints: Vec::new(),
@@ -434,6 +435,7 @@ mod tests {
             drawer_cwd: None,
         });
         cfg.tools.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "lazygit".into(),
             command: "lazygit".into(),
             hints: Vec::new(),

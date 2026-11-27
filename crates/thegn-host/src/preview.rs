@@ -731,6 +731,7 @@ pub(crate) fn probe_allowed(
     let Some(backend) = thegn_core::sandbox::Backend::parse(label) else {
         return label.is_empty() && (!sandbox_enabled || live_pane_evidence);
     };
+    let network = network.resolved();
     backend == thegn_core::sandbox::Backend::None
         || (network != thegn_core::config::Network::None
             && (network == thegn_core::config::Network::Host

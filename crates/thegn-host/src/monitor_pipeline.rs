@@ -56,6 +56,8 @@ pub(crate) struct PipelineRow {
     pub glyph: &'static str,
     pub status: AgentDispatchStatus,
     pub agent_name: String,
+    /// Backend selected by a waited CLI run, if the dispatch history recorded it.
+    pub selected_backend: Option<String>,
     /// Basename of the worktree path — the sidebar's own row identity.
     pub worktree: String,
     /// Full worktree path, for the jump action.
@@ -382,12 +384,19 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
         glyph: d.status.glyph(),
         status: d.status,
         agent_name: d.agent_name.clone(),
+        selected_backend: selected_backend_from_note(d.note.as_deref()),
         worktree: display_label(thegn_core::util::basename(&d.worktree_path)),
         worktree_path: d.worktree_path.clone(),
         session_id: d.session_id.clone(),
         age: fmt_age_ms(now_ms.saturating_sub(d.dispatched_at_ms)),
         issue_id: display_label(&d.issue_id),
     }
+}
+
+fn selected_backend_from_note(note: Option<&str>) -> Option<String> {
+    note?
+        .lines()
+        .find_map(|line| line.strip_prefix("backend selected: ").map(display_label))
 }
 
 /// Sanitize labels that enter board and sidebar text rendering. Keep the raw
@@ -764,6 +773,16 @@ mod tests {
             rows.iter().map(|r| r.group_head).collect::<Vec<_>>(),
             vec![true, false, false]
         );
+    }
+
+    #[test]
+    fn recorded_backend_is_carried_into_the_pipeline_row() {
+        let mut dispatch = d(1, Some("code"), None, 10);
+        dispatch.note = Some("progress: retrying\nbackend selected: codex-pro".into());
+
+        let rows = ordered_rows(&[dispatch], &["code".into()], 10);
+
+        assert_eq!(rows[0].selected_backend.as_deref(), Some("codex-pro"));
     }
 
     #[test]
