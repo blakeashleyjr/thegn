@@ -17,9 +17,10 @@
 //! - The land rule's seventh check (`gate_isolated`, backed by
 //!   [`merge_gate_isolated`]) passes only when `[merge_queue] gate_sandbox =
 //!   "sealed"` and the sealed spec resolves for the lane's repo right now
-//!   (THE-2200). With the host gate (`off`, the default) `merge` behaves like
-//!   `review`: every land stops for the owner's approval with "the merge gate
-//!   is not sandboxed"; a sealed gate that cannot start asks with its cause.
+//!   (THE-2200). With `gate_sandbox = "off"` (the default), candidate gate
+//!   commands refuse to run and `merge` behaves like `review`: every land
+//!   stops for the owner's approval with "the merge gate is not sandboxed";
+//!   a sealed gate that cannot start asks with its cause.
 //!
 //! Other escalations ([`on_escalate`]) ring the owner (and the Lead) once
 //! per (row, head, reason), only for `on_blocked = "escalate"` stages or an

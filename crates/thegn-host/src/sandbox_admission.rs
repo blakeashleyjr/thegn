@@ -200,7 +200,7 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
         id: "merge-gate",
         route: "Merge gate/setup/regeneration",
         status: RouteStatus::OwnGate,
-        path: "merge gate/setup/regenerate: sealed spec via gate_sandbox when [merge_queue] gate_sandbox = sealed, else host-capped; local bwrap, network none, no host daemon socket, read-only caches",
+        path: "merge gate/setup/regenerate: sealed spec via gate_sandbox when [merge_queue] gate_sandbox = sealed; off refuses candidate code; local bwrap, network none, no host daemon socket, read-only caches",
         anchor: Some(("gate_sandbox.rs", "fn resolve_for_gate(")),
     },
     LaunchRoute {
@@ -524,7 +524,7 @@ mod tests {
             .expect("merge-gate route is present");
         assert_eq!(gate.status, RouteStatus::OwnGate);
         assert!(gate.path.contains("gate_sandbox = sealed"));
-        assert!(gate.path.contains("host-capped"));
+        assert!(gate.path.contains("off refuses candidate code"));
         let tests = LAUNCH_ROUTES
             .iter()
             .find(|route| route.id == "tests-gates")

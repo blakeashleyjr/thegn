@@ -460,10 +460,11 @@ the Lead cannot influence.
 
 ## The merge gate
 
-By default the merge queue's gate runs on the host. `[merge_queue] gate_sandbox
-= "sealed"` (global or trusted-profile config only, never a repo overlay) runs
-`gate_setup_command`, `gate_command` and `regenerate_command` in the repo's
-sealed sandbox instead. Not yet verified live.
+The merge queue runs `gate_setup_command`, `gate_command` and
+`regenerate_command` only when `[merge_queue] gate_sandbox = "sealed"` (global
+or trusted-profile config only, never a repo overlay). The default `"off"`
+setting is retained for compatibility but refuses candidate code execution;
+host execution cannot produce a trusted gate result.
 
 - **Writable:** the gate checkout and its target dir, nothing else. A
   configured `gate_target_dir` is ignored.
