@@ -1339,6 +1339,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
         cfg.agents.push(NamedCommand {
+            backends: Vec::new(),
             name: "claude".into(),
             command: "claude".into(),
             hints: vec![],
@@ -1529,6 +1530,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
         cfg.agents.push(NamedCommand {
+            backends: Vec::new(),
             name: "claude".into(),
             command: "claude".into(),
             hints: vec![],
@@ -1561,6 +1563,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
         cfg.agents.push(NamedCommand {
+            backends: Vec::new(),
             name: "claude".into(),
             command: "claude".into(),
             hints: vec![],

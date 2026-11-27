@@ -860,6 +860,7 @@ mod tests {
 
     fn agent(name: &str, command: &str, provider: Option<&str>) -> NamedCommand {
         NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: command.into(),
             hints: vec![],

@@ -100,3 +100,12 @@ or the `thegn` that the connection pushes there, and report plainly when
 neither exists. Re-provisioning or restoring a snapshot changes nothing that is
 already in place, and an entry or skill you wrote yourself is never replaced.
 See [[environments]].
+
+## Ordered backends
+
+An agent role can document ordered alternatives under `[[agents.backends]]`.
+Each entry selects a harness, optional model and harness-specific environment
+overlay; `account` can bind the choice to a usage key or credential-home path.
+The `agent list` command shows names and non-secret launch metadata. Usage
+headroom is considered known only when an account snapshot has at least one
+window below its limit.

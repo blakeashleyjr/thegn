@@ -307,8 +307,17 @@ pub(crate) struct EffectiveRow {
     model: Option<String>,
     env_keys: Vec<String>,
     permissions: usize,
+    backends: Vec<BackendRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BackendRow {
+    name: String,
+    harness: String,
+    model: Option<String>,
+    env_keys: Vec<String>,
 }
 
 /// Pure: the rows `agent list` prints, from config alone.
@@ -316,6 +325,24 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
     use thegn_core::agent_task::effective_agent;
     let row = |name: &str, agent: Option<&str>, stage: Option<&str>| {
         let target = agent.unwrap_or(name);
+        let backends = cfg
+            .agents
+            .iter()
+            .chain(cfg.tools.iter())
+            .find(|entry| entry.name == target)
+            .map(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .map(|backend| BackendRow {
+                        name: backend.name.clone(),
+                        harness: backend.harness.clone(),
+                        model: backend.model.clone(),
+                        env_keys: backend.env.keys().cloned().collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         match effective_agent(cfg, target, stage) {
             Ok(e) => EffectiveRow {
                 name: name.to_string(),
@@ -324,6 +351,7 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
                 model: e.model,
                 env_keys: e.env.keys().cloned().collect(),
                 permissions: e.permissions.len(),
+                backends,
                 error: None,
             },
             Err(why) => EffectiveRow {
@@ -333,6 +361,7 @@ pub(crate) fn effective_rows(cfg: &Config) -> (Vec<EffectiveRow>, Vec<EffectiveR
                 model: None,
                 env_keys: Vec::new(),
                 permissions: 0,
+                backends,
                 error: Some(why),
             },
         }
@@ -377,6 +406,14 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         }
         if r.permissions > 0 {
             write!(s, "  perms:{}", r.permissions).expect("writing to String cannot fail");
+        }
+        if !r.backends.is_empty() {
+            let names = r
+                .backends
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>();
+            write!(s, "  backends:{}", names.join(",")).expect("writing to String cannot fail");
         }
         s
     };

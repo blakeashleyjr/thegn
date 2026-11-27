@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn agent_backends_parse_in_order_without_changing_single_backend_defaults() {
+    let legacy: Config = toml::from_str("[[agents]]\nname='legacy'\ncommand='claude'\n").unwrap();
+    assert!(legacy.agents[0].backends.is_empty());
+
+    let cfg: Config = toml::from_str(
+        "[[agents]]\nname='coder'\ncommand='claude'\n\
+         [[agents.backends]]\nname='pi'\nharness='pi'\nmodel='local/model'\n\
+         [agents.backends.env]\nPI_CODING_AGENT_DIR='~/.pi'\n\
+         [[agents.backends]]\nname='codex'\nharness='codex'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.agents[0]
+            .backends
+            .iter()
+            .map(|backend| backend.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pi", "codex"]
+    );
+    assert_eq!(
+        cfg.agents[0].backends[0].env["PI_CODING_AGENT_DIR"],
+        "~/.pi"
+    );
+}
+
+#[test]
 fn forward_reverse_tunnel_caps_default_to_shipped_limits_and_parse() {
     let defaults = ForwardConfig::default();
     assert_eq!(defaults.reverse_max_connections, 256);
@@ -2230,6 +2256,7 @@ fn repo_sandbox_expands_mount_tildes() {
 fn agent_command() {
     let mut cfg = Config::default();
     cfg.agents.push(crate::config::NamedCommand {
+        backends: Vec::new(),
         name: "test".into(),
         command: "echo test".into(),
         hints: vec![],
@@ -2253,6 +2280,7 @@ fn default_agent_name_skips_the_shell_fallback() {
     // Only the shell configured ⇒ no default agent.
     let mut cfg = Config {
         agents: vec![NamedCommand {
+            backends: Vec::new(),
             name: "shell".into(),
             command: "__shell__".into(),
             hints: vec![],
@@ -2271,6 +2299,7 @@ fn default_agent_name_skips_the_shell_fallback() {
     assert_eq!(cfg.default_agent_name(), None);
     // The first real agent wins, even when the shell precedes it.
     cfg.agents.push(NamedCommand {
+        backends: Vec::new(),
         name: "codex".into(),
         command: "codex".into(),
         hints: vec![],
@@ -2285,6 +2314,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         drawer_cwd: None,
     });
     cfg.agents.push(NamedCommand {
+        backends: Vec::new(),
         name: "claude".into(),
         command: "claude".into(),
         hints: vec![],
@@ -2305,6 +2335,7 @@ fn default_agent_name_skips_the_shell_fallback() {
 fn tool_command() {
     let mut cfg = Config::default();
     cfg.tools.push(crate::config::NamedCommand {
+        backends: Vec::new(),
         name: "test".into(),
         command: "echo test".into(),
         hints: vec![],

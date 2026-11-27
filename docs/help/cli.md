@@ -745,8 +745,11 @@ terminal escape sequences.
 `thegn agent list` is the one-screen answer to "what will actually run": one
 line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
 model, env keys (never values), permission count — resolved the way a launch
-resolves them. `thegn dispatch list --active` is the roster reduced to active rows (including
-`waiting_human`/`pr_open` rows, which are protected from redispatch but no
+resolves them. Entries with `[[agents.backends]]` also show the ordered
+backend names; `--json` includes each backend's harness, model and env key
+names, never environment values or account paths. `thegn dispatch list --active`
+is the roster reduced to active rows (including `waiting_human`/`pr_open` rows,
+which are protected from redispatch but no
 longer hold a stage slot). The `dispatch list --json` `liveness` field also
 uses the `parked` token for those rows. Both are terse by default and take
 `--json`.

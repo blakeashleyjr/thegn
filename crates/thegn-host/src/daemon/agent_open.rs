@@ -814,6 +814,7 @@ mod tests {
 
     fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
         thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: name.into(),
@@ -946,6 +947,7 @@ mod tests {
     fn a_stage_model_lands_on_the_command() {
         let mut c = cfg();
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "worker".into(),
             command: "claude".into(),
             hints: Vec::new(),
@@ -1162,6 +1164,7 @@ mod tests {
     fn native_fork_requires_the_configured_agent_provider_to_match() {
         let mut c = cfg();
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),
@@ -1193,6 +1196,7 @@ mod tests {
         let mut env = std::collections::BTreeMap::new();
         env.insert("THEGN_TEST_FORK_AGENT_ENV".into(), "fresh-context".into());
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),
@@ -1942,6 +1946,7 @@ mod tests {
         let mut c = cfg();
         c.sandbox.enabled = false;
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             provider: Some("codex".into()),
             ..named("worker", "codex")
         });

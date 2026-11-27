@@ -82,6 +82,7 @@ mod tests {
     fn transition_helpers_share_the_runtime_path() {
         let mut cfg = Config::default();
         cfg.tools.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "db".into(),
             command: "psql".into(),
             hints: Vec::new(),

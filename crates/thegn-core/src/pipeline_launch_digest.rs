@@ -20,7 +20,7 @@ use crate::config::Config;
 /// Private request marker carrying the stage configuration digest to the daemon.
 pub const STAGE_CONFIG_DIGEST_ENV: &str = "THEGN_STAGE_CONFIG_DIGEST";
 
-const DOMAIN: &[u8] = b"thegn-stage-launch-digest-v2\0";
+const DOMAIN: &[u8] = b"thegn-stage-launch-digest-v3\0";
 
 /// A typed refusal when the claimed stage configuration no longer matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,27 @@ pub fn stage_launch_digest(cfg: &Config, agent: &str, stage: &str) -> Result<Str
     add(provider);
     add(effective.model.as_deref().unwrap_or(""));
     add(if effective.route_via_proxy { "1" } else { "0" });
+    let entry = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .find(|entry| entry.name == effective.name);
+    if let Some(entry) = entry {
+        add(&entry.backends.len().to_string());
+        for backend in &entry.backends {
+            add(&backend.name);
+            add(&backend.harness);
+            add(backend.model.as_deref().unwrap_or(""));
+            add(backend.account.as_deref().unwrap_or(""));
+            add(&backend.env.len().to_string());
+            for (key, value) in &backend.env {
+                add(key);
+                add(value);
+            }
+        }
+    } else {
+        add("0");
+    }
     add(&effective.env.len().to_string());
     for (key, value) in &effective.env {
         add(key);
@@ -153,6 +174,7 @@ mod tests {
     fn config(stage_name: &str, stage_agent: &str) -> Config {
         let mut cfg = Config::default();
         cfg.agents.push(NamedCommand {
+            backends: Vec::new(),
             name: "worker".into(),
             command: "claude".into(),
             hints: Vec::new(),
@@ -223,6 +245,16 @@ mod tests {
         stage_agent_changed.pipeline.stages[0].agent = "another-worker".into();
         let mut proxy_changed = first.clone();
         proxy_changed.agents[0].route_via_proxy = true;
+        let mut backend_changed = first.clone();
+        backend_changed.agents[0]
+            .backends
+            .push(crate::config::AgentBackend {
+                name: "codex-fallback".into(),
+                harness: "codex".into(),
+                model: Some("gpt-6-luna".into()),
+                env: Default::default(),
+                account: Some("/accounts/codex".into()),
+            });
         let expected = stage_launch_digest(&first, "worker", "review").expect("first");
         assert_ne!(
             expected,
@@ -239,6 +271,10 @@ mod tests {
         assert_ne!(
             expected,
             stage_launch_digest(&proxy_changed, "worker", "review").expect("proxy route")
+        );
+        assert_ne!(
+            expected,
+            stage_launch_digest(&backend_changed, "worker", "review").expect("backend list")
         );
     }
 

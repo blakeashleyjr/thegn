@@ -1280,6 +1280,7 @@ mod tests {
         let cfg = thegn_core::config::Config {
             tools: vec![
                 thegn_core::config::NamedCommand {
+                    backends: Vec::new(),
                     name: "db".into(),
                     command: "psql".into(),
                     hints: Vec::new(),
@@ -1294,6 +1295,7 @@ mod tests {
                     drawer_cwd: None,
                 },
                 thegn_core::config::NamedCommand {
+                    backends: Vec::new(),
                     name: "local".into(),
                     command: "atac".into(),
                     hints: Vec::new(),
@@ -1615,6 +1617,7 @@ mod tests {
     fn active_worktree_selection_uses_configured_global_scope() {
         let mut cfg = thegn_core::config::Config::default();
         cfg.tools.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "db".into(),
             command: "psql".into(),
             hints: Vec::new(),

@@ -616,6 +616,7 @@ mod tests {
         stages[1].model = Some("opus".into());
         let mut cfg = config(&stages);
         cfg.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "worker".into(),
             command: "claude".into(),
             hints: Vec::new(),

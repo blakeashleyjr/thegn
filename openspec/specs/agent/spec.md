@@ -742,3 +742,30 @@ only when the reload fails.
 
 - WHEN an operator adds `[[agents]] name = "pipeline-pi"` while the daemon runs
 - THEN the next `session open --agent pipeline-pi` resolves it
+
+### Requirement: Agent roles may declare ordered alternate backends
+
+An `[[agents]]` entry MAY declare ordered `[[agents.backends]]` records with a
+stable name, harness, optional model, optional env overlay and optional account
+usage key or credential-home path. Existing entries without backends SHALL
+retain their single-backend configuration. `thegn agent list` SHALL expose
+backend names and non-secret launch metadata without printing environment
+values or account paths. The core usage selector SHALL choose the first
+backend whose matching account has a known window below 100 percent; unknown
+usage SHALL NOT count as headroom.
+
+#### Scenario: Existing single-backend entry remains valid
+
+- WHEN an agent entry omits `backends`
+- THEN the entry resolves through its existing harness, model and env fields
+
+#### Scenario: A known exhausted account is skipped
+
+- WHEN ordered backends match an exhausted Claude account followed by a Codex
+  account with a window below its limit
+- THEN the usage selector returns the Codex backend
+
+#### Scenario: Unknown usage is not headroom
+
+- WHEN no matching account has a usable usage snapshot
+- THEN the usage selector returns no backend

@@ -10163,6 +10163,7 @@ mod tests {
         let mut boot = thegn_core::config::Config::default();
         boot.sandbox.enabled = false;
         boot.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),

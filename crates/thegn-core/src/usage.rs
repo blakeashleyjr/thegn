@@ -133,6 +133,75 @@ pub struct AccountUsage {
     pub tokens: Option<TokenTotals>,
 }
 
+/// Result of matching one configured backend against discovered account usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHeadroom {
+    /// A matching account has at least one known usage window below its limit.
+    Available,
+    /// A matching account is known, but all reported windows are exhausted.
+    Exhausted,
+    /// No matching account or no usable usage snapshot was found.
+    Unknown,
+}
+
+/// Classify an ordered agent backend from a usage snapshot. Account matching
+/// uses the configured stable account key or credential-home path. Unknown
+/// usage is not treated as headroom, so selection fails closed.
+pub fn backend_headroom(
+    backend: &crate::config::AgentBackend,
+    accounts: &[AccountUsage],
+) -> BackendHeadroom {
+    let harness = backend.harness.trim();
+    let account_identity = backend
+        .account
+        .as_deref()
+        .map(|identity| crate::util::expand_tilde(identity));
+    let matched: Vec<_> = accounts
+        .iter()
+        .filter(|account| {
+            account.provider == harness
+                && account_identity.as_deref().is_none_or(|identity| {
+                    account.key.as_str() == identity
+                        || account
+                            .home
+                            .as_ref()
+                            .is_some_and(|home| home.to_string_lossy().as_ref() == identity)
+                })
+        })
+        .collect();
+    if matched.is_empty() {
+        return BackendHeadroom::Unknown;
+    }
+    let known: Vec<_> = matched
+        .iter()
+        .filter(|account| account.state == UsageState::Ok && !account.windows.is_empty())
+        .collect();
+    if known.is_empty() {
+        return BackendHeadroom::Unknown;
+    }
+    if known.iter().any(|account| {
+        account
+            .windows
+            .iter()
+            .any(|window| window.used_percent < 100.0)
+    }) {
+        BackendHeadroom::Available
+    } else {
+        BackendHeadroom::Exhausted
+    }
+}
+
+/// Choose the first configured backend with known headroom, preserving the
+/// user's order. Returns `None` when every backend is exhausted or unknown.
+pub fn select_backend<'a>(
+    backends: &'a [crate::config::AgentBackend],
+    accounts: &[AccountUsage],
+) -> Option<&'a crate::config::AgentBackend> {
+    backends
+        .iter()
+        .find(|backend| backend_headroom(backend, accounts) == BackendHeadroom::Available)
+}
+
 impl AccountUsage {
     /// The shared skeleton: provider + label, everything else empty. The three
     /// state constructors below differ only in `state`/`note`/`windows`, so they
@@ -2029,5 +2098,47 @@ mod tests {
         let blob = br#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12,"window_minutes":299},"plan_type":"plus\nZAP"}}}"#;
         let u = parse_codex_rollup(blob, now).expect("parsed");
         assert_eq!(u.plan.as_deref(), Some("plusZAP"));
+    }
+
+    #[test]
+    fn backend_selection_preserves_order_and_requires_known_headroom() {
+        let backend =
+            |name: &str, harness: &str, account: Option<&str>| crate::config::AgentBackend {
+                name: name.into(),
+                harness: harness.into(),
+                model: None,
+                env: Default::default(),
+                account: account.map(str::to_string),
+            };
+        let exhausted = AccountUsage::ok(
+            "claude",
+            "primary",
+            None,
+            vec![UsageWindow::new("weekly", 100.0, Some(5_000))],
+        )
+        .with_home("/accounts/claude-a");
+        let available = AccountUsage::ok(
+            "codex",
+            "Codex",
+            None,
+            vec![UsageWindow::new("weekly", 70.0, Some(6_000))],
+        );
+        let backends = vec![
+            backend("claude-a", "claude", Some("/accounts/claude-a")),
+            backend("codex", "codex", None),
+        ];
+        assert_eq!(
+            backend_headroom(&backends[0], &[exhausted.clone()]),
+            BackendHeadroom::Exhausted
+        );
+        assert_eq!(
+            select_backend(&backends, &[exhausted, available]).map(|b| b.name.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            backend_headroom(&backends[0], &[]),
+            BackendHeadroom::Unknown
+        );
+        assert_eq!(select_backend(&backends, &[]), None);
     }
 }
