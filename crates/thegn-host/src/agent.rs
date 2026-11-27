@@ -1167,14 +1167,15 @@ pub fn prepare_sandbox_env_with_selection(
                         e.downcast_ref::<thegn_core::sandbox_compose::ComposeBindRefusal>()
                     {
                         let message = refusal.to_string();
-                        if explicit_choice {
-                            anyhow::bail!("{message} for {worktree}");
+                        return Err(SandboxHalt {
+                            env_name: env_name.clone(),
+                            placement: placement_label.clone(),
+                            reason: format!("{message} for {worktree}"),
+                            ask,
+                            dormant: None,
+                            sealed_home: sb.profile.hides_home(),
                         }
-                        thegn_core::msg::warn(&format!(
-                            "{message} for {worktree}; trying next backend"
-                        ));
-                        compose_miss = Some(message);
-                        continue;
+                        .into());
                     }
                     let m =
                         crate::sandbox_failure::sandbox_failed_message(spec.backend.label(), &e);

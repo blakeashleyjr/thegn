@@ -528,6 +528,10 @@ pub(crate) fn spawn_job(
                 let result = tokio::task::spawn_blocking(|| {
                     let exe = thegn_core::util::self_exe_path()
                         .ok_or_else(|| "cannot find the thegn executable".to_string())?;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "daemon stop runs on this spawn_blocking worker"
+                    )]
                     let output = std::process::Command::new(exe)
                         .args(["daemon", "stop"])
                         .env("THEGN_CHANNEL", crate::channel_state::current().as_str())

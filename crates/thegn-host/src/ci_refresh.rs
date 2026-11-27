@@ -986,69 +986,6 @@ fn run_ci_refresh_request(request: &RefreshRequest) {
     }
 }
 
-/// Round-robin cursor over background worktrees, advanced once per sweep so
-/// every worktree gets a turn even when several are stale.
-#[cfg(test)]
-static SWEEP_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Refresh at most ONE stale background worktree's CI cache, or none when the
-/// request's budget is exhausted (the ttl guard decides staleness), starting
-/// from the rotating cursor. Blocking; must run on the bg lane.
-#[cfg(test)]
-fn sweep_one_background(
-    session: &crate::session::Session,
-    active: &std::path::Path,
-    cfg: &thegn_core::config::CiConfig,
-    full: &thegn_core::config::Config,
-    waker: Option<&TerminalWaker>,
-    context: RefreshContext<'_>,
-) {
-    let others: Vec<&str> = session
-        .worktrees
-        .iter()
-        .map(|g| g.path.as_str())
-        .filter(|p| std::path::Path::new(p) != active)
-        .collect();
-    if others.is_empty() {
-        return;
-    }
-    let locations = thegn_core::db::Db::open()
-        .and_then(|db| db.worktrees())
-        .map(|rows| thegn_core::remote::WorktreeLocations::from_rows(&rows))
-        .unwrap_or_default();
-    let start = SWEEP_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for i in 0..others.len() {
-        let p = std::path::Path::new(others[(start + i) % others.len()]);
-        if !p.is_dir() {
-            continue;
-        }
-        let loc = locations.loc(p);
-        // First worktree that actually fetched (fresh ones are skipped by the
-        // guard) ends the sweep — one provider subprocess per tick, max.
-        if context.cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        if context.budget.exhausted() {
-            return;
-        }
-        if refresh_ci_cache_for(
-            p,
-            &loc,
-            cfg,
-            full,
-            waker,
-            false,
-            RefreshContext {
-                generation: context.generation.clone(),
-                cancel: Arc::clone(&context.cancel),
-                budget: &mut *context.budget,
-            },
-        ) {
-            return;
-        }
-    }
-}
-
 /// Build the refresh's provider client bound to the refresh wall: every
 /// provider call clips its timeout to the time left on `budget.deadline`, so a
 /// call admitted just before the wall still ends by it (a clipped call fails

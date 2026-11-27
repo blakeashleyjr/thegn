@@ -541,7 +541,7 @@ mod tests {
         let l = draw(&steps, &[]);
         let detail = l[5..11]
             .iter()
-            .map(|line| line.trim())
+            .map(|line| line.trim().trim_start_matches('│').trim())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(detail.contains("Clone repository"), "{detail:?}");
