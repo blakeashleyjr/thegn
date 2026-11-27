@@ -32,12 +32,12 @@ done
 
 # Fail before a long run if a harness interface this script relies on has drifted.
 for requirement in '--bin)' '--worktrees)' '--json)'; do
-  grep -Fq "$requirement" "$HERE/cpu-sample.sh" || {
+  grep -Fq -- "$requirement" "$HERE/cpu-sample.sh" || {
     echo "claim-run: cpu-sample.sh no longer accepts $requirement" >&2
     exit 1
   }
   if [ "$requirement" != '--worktrees)' ]; then
-    grep -Fq "$requirement" "$HERE/flood.sh" || {
+    grep -Fq -- "$requirement" "$HERE/flood.sh" || {
       echo "claim-run: flood.sh no longer accepts $requirement" >&2
       exit 1
     }
