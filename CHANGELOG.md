@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.140] — 2026-11-26
+
+The macOS release build links again, and trackpad scrolling no longer switches views under load.
+
+### Fixed
+
+- The aarch64 macOS release build links clang's compiler runtime for the voice engine's Metal backend (`___isPlatformVersionAtLeast` was undefined, which blocked the alpha.139 release assets).
+- A mouse-wheel report split across reads under load is no longer decoded as Alt+[ or Alt+], so a trackpad scroll in a pane cannot switch between the Work view and the Observe tab.
+- Configuration and process tests no longer read the caller's `THEGN_*` environment, and the pre-push test hook clears it, so the test gate passes inside a developer's thegn session.
+
 ## [0.1.0-alpha.139] — 2026-11-26
 
 Voice dictation ships on the stable channel, and the side panel's Work, Issues, Hosts and Environments views have been reworked.
