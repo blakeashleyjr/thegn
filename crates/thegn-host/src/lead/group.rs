@@ -179,22 +179,30 @@ mod tests {
     }
 
     #[test]
-    fn ready_lead_entry_targets_its_active_tab() {
+    fn ready_lead_entry_resolves_to_its_tab_from_another_group() {
         let cfg = thegn_core::config::Config {
             lead: Some(thegn_core::config_lead::LeadConfig::default()),
             ..Default::default()
         };
         let session = crate::session::Session {
             id: "s".into(),
-            worktrees: vec![crate::session::WorktreeGroup::terminal("lead")],
+            worktrees: vec![
+                crate::session::WorktreeGroup::new(
+                    "project",
+                    crate::session::GroupKind::Home,
+                    "/project",
+                ),
+                crate::session::WorktreeGroup::terminal("lead"),
+            ],
             active: 0,
         };
         assert_eq!(
             plan(&cfg, &session, &[]),
-            JumpPlan::Activate(RowTarget::Tab(0, 0))
+            JumpPlan::Activate(RowTarget::Tab(1, 0))
         );
-        assert!(is_lead_target(&RowTarget::Tab(0, 0), &session));
-        assert_eq!(session.worktrees[session.active].name, LEAD_GROUP_NAME);
+        let target = RowTarget::Tab(1, 0);
+        assert!(is_lead_target(&target, &session));
+        assert_eq!(session.worktrees[1].name, LEAD_GROUP_NAME);
     }
 
     #[test]
@@ -225,22 +233,29 @@ mod tests {
     }
 
     #[test]
-    fn failed_lead_start_reentry_stays_on_the_lead_tab() {
+    fn failed_lead_start_reentry_resolves_to_the_lead_tab() {
         let cfg = thegn_core::config::Config {
             lead: Some(thegn_core::config_lead::LeadConfig::default()),
             ..Default::default()
         };
         let session = crate::session::Session {
             id: "s".into(),
-            worktrees: vec![crate::session::WorktreeGroup::terminal("lead")],
+            worktrees: vec![
+                crate::session::WorktreeGroup::new(
+                    "project",
+                    crate::session::GroupKind::Home,
+                    "/project",
+                ),
+                crate::session::WorktreeGroup::terminal("lead"),
+            ],
             active: 0,
         };
-        let target = RowTarget::Tab(0, 0);
+        let target = RowTarget::Tab(1, 0);
         // The error recovery click is another activation of the same row; the
-        // jump plan remains pinned to the Lead tab that owns the failed launch.
+        // jump plan resolves to the Lead tab that owns the failed launch.
         assert!(is_lead_target(&target, &session));
         assert_eq!(plan(&cfg, &session, &[]), JumpPlan::Activate(target));
-        assert_eq!(session.worktrees[session.active].name, LEAD_GROUP_NAME);
+        assert_eq!(session.worktrees[1].name, LEAD_GROUP_NAME);
     }
 
     #[test]

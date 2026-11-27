@@ -8928,6 +8928,15 @@ async fn event_loop<T: Terminal>(
                     focus.zone = crate::focus::Zone::Center;
                 }
                 crate::lead::group::JumpOutcome::Activate(t) => {
+                    // Lead clicks used to pass through the sidebar activation
+                    // arm, which stamps the center switch for the renderer.
+                    // Keep that damage signal when routing them through the
+                    // shared jump path so the old worktree cannot remain on
+                    // screen after session focus changes.
+                    switch_at = Some((
+                        std::time::Instant::now(),
+                        crate::handlers::sidebar_activate::switch_kind(&t, &session.id),
+                    ));
                     let (hydrate, _pending) = activate_row!(t);
                     sb.focus_active_row(&mut model);
                     focus.zone = crate::focus::Zone::Center;
