@@ -800,6 +800,26 @@ fn allocate_private_tmp_fallback_within(
     euid: u32,
     wait: std::time::Duration,
 ) -> Result<PathBuf> {
+    allocate_private_tmp_fallback_within_using_suffixes(tmp_root, state_dir, euid, wait, || {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).with_context(|| {
+            format!(
+                "draw random private control-runtime suffix under {}",
+                tmp_root.display()
+            )
+        })?;
+        Ok(random)
+    })
+}
+
+#[cfg(unix)]
+fn allocate_private_tmp_fallback_within_using_suffixes(
+    tmp_root: &std::path::Path,
+    state_dir: &std::path::Path,
+    euid: u32,
+    wait: std::time::Duration,
+    mut next_suffix: impl FnMut() -> Result<[u8; 16]>,
+) -> Result<PathBuf> {
     let _run =
         thegn_core::fsperm::ensure_private_dir_beneath(state_dir, std::path::Path::new("run"))
             .with_context(|| {
@@ -890,13 +910,7 @@ fn allocate_private_tmp_fallback_within(
 
     let mut allocated = None;
     for attempt in 0..2 {
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).with_context(|| {
-            format!(
-                "draw random private control-runtime suffix under {}",
-                tmp_root.display()
-            )
-        })?;
+        let random = next_suffix()?;
         let suffix = random
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -3355,6 +3369,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tmp_fallback_allocator_concurrent_starters_converge() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
         // Both scoped threads share the same private temp roots. The persistent
         // allocation lock serializes locator reconciliation and publication;
         // the second thread must observe and reuse the first thread's directory.
@@ -3366,11 +3382,14 @@ mod tests {
             .prefix("tg")
             .tempdir_in("/tmp")
             .unwrap();
+        let start = std::sync::Barrier::new(2);
         let (first, second) = std::thread::scope(|scope| {
             let first = scope.spawn(|| {
+                start.wait();
                 allocate_private_tmp_fallback_in(tmp.path(), state.path(), effective_uid())
             });
             let second = scope.spawn(|| {
+                start.wait();
                 allocate_private_tmp_fallback_in(tmp.path(), state.path(), effective_uid())
             });
             (
@@ -3390,6 +3409,65 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
             .count();
         assert_eq!(siblings, 1);
+        let metadata = std::fs::symlink_metadata(first.parent().unwrap()).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), effective_uid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_allocator_skips_a_foreign_reservation_in_a_sticky_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let state = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let key = thegn_core::config_daemon::state_endpoint_key(state.path());
+        let reserved_name = format!("thegn-{}-{key}-{}", effective_uid(), "11".repeat(16));
+        let reserved = tmp.path().join(&reserved_name);
+        std::fs::create_dir(&reserved).unwrap();
+        std::fs::set_permissions(&reserved, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let canary = reserved.join("foreign-reservation");
+        std::fs::write(&canary, b"leave this reservation alone").unwrap();
+
+        let mut suffixes = [[0x11; 16], [0x22; 16]].into_iter();
+        let socket = allocate_private_tmp_fallback_within_using_suffixes(
+            tmp.path(),
+            state.path(),
+            effective_uid(),
+            ALLOC_LOCK_WAIT,
+            || Ok(suffixes.next().expect("two deterministic suffixes")),
+        )
+        .unwrap();
+
+        let expected_name = format!("thegn-{}-{key}-{}", effective_uid(), "22".repeat(16));
+        assert_eq!(
+            socket.parent().unwrap().file_name().unwrap(),
+            expected_name.as_str()
+        );
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"leave this reservation alone"
+        );
+        let reserved_metadata = std::fs::symlink_metadata(&reserved).unwrap();
+        assert!(reserved_metadata.is_dir());
+        assert_eq!(reserved_metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::symlink_metadata(tmp.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o1777,
+            0o1777,
+            "allocation must preserve the shared sticky directory"
+        );
     }
 
     #[cfg(unix)]
