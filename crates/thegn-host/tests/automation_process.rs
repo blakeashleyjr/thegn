@@ -53,10 +53,6 @@ fn automation_dry_run_leaves_an_empty_state_home_empty() {
     let home = tempfile::tempdir().unwrap();
     let config_home = home.path().join("config");
     std::fs::create_dir_all(&config_home).unwrap();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "process integration test synchronously waits for the isolated CLI under test"
-    )]
     let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
     command.args([
         "automations",
@@ -72,6 +68,10 @@ fn automation_dry_run_leaves_an_empty_state_home_empty() {
         state.path(),
         runtime.path(),
     );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "process integration test synchronously waits for the isolated CLI under test"
+    )]
     let output = command.output().unwrap();
     assert!(!output.status.success());
     assert!(
@@ -95,10 +95,6 @@ fn automation_dry_run_leaves_an_empty_state_home_empty() {
         "[log]\nfile = true\n\n[usage]\nenabled = true\n",
     )
     .unwrap();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "process integration test synchronously waits for the isolated CLI under test"
-    )]
     let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
     command.args([
         "--config",
@@ -116,6 +112,10 @@ fn automation_dry_run_leaves_an_empty_state_home_empty() {
         configured_state.path(),
         configured_runtime.path(),
     );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "process integration test synchronously waits for the isolated CLI under test"
+    )]
     let output = command.output().unwrap();
     assert!(!output.status.success());
     assert!(
