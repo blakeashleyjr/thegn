@@ -144,17 +144,35 @@ pub(crate) fn jump_after_restart(
     if !super::enabled(cfg) || super::disabled_reason(cfg).is_some() {
         return JumpOutcome::Setup;
     }
-    if let Some(i) = session
-        .worktrees
-        .iter()
-        .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal)
-    {
-        return JumpOutcome::Activate(RowTarget::Tab(i, session.worktrees[i].active_tab));
-    }
     let choice = lead_choice();
     crate::handlers::terminal::persist(&choice, tx, waker);
-    crate::handlers::terminal::push_terminal_group(session, panes, &choice);
+    reset_lead_group(session, panes, &choice);
     JumpOutcome::Created
+}
+
+/// Replace an existing Lead group after its daemon sessions have been stopped,
+/// or create one if it was only present in the registry.
+fn reset_lead_group(
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    choice: &TerminalChoice,
+) {
+    // `daemon stop` ends the sessions hosted by the old daemon. Reusing the
+    // old Lead tabs would only focus dead PTYs, so install a fresh placeholder
+    // that starts a new Lead on attach. Keep the group's sidebar position.
+    let existing = session
+        .worktrees
+        .iter()
+        .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal);
+    if let Some(i) = existing {
+        session.worktrees.remove(i);
+        crate::handlers::terminal::push_terminal_group(session, panes, choice);
+        let fresh = session.worktrees.pop().expect("the Lead group was just pushed");
+        session.worktrees.insert(i, fresh);
+        session.active = i;
+    } else {
+        crate::handlers::terminal::push_terminal_group(session, panes, choice);
+    }
 }
 
 /// Whether activating `target` is the sidebar's "Lead — set up" row: the Lead
@@ -204,6 +222,33 @@ mod tests {
         assert!(lead_row(&[row("other", "lead")]).is_none());
         let rows = [row("local", "local"), row("lead", "lead")];
         assert_eq!(lead_row(&rows).map(|r| r.name.as_str()), Some("lead"));
+    }
+
+    #[test]
+    fn restart_replaces_dead_lead_tabs_with_a_fresh_terminal() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let old = crate::session::WorktreeGroup::terminal(LEAD_GROUP_NAME);
+        let old_id = old.tabs[0].focused_pane;
+        let mut session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![
+                crate::session::WorktreeGroup::new(
+                    "home",
+                    crate::session::GroupKind::Home,
+                    "/home",
+                ),
+                old,
+            ],
+            active: 0,
+        };
+
+        reset_lead_group(&mut session, &mut panes, &lead_choice());
+
+        assert_eq!(session.active, 1);
+        assert_eq!(session.worktrees[1].name, LEAD_GROUP_NAME);
+        assert_eq!(session.worktrees[1].tabs.len(), 1);
+        assert_ne!(session.worktrees[1].tabs[0].focused_pane, old_id);
     }
 
     #[test]

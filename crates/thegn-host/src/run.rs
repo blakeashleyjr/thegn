@@ -15516,9 +15516,16 @@ async fn event_loop<T: Terminal>(
                     match *done {
                         crate::lead::setup::Async::Restarted { result, .. } => match result {
                             Ok(()) => {
-                                active_menu = None;
-                                model.status = "daemon stopped; reopening the Lead".into();
-                                jump_lead!(after_restart);
+                                let host = crate::lead::setup::RealHost {
+                                    cfg: keymap.config(),
+                                };
+                                if !crate::lead::setup::Host::facts(&host).logged_in {
+                                    active_menu = Some(crate::lead::setup::after_restart(&host));
+                                } else {
+                                    active_menu = None;
+                                    model.status = "daemon stopped; reopening the Lead".into();
+                                    jump_lead!(after_restart);
+                                }
                             }
                             Err(error) => {
                                 model.status = format!("daemon not restarted: {error}");

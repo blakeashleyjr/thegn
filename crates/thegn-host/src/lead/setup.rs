@@ -286,6 +286,18 @@ pub(crate) fn begin(host: &dyn Host) -> MenuOverlay {
     )
 }
 
+/// Continue setup after a confirmed daemon stop without offering the same
+/// restart again. In particular, an unauthenticated Lead must finish login
+/// before the retry can open it.
+pub(crate) fn after_restart(host: &dyn Host) -> MenuOverlay {
+    let facts = host.facts();
+    let plan = Plan {
+        restarted: true,
+        ..Plan::from_facts(&facts)
+    };
+    step_menu(&facts, &plan)
+}
+
 /// The menu for `plan` given fresh facts.
 pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
     match next_step(f, plan) {
@@ -1257,6 +1269,21 @@ mod tests {
         // Skipping moves on without stopping it.
         let out = apply(&mut host, &arg("skip", &p, ""));
         assert_eq!(out.menu.expect("login").title, "Log the Lead's agent in");
+    }
+
+    #[test]
+    fn post_restart_continues_to_login_without_offering_another_stop() {
+        let mut facts = ready();
+        facts.listener_up = false;
+        facts.logged_in = false;
+        let host = Fake {
+            facts,
+            ..Fake::default()
+        };
+
+        let menu = after_restart(&host);
+
+        assert_eq!(menu.title, "Log the Lead's agent in");
     }
 
     #[test]
