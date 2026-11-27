@@ -2965,6 +2965,7 @@ image = ""
 # nat  — egress only, no inbound ports. Required for API-backed agents.
 # host — share the host network stack (no isolation; fastest for local services).
 # none — no network (offline/air-gapped agents).
+# allowlist — accepted but currently fails closed as none until egress filtering exists.
 network = "nat"
 
 # Host ports to publish from the container: ["host_port:container_port", ...].

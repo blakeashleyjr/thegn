@@ -534,6 +534,13 @@
       ]
     },
     {
+      "issue": "THE-2119",
+      "project": "Sandbox & Remote 04",
+      "changes": [
+        "add-network-allowlist-fail-closed"
+      ]
+    },
+    {
       "issue": "THE-2131",
       "project": "Sandbox & Remote 05: macOS",
       "changes": [

@@ -481,7 +481,18 @@ config_enum! {
     /// Sandbox network mode.
     pub enum Network: "sandbox network" {
         Nat = "nat", Host = "host", None = "none",
+        Allowlist = "allowlist" | "filtered" | "egress-proxy",
     } default = Nat;
+}
+impl Network {
+    /// Until packet-enforced egress exists, allowlist mode behaves as `none`.
+    #[must_use]
+    pub const fn resolved(self) -> Network {
+        match self {
+            Network::Allowlist => Network::None,
+            other => other,
+        }
+    }
 }
 config_enum! {
     /// `[sandbox] compiler_cache` is the sole authority for carrying a compiler

@@ -219,7 +219,8 @@ fn network_rank(n: Network) -> u8 {
     match n {
         Network::Host => 0,
         Network::Nat => 1,
-        Network::None => 2,
+        Network::Allowlist => 2,
+        Network::None => 3,
     }
 }
 

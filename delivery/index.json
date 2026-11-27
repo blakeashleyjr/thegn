@@ -14,6 +14,7 @@
     "Proposal Retirement & Cleanup",
     "Sandbox & Remote 00: Shared contracts",
     "Sandbox & Remote 01: Truth and fixes",
+    "Sandbox & Remote 04",
     "Sandbox & Remote 05: macOS",
     "Sandbox & Remote 06: Windows"
   ],
@@ -306,6 +307,19 @@
         }
       ],
       "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
+    },
+    {
+      "change": "add-network-allowlist-fail-closed",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2119",
+          "project": "Sandbox & Remote 04"
+        }
+      ],
+      "summary": "`network = \"allowlist\"` parses and fails closed as `none` until an egress datapath exists; the spec records the request.",
+      "delivered_at": "2026-11-26"
     },
     {
       "change": "add-observability-dashboards",

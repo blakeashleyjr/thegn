@@ -419,6 +419,7 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
         ("nat", Network::Nat),
         ("host", Network::Host),
         ("none", Network::None),
+        ("allowlist", Network::Allowlist),
     ] {
         assert_eq!(Network::from_str_validated(s).unwrap(), v);
         assert_eq!(v.as_str(), s);

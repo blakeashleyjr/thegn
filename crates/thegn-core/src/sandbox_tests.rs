@@ -5726,6 +5726,53 @@ fn universal_block_lowers_to_network_none() {
 }
 
 #[test]
+fn allowlist_network_resolves_fail_closed_as_none() {
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::None,
+        network: Network::Allowlist,
+        isolation_floor: Some(crate::config::IsolationFloor::Off),
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    let placement = Placement::Ssh(SshPlacement::plain(
+        "host".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let resolved = resolve_placed_exact(
+        &cfg,
+        &loc,
+        "test",
+        SandboxProfile::Hardened,
+        placement.clone(),
+    )
+    .expect("explicit remote host backend resolves without probing");
+    assert_eq!(resolved.network, Network::None);
+    assert!(resolved.egress_requested);
+    let mut oci = spec(Backend::Podman);
+    oci.network = resolved.network;
+    let opts = oci_create_opts(&oci).expect("valid volume names");
+    assert!(
+        opts.windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == "none"),
+        "{opts:?}"
+    );
+
+    let nat = crate::config::SandboxConfig {
+        network: Network::Nat,
+        ..cfg
+    };
+    let resolved_nat =
+        resolve_placed_exact(&nat, &loc, "test", SandboxProfile::Hardened, placement)
+            .expect("explicit remote host backend resolves without probing");
+    assert_eq!(resolved_nat.network, Network::Nat);
+    assert!(!resolved_nat.egress_requested);
+}
+
+#[test]
 fn hostname_rules_note_names_backend_on_every_local_backend() {
     for backend in [
         Backend::Bwrap,
@@ -7834,6 +7881,7 @@ fn default_spec_is_inert() {
     assert!(spec.env_overrides.is_empty());
     assert!(spec.env_block.is_empty());
     assert_eq!(spec.network, Network::default());
+    assert!(!spec.egress_requested);
     assert!(spec.network_allow.is_empty());
     assert!(spec.network_block.is_empty());
     assert!(!spec.read_only_root);

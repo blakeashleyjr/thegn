@@ -18,7 +18,9 @@ advisory, not an egress boundary: no local backend enforces them, and only the
 Sprites and Vercel providers lower them to their own policy API (Vercel takes
 allow lists only). `network = "none"` is the
 only enforced deny, and `*` in `network_block` means offline — see
-[[config-reference]]. thegn warns when lists are set but not enforced: at
+[[config-reference]]. `network = "allowlist"` (also `filtered` or
+`egress-proxy`) is accepted, but no egress filter exists yet, so it fails
+closed and launches offline, as `network = "none"`. thegn warns when lists are set but not enforced: at
 launch (standalone sandboxed terminals included), at `thegn env provision`, and
 in `thegn doctor`.
 
