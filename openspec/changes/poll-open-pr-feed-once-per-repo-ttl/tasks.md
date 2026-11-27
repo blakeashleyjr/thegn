@@ -1,0 +1,3 @@
+- [x] 1.1 Share repository-wide open-PR feed polling by root checkout and configured interval.
+- [x] 1.2 Add a unit test proving multiple worktrees share one poll per interval.
+- [x] 1.3 Update forge behavior specification and PR panel help.

@@ -129,6 +129,22 @@ sampled repositories without an origin.
 - **THEN** cleanup still requires a definitive targeted state lookup and
   matching target checkout scope before and after that lookup
 
+### Requirement: Repository-wide open-PR polling is shared across worktrees
+
+The UI SHALL refresh the root checkout's repository-wide open-PR list no more
+often than `[watch].pr_interval_secs` for one repository, regardless of how
+many of its worktrees are focused during that interval. The cache key and poll
+gate SHALL use the root checkout. A focused worktree MAY trigger the refresh;
+inactive worktrees and panel redraws SHALL NOT create additional polls.
+Branch-specific PR detail remains cached and refreshed per worktree.
+
+#### Scenario: Several worktrees share the open-PR poll window
+
+- **WHEN** several worktrees from one repository become focused within one
+  configured PR interval
+- **THEN** the repository-wide open-PR list is fetched once, and the next fetch
+  becomes eligible when the interval expires
+
 ### Requirement: Native open-PR pagination is bounded
 
 Native open-PR collection SHALL fetch at most three pages and 300 rows, reject

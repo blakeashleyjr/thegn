@@ -630,7 +630,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "First-party worker dictation adds embedded Whisper, rolling previews, pinned models and HTTP. THE-1510 parents THE-1511\u2013THE-1515; THE-148 owns reconciliation. Locked Linux native build, HTTP and synthetic worker evidence is in docs/voice-verification.md; real-platform latency, routing, permissions and release gates remain open."
+      "summary": "First-party worker dictation adds embedded Whisper, rolling previews, pinned models and HTTP. THE-1510 parents THE-1511–THE-1515; THE-148 owns reconciliation. Locked Linux native build, HTTP and synthetic worker evidence is in docs/voice-verification.md; real-platform latency, routing, permissions and release gates remain open."
     },
     {
       "change": "add-vps-providers",
@@ -1520,6 +1520,19 @@
         }
       ],
       "summary": "THE-2148 (WS11-P3-02) pins objects/info/alternates and http-alternates read-only under [sandbox.git] and probes the object store at launch (alternates, symlinks in objects/, an outside commondir): sealed and sealed-tunnel refuse, other profiles warn; remote build and tests remain unchecked."
+    },
+    {
+      "change": "poll-open-pr-feed-once-per-repo-ttl",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2775",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Share the repository-wide open-PR feed poll across focused worktrees for the configured PR interval.",
+      "delivered_at": "2026-11-27"
     },
     {
       "change": "preserve-config-validation-severity",

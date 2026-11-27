@@ -303,6 +303,10 @@ repo's other open PRs (`◈` = that branch already has a local worktree),
 so the section answers "what's open on this repo", not only "what's open
 on this branch".
 
+The open-PR list is shared by the repository's worktrees and refreshes at most
+once per `[watch].pr_interval_secs` while a worktree from that repository is
+focused. Branch-specific PR details keep their own worktree cache.
+
 OPEN PRS rows are selectable. Enter on one jumps to its worktree when
 available, or opens a read-only view of that PR; write actions are refused
 there. `w` creates or jumps to a worktree on that PR's head branch. `M`

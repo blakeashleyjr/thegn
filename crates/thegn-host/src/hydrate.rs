@@ -4693,6 +4693,10 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     let branch_waker = waker.clone();
     let branch_generation = generation.clone();
     let disk_cfg = cfg.disk.clone();
+    let poll_ttl_secs = cfg
+        .watch
+        .pr_interval_secs
+        .max(crate::hydrate_schedule::PR_FLOOR_SECS);
     crate::sched::spawn_bg_replaceable(move || {
         let outcome = pr_refresh_blocking_fenced(&cwd, &cfg, PrSite::Ui, generation.as_ref());
         // A fetched PR cache, or (yielded) the daemon's cache, surfaces via a
@@ -4705,7 +4709,13 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
-    spawn_pr_branch_feed(branch_cwd, branch_waker, branch_generation, disk_cfg);
+    spawn_pr_branch_feed(
+        branch_cwd,
+        branch_waker,
+        branch_generation,
+        disk_cfg,
+        poll_ttl_secs,
+    );
 }
 
 /// Where a PR refresh runs (THE-2210). Lane-local on purpose: the tracker's
@@ -5183,18 +5193,44 @@ mod pr_cas_tests {
     }
 }
 
-/// Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
-/// branch rows as PR badges and back the branches view's open-in-browser; it
-/// also runs the on-merge auto-clean, the `pr_linked` producer and (via
-/// [`mentions_poll`]) the mentions producer. The forge ladder (native HTTP →
-/// gh CLI) is a blocking seam, so it runs on its own blocking thread — neither
-/// the subprocess fallback nor the HTTP wait can ever touch the event loop.
-/// UI-only: the daemon does not poll the open-PR list (THE-2210).
+struct RepoPrBranchPolls(std::sync::Mutex<std::collections::HashMap<String, i64>>);
+
+impl RepoPrBranchPolls {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn claim(&self, repo_root: &str, now: i64, ttl_secs: u64) -> bool {
+        let mut polls = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        polls.retain(|_, last| pr_branch_feed_fresh(*last, now, ttl_secs));
+        if polls
+            .get(repo_root)
+            .is_some_and(|last| pr_branch_feed_fresh(*last, now, ttl_secs))
+        {
+            return false;
+        }
+        polls.insert(repo_root.to_owned(), now);
+        true
+    }
+}
+
+static PR_BRANCH_FEED_POLLS: RepoPrBranchPolls = RepoPrBranchPolls::new();
+
+fn pr_branch_feed_fresh(fetched_at: i64, now: i64, ttl_secs: u64) -> bool {
+    now.saturating_sub(fetched_at) < thegn_core::time_policy::saturating_i64(u128::from(ttl_secs))
+}
+
+/// Sibling feed: repo-wide open-PR headers join onto branch rows as badges
+/// and back the branches view's open-in-browser. It also runs on-merge
+/// auto-clean, the `pr_linked` producer and the mentions producer. The forge
+/// ladder is a blocking seam, so it runs on a background worker. UI-only: the
+/// daemon does not poll the open-PR list (THE-2210).
 fn spawn_pr_branch_feed(
     branch_cwd: std::path::PathBuf,
     branch_waker: Option<TerminalWaker>,
     branch_generation: Option<crate::hydrate_schedule::ScheduleFence>,
     disk_cfg: thegn_core::config::DiskConfig,
+    poll_ttl_secs: u64,
 ) {
     crate::sched::spawn_bg_replaceable(move || {
         if branch_generation
@@ -5216,6 +5252,23 @@ fn spawn_pr_branch_feed(
         let loc = thegn_core::remote::GitLoc::Local(root_path);
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
+        let Ok(db) = thegn_core::db::Db::open() else {
+            return;
+        };
+        let now = thegn_core::util::now();
+        let cached_at = db
+            .get_pr_branch_cache(&repo_root)
+            .ok()
+            .flatten()
+            .map(|(_, fetched_at)| fetched_at);
+        if cached_at.is_some_and(|fetched_at| pr_branch_feed_fresh(fetched_at, now, poll_ttl_secs))
+            || !PR_BRANCH_FEED_POLLS.claim(&repo_root, now, poll_ttl_secs)
+        {
+            mentions_poll(&db, &repo_root, &loc, forge, PrSite::Ui, || {
+                load_hydration_config().notifications.github_mentions
+            });
+            return;
+        }
         let origin_before = thegn_core::forge::model::repo_identity_from_remote_url(
             &loc.origin_url().unwrap_or_default(),
         );
@@ -5229,7 +5282,6 @@ fn spawn_pr_branch_feed(
             && origin_before.is_some()
             && origin_before == origin_after
             && let Ok(json) = serde_json::to_string(&prs)
-            && let Ok(db) = thegn_core::db::Db::open()
         {
             // On-merge auto-clean (background worktrees only): a branch that had
             // an open PR last round but is gone from the open set now has
@@ -5329,6 +5381,34 @@ fn spawn_pr_branch_feed(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod pr_branch_feed_poll_tests {
+    use super::RepoPrBranchPolls;
+
+    #[test]
+    fn worktrees_in_one_repo_share_the_repo_poll_ttl() {
+        let polls = RepoPrBranchPolls::new();
+        let repo_root = "/repo/root";
+        let worktrees = ["/repo/root", "/repo/wt-a", "/repo/wt-b", "/repo/wt-c"];
+        let first = worktrees
+            .iter()
+            .filter(|_| polls.claim(repo_root, 100, 30))
+            .count();
+        let within_ttl = worktrees
+            .iter()
+            .filter(|_| polls.claim(repo_root, 129, 30))
+            .count();
+        let after_ttl = worktrees
+            .iter()
+            .filter(|_| polls.claim(repo_root, 130, 30))
+            .count();
+
+        assert_eq!(first, 1);
+        assert_eq!(within_ttl, 0);
+        assert_eq!(after_ttl, 1);
+    }
 }
 
 /// One mentions poll of `repo_root` from the daemon (THE-2210): the same
