@@ -814,7 +814,6 @@
       "changes": [
         "sidebar-finished-pipelines-age-out"
       ]
-<<<<<<< HEAD
     },
     {
       "issue": "THE-2769",
@@ -822,10 +821,6 @@
       "changes": [
         "agent-account-failover"
       ]
-    }
-||||||| 4b3669b23c
-    }
-=======
     },
     {
       "issue": "THE-2773",
@@ -834,6 +829,5 @@
         "bound-idle-worktree-refresh"
       ]
     }
->>>>>>> tg/b314-the-2773
   ]
 }
