@@ -219,6 +219,7 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: Some(&active),
+            busy_paths: &std::collections::HashSet::new(),
             active_print_unchanged: false,
             gate_remote_scans: true,
             now,
@@ -3147,6 +3148,7 @@ fn an_idle_tick_with_no_event_rescans_nothing() {
             &no_locations,
             GlyphPartitionConfig {
                 active_path: None,
+                busy_paths: &std::collections::HashSet::new(),
                 active_print_unchanged: false,
                 gate_remote_scans: false,
                 now: started + elapsed,
@@ -3194,6 +3196,7 @@ fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: None,
+            busy_paths: &no_changes,
             active_print_unchanged: false,
             gate_remote_scans: false,
             now,
@@ -3215,6 +3218,7 @@ fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
         &may_scan,
         GlyphPartitionConfig {
             active_path: None,
+            busy_paths: &no_changes,
             active_print_unchanged: false,
             gate_remote_scans: false,
             now,
@@ -3225,6 +3229,50 @@ fn partition_scans_only_rows_with_a_changed_fingerprint_before_safety() {
         },
     );
     assert_eq!(to_scan, vec![paths[7].clone()]);
+}
+
+#[test]
+fn offscreen_idle_waits_for_safety_while_visible_rows_keep_the_busy_cadence() {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+    let quiet = "/worktrees/offscreen-idle".to_string();
+    let visible = "/worktrees/visible".to_string();
+    let paths = vec![quiet.clone(), visible.clone()];
+    let cached_at = now - Duration::from_secs(60);
+    let row = glyph_row(true, 0, 0, Some("main"), "/repo", 0, 0, None);
+    let cache = HashMap::from([
+        (quiet.clone(), (row.clone(), cached_at)),
+        (visible.clone(), (row, cached_at)),
+    ]);
+    let busy_paths = HashSet::from([visible.clone()]);
+    let ttls = crate::hydrate_tuning::glyph_ttls_from(
+        None,
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+    let (to_scan, reused, _) = partition_glyph_paths(
+        &paths,
+        &cache,
+        &HashMap::new(),
+        GlyphPartitionConfig {
+            active_path: None,
+            busy_paths: &busy_paths,
+            active_print_unchanged: false,
+            gate_remote_scans: false,
+            now,
+            ttls: &ttls,
+            since_active: &HashMap::new(),
+            fingerprint_changed: &HashSet::new(),
+            since_ref_move: None,
+        },
+    );
+
+    assert_eq!(to_scan, vec![visible]);
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0].0, quiet);
 }
 
 #[test]
@@ -3348,6 +3396,7 @@ fn idle_glyph_partition(
         &HashMap::new(),
         GlyphPartitionConfig {
             active_path: Some(&active),
+            busy_paths: &HashSet::new(),
             active_print_unchanged,
             gate_remote_scans: false,
             now,
@@ -3412,6 +3461,7 @@ fn idle_glyph_unchanged_flag_never_affects_background_rows() {
             &HashMap::new(),
             GlyphPartitionConfig {
                 active_path: Some(&active),
+                busy_paths: &HashSet::new(),
                 active_print_unchanged,
                 gate_remote_scans: false,
                 now,

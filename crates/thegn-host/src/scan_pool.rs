@@ -84,6 +84,9 @@ impl ScanPool {
         use thegn_svc::git::{ReadPriority, with_read_priority};
 
         let n = jobs.len();
+        if n == 0 {
+            return Vec::new();
+        }
         let (tx, rx) = mpsc::channel::<(usize, Option<R>)>();
         for (i, (urgent, job)) in jobs.into_iter().enumerate() {
             let tx = tx.clone();

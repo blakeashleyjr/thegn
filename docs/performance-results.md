@@ -34,3 +34,24 @@ with `--allow-version-drift`, and refuses to skip a missing tool.
 No results are recorded yet: the harness was added without a run on the target
 machines. Add one subsection per run (date, OS, CPU, terminal, git sha, tool
 versions, table) below this line.
+
+## Published release claim runs (THE-2660 / THE-2617)
+
+Run `test/perf/claim-run.sh BINARY OUTDIR` with an already-built release binary
+from a published archive. The script does not build the binary. It measures
+cold and warm first-frame launch with 30 Hyperfine runs each, idle cores and
+host/daemon RSS at 1, 8 and 32 worktrees, and switch/input latency under the
+`perf-flood` workload. It writes the Hyperfine exports, harness JSON and logs,
+`manifest.json`, and a paste-ready `summary.md` into `OUTDIR`. Keep every run;
+do not select only the fastest result.
+
+Histogram latency values are lower bucket edges, not exact elapsed times. The
+flood summary reports the worst per-rollup p50/p95/p99 and the total observed
+sample counts. A percentile with fewer than 100 samples is reported as
+**insufficient samples**. Do not use a bucket edge as a precise microsecond
+measurement or compare it as exact time.
+
+| Platform     | Cold launch         | Warm launch         | Idle cores (1 / 8 / 32) | Host / daemon RSS (1 / 8 / 32) | Flood switch / input p50, p95, p99 | Status              |
+| ------------ | ------------------- | ------------------- | ----------------------- | ------------------------------ | ---------------------------------- | ------------------- |
+| Linux x86_64 | pending measurement | pending measurement | pending measurement     | pending measurement            | pending measurement                | pending measurement |
+| macOS arm64  | pending measurement | pending measurement | pending measurement     | pending measurement            | pending measurement                | pending measurement |

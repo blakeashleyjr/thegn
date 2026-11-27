@@ -153,6 +153,7 @@ pub(crate) fn should_rescan_glyphs(cached_age: Option<Duration>, window: Duratio
 /// bridge lookups are resolved before the shared cache lock is acquired.
 struct GlyphPartitionConfig<'a> {
     active_path: Option<&'a str>,
+    busy_paths: &'a std::collections::HashSet<String>,
     active_print_unchanged: bool,
     gate_remote_scans: bool,
     now: Instant,
@@ -212,7 +213,8 @@ fn partition_glyph_paths(
                 config.ttls.tick,
             )
         });
-        let window = glyph_window(is_active, touched, std::path::Path::new(p), config.ttls);
+        let busy = touched || config.busy_paths.contains(p);
+        let window = glyph_window(is_active, busy, std::path::Path::new(p), config.ttls);
         let window = crate::hydrate_tuning::fingerprint_adjusted_window(
             config.fingerprint_changed.contains(p),
             window,
@@ -1978,23 +1980,49 @@ fn collect_sidebar_status(
     // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
     // full `git status` scan (50-150ms), so scanning every worktree every Model
     // tick was the dominant hydration cost (cpu_hydrate scaled with worktree
-    // count). Tier it: the *active* worktree always rescans (and its diff
-    // fs-watcher forces immediate refreshes), while background worktrees reuse a
-    // cached glyph row until it goes stale. The remaining scans still fan out
-    // across scoped threads; DB-keyed inserts (agent, PR counts) stay on this
-    // thread since `Db` isn't `Send`.
+    // count). Busy rows use a shorter refresh window; other registered rows use
+    // the quiet safety TTL. The remaining scans fan out through the bounded
+    // pool; DB-keyed inserts (agent, PR counts) stay on this thread since `Db`
+    // isn't `Send`.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
     let mut seen = std::collections::HashSet::new();
-    let paths: Vec<String> = session
-        .worktrees
+    let paths: Vec<String> = db_worktrees
         .iter()
-        .filter(|g| !g.path.is_empty())
-        .map(|g| g.path.clone())
+        .map(|wt| wt.worktree.clone())
+        .chain(
+            session
+                .worktrees
+                .iter()
+                .filter(|g| !g.path.is_empty())
+                .map(|g| g.path.clone()),
+        )
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
-        .filter(|p| {
-            crate::hydrate_tuning::include_glyph_path(p, active_path.as_deref(), &since_active)
-        })
         .collect();
+    // Visible session rows, recent activity, live panes (including parked
+    // workspaces), and real agents use the busy window. Other registered rows
+    // remain eligible on the quiet safety cadence.
+    let mut busy_glyph_paths: std::collections::HashSet<String> = paths
+        .iter()
+        .filter(|path| {
+            crate::hydrate_tuning::include_glyph_path(path, active_path.as_deref(), &since_active)
+        })
+        .cloned()
+        .collect();
+    busy_glyph_paths.extend(
+        session
+            .worktrees
+            .iter()
+            .filter(|group| !group.path.is_empty())
+            .map(|group| group.path.clone()),
+    );
+    busy_glyph_paths.extend(
+        activity_agents
+            .iter()
+            .filter(|(_, is_agent)| **is_agent)
+            .map(|(path, _)| path.clone()),
+    );
+    busy_glyph_paths.extend(crate::agent_output::snapshot_live_agents());
+    busy_glyph_paths.extend(crate::agent_output::snapshot_live_pane_worktrees());
     // All registered worktree paths (every workspace) PLUS every known repo
     // root: the retain + seed passes below use them to keep/serve other
     // workspaces' glyphs across a switch. Repo roots matter because a dormant
@@ -2078,6 +2106,7 @@ fn collect_sidebar_status(
             &may_live_scan,
             GlyphPartitionConfig {
                 active_path: active_path.as_deref(),
+                busy_paths: &busy_glyph_paths,
                 active_print_unchanged,
                 gate_remote_scans,
                 now,
@@ -2219,6 +2248,7 @@ fn collect_sidebar_status(
     }
 
     let scanned_n = scanned.len();
+    let reused_n = reused.len();
     let git_rows = scanned
         .into_iter()
         // Keep first-scan degraded rows only when dirty and submodule status
@@ -2347,9 +2377,9 @@ fn collect_sidebar_status(
     tracing::debug!(
         target: "thegn::hydrate",
         status_ms = t0.elapsed().as_millis() as u64,
-        worktrees = paths.len(),
+        considered = paths.len(),
+        reused = reused_n,
         scanned = scanned_n,
-        cached = paths.len().saturating_sub(scanned_n),
         "sidebar status collected"
     );
     status

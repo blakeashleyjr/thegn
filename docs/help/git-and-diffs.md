@@ -257,9 +257,12 @@ for that repository's checked-out worktrees; their status and diff counts are
 left alone when the row can be patched (a detached or unmatched checkout is
 rescanned instead).
 
-Live sidebar git status is refreshed for the focused worktree and worktrees
-active in the last fifteen minutes. Older rows keep their last-known status
-until focused again, which keeps large worktree registries quiet while idle.
+Live sidebar git status uses a 30-second default busy cadence for visible,
+recently touched, pane-bearing, or agent-bearing worktrees. Other registered
+rows keep their last-known status until the quiet safety TTL expires. Set
+`THEGN_BG_MODEL_REFRESH_MS` to override the busy interval (`0` scans every
+background row each pass); `THEGN_BG_SAFETY_GLYPH_TTL_MS` overrides the quiet
+TTL, which defaults to ten minutes.
 
 ## Rollback
 
