@@ -568,7 +568,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         cfg,
         &client,
         crate::cmd::session::PlainOpen {
-            agent: Some(agent),
+            agent: Some(agent.clone()),
             backend: backend.clone(),
             stage: None,
             worktree: Some(worktree.clone()),

@@ -153,10 +153,7 @@ pub fn backend_headroom(
     accounts: &[AccountUsage],
 ) -> BackendHeadroom {
     let harness = backend.harness.trim();
-    let account_identity = backend
-        .account
-        .as_deref()
-        .map(|identity| crate::util::expand_tilde(identity));
+    let account_identity = backend.account.as_deref().map(crate::util::expand_tilde);
     let matched: Vec<_> = accounts
         .iter()
         .filter(|account| {

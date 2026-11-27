@@ -279,7 +279,7 @@ mod tests {
             worktrees: vec![],
             active: 0,
         };
-        let facts = super::setup::Facts {
+        let facts = crate::lead::setup::Facts {
             dev_channel: true,
             file_preview: true,
             agents: vec![],
@@ -309,7 +309,7 @@ mod tests {
             worktrees: vec![crate::session::WorktreeGroup::terminal("lead")],
             active: 0,
         };
-        let facts = super::setup::Facts {
+        let facts = crate::lead::setup::Facts {
             dev_channel: true,
             file_preview: true,
             agents: vec![],

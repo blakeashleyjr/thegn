@@ -970,6 +970,7 @@ async fn fetch_state(
                 &c,
                 super::session::PlainOpen {
                     agent: Some(agent.to_string()),
+                    backend: None,
                     stage: stage.map(str::to_string),
                     worktree: Some(worktree.to_string()),
                     prompt: prompt.to_string(),

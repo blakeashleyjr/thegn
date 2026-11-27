@@ -25,7 +25,12 @@ fn panel_error_keeps_its_last_visible_line_above_the_retry_hint() {
         ..FrameModel::default()
     };
 
-    draw_panel(&mut surface, rect, &model, &PanelUi::default());
+    draw_panel(
+        &mut surface,
+        rect,
+        &model,
+        &crate::panel::PanelUi::default(),
+    );
 
     let painted = lines(&surface);
     assert!(painted[3].contains("lines"));
@@ -2894,7 +2899,7 @@ fn panel_renders_accordion_sections_and_open_content() {
     // Help hints moved to the bottom bar: section mode offers the open
     // affordance (Enter to drill into rows), row mode the section's actions.
     assert!(
-        panel_help_pairs(&PanelUi::default())
+        panel_help_pairs(&crate::panel::PanelUi::default())
             .iter()
             .any(|(_, l)| l == "open")
     );
@@ -2952,7 +2957,7 @@ fn panel_renders_accordion_sections_and_open_content() {
             rows: 0,
         },
         &model,
-        &PanelUi::default(),
+        &crate::panel::PanelUi::default(),
     );
 }
 
@@ -2973,7 +2978,7 @@ fn focused_panel_reveals_navigation_footer_from_live_keyhints() {
         ("j/k".to_string(), "row".to_string()),
     ];
     let mut s = Surface::new(44, 30);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(text.contains("NAVIGATE"), "footer title missing: {text:?}");
     assert!(
@@ -2996,7 +3001,7 @@ fn unfocused_panel_hides_navigation_footer() {
     model.panel_focused = false;
     model.keyhints = vec![("↵".to_string(), "open".to_string())];
     let mut s = Surface::new(44, 30);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(
         !text.contains("NAVIGATE"),
@@ -3018,7 +3023,7 @@ fn dense_panel_shows_no_navigation_footer() {
     let mut model = panel_model();
     model.keyhints = vec![("↵".to_string(), "open".to_string())];
     let mut s = Surface::new(44, 8);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(
         !text.contains("NAVIGATE"),
@@ -3048,7 +3053,7 @@ fn panel_shows_layout_keys_block_and_follows_a_rebind() {
     let mut model = layout_hint_model();
     model.chord_hints.insert("zoom".into(), "Ctrl-q".into());
     let mut s = Surface::new(44, 30);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(text.contains("LAYOUT KEYS"), "title missing: {text:?}");
     assert!(
@@ -3078,7 +3083,7 @@ fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
         ("Alt-n".to_string(), "new pane here".to_string()),
     ];
     let mut s = Surface::new(44, 40);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     let text = s.screen_chars_to_string();
     assert!(text.contains("PANE KEYS"), "title missing: {text:?}");
     assert!(text.contains("new pane here"), "pane key missing: {text:?}");
@@ -3090,7 +3095,7 @@ fn panel_shows_the_focused_panes_keys_below_content_and_skips_layout_dupes() {
 
     model.context_hints_off = true;
     let mut s = Surface::new(44, 40);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     assert!(!s.screen_chars_to_string().contains("PANE KEYS"));
 }
 
@@ -3178,7 +3183,7 @@ fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
         rows: 30,
     };
     let mut s = Surface::new(44, 30);
-    draw_panel(&mut s, rect, &model, &PanelUi::default());
+    draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
     assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
     // Enabled, but a rect the panel body fills leaves no room for it.
     let model = layout_hint_model();
@@ -3189,7 +3194,7 @@ fn panel_layout_keys_block_hides_when_disabled_or_cramped() {
         rows: 8,
     };
     let mut s = Surface::new(44, 8);
-    draw_panel(&mut s, tiny, &model, &PanelUi::default());
+    draw_panel(&mut s, tiny, &model, &crate::panel::PanelUi::default());
     assert!(!s.screen_chars_to_string().contains("LAYOUT KEYS"));
 }
 
@@ -3203,7 +3208,7 @@ fn panel_hits_expose_all_sections_at_distinct_rows() {
         rows: 30,
     };
     let model = panel_model();
-    let hits = panel_hits(&model, &PanelUi::default(), rect);
+    let hits = panel_hits(&model, &crate::panel::PanelUi::default(), rect);
     let section_rows: Vec<usize> = hits
         .iter()
         .filter(|(_, h)| matches!(h, PanelHit::OpenSection(_)))
