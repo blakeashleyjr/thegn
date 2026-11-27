@@ -2385,7 +2385,11 @@ pub fn draw_panel(
     if let Some(error) = &model.panel_error {
         let red = theme_color(&theme::RED);
         let wrapped = crate::detail::wrap_full_text(error, rect.cols.saturating_sub(4).max(1));
-        for (i, line) in wrapped.iter().take(rect.rows.saturating_sub(2)).enumerate() {
+        // Keep the final row for the retry instruction so it cannot overwrite
+        // the last visible line of a long panel error.
+        let error_rows = rect.rows.saturating_sub(2);
+        let shown = wrapped.len().min(error_rows);
+        for (i, line) in wrapped.iter().take(shown).enumerate() {
             draw_text(
                 surface,
                 rect.x + 2,
@@ -2400,7 +2404,7 @@ pub fn draw_panel(
         draw_text(
             surface,
             rect.x + 2,
-            rect.y + 1 + wrapped.len().min(rect.rows.saturating_sub(3)),
+            rect.y + 1 + shown,
             hint,
             col(S::Dim),
             col(S::Panel),
