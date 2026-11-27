@@ -393,6 +393,12 @@ pub fn run(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
             );
+            if mq.gate_on
+                && !mq.gate_command.trim().is_empty()
+                && !integrate::gate_isolated(mq.gate_sandbox)
+            {
+                outln!("{}", integrate::UNTRUSTED_GATE_LABEL);
+            }
             if let Some(detail) = degraded {
                 thegn_core::msg::warn(&format!("{branch} landed, but {detail}"));
                 outln!("! {detail}");
@@ -440,10 +446,15 @@ pub fn run(
             // hand in the gate worktree just to learn which test broke — which
             // happened for THE-11, THE-19, THE-7, THE-22 and THE-51 in one drain.
             let failures = gate_failure_digest(&log);
+            let label = if integrate::gate_isolated(mq.gate_sandbox) {
+                String::new()
+            } else {
+                format!(" — {}", integrate::UNTRUSTED_GATE_LABEL)
+            };
             if failures.is_empty() {
-                anyhow::bail!("{branch} breaks the build (gate red); not landed.");
+                anyhow::bail!("{branch} breaks the build (gate red){label}; not landed.");
             }
-            anyhow::bail!("{branch} breaks the build (gate red); not landed:\n{failures}");
+            anyhow::bail!("{branch} breaks the build (gate red){label}; not landed:\n{failures}");
         }
         AttemptOutcome::GateError {
             reason,

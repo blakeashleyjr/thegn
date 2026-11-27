@@ -1053,7 +1053,10 @@ fn drive_queue_with(
             let fields = MergeStatusFields {
                 result_oid: Some(commit.to_owned()),
                 conflict_paths: None,
-                error_detail: None,
+                error_detail: (!integrate::gate_isolated(cfg.gate_sandbox)
+                    && cfg.gate_on
+                    && !cfg.gate_command.trim().is_empty())
+                .then(|| integrate::UNTRUSTED_GATE_LABEL.to_owned()),
             };
             let result = if let Some(claim) = claim.borrow().as_ref() {
                 claim.write_landed(db, &fields, target_base_oid)
@@ -1242,8 +1245,16 @@ fn drive_queue_with(
                             lifecycle_notes.borrow_mut().push(note.text().to_owned());
                         }
                     }
-                    *landed_step.borrow_mut() =
-                        Some((fields, commit[..commit.len().min(12)].to_owned()));
+                    let detail = if fields.error_detail.is_some() {
+                        format!(
+                            "{} — {}",
+                            &commit[..commit.len().min(12)],
+                            integrate::UNTRUSTED_GATE_LABEL
+                        )
+                    } else {
+                        commit[..commit.len().min(12)].to_owned()
+                    };
+                    *landed_step.borrow_mut() = Some((fields, detail));
                     out.landed.push(item.branch.clone());
                     break;
                 }
@@ -1256,19 +1267,25 @@ fn drive_queue_with(
                     break;
                 }
                 AttemptOutcome::Ready { tip } => {
-                    let fields = set(
-                        db,
-                        MqStatus::Ready,
-                        Some(&tip),
-                        Some("gated green — awaiting land"),
-                    );
+                    let detail = if cfg.gate_on
+                        && !cfg.gate_command.trim().is_empty()
+                        && !integrate::gate_isolated(cfg.gate_sandbox)
+                    {
+                        format!(
+                            "gated green — awaiting land\n{}",
+                            integrate::UNTRUSTED_GATE_LABEL
+                        )
+                    } else {
+                        "gated green — awaiting land".to_owned()
+                    };
+                    let fields = set(db, MqStatus::Ready, Some(&tip), Some(&detail));
                     stop_on_write_error!('attempt);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: MqStatus::Ready.as_str(),
-                        detail: "gated green — awaiting land",
+                        detail: &detail,
                     });
                     out.ready.push(item.branch.clone());
                     break;
@@ -1638,15 +1655,25 @@ fn drive_queue_with(
                     // Persist the actual gate output, not a fixed two-word
                     // string: "breaks build" told the user nothing about WHY,
                     // and the log was otherwise discarded entirely.
-                    let detail = detail_with_log("breaks build", &log);
+                    let headline = if integrate::gate_isolated(cfg.gate_sandbox) {
+                        "breaks build".to_owned()
+                    } else {
+                        format!("breaks build — {}", integrate::UNTRUSTED_GATE_LABEL)
+                    };
+                    let detail = detail_with_log(&headline, &log);
                     let fields = set(db, status, None, Some(&detail));
                     stop_on_write_error!('attempt);
+                    let progress_detail = if integrate::gate_isolated(cfg.gate_sandbox) {
+                        tail_line(&log)
+                    } else {
+                        format!("{} — {}", tail_line(&log), integrate::UNTRUSTED_GATE_LABEL)
+                    };
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: status.as_str(),
-                        detail: &tail_line(&log),
+                        detail: &progress_detail,
                     });
                     if agent_runs > 0 {
                         out.needs_human.push(item.branch.clone());

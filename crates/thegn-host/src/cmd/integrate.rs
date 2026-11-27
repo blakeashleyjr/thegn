@@ -366,11 +366,23 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         );
     }
     match &report.gate {
-        GateOutcome::Passed => outln!("Gate passed."),
-        GateOutcome::Failed { offender } => match offender {
-            Some(b) => outln!("Gate failed — isolated {b}; {target} not advanced by this fold."),
-            None => outln!("Gate failed — {target} not advanced by this fold."),
-        },
+        GateOutcome::Passed => {
+            outln!("Gate passed.");
+            if !integrate::gate_isolated(mq.gate_sandbox) {
+                outln!("{}", integrate::UNTRUSTED_GATE_LABEL);
+            }
+        }
+        GateOutcome::Failed { offender } => {
+            match offender {
+                Some(b) => {
+                    outln!("Gate failed — isolated {b}; {target} not advanced by this fold.")
+                }
+                None => outln!("Gate failed — {target} not advanced by this fold."),
+            }
+            if !integrate::gate_isolated(mq.gate_sandbox) {
+                outln!("{}", integrate::UNTRUSTED_GATE_LABEL);
+            }
+        }
         GateOutcome::Errored {
             reason,
             phase,

@@ -275,7 +275,6 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
             }
         }
     }
-
     out.extend(list_detail(
         Section::MergeQueue,
         &list_rows,

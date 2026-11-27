@@ -1309,6 +1309,17 @@ pub enum GateOutcome {
     },
 }
 
+/// The presentation label for a gate result produced by the host runner.
+pub(crate) const UNTRUSTED_GATE_LABEL: &str = "untrusted: ran on host, not isolated";
+
+pub(crate) fn gate_isolated(sandbox: thegn_core::config::GateSandbox) -> bool {
+    sandbox == thegn_core::config::GateSandbox::Sealed
+}
+
+pub(crate) fn gate_result_label(sandbox: thegn_core::config::GateSandbox) -> Option<&'static str> {
+    (!gate_isolated(sandbox)).then_some(UNTRUSTED_GATE_LABEL)
+}
+
 /// A branch that landed in this fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandedReport {
@@ -3377,6 +3388,18 @@ mod enqueue_guard_tests {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn host_gate_result_label_is_untrusted_and_sealed_gate_is_not() {
+        assert_eq!(
+            gate_result_label(thegn_core::config::GateSandbox::Off),
+            Some("untrusted: ran on host, not isolated")
+        );
+        assert_eq!(
+            gate_result_label(thegn_core::config::GateSandbox::Sealed),
+            None
+        );
+    }
 
     #[test]
     fn parse_merge_config_collects_driver_names_and_default() {

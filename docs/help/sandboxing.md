@@ -465,6 +465,10 @@ By default the merge queue's gate runs on the host. `[merge_queue] gate_sandbox
 `gate_setup_command`, `gate_command` and `regenerate_command` in the repo's
 sealed sandbox instead. Not yet verified live.
 
+By default, gate commands run on your machine with your permissions. A
+candidate branch's code therefore runs unsandboxed. To isolate it, set
+`[merge_queue] gate_sandbox = "sealed"`; this requires Podman or Docker.
+
 - **Writable:** the gate checkout and its target dir, nothing else. A
   configured `gate_target_dir` is ignored.
 - **Read-only:** the repo's git common dir and the profile's own mounts.

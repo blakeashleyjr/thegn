@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Host-run merge gate results are labeled as untrusted; sealed gate results remain unlabeled.
+
 ## [0.1.0-alpha.142] — 2026-11-27
 
 Idle hosts use much less CPU across many worktrees.

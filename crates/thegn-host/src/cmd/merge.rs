@@ -1220,7 +1220,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             if json {
                 let mut out = merge_driver::DriveOutcome::default();
                 out.warnings.push(warning);
-                super::emit_json(&drain_json(&target, &out))?;
+                super::emit_json(&drain_json(&target, &out, None))?;
             } else {
                 outln!("Warning: {warning}");
                 outln!("Nothing to drain.");
@@ -1228,7 +1228,11 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             anyhow::bail!("merge drain completed with pipeline worktree refusals");
         }
         if json {
-            return super::emit_json(&drain_json(&target, &merge_driver::DriveOutcome::default()));
+            return super::emit_json(&drain_json(
+                &target,
+                &merge_driver::DriveOutcome::default(),
+                None,
+            ));
         }
         outln!("Nothing to drain.");
         return Ok(());
@@ -1347,7 +1351,16 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     }
 
     if json {
-        let mut doc = drain_json(&target, &out);
+        // `deferred` also includes conflicts and unreachable worktrees, while
+        // `gate_error` means the gate never produced a verdict. Only mark
+        // isolation when this drain actually has a gate result.
+        let isolated = gate_result_isolated(
+            mq.gate_on,
+            &mq.gate_command,
+            mq.gate_sandbox,
+            &out,
+        );
+        let mut doc = drain_json(&target, &out, isolated);
         if push_mode {
             doc["pushed"] = serde_json::json!(pushed);
         }
@@ -1412,9 +1425,14 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
 
 /// The `drain --json` document. One shape for every exit path, including the
 /// empty queue — scripts must not have to special-case the common no-op.
-fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Value {
+fn drain_json(
+    target: &str,
+    out: &merge_driver::DriveOutcome,
+    isolated: Option<bool>,
+) -> serde_json::Value {
     serde_json::json!({
         "target": target,
+        "isolated": isolated,
         "landed": out.landed,
         "ready": out.ready,
         "deferred": out.deferred,
@@ -1469,6 +1487,20 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
     })
 }
 
+fn gate_result_isolated(
+    gate_on: bool,
+    gate_command: &str,
+    gate_sandbox: thegn_core::config::GateSandbox,
+    out: &merge_driver::DriveOutcome,
+) -> Option<bool> {
+    let gate_configured = gate_on && !gate_command.trim().is_empty();
+    let gate_result = gate_configured
+        && (!out.ready.is_empty()
+            || out.gate_verdicts.iter().any(|verdict| verdict.verdict == "failed")
+            || !out.landed.is_empty());
+    gate_result.then_some(integrate::gate_isolated(gate_sandbox))
+}
+
 /// First line of a multi-line status detail (the rest is the retained gate log).
 fn first_line(detail: &str) -> &str {
     detail.lines().next().unwrap_or(detail)
@@ -1501,6 +1533,10 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
     let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
+    let mq = cfg.repo_merge_queue(&root);
+    let gate_untrusted = mq.gate_on
+        && !mq.gate_command.trim().is_empty()
+        && !integrate::gate_isolated(mq.gate_sandbox);
     let guard_db = Db::open().context("remote-target guard database unavailable")?;
     if let Some(msg) = crate::merge_ops::remote_target_guard(&guard_db, &root)? {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
@@ -1567,7 +1603,15 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
                 &branch,
                 &commit,
             );
-            outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
+            outln!(
+                "✓ landed {branch} → {}{}",
+                &commit[..commit.len().min(12)],
+                if gate_untrusted {
+                    format!(" — {}", integrate::UNTRUSTED_GATE_LABEL)
+                } else {
+                    String::new()
+                }
+            );
             integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate { commit } => {
@@ -1608,7 +1652,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
         AttemptOutcome::GateFailed { .. } => {
             lifecycle(LifecycleEvent::Failed);
-            outln!("✗ {branch} breaks the build (gate red).");
+            outln!(
+                "✗ {branch} breaks the build (gate red){}.",
+                if gate_untrusted {
+                    format!(" — {}", integrate::UNTRUSTED_GATE_LABEL)
+                } else {
+                    String::new()
+                }
+            );
             failure = Some(format!("land failed: {branch} gate red"));
         }
         AttemptOutcome::GateError { reason, log, .. } => {
@@ -1827,7 +1878,7 @@ mod progress_tests {
 
 #[cfg(test)]
 mod gate_verdict_tests {
-    use super::drain_json;
+    use super::{drain_json, gate_result_isolated, integrate, progress_line, MqStatus};
     use crate::merge_driver::{DriveOutcome, GateVerdictReport};
 
     #[test]
@@ -1843,12 +1894,78 @@ mod gate_verdict_tests {
             }],
             ..Default::default()
         };
-        let json = drain_json("main", &outcome);
+        let json = drain_json("main", &outcome, None);
         assert_eq!(json["gate_error"][0], "feature");
         assert_eq!(json["gate_verdicts"][0]["branch"], "feature");
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
         assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
         assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
+    }
+
+    #[test]
+    fn host_gate_result_is_labeled_in_cli_and_json_but_sealed_is_not() {
+        let host = DriveOutcome {
+            ready: vec!["feature".into()],
+            ..Default::default()
+        };
+        let host_detail = format!(
+            "gated green — awaiting land\n{}",
+            integrate::UNTRUSTED_GATE_LABEL
+        );
+        assert!(
+            progress_line(MqStatus::Ready, "feature", &host_detail)
+                .unwrap()
+                .contains(integrate::UNTRUSTED_GATE_LABEL)
+        );
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &host,
+        );
+        assert_eq!(drain_json("main", &host, isolated)["isolated"], false);
+
+        let sealed_detail = "gated green — awaiting land";
+        assert!(
+            !progress_line(MqStatus::Ready, "feature", sealed_detail)
+                .unwrap()
+                .contains(integrate::UNTRUSTED_GATE_LABEL)
+        );
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Sealed,
+            &host,
+        );
+        assert_eq!(drain_json("main", &host, isolated)["isolated"], true);
+    }
+
+    #[test]
+    fn no_gate_verdict_does_not_claim_host_isolation() {
+        let outcome = DriveOutcome {
+            gate_error: vec!["feature".into()],
+            deferred: vec!["unreachable".into()],
+            ..Default::default()
+        };
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &outcome,
+        );
+        assert!(drain_json("main", &outcome, isolated)["isolated"].is_null());
+
+        let ungated = DriveOutcome {
+            ready: vec!["feature".into()],
+            ..Default::default()
+        };
+        assert!(gate_result_isolated(
+            false,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &ungated,
+        )
+        .is_none());
     }
 }
 
@@ -1944,6 +2061,24 @@ mod list_claim_tests {
             claim_json(Some(&claim_view("unclaimed", Some(200))), 100),
             None
         );
+    }
+
+    #[test]
+    fn merge_queue_json_marks_host_gate_results_untrusted() {
+        let mut host = row();
+        host.error_detail = Some(crate::integrate::UNTRUSTED_GATE_LABEL.to_owned());
+        let host_json = serde_json::to_value(host).unwrap();
+        assert_eq!(host_json["isolated"], false);
+        assert!(
+            host_json["error_detail"]
+                .as_str()
+                .unwrap()
+                .contains(crate::integrate::UNTRUSTED_GATE_LABEL)
+        );
+
+        let sealed_json = serde_json::to_value(row()).unwrap();
+        assert!(sealed_json["isolated"].is_null());
+        assert!(sealed_json["error_detail"].is_null());
     }
 
     #[test]
