@@ -980,7 +980,10 @@ pub struct PerfSnapshot {
     pub input_p95_us: u64,
     /// Switch→first-frame latency percentiles (0 when no switch happened).
     /// Tab/worktree switches only; workspace switches are `switch_ws_*`.
+    pub switch_samples: u64,
     pub switch_p50_us: u64,
+    /// Bucket lower edge; read with `switch_samples`.
+    pub switch_p95_us: u64,
     pub switch_p99_us: u64,
     /// Workspace-switch→first-frame latency percentiles.
     pub switch_ws_p50_us: u64,
@@ -1086,7 +1089,9 @@ impl LoopPerf {
             input_p50_us: self.input_us.percentile_us(0.50),
             input_p99_us: self.input_us.percentile_us(0.99),
             input_p95_us: self.input_us.percentile_us(0.95),
+            switch_samples: self.switch_us.count(),
             switch_p50_us: self.switch_us.percentile_us(0.50),
+            switch_p95_us: self.switch_us.percentile_us(0.95),
             switch_p99_us: self.switch_us.percentile_us(0.99),
             switch_ws_p50_us: self.switch_ws_us.percentile_us(0.50),
             switch_ws_p99_us: self.switch_ws_us.percentile_us(0.99),
@@ -1172,7 +1177,9 @@ impl LoopPerf {
             input_p50_us = snap.input_p50_us,
             input_p99_us = snap.input_p99_us,
             input_p95_us = snap.input_p95_us,
+            switch_samples = snap.switch_samples,
             switch_p50_us = snap.switch_p50_us,
+            switch_p95_us = snap.switch_p95_us,
             switch_p99_us = snap.switch_p99_us,
             switch_ws_p50_us = snap.switch_ws_p50_us,
             switch_ws_p99_us = snap.switch_ws_p99_us,
@@ -1717,6 +1724,10 @@ mod tests {
         );
         assert_eq!(lp.switch_us.percentile_us(1.0), one);
         assert_eq!(lp.renders, 2);
+        let expected_p95 = lp.switch_us.percentile_us(0.95);
+        let snapshot = lp.rollup(Instant::now(), 0, 0, 0);
+        assert_eq!(snapshot.switch_samples, 1);
+        assert_eq!(snapshot.switch_p95_us, expected_p95);
         set_enabled(false);
     }
 
