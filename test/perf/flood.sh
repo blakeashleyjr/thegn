@@ -407,9 +407,12 @@ ROLLUPS="$(grep -c 'perf rollup' "$LOG" || true)"
   exit 1
 }
 SWITCH_P50="$(extract switch_p50_us)"
+SWITCH_P95="$(extract switch_p95_us)"
 SWITCH_P99="$(extract switch_p99_us)"
 SWITCH_P99_ALL="$(extract_p99 switch_p99_us)"
+SWITCH_SAMPLES_TOTAL="$(sum_field switch_samples)"
 INPUT_P50="$(extract input_p50_us)"
+INPUT_P95="$(extract input_p95_us)"
 INPUT_P99="$(extract input_p99_us)"
 INPUT_P99_ALL="$(extract_p99 input_p99_us)"
 INPUT_SAMPLES_TOTAL="$(sum_field input_samples)"
@@ -475,14 +478,14 @@ if [ "$MODE" = many-panes ]; then
   DESC="$DESC panes=$PANES"
 fi
 
-RESULT="{\"scenario\":\"flood\",\"mode\":\"$MODE\",\"build\":\"$BUILD\",\"panes\":$PANES_JSON,\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"tab_switches\":$TAB_SWITCHES,\"cat_bytes\":$BIG_BYTES,\"quiet_markers\":$MARKERS,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"switch_p99_all_us\":${SWITCH_P99_ALL:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p99_us\":${INPUT_P99:-0},\"input_p99_all_us\":${INPUT_P99_ALL:-0},\"input_samples_total\":${INPUT_SAMPLES_TOTAL:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"pty_bytes_total\":${PTY_BYTES_TOTAL:-0},\"quiet_ok\":$QUIET_OK,\"echo_ok\":$ECHO_OK,\"budget_ok\":$BUDGET_OK,\"input_budget_us\":$INPUT_BUDGET_US,\"switch_budget_us\":$SWITCH_BUDGET_US,\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
+RESULT="{\"scenario\":\"flood\",\"mode\":\"$MODE\",\"build\":\"$BUILD\",\"panes\":$PANES_JSON,\"worktrees\":$WORKTREES,\"floods\":$FLOODS,\"switches\":$SWITCHES,\"tab_switches\":$TAB_SWITCHES,\"cat_bytes\":$BIG_BYTES,\"quiet_markers\":$MARKERS,\"switch_p50_us\":${SWITCH_P50:-0},\"switch_p95_us\":${SWITCH_P95:-0},\"switch_p99_us\":${SWITCH_P99:-0},\"switch_p99_all_us\":${SWITCH_P99_ALL:-0},\"switch_samples_total\":${SWITCH_SAMPLES_TOTAL:-0},\"input_p50_us\":${INPUT_P50:-0},\"input_p95_us\":${INPUT_P95:-0},\"input_p99_us\":${INPUT_P99:-0},\"input_p99_all_us\":${INPUT_P99_ALL:-0},\"input_samples_total\":${INPUT_SAMPLES_TOTAL:-0},\"drain_p99_us\":${DRAIN_P99:-0},\"flush_p99_us\":${FLUSH_P99:-0},\"render_p99_us\":${RENDER_P99:-0},\"pty_bytes_per_s\":${PTY_BPS:-0},\"pty_bytes_total\":${PTY_BYTES_TOTAL:-0},\"quiet_ok\":$QUIET_OK,\"echo_ok\":$ECHO_OK,\"budget_ok\":$BUDGET_OK,\"input_budget_us\":$INPUT_BUDGET_US,\"switch_budget_us\":$SWITCH_BUDGET_US,\"rollups\":$ROLLUPS,\"git_sha\":\"$GIT_SHA\",\"host_tag\":\"$HOST_TAG\"}"
 
 if [ "$JSON_ONLY" = 1 ]; then
   printf '%s\n' "$RESULT"
 else
   echo "scenario=flood $DESC build=$BUILD worktrees=$WORKTREES floods=$FLOODS switches=$SWITCHES tab_switches=$TAB_SWITCHES (sha=$GIT_SHA host=$HOST_TAG)"
-  echo "  switch→frame (worktree+tab)  p50=${SWITCH_P50:-–}us  p99=${SWITCH_P99:-–}us (worst)  p99=${SWITCH_P99_ALL:-–}us (all rollups)"
-  echo "  input→frame   p50=${INPUT_P50:-–}us  p99=${INPUT_P99:-–}us (worst)  p99=${INPUT_P99_ALL:-–}us (all rollups)  samples=${INPUT_SAMPLES_TOTAL:-0}"
+  echo "  switch→frame (worktree+tab)  p50=${SWITCH_P50:-–}us  p95=${SWITCH_P95:-–}us  p99=${SWITCH_P99:-–}us (worst rollup)  samples=${SWITCH_SAMPLES_TOTAL:-0}"
+  echo "  input→frame   p50=${INPUT_P50:-–}us  p95=${INPUT_P95:-–}us  p99=${INPUT_P99:-–}us (worst rollup)  samples=${INPUT_SAMPLES_TOTAL:-0}"
   echo "  drain p99=${DRAIN_P99:-–}us  flush p99=${FLUSH_P99:-–}us  render p99=${RENDER_P99:-–}us"
   echo "  pty_bytes_per_s=${PTY_BPS:-0} (worst)  accounted=${PTY_BYTES_TOTAL:-0}B total  cat_bytes/flooder=$BIG_BYTES  rollups=$ROLLUPS"
   if [ "$QUIET_OK" = 1 ]; then

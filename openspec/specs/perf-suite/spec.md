@@ -73,6 +73,23 @@ neither SHALL claim physical display or application-response acknowledgement.
 - **THEN** submission and successful completion are measured independently
 - **AND** failed writes and out-of-band output do not count as successful frames
 
+### Requirement: Published release claim runs retain raw measurements
+
+The release claim harness SHALL measure an existing binary without building it,
+retain raw launch and harness JSON for every run, and write a manifest and summary.
+Its manifest SHALL identify the version/tag, platform class, OS, CPU, terminal,
+geometry, worktree counts, cache state, and sample counts. Flood latency
+percentiles SHALL disclose their rollup sample counts and be marked insufficient
+when fewer than 100 samples were collected.
+
+#### Scenario: Measuring a published release
+
+- **WHEN** the release claim harness runs against a published binary
+- **THEN** it reports cold and warm first-frame launches, idle cores, flood
+  switch/input latency, and host/daemon RSS for 1, 8, and 32 worktrees
+- **AND** it writes raw JSON and a paste-ready Markdown summary
+- **AND** it does not claim histogram lower bucket edges are exact timings
+
 ### Requirement: Input and CPU accounting preserve observed work
 
 The earliest pending input observation SHALL survive dispatch and coalescing.
