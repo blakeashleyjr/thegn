@@ -17,8 +17,9 @@ it is not true yet.
   and the repositories beside the worktree. The rest of home, including agent
   logins, stays readable, and the network is open.
 - `sealed` hides `$HOME` and the network but shares toolchain caches read-only.
-- Interactive worktree panes are sandboxed. Headless agent runs, the queue, the
-  merge gate, tests and language servers run on the host (see the table below).
+- Interactive worktree panes are sandboxed. Headless agent runs, tests and
+  language servers may run on the host (see the table below). Merge gate
+  commands require the sealed runner; `gate_sandbox = "off"` holds them.
 - Network allow and block lists are advisory except on Sprites and Vercel (dev
   channel).
 
@@ -158,8 +159,7 @@ Further tiers (Landlock, Seatbelt, MXC, microVMs, WSL) are not available yet. Se
 - Allow and block lists are advisory, except on Sprites and Vercel, which
   translate them to their own policy APIs.
 - A VPN sidecar is not an exclusive route.
-- ⚠ There is no allowlist proxy yet. `network = "allowlist"` launches offline,
-  as `none`, until one exists.
+- ⚠ There is no allowlist proxy yet.
 
 See [[sandbox-network]].
 
@@ -186,8 +186,8 @@ hooks read-only.
 - Data can leave to any destination the network policy allows.
 - In `standard`, every file in your home directory outside the hidden
   credential locations and sibling repositories is readable.
-- Code from a sandboxed branch runs on your host when it is landed and gated,
-  tested, or built there.
+- Code from a sandboxed branch can run on your host when it is tested or built
+  there; merge gate commands require the sealed runner.
 - Terminal channels, as above.
 - Providers and remote hosts are trusted with what you send them.
 
@@ -208,8 +208,8 @@ flips the defaults. Until then each class below runs as the W1 column says.
 | `QueueAgent`                                          | ⚠ Held on the host by default. Runs on the host only if you lower the floor. | Sealed, private copy, private home, `agent` preset. |
 | `Autopilot`                                           | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `agent` preset. |
 | `AgentRun` (`thegn agent run`, headless session open) | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `agent` preset. |
-| `MergeGate` (`gate_command`)                          | ⚠ Runs on the host under a CPU and memory slice only.                        | Sealed, private copy, private home, `offline`.      |
-| `Regenerate`                                          | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
+| `MergeGate` (`gate_command`)                          | Sealed runner required; `off` holds candidate execution.                     | Sealed, private copy, private home, `offline`.      |
+| `Regenerate`                                          | Sealed runner required; `off` holds candidate execution.                     | Sealed, private copy, private home, `offline`.      |
 | `TestDiscovery`                                       | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
 | `TestRun` (Tests panel)                               | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |
 | `RepoLifecycle` (repo lifecycle scripts)              | ⚠ Runs on the host.                                                          | Sealed, private copy, private home, `offline`.      |

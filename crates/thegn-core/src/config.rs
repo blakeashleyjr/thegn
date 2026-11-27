@@ -481,18 +481,7 @@ config_enum! {
     /// Sandbox network mode.
     pub enum Network: "sandbox network" {
         Nat = "nat", Host = "host", None = "none",
-        Allowlist = "allowlist" | "filtered" | "egress-proxy",
     } default = Nat;
-}
-impl Network {
-    /// Until packet-enforced egress exists, allowlist mode behaves as `none`.
-    #[must_use]
-    pub const fn resolved(self) -> Network {
-        match self {
-            Network::Allowlist => Network::None,
-            other => other,
-        }
-    }
 }
 config_enum! {
     /// `[sandbox] compiler_cache` is the sole authority for carrying a compiler
@@ -890,10 +879,11 @@ pub struct MergeQueueConfig {
     pub gate_timeout_secs: u64,
     /// Whether to run `gate_command` at all.
     pub gate_on: bool,
-    /// Where the gate's commands run: `"off"` (default) on the host, or
-    /// `"sealed"` inside the repo's sealed sandbox (network `none`, no
-    /// credentials). Honoured only from global or trusted config; the
-    /// `[workspace.<slug>.merge_queue]` layer may only raise it (THE-2200).
+    /// Require `"sealed"` to run candidate gate commands in the repo's sealed
+    /// sandbox (network `none`, no credentials). `"off"` (default) is retained
+    /// for compatibility and refuses candidate code execution. Honoured only
+    /// from global or trusted config; the `[workspace.<slug>.merge_queue]`
+    /// layer may only raise it (THE-2200).
     pub gate_sandbox: GateSandbox,
     /// Reuse a stable per-repo gate worktree + `target/` between folds (warm rebuild); `false` ⇒ throwaway `/tmp` (always cold).
     pub gate_reuse_worktree: bool,

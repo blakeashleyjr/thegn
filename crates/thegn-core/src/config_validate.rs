@@ -1914,7 +1914,7 @@ mod tests {
         // 107 → 108 (THE-2233): `[env.<name>.provider] model_credentials`
         // (ModelCredentials) — the Vercel credential mode.
         // 108 → 109 (THE-2200): `[merge_queue] gate_sandbox` (GateSandbox) —
-        // whether the merge gate runs on the host or in the sealed sandbox.
+        // whether candidate merge gate commands require the sealed sandbox.
         // 109 → 110 (THE-2214): `[[inbox.accounts]] kind` (InboxKind —
         // command/todoist/imap implemented; gmail/jmap/outlook/slack reserved).
         // 110 → 111 (THE-2234): `[env.<name>.provider] egress` (SandboxEgress)
