@@ -484,14 +484,11 @@ point (it tests the union, which exists nowhere else), but it means
 `node_modules`, no virtualenv, no `.direnv`. Rust works out of the box
 only because `cargo` is global.
 
-Gate setup, gate and regenerate commands require `gate_sandbox = "sealed"`.
-They run in a local bwrap sandbox with network disabled, no host credentials or
-control sockets, a private checkout and target directory, and a read-only Git
-common directory. If that backend cannot be resolved or started, the gate is
-held as an infrastructure error; host execution cannot produce a trusted
-result. Custom merge drivers, rerere, Tests panel runs, and command-based test
-discovery are separate candidate execution paths and are not covered by this
-gate runner.
+Gate setup, gate and regenerate commands, custom merge drivers and rerere,
+Tests panel runs, and command-based test discovery execute candidate code on
+the host without isolation, with access to its environment, files, and network.
+`thegn doctor` lists these under “Host execution (no isolation)”; a non-empty
+failed or errored gate log starts with a line identifying host execution.
 
 Provision it with `gate_setup_command`, which runs first and is **not**
 part of the verdict:
