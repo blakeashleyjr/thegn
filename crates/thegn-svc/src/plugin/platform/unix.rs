@@ -766,24 +766,16 @@ impl Leader {
             // reports signalling its zombie does not matter.
             .or_else(|error| if zombie_group { Ok(()) } else { Err(error) });
         kill_tracked(&tracked);
-        // macOS answers EPERM (not ESRCH) when signalling a group or pid whose only
-        // member is an exited-but-unreaped zombie. The leader is unreaped here, so
-        // a still-observable exit means there is nothing left to signal.
-        let saw_eperm = [&group_result, &leader_result]
-            .iter()
-            .any(|r| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EPERM)));
-        let leader_gone = cfg!(target_os = "macos")
-            && saw_eperm
-            && matches!(self.exited_without_reaping(), Ok(true));
-        let eperm_is_gone = |error: &io::Error| {
-            cfg!(target_os = "macos") && leader_gone && error.raw_os_error() == Some(libc::EPERM)
-        };
-        let group_result = match group_result {
-            Err(error) if eperm_is_gone(&error) => Ok(()),
-            other => other,
-        };
+        // A group-level EPERM is discharged only by the member scan above. The
+        // owned child handle can independently report EPERM for its exited leader.
         let leader_result = match leader_result {
-            Err(error) if eperm_is_gone(&error) => Ok(()),
+            Err(error)
+                if cfg!(target_os = "macos")
+                    && error.raw_os_error() == Some(libc::EPERM)
+                    && matches!(self.exited_without_reaping(), Ok(true)) =>
+            {
+                Ok(())
+            }
             other => other,
         };
         match (group_result, leader_result) {
@@ -1359,6 +1351,40 @@ mod tests {
 
         assert!(process.leader.reaped_status().is_none());
         assert!(process.leader.reap().unwrap().success());
+        runtime.block_on(process.settle_pipes(Instant::now()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_macos_eperm_for_live_group_remains_an_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = Prepared::new().unwrap().spawn(command).unwrap();
+        drop(entered);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), process.leader.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        process.leader.signal_override =
+            Some(Box::new(|_| Err(io::Error::from_raw_os_error(libc::EPERM))));
+
+        let error = process.leader.terminate().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+
+        process.leader.signal_override = None;
+        process.leader.terminate().unwrap();
+        assert!(!process.leader.reap().unwrap().success());
         runtime.block_on(process.settle_pipes(Instant::now()));
     }
 

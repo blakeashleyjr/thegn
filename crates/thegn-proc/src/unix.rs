@@ -2284,10 +2284,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "macOS libproc keeps listing the killed group's reparented member past the settle window; tracked as a post-141 follow-up"
-    )]
     fn stderr_consumer_panic_unwinds_after_killing_and_reaping_the_group() {
         let scripts = Scripts::new();
         let pid_file = scripts.path().join("leader.pid");
