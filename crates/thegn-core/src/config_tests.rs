@@ -3052,6 +3052,7 @@ fn profile_toml_overlay_merges_over_base_and_preserves_untouched() {
 
 #[test]
 fn profile_overlay_path_none_for_default_some_for_named() {
+    let _env = crate::testenv::EnvGuard::unset(&[util::THEGN_CONFIG_DIR_ENV]);
     struct FakeEnv(Option<String>);
     impl EnvSource for FakeEnv {
         fn get(&self, k: &str) -> Option<String> {
@@ -3061,11 +3062,10 @@ fn profile_overlay_path_none_for_default_some_for_named() {
     assert!(Config::profile_overlay_path(&FakeEnv(None)).is_none());
     assert!(Config::profile_overlay_path(&FakeEnv(Some("default".into()))).is_none());
     let p = Config::profile_overlay_path(&FakeEnv(Some("work".into()))).unwrap();
-    // Compared against the resolver, not a literal shape: a dev instance
-    // relocates the whole config dir with THEGN_CONFIG_DIR.
     assert_eq!(
         p,
-        util::thegn_config_dir()
+        util::xdg_config_home()
+            .join("thegn")
             .join("profiles")
             .join("work")
             .join("config.toml")
