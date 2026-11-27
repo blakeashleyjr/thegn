@@ -2377,7 +2377,7 @@ fn collect_sidebar_status(
     tracing::debug!(
         target: "thegn::hydrate",
         status_ms = t0.elapsed().as_millis() as u64,
-        considered = paths.len(),
+        worktrees = paths.len(),
         reused = reused_n,
         scanned = scanned_n,
         "sidebar status collected"

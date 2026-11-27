@@ -411,7 +411,7 @@ WORKTREES_COLLECTED=0
 VERIFY_POLLS=$(((SETTLE_MAX_MS + 199) / 200))
 for _ in $(seq 1 "$VERIFY_POLLS"); do
   if [ -f "$LOG_FILE" ] && awk -v expected="$EXPECTED_WORKTREES" \
-    'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])worktrees=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
+    'index($0, "sidebar status collected") && match($0, "(^|[[:space:]])(worktrees|considered)=" expected "([[:space:]]|$)") { found = 1 } END { exit !found }' \
     "$LOG_FILE"; then
     WORKTREES_COLLECTED="$EXPECTED_WORKTREES"
     break
