@@ -750,7 +750,7 @@
     },
     {
       "change": "agent-account-failover",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -758,7 +758,8 @@
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "Route agent-run roles through ordered harness/account/model backends using per-account usage headroom."
+      "summary": "Route agent-run roles through ordered harness/account/model backends using per-account usage headroom, quota cooldowns and dispatch attribution.",
+      "delivered_at": "2026-11-26"
     },
     {
       "change": "agent-integrations-out-of-box",

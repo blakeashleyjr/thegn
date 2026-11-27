@@ -110,6 +110,9 @@ overlay; `account` can bind it to a usage key or credential-home path. The
 `agent backends` reports current usage headroom and reset time. `agent run`
 selects the first backend with known headroom; `--backend <name>` pins one.
 With `agent run --wait`, a recognized Claude, Codex or Pi quota response
-retries once on the next configured backend with known headroom. A pinned
-backend is never switched. Pipeline stages continue to use their configured
-single backend.
+retries once on the next configured backend with known headroom. When the usage
+tracker reports a reset time for the account that hit the limit, later
+automatic runs skip that backend until the reset; `agent backends` labels it
+`cooldown`. A pinned backend is never switched. Tracked runs record the backend
+that ultimately ran in dispatch history, and the pipeline board shows it on the
+dispatch row.

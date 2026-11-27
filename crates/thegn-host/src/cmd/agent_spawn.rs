@@ -628,8 +628,17 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
             });
         if quota_hit && pinned_backend.is_none() {
             let attempted = vec![current.to_string()];
+            let current_backend = current.to_string();
             let (cfg_for_select, agent_for_select) = (cfg.clone(), agent.clone());
             let next = tokio::task::spawn_blocking(move || {
+                // The usage service remains the source of the reset deadline.
+                // Persist that provider-reported boundary so later runs do not
+                // immediately select an account whose tracker snapshot lags.
+                let _ = super::agent::remember_quota_reset(
+                    &cfg_for_select,
+                    &agent_for_select,
+                    &current_backend,
+                );
                 super::agent::choose_backend_excluding(
                     &cfg_for_select,
                     &agent_for_select,
@@ -677,6 +686,26 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
     let hint = exit_hint(status.exit_code());
+    if let (Some(row), Some(backend)) = (row, backend.as_deref()) {
+        // Dispatch status and lane history already surface progress notes; use
+        // that durable channel to retain the backend that ultimately ran.
+        let backend = backend.to_string();
+        let db_result = tokio::task::spawn_blocking(move || {
+            let db = Db::open()?;
+            db.append_dispatch_note(row, &format!("backend selected: {backend}"))?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match db_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "could not record agent backend attribution");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not record agent backend attribution");
+            }
+        }
+    }
     // A tracked `--wait` owns its row's verdict (THE-2681): once the agent
     // actually exited, close the row here — `done` on exit 0, `failed` for
     // any other exit — instead of leaving it `running` for a supervisor that

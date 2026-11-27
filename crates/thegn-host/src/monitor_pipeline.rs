@@ -56,6 +56,8 @@ pub(crate) struct PipelineRow {
     pub glyph: &'static str,
     pub status: AgentDispatchStatus,
     pub agent_name: String,
+    /// Backend selected by a waited CLI run, if the dispatch history recorded it.
+    pub selected_backend: Option<String>,
     /// Basename of the worktree path — the sidebar's own row identity.
     pub worktree: String,
     /// Full worktree path, for the jump action.
@@ -382,6 +384,11 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
         glyph: d.status.glyph(),
         status: d.status,
         agent_name: d.agent_name.clone(),
+        selected_backend: d
+            .note
+            .as_deref()
+            .and_then(|note| note.strip_prefix("backend selected: "))
+            .map(display_label),
         worktree: display_label(thegn_core::util::basename(&d.worktree_path)),
         worktree_path: d.worktree_path.clone(),
         session_id: d.session_id.clone(),
@@ -764,6 +771,16 @@ mod tests {
             rows.iter().map(|r| r.group_head).collect::<Vec<_>>(),
             vec![true, false, false]
         );
+    }
+
+    #[test]
+    fn recorded_backend_is_carried_into_the_pipeline_row() {
+        let mut dispatch = d(1, Some("code"), None, 10);
+        dispatch.note = Some("backend selected: codex-pro".into());
+
+        let rows = ordered_rows(&[dispatch], &["code".into()], 10);
+
+        assert_eq!(rows[0].selected_backend.as_deref(), Some("codex-pro"));
     }
 
     #[test]

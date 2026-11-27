@@ -752,7 +752,12 @@ retain their single-backend configuration. `thegn agent list` SHALL expose
 backend names and non-secret launch metadata without printing environment
 values or account paths. The core usage selector SHALL choose the first
 backend whose matching account has a known window below 100 percent; unknown
-usage SHALL NOT count as headroom.
+usage SHALL NOT count as headroom. A quota response on a waited CLI run SHALL
+persist a cooldown for the selected backend until the usage tracker reports
+the matching account's reset time; later automatic selections SHALL skip that
+backend while the cooldown is active. A tracked run SHALL record the backend
+that ultimately ran in its dispatch history, and the pipeline board SHALL show
+that recorded backend for the dispatch row.
 
 #### Scenario: Existing single-backend entry remains valid
 
@@ -769,3 +774,16 @@ usage SHALL NOT count as headroom.
 
 - WHEN no matching account has a usable usage snapshot
 - THEN the usage selector returns no backend
+
+#### Scenario: A quota response cools a backend until its reported reset
+
+- WHEN a waited run receives a recognized quota response and the usage tracker
+  reports a future reset for that backend's account
+- THEN later automatic runs skip that backend until the reset time, while a
+  named `--backend` pin can still select it
+
+#### Scenario: A tracked run records its selected backend
+
+- WHEN `agent run --wait --track` completes after automatic selection or
+  failover
+- THEN the dispatch history records the backend that ultimately ran

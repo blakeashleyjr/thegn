@@ -64,11 +64,24 @@ pub fn spawn_dispatch_sample(
 fn read_roster(
     db: &thegn_core::db::Db,
 ) -> Result<(Vec<thegn_core::issue::AgentDispatch>, bool), String> {
-    db.list_dispatch_roster_window(
-        thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
-        thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
-    )
-    .map_err(|e| format!("read: {e}"))
+    let (mut rows, truncated) = db
+        .list_dispatch_roster_window(
+            thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+            thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+        )
+        .map_err(|e| format!("read: {e}"))?;
+    for row in &mut rows {
+        if let Ok(notes) = db.newest_dispatch_notes(row.id, None, 20)
+            && let Some(backend) = notes.iter().rev().find_map(|note| {
+                note.text
+                    .strip_prefix("backend selected: ")
+                    .map(str::to_owned)
+            })
+        {
+            row.note = Some(format!("backend selected: {backend}"));
+        }
+    }
+    Ok((rows, truncated))
 }
 
 /// Resolve a board-row jump into a sidebar row target.

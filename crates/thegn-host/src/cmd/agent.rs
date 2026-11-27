@@ -23,6 +23,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use thegn_core::config::Config;
+use thegn_core::db::Db;
 use thegn_core::outln;
 
 #[derive(clap::Subcommand, Clone)]
@@ -225,7 +226,7 @@ struct BackendStatusRow {
     backend: String,
     harness: String,
     model: Option<String>,
-    headroom: &'static str,
+    headroom: String,
     resets_at: Option<i64>,
 }
 
@@ -252,13 +253,27 @@ fn backend_status_rows(cfg: &Config, agent_filter: Option<&str>) -> Vec<BackendS
         })
         .collect::<Vec<_>>();
     let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
-    backend_status_rows_for_accounts(cfg, agent_filter, &accounts)
+    let cooldowns = cfg
+        .agents
+        .iter()
+        .filter(|entry| agent_filter.is_none_or(|name| name == entry.name))
+        .flat_map(|entry| {
+            entry.backends.iter().filter_map(|backend| {
+                backend_cooldown_until(&entry.name, backend)
+                    .ok()
+                    .flatten()
+                    .map(|reset| ((entry.name.clone(), backend.name.clone()), reset))
+            })
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    backend_status_rows_for_accounts(cfg, agent_filter, &accounts, &cooldowns)
 }
 
 fn backend_status_rows_for_accounts(
     cfg: &Config,
     agent_filter: Option<&str>,
     accounts: &[thegn_core::usage::AccountUsage],
+    cooldowns: &std::collections::HashMap<(String, String), i64>,
 ) -> Vec<BackendStatusRow> {
     use thegn_core::usage::{BackendHeadroom, backend_headroom};
     cfg.agents
@@ -281,17 +296,26 @@ fn backend_status_rows_for_accounts(
                     })
                     .flat_map(|account| account.windows.iter().filter_map(|w| w.resets_at))
                     .min();
+                let cooldown = cooldowns
+                    .get(&(entry.name.clone(), backend.name.clone()))
+                    .copied()
+                    .filter(|reset| *reset > thegn_core::util::now_ms() / 1000);
                 BackendStatusRow {
                     agent: entry.name.clone(),
                     backend: backend.name.clone(),
                     harness: backend.harness.clone(),
                     model: backend.model.clone(),
-                    headroom: match headroom {
-                        BackendHeadroom::Available => "available",
-                        BackendHeadroom::Exhausted => "exhausted",
-                        BackendHeadroom::Unknown => "unknown",
+                    headroom: if cooldown.is_some() {
+                        "cooldown".to_string()
+                    } else {
+                        match headroom {
+                            BackendHeadroom::Available => "available",
+                            BackendHeadroom::Exhausted => "exhausted",
+                            BackendHeadroom::Unknown => "unknown",
+                        }
+                        .to_string()
                     },
-                    resets_at: reset,
+                    resets_at: cooldown.or(reset),
                 }
             })
         })
@@ -354,7 +378,19 @@ pub(crate) fn choose_backend_excluding(
         })
         .collect::<Vec<_>>();
     let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
-    thegn_core::usage::select_backend_excluding(&role.backends, &accounts, excluded)
+    let cooling = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            backend_cooldown_until(agent, backend)
+                .ok()
+                .flatten()
+                .filter(|reset| *reset > thegn_core::util::now_ms() / 1000)
+                .map(|_| backend.name.clone())
+        })
+        .collect::<Vec<_>>();
+    let excluded = excluded.iter().cloned().chain(cooling).collect::<Vec<_>>();
+    thegn_core::usage::select_backend_excluding(&role.backends, &accounts, &excluded)
         .map(|backend| Some(backend.name.clone()))
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -362,6 +398,106 @@ pub(crate) fn choose_backend_excluding(
                  pin one with --backend to override"
             )
         })
+}
+
+const BACKEND_COOLDOWN_SCOPE: &str = "agent-backend-quota";
+
+fn backend_cooldown_key(agent: &str, backend: &thegn_core::config::AgentBackend) -> String {
+    let account = backend
+        .account
+        .as_deref()
+        .map(thegn_core::util::expand_tilde)
+        .unwrap_or_else(|| backend.name.clone());
+    format!("{agent}:{}:{account}", backend.harness)
+}
+
+fn backend_cooldown_until(
+    agent: &str,
+    backend: &thegn_core::config::AgentBackend,
+) -> Result<Option<i64>> {
+    let db = Db::open()?;
+    backend_cooldown_until_in(&db, agent, backend)
+}
+
+fn backend_cooldown_until_in(
+    db: &Db,
+    agent: &str,
+    backend: &thegn_core::config::AgentBackend,
+) -> Result<Option<i64>> {
+    use thegn_core::store::WorkspaceStore;
+    let key = backend_cooldown_key(agent, backend);
+    let Some(value) = db.get_ui_state(BACKEND_COOLDOWN_SCOPE, &key)? else {
+        return Ok(None);
+    };
+    let reset = value.parse::<i64>().ok();
+    if reset.is_none_or(|reset| reset <= thegn_core::util::now_ms() / 1000) {
+        db.del_ui_state(BACKEND_COOLDOWN_SCOPE, &key)?;
+        return Ok(None);
+    }
+    Ok(reset)
+}
+
+pub(crate) fn remember_quota_reset(
+    cfg: &Config,
+    agent: &str,
+    backend_name: &str,
+) -> Result<Option<i64>> {
+    use thegn_core::store::WorkspaceStore;
+    let Some(role) = cfg.agents.iter().find(|entry| entry.name == agent) else {
+        return Ok(None);
+    };
+    let Some(backend) = role
+        .backends
+        .iter()
+        .find(|backend| backend.name == backend_name)
+    else {
+        return Ok(None);
+    };
+    let configured_homes = role
+        .backends
+        .iter()
+        .filter_map(|backend| {
+            let identity = backend.account.as_deref()?;
+            let path = std::path::PathBuf::from(thegn_core::util::expand_tilde(identity));
+            path.is_absolute()
+                .then_some(thegn_core::usage::HomeCandidate {
+                    provider: backend.harness.clone(),
+                    dir: path,
+                    origin: thegn_core::usage::HomeOrigin::Configured,
+                    label: Some(backend.name.clone()),
+                    enabled: true,
+                })
+        })
+        .collect::<Vec<_>>();
+    let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
+    let identity = backend
+        .account
+        .as_deref()
+        .map(thegn_core::util::expand_tilde);
+    let reset = accounts
+        .iter()
+        .filter(|account| {
+            account.provider == backend.harness
+                && identity.as_deref().is_none_or(|identity| {
+                    account.key == identity
+                        || account
+                            .home
+                            .as_ref()
+                            .is_some_and(|home| home.to_string_lossy().as_ref() == identity)
+                })
+        })
+        .flat_map(|account| account.windows.iter().filter_map(|window| window.resets_at))
+        .filter(|reset| *reset > thegn_core::util::now_ms() / 1000)
+        .min();
+    if let Some(reset) = reset {
+        let db = Db::open()?;
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key(agent, backend),
+            &reset.to_string(),
+        )?;
+    }
+    Ok(reset)
 }
 
 fn backends(cfg: &Config, agent_filter: Option<&str>, json: bool) -> Result<()> {
@@ -748,7 +884,12 @@ mod hook_tests {
                 )],
             ),
         ];
-        let rows = backend_status_rows_for_accounts(&cfg, Some("coder"), &accounts);
+        let rows = backend_status_rows_for_accounts(
+            &cfg,
+            Some("coder"),
+            &accounts,
+            &std::collections::HashMap::new(),
+        );
         let names = rows.iter().map(|r| r.backend.as_str()).collect::<Vec<_>>();
         assert_eq!(names, vec!["claude-a", "codex"]);
         assert_eq!(rows[0].headroom, "exhausted");
@@ -756,5 +897,41 @@ mod hook_tests {
         assert_eq!(rows[1].headroom, "available");
         let json = serde_json::to_string(&rows).expect("serialize status rows");
         assert!(!json.contains("/accounts/a"));
+    }
+
+    #[test]
+    fn backend_quota_cooldown_persists_until_the_provider_reset() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = Db::open_memory().expect("in-memory db");
+        let backend = thegn_core::config::AgentBackend {
+            name: "claude-a".into(),
+            harness: "claude".into(),
+            model: None,
+            env: Default::default(),
+            account: Some("/accounts/a".into()),
+        };
+        let reset = thegn_core::util::now_ms() / 1000 + 60;
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key("coder", &backend),
+            &reset.to_string(),
+        )
+        .expect("save provider reset");
+
+        assert_eq!(
+            backend_cooldown_until_in(&db, "coder", &backend).expect("read cooldown"),
+            Some(reset)
+        );
+        db.set_ui_state(
+            BACKEND_COOLDOWN_SCOPE,
+            &backend_cooldown_key("coder", &backend),
+            &(thegn_core::util::now_ms() / 1000 - 1).to_string(),
+        )
+        .expect("expire provider reset");
+        assert_eq!(
+            backend_cooldown_until_in(&db, "coder", &backend).expect("read expired cooldown"),
+            None
+        );
     }
 }
