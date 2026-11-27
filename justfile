@@ -395,6 +395,11 @@ _perf-guard:
 bench-idle: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario idle
 
+# Worktree-count regression for idle CPU. The same harness and fixed idle
+# ceiling run against a 1,000-linked-worktree fixture.
+bench-idle-many-worktrees: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario idle --worktrees 1000 --dirty 0 --settle-ms 10000 --window-ms 8000 --ceiling 0.12
+
 # Record the current idle reading as this machine's baseline (machine-scoped).
 bench-idle-record: release _perf-guard
     bash test/perf/cpu-sample.sh --scenario idle --record

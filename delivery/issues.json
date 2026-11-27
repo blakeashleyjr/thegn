@@ -814,6 +814,13 @@
       "changes": [
         "sidebar-finished-pipelines-age-out"
       ]
+    },
+    {
+      "issue": "THE-2773",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "bound-idle-worktree-refresh"
+      ]
     }
   ]
 }
