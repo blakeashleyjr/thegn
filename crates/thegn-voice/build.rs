@@ -7,6 +7,11 @@
 //! architecture arm64: ___isPlatformVersionAtLeast". Nix's cc-wrapper adds the runtime itself,
 //! which is why the Mac host's dev builds linked fine.
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "a build script talks to cargo through println! directives"
+)]
+
 use std::path::PathBuf;
 
 fn main() {
@@ -17,10 +22,6 @@ fn main() {
         return;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_owned());
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "build script: a one-shot synchronous query of the C compiler's resource dir"
-    )]
     let Ok(output) = std::process::Command::new(&cc)
         .arg("--print-resource-dir")
         .output()
