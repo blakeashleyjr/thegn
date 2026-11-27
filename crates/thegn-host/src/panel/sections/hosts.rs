@@ -340,9 +340,9 @@ mod tests {
         let cols = 40;
         let lines = render_at(
             vec![HostSnapshot {
-                name: "ws-mac-1".into(),
+                name: "build-host-1".into(),
                 reach: "ssh".into(),
-                target: "ws-mac-1".into(),
+                target: "build-host-1".into(),
                 consent: "never (config)".into(),
                 ..Default::default()
             }],

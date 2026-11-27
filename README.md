@@ -2,7 +2,7 @@
 
 **A terminal-native Git worktree IDE that is its own multiplexer.**
 
-> **Status: public alpha** (`0.1.0-alpha.137`). **x86_64 Linux and macOS on
+> **Status: public alpha** (`0.1.0-alpha.140`). **x86_64 Linux and macOS on
 > Apple silicon are supported;** on macOS install with `brew install blakeashleyjr/thegn/thegn`,
 > the release tarball (see [Install](#install)), the flake, or a source build. Pull requests run lean CI checks
 > (format, lint, test, smoke); the full gate runs nightly and on demand, and

@@ -7,6 +7,62 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.140] — 2026-11-26
+
+The macOS release build links again, and trackpad scrolling no longer switches views under load.
+
+### Fixed
+
+- `just update dev` refuses to downgrade a newer dev build, `thegn daemon stop` completes across a pending database schema upgrade, and upgrade errors name the process holding the old schema and the next command.
+- The aarch64 macOS release build links clang's compiler runtime for the voice engine's Metal backend (`___isPlatformVersionAtLeast` was undefined, which blocked the alpha.139 release assets).
+- A mouse-wheel report split across reads under load is no longer decoded as Alt+[ or Alt+], so a trackpad scroll in a pane cannot switch between the Work view and the Observe tab.
+- Configuration and process tests no longer read the caller's `THEGN_*` environment, and the pre-push test hook clears it, so the test gate passes inside a developer's thegn session.
+
+## [0.1.0-alpha.139] — 2026-11-26
+
+Voice dictation ships on the stable channel, and the side panel's Work, Issues, Hosts and Environments views have been reworked.
+
+### Added
+
+- Voice dictation is on the stable channel, with the native engine in default builds. It adds vocabulary prompts, replacement rules for the final text, and a readiness verdict in `voice status` and `voice doctor`.
+- A search field in the docked help view.
+- An Acknowledgments page and complete third-party licence notices.
+- A one-time warning when an ssh host has systemd lingering off.
+
+### Changed
+
+- Issues in the panel are scoped to one team. Enter opens an issue's details.
+- The Hosts and Environments sections show per-host and per-environment health, usage and labelled actions.
+- One Pipelines section in the sidebar, with one-row lanes. Finished lanes age out.
+- The CPU, memory and disk popovers in the masthead are reworked. The Keys view shows chords as keycaps.
+
+### Fixed
+
+- A worktree's programs are stopped before it is deleted, and locked or main worktrees are refused.
+- The notification cursor stays in place when a leaf is removed.
+- Sandbox installer prefixes match under a symlinked home.
+- A transient ENOENT from racing file creates is retried.
+- macOS file watching and process tests behave correctly.
+
+## [0.1.0-alpha.138] — 2026-11-25
+
+Cloud spend in the top bar now includes Sprites, and Lead can be set up from inside thegn.
+
+### Added
+
+- Lead can be set up from inside the app, and is available on the stable channel as a preview.
+- A clean-install release smoke test checks that a fresh install starts without leftover state.
+
+### Changed
+
+- Sprites are priced from the account's usage, and sprites this host did not create count toward spend.
+- A pending database migration is announced at most once a day.
+- `thegn env up` with the warm pool off still claims a ready spare when its lock is fresh.
+
+### Fixed
+
+- Sprite errors name the real sprite rather than an internal handle.
+
 ## [0.1.0-alpha.137] — 2026-11-25
 
 Remote environments report their health, Sprite and Vercel jobs survive dropped

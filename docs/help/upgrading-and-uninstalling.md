@@ -165,7 +165,7 @@ detects this, explains it, and offers a one-step fix:
 - In a script or pipe, thegn prints the exact command and changes nothing:
   `thegn daemon stop`; rerun the original command afterward.
 - In a running host the banner reads `OLD DAEMON: run thegn daemon stop, then
-  restart thegn`. The banner command stops the old daemon; rerun the operation
+restart thegn`. The banner command stops the old daemon; rerun the operation
   that reported the migration refusal afterward.
 
 `thegn daemon stop` works even while the migration is blocked.

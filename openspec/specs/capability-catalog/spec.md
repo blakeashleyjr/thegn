@@ -190,3 +190,28 @@ worktree resolves to the latest failed run's first failing job.
 - **WHEN** `ci.logs` is requested for a job that is not in the cache
 - **THEN** the daemon fetches the log on its blocking provider lane, keeping
   provider I/O off the event loop
+
+### Requirement: The Lead capabilities are cataloged with fixed scopes
+
+The catalog SHALL contain `overview.get`, `notifications.list`,
+`notifications.ack`, `automations.put`, `automations.rm`, `automations.enable`,
+`automations.runs`, `approvals.list`, `approvals.request`, `approvals.resolve`
+and `merge.drain`. Reads SHALL require Read scope, writes Write scope,
+`approvals.resolve` Admin scope and `merge.drain` MergeAdd scope. All HTTP routes
+SHALL be `POST` with a JSON body.
+
+#### Scenario: Resolving an approval needs Admin
+
+- **WHEN** a Write-scoped caller invokes `approvals.resolve`
+- **THEN** the call is refused for insufficient scope
+
+### Requirement: Lead-authored rules are limited to two actions
+
+A rule with `origin = lead` SHALL be refused at put time and at evaluation unless
+its action is `notify.push` or `sessions.open`. Config rules MUST NOT be
+removable or togglable; those calls SHALL answer Conflict.
+
+#### Scenario: A Lead rule asks for merge.add
+
+- **WHEN** `automations.put` carries an action of `merge.add`
+- **THEN** the put is refused and nothing is stored

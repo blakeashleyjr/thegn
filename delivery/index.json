@@ -231,7 +231,7 @@
     },
     {
       "change": "add-lead-tool-surface",
-      "lifecycle": "delivered-awaiting-archive",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -240,7 +240,7 @@
         }
       ],
       "summary": "Bird's-eye capabilities for the Lead: overview, notifications, automation authoring, approvals and merge drain.",
-      "delivered_at": "2026-11-18"
+      "archive_path": "openspec/changes/archive/2026-11-26-add-lead-tool-surface/"
     },
     {
       "change": "add-localization",
