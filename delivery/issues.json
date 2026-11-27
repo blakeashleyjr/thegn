@@ -326,6 +326,13 @@
       ]
     },
     {
+      "issue": "THE-413",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "pin-ci-bootstrap-inputs"
+      ]
+    },
+    {
       "issue": "THE-416",
       "project": "Distribution & Release Readiness",
       "changes": [

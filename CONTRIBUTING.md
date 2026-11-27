@@ -31,10 +31,10 @@ runtime tools the project is built and CI-tested with. On macOS the
 [Determinate installer](https://install.determinate.systems/) is the least
 fuss (flakes on by default).
 
-|           | Nix path (recommended)                         | Bare path                                                                                |
-| --------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| **macOS** | Xcode CLT (`xcode-select --install`), then Nix | Xcode CLT + [rustup](https://rustup.rs) (stable ≥ 1.96) + `brew install pkg-config just` |
-| **Linux** | Nix                                            | rustup (stable ≥ 1.96) + `just` + a C toolchain                                          |
+|           | Nix path (recommended)                         | Bare path                                                                                                                                     |
+| --------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **macOS** | Xcode CLT (`xcode-select --install`), then Nix | Xcode CLT + pinned rustup-init ([pin procedure](docs/self-hosted-ci.md#refresh-a-pinned-bootstrap-artifact)) + `brew install pkg-config just` |
+| **Linux** | Nix                                            | rustup (stable ≥ 1.96) + `just` + a C toolchain                                                                                               |
 
 On macOS you can skip the table entirely and run `./setup-macos.sh` — it
 checks each prerequisite and offers to install what's missing (nothing is

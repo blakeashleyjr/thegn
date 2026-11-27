@@ -1484,6 +1484,18 @@
       "summary": "Per-tab zoom renders as a pane stack with one-row bars; keyboard, mouse and narrow-width geometry share one drawn layout."
     },
     {
+      "change": "pin-ci-bootstrap-inputs",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-413",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Pin and authenticate CI runner and installer artifacts and the bare macOS rustup bootstrap before execution or extraction; offline fixture execution remains for remote verification."
+    },
+    {
       "change": "pin-git-alternates-read-only",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

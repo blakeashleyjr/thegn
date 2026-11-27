@@ -45,6 +45,22 @@ if [ "$1" = grep ]; then
   shift
   exec grep "$@"
 fi
+# Stage-and-promote tests run unprivileged: drop the owner/group options the
+# script passes to install(1) and execute the rest for real in the test root.
+if [ "$1" = install ]; then
+  shift
+  filtered=()
+  while (($#)); do
+    case "$1" in
+      -o | -g) shift 2 ;;
+      *) filtered+=("$1"); shift ;;
+    esac
+  done
+  exec install "${filtered[@]}"
+fi
+if [ "$1" = mv ] || [ "$1" = rm ] || [ "$1" = stat ] || [ "$1" = mkdir ]; then
+  exec "$@"
+fi
 if [ "$1" = systemctl ] && [ "${2:-}" = list-unit-files ]; then
   printf '%s' "${TEST_LEGACY_UNITS:-}"
   exit 0
@@ -63,9 +79,81 @@ chmod 700 "$STUB_BIN"/*
 PATH="$STUB_BIN:$PATH"
 export PATH
 mkdir -m 700 "$TEST_ROOT/home"
+# shellcheck source=test/lib/bootstrap-stubs.sh
+export TEST_ROOT STUB_BIN
+# shellcheck disable=SC1091 # the checked-out library path is explicit
+source "$ROOT/test/lib/bootstrap-stubs.sh"
 THEGN_CI_SETUP_SOURCE_ONLY=1
 export THEGN_CI_SETUP_SOURCE_ONLY
 source "$ROOT/scripts/ci/ageless-runner-setup.sh"
+
+# Fixture archives for the validation tests. Generated with python3 so the
+# hostile layouts (traversal, absolute, hardlink, device, duplicate) are exact
+# ustar members; tar(1) refuses to create most of them on purpose.
+ARCHIVES="$TEST_ROOT/archives"
+mkdir -m 700 "$ARCHIVES"
+python3 - "$ARCHIVES" <<'PY'
+import io
+import os
+import sys
+import tarfile
+
+out = sys.argv[1]
+
+
+def member(tar, name, kind="file", payload=b"", linkname=""):
+    info = tarfile.TarInfo(name)
+    info.mtime = 0
+    if kind == "file":
+        info.mode = 0o755
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    elif kind == "dir":
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        tar.addfile(info)
+    elif kind == "sym":
+        info.type = tarfile.SYMTYPE
+        info.linkname = linkname
+        info.mode = 0o777
+        tar.addfile(info)
+    elif kind == "hard":
+        info.type = tarfile.LNKTYPE
+        info.linkname = linkname
+        tar.addfile(info)
+    elif kind == "dev":
+        info.type = tarfile.CHRTYPE
+        tar.addfile(info)
+
+
+def archive(name, entries):
+    with tarfile.open(os.path.join(out, name), "w:gz") as tar:
+        for entry in entries:
+            member(tar, *entry)
+
+
+archive(
+    "valid.tar.gz",
+    [
+        ("run.sh", "file", b"#!/bin/sh\nexit 0\n"),
+        ("config.sh", "file", b"#!/bin/sh\nexit 0\n"),
+        ("bin", "dir"),
+        ("bin/Runner.Listener", "file", b"listener\n"),
+        ("lib", "dir"),
+        ("lib/npm.js", "file", b"module.exports = {};\n"),
+        ("bin/npm", "sym", b"", "../lib/npm.js"),
+    ],
+)
+archive("traversal.tar.gz", [("run.sh",), ("../evil",)])
+archive("absolute.tar.gz", [("run.sh",), ("/etc/evil",)])
+archive("symlink-escape.tar.gz", [("run.sh",), ("link", "sym", b"", "../../etc/passwd")])
+archive("hardlink.tar.gz", [("run.sh",), ("h", "hard", b"", "run.sh")])
+archive("device.tar.gz", [("run.sh",), ("dev", "dev")])
+archive("duplicate.tar.gz", [("run.sh",), ("run.sh",)])
+archive("empty.tar.gz", [])
+with open(os.path.join(out, "malformed.tar.gz"), "wb") as handle:
+    handle.write(b"this is not a tar archive\n")
+PY
 
 failures=0
 assert_case() {
@@ -213,18 +301,28 @@ case_runner_no_token_to_job() {
   [[ $job_line != *token* && $job_line != *GH_PAT* && $job_line != *NIX_GITHUB_TOKEN* ]]
 }
 stub_curl_payload() {
-  cat >"$STUB_BIN/curl" <<'STUB'
-#!/usr/bin/env bash
-while (($#)); do
-  if [ "$1" = -o ]; then
-    cp -- "$TEST_PAYLOAD" "$2"
-    exit 0
-  fi
-  shift
-done
-exit 93
-STUB
-  chmod 700 "$STUB_BIN/curl"
+  bootstrap_stub_curl
+}
+# A valid fixture archive with the pins every runner artifact check reads.
+runner_fixture_env() {
+  RUNNER_BASE="$TEST_ROOT/base"
+  RUNNER_TARBALL="actions-runner-fixture.tar.gz"
+  RUNNER_URL="https://github.com/actions/runner/releases/download/v0/fixture.tar.gz"
+  RUNNER_SIZE="$(wc -c <"$ARCHIVES/valid.tar.gz" | tr -d '[:space:]')"
+  RUNNER_SHA256="$(bootstrap_sha256_file "$ARCHIVES/valid.tar.gz")"
+  RUNNER_MAX_BYTES="$RUNNER_SIZE"
+  RUNNER_MAX_EXPANDED_BYTES=4096
+  RUNNER_MAX_MEMBERS=32
+  RUNNER_REQUIRED_MEMBERS="run.sh config.sh bin/Runner.Listener"
+  rm -rf -- "$RUNNER_BASE"
+  mkdir -p "$RUNNER_BASE"
+}
+payload_pins() {
+  TEST_PAYLOAD="$ARCHIVES/valid.tar.gz"
+  TEST_EFFECTIVE_URL="$RUNNER_URL"
+  TEST_CURL_FAIL=0
+  export TEST_PAYLOAD TEST_EFFECTIVE_URL TEST_CURL_FAIL
+  bootstrap_stub_curl
 }
 case_verified_installer_runs_matching_bytes() {
   clean_environment
@@ -234,12 +332,13 @@ case_verified_installer_runs_matching_bytes() {
 #!/bin/sh
 printf '%s\n' "$*" >"$TEST_ROOT/installer-ran"
 FIXTURE
-  payload_sha="$(sha256sum "$TEST_ROOT/installer-fixture" | awk '{print $1}')"
-  payload_size="$(wc -c <"$TEST_ROOT/installer-fixture")"
+  payload_sha="$(bootstrap_sha256_file "$TEST_ROOT/installer-fixture")"
+  payload_size="$(wc -c <"$TEST_ROOT/installer-fixture" | tr -d '[:space:]')"
   TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
-  export TEST_PAYLOAD
+  TEST_EFFECTIVE_URL="https://github.com/DeterminateSystems/nix-installer/releases/download/v3.24.2/nix-installer-x86_64-linux"
+  export TEST_PAYLOAD TEST_EFFECTIVE_URL
   stub_curl_payload
-  run_verified_installer https://fixture.invalid/installer "$payload_sha" "$payload_size" install --no-confirm || return 1
+  run_verified_installer https://github.com/DeterminateSystems/nix-installer/releases/download/v3.24.2/nix-installer-x86_64-linux "$payload_sha" "$payload_size" install --no-confirm || return 1
   [[ $(<"$TEST_ROOT/installer-ran") == 'install --no-confirm' ]]
 }
 # shellcheck disable=SC2016  # assertion matches shell source with literal variable names
@@ -250,14 +349,24 @@ case_nix_bootstrap_uses_reviewed_pin() {
     grep -Fq 'run_verified_installer "$NIX_INSTALLER_URL" "$NIX_INSTALLER_SHA256" "$NIX_INSTALLER_SIZE" install --no-confirm' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
     ! grep -Fq 'curl -fsSL https://install.determinate.systems/nix | sh' "$ROOT/scripts/ci/ageless-runner-setup.sh"
 }
+# shellcheck disable=SC2016  # assertion matches shell source with literal variable names
+case_runner_bootstrap_uses_reviewed_pin() {
+  grep -Fq 'RUNNER_VERSION="2.338.2"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'RUNNER_SHA256="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'RUNNER_SIZE=228071396' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    grep -Fq 'bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE"' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    ! grep -Fq 'releases/latest' "$ROOT/scripts/ci/ageless-runner-setup.sh" &&
+    ! grep -Fq 'sudo ./bin/installdependencies.sh' "$ROOT/scripts/ci/ageless-runner-setup.sh"
+}
 case_verified_installer_rejects_bad_digest_before_execution() {
   clean_environment
   rm -f -- "$TEST_ROOT/installer-ran"
   printf '#!/bin/sh\ntouch "%s/installer-ran"\n' "$TEST_ROOT" >"$TEST_ROOT/installer-fixture"
   TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
-  export TEST_PAYLOAD
+  TEST_EFFECTIVE_URL="https://github.com/fixture/installer"
+  export TEST_PAYLOAD TEST_EFFECTIVE_URL
   stub_curl_payload
-  if run_verified_installer https://fixture.invalid/installer "$(printf '0%.0s' {1..64})" "$(wc -c <"$TEST_ROOT/installer-fixture")" install; then return 1; fi
+  if run_verified_installer https://github.com/fixture/installer "$(printf '0%.0s' {1..64})" "$(wc -c <"$TEST_ROOT/installer-fixture" | tr -d '[:space:]')" install; then return 1; fi
   [[ ! -e $TEST_ROOT/installer-ran ]]
 }
 case_verified_installer_rejects_oversized_bytes_before_execution() {
@@ -265,10 +374,157 @@ case_verified_installer_rejects_oversized_bytes_before_execution() {
   rm -f -- "$TEST_ROOT/installer-ran"
   printf '#!/bin/sh\ntouch "%s/installer-ran"\n' "$TEST_ROOT" >"$TEST_ROOT/installer-fixture"
   TEST_PAYLOAD="$TEST_ROOT/installer-fixture"
-  export TEST_PAYLOAD
+  TEST_EFFECTIVE_URL="https://github.com/fixture/installer"
+  export TEST_PAYLOAD TEST_EFFECTIVE_URL
   stub_curl_payload
-  if run_verified_installer https://fixture.invalid/installer "$(printf '0%.0s' {1..64})" "$((NIX_INSTALLER_MAX_BYTES + 1))" install; then return 1; fi
+  if run_verified_installer https://github.com/fixture/installer "$(printf '0%.0s' {1..64})" "$((NIX_INSTALLER_MAX_BYTES + 1))" install; then return 1; fi
   [[ ! -e $TEST_ROOT/installer-ran ]]
+}
+case_download_refuses_non_https() {
+  clean_environment
+  local destination="$TEST_ROOT/non-https"
+  if bootstrap_download_pinned "http://github.com/fixture" "$(printf '0%.0s' {1..64})" 1 16 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS"; then return 1; fi
+  [[ ! -e $destination ]]
+}
+case_download_refuses_unapproved_redirect() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  TEST_EFFECTIVE_URL="https://evil.invalid/github-production-release-asset/fixture.tar.gz"
+  export TEST_EFFECTIVE_URL
+  local destination="$TEST_ROOT/redirected"
+  if bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE" "$RUNNER_MAX_BYTES" 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS" >"$TEST_ROOT/output" 2>&1; then return 1; fi
+  grep -Fq 'unapproved origin' "$TEST_ROOT/output"
+}
+case_download_accepts_approved_redirect() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  TEST_EFFECTIVE_URL="https://release-assets.githubusercontent.com/github-production-release-asset/fixture.tar.gz"
+  export TEST_EFFECTIVE_URL
+  local destination="$TEST_ROOT/redirected-ok"
+  bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE" "$RUNNER_MAX_BYTES" 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS" || return 1
+  [[ $(bootstrap_sha256_file "$destination") == "$RUNNER_SHA256" ]]
+}
+case_download_bounds_the_transfer() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  : >"$TEST_ROOT/curl-argv"
+  local destination="$TEST_ROOT/bounded" argv
+  bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE" "$RUNNER_MAX_BYTES" 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS" || return 1
+  argv="$(<"$TEST_ROOT/curl-argv")"
+  [[ $argv == *'--connect-timeout 30'* && $argv == *'--speed-time 60'* && $argv == *'--max-time 5'* && $argv == *"--max-filesize $RUNNER_MAX_BYTES"* && $argv == *'--proto-redir =https'* ]]
+}
+case_download_refuses_truncated_body() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  local destination="$TEST_ROOT/truncated"
+  if bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$((RUNNER_SIZE + 1))" "$((RUNNER_SIZE + 1))" 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS" >"$TEST_ROOT/output" 2>&1; then return 1; fi
+  grep -Fq 'size mismatch' "$TEST_ROOT/output"
+}
+case_download_refuses_interrupted_transfer() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  TEST_CURL_FAIL=1
+  export TEST_CURL_FAIL
+  local destination="$TEST_ROOT/interrupted"
+  if bootstrap_download_pinned "$RUNNER_URL" "$RUNNER_SHA256" "$RUNNER_SIZE" "$RUNNER_MAX_BYTES" 5 "$destination" 'Fixture' "$GITHUB_RELEASE_HOSTS" >"$TEST_ROOT/output" 2>&1; then return 1; fi
+  grep -Fq 'could not download' "$TEST_ROOT/output"
+}
+case_cached_archive_is_reauthenticated() {
+  clean_environment
+  runner_fixture_env
+  local cache="$TEST_ROOT/cache-$RUNNER_TARBALL"
+  cp -- "$ARCHIVES/valid.tar.gz" "$cache"
+  authenticate_cached_runner_archive "$cache" >/dev/null 2>&1 || return 1
+  # Same size, different bytes: only the digest can catch this, and existence
+  # must never stand in for it.
+  printf 'X' | dd of="$cache" bs=1 seek=30 conv=notrunc 2>/dev/null
+  if authenticate_cached_runner_archive "$cache" >/dev/null 2>&1; then return 1; fi
+  cp -- "$ARCHIVES/valid.tar.gz" "$cache"
+  authenticate_cached_runner_archive "$cache" >/dev/null 2>&1
+}
+refuses_archive() {
+  local archive="$1" expected="$2"
+  if validate_runner_archive "$archive" >"$TEST_ROOT/output" 2>&1; then return 1; fi
+  grep -Fq "$expected" "$TEST_ROOT/output"
+}
+# validate_runner_archive parses `tar -tvzf` columns, which is the GNU layout the
+# Linux setup host has. bsdtar (a macOS dev machine) orders the verbose columns
+# differently, so those cases are skipped there rather than asserting a layout
+# the runtime target never sees.
+gnu_tar_listing() {
+  [[ $(tar --version 2>/dev/null) == *"GNU tar"* ]]
+}
+case_archive_accepts_reviewed_layout() {
+  clean_environment
+  validate_runner_archive "$ARCHIVES/valid.tar.gz" >/dev/null 2>&1
+}
+case_archive_refuses_traversal() {
+  clean_environment
+  refuses_archive "$ARCHIVES/traversal.tar.gz" 'traversal component'
+}
+case_archive_refuses_absolute_path() {
+  clean_environment
+  refuses_archive "$ARCHIVES/absolute.tar.gz" 'absolute member path'
+}
+case_archive_refuses_escaping_symlink() {
+  clean_environment
+  refuses_archive "$ARCHIVES/symlink-escape.tar.gz" 'escaping symlink'
+}
+case_archive_refuses_hardlink() {
+  clean_environment
+  refuses_archive "$ARCHIVES/hardlink.tar.gz" 'refused member type h'
+}
+case_archive_refuses_device() {
+  clean_environment
+  refuses_archive "$ARCHIVES/device.tar.gz" 'refused member type c'
+}
+case_archive_refuses_duplicate_destination() {
+  clean_environment
+  refuses_archive "$ARCHIVES/duplicate.tar.gz" 'duplicate member destinations'
+}
+case_archive_refuses_malformed() {
+  clean_environment
+  refuses_archive "$ARCHIVES/malformed.tar.gz" 'malformed'
+}
+case_archive_refuses_empty() {
+  clean_environment
+  refuses_archive "$ARCHIVES/empty.tar.gz" 'is empty'
+}
+case_archive_refuses_excess_expanded_size() {
+  clean_environment
+  local saved="$RUNNER_MAX_EXPANDED_BYTES"
+  RUNNER_MAX_EXPANDED_BYTES=1
+  if validate_runner_archive "$ARCHIVES/valid.tar.gz" >"$TEST_ROOT/output" 2>&1; then
+    RUNNER_MAX_EXPANDED_BYTES="$saved"
+    return 1
+  fi
+  RUNNER_MAX_EXPANDED_BYTES="$saved"
+  grep -Fq 'expands to' "$TEST_ROOT/output"
+}
+case_stage_promotes_authenticated_archive() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  : >"$TEST_ROOT/sudo-argv"
+  stage_runner_archive >/dev/null 2>&1 || return 1
+  [[ -f $RUNNER_BASE/$RUNNER_TARBALL ]] || return 1
+  [[ $(bootstrap_sha256_file "$RUNNER_BASE/$RUNNER_TARBALL") == "$RUNNER_SHA256" ]] || return 1
+  [[ -z $(find "$RUNNER_BASE" -name '*.partial' -print -quit) ]] || return 1
+  grep -Fq 'install -m 0644' "$TEST_ROOT/sudo-argv" &&
+    grep -Fq 'mv -f' "$TEST_ROOT/sudo-argv"
+}
+case_stage_refuses_wrong_digest_before_promotion() {
+  clean_environment
+  runner_fixture_env
+  payload_pins
+  RUNNER_SHA256="$(printf '0%.0s' {1..64})"
+  if stage_runner_archive >/dev/null 2>&1; then return 1; fi
+  [[ ! -e $RUNNER_BASE/$RUNNER_TARBALL ]]
 }
 case_runner_env_clean() {
   local rendered
@@ -309,6 +565,30 @@ assert_case pinned_installer_executes_only_matching_bytes case_verified_installe
 assert_case nix_bootstrap_uses_reviewed_version_size_and_digest case_nix_bootstrap_uses_reviewed_pin
 assert_case pinned_installer_rejects_wrong_digest_before_execution case_verified_installer_rejects_bad_digest_before_execution
 assert_case pinned_installer_rejects_oversize_before_execution case_verified_installer_rejects_oversized_bytes_before_execution
+assert_case runner_bootstrap_uses_reviewed_version_size_and_digest case_runner_bootstrap_uses_reviewed_pin
+assert_case download_refuses_non_https_url case_download_refuses_non_https
+assert_case download_refuses_unapproved_redirect_origin case_download_refuses_unapproved_redirect
+assert_case download_accepts_approved_redirect_origin case_download_accepts_approved_redirect
+assert_case download_bounds_timeouts_and_size case_download_bounds_the_transfer
+assert_case download_refuses_truncated_body case_download_refuses_truncated_body
+assert_case download_refuses_interrupted_transfer case_download_refuses_interrupted_transfer
+if gnu_tar_listing; then
+  assert_case cached_archive_is_reauthenticated_not_trusted_by_existence case_cached_archive_is_reauthenticated
+  assert_case archive_accepts_reviewed_layout case_archive_accepts_reviewed_layout
+  assert_case archive_refuses_traversal case_archive_refuses_traversal
+  assert_case archive_refuses_absolute_path case_archive_refuses_absolute_path
+  assert_case archive_refuses_escaping_symlink case_archive_refuses_escaping_symlink
+  assert_case archive_refuses_hardlink case_archive_refuses_hardlink
+  assert_case archive_refuses_device case_archive_refuses_device
+  assert_case archive_refuses_duplicate_destination case_archive_refuses_duplicate_destination
+  assert_case archive_refuses_malformed case_archive_refuses_malformed
+  assert_case archive_refuses_empty case_archive_refuses_empty
+  assert_case archive_refuses_excess_expanded_size case_archive_refuses_excess_expanded_size
+  assert_case stage_promotes_only_authenticated_archive case_stage_promotes_authenticated_archive
+  assert_case stage_refuses_wrong_digest_before_promotion case_stage_refuses_wrong_digest_before_promotion
+else
+  printf 'skip 13 archive/staging cases: GNU tar verbose listing is required and the runtime target is Linux\n'
+fi
 assert_case runner_loop_never_passes_token_to_job case_runner_no_token_to_job
 assert_case runner_env_has_no_shared_cargo_cache case_runner_env_clean
 assert_case unit_runs_loop_as_root_template case_unit_root
