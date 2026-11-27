@@ -145,8 +145,9 @@ pub enum BackendHeadroom {
 }
 
 /// Classify an ordered agent backend from a usage snapshot. Account matching
-/// uses the configured stable account key or credential-home path. Unknown
-/// usage is not treated as headroom, so selection fails closed.
+/// uses the configured stable account key or credential-home path. Every
+/// reported quota window must have room; unknown usage is not treated as
+/// headroom, so selection fails closed.
 pub fn backend_headroom(
     backend: &crate::config::AgentBackend,
     accounts: &[AccountUsage],
@@ -179,12 +180,10 @@ pub fn backend_headroom(
     if known.is_empty() {
         return BackendHeadroom::Unknown;
     }
-    if known.iter().any(|account| {
-        account
-            .windows
-            .iter()
-            .any(|window| window.used_percent < 100.0)
-    }) {
+    if known
+        .iter()
+        .any(|account| account.windows.iter().all(|window| window.used_percent < 100.0))
+    {
         BackendHeadroom::Available
     } else {
         BackendHeadroom::Exhausted
@@ -2140,5 +2139,30 @@ mod tests {
             BackendHeadroom::Unknown
         );
         assert_eq!(select_backend(&backends, &[]), None);
+    }
+
+    #[test]
+    fn backend_is_exhausted_when_any_quota_window_is_full() {
+        let backend = crate::config::AgentBackend {
+            name: "claude-a".into(),
+            harness: "claude".into(),
+            model: None,
+            env: Default::default(),
+            account: None,
+        };
+        let account = AccountUsage::ok(
+            "claude",
+            "primary",
+            None,
+            vec![
+                UsageWindow::new("weekly", 25.0, Some(5_000)),
+                UsageWindow::new("session", 100.0, Some(2_000)),
+            ],
+        );
+
+        assert_eq!(
+            backend_headroom(&backend, &[account]),
+            BackendHeadroom::Exhausted
+        );
     }
 }
