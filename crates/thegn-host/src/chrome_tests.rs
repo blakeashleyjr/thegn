@@ -11,6 +11,27 @@ fn lines(s: &Surface) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn panel_error_keeps_its_last_visible_line_above_the_retry_hint() {
+    let mut surface = Surface::new(24, 5);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 24,
+        rows: 5,
+    };
+    let model = FrameModel {
+        panel_error: Some("first error line has enough words to wrap into several lines".into()),
+        ..FrameModel::default()
+    };
+
+    draw_panel(&mut surface, rect, &model, &PanelUi::default());
+
+    let painted = lines(&surface);
+    assert!(painted[3].contains("lines"));
+    assert!(painted[4].contains("retry"));
+}
+
 fn has_bidi_control(text: &str) -> bool {
     text.chars().any(|ch| {
         matches!(

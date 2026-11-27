@@ -59,7 +59,15 @@ const SUBLINE_MAX: usize = 60;
 /// (not of tick-by-tick state).
 pub(crate) fn reserved_rows(steps: &[LoadStep], ctx: &[(String, String)]) -> usize {
     let ctx_rows = if ctx.is_empty() { 0 } else { 1 + ctx.len() };
-    (1 + steps.len() + SUBLINE_RESERVE.max(ERROR_SUBLINE_RESERVE) + ctx_rows).max(RESERVE_MIN)
+    let error_rows = steps
+        .iter()
+        .filter(|step| step.state == StepState::Failed)
+        .filter_map(|step| step.detail.as_deref())
+        .map(|detail| wrap(detail, 6, usize::MAX).len())
+        .max()
+        .unwrap_or(ERROR_SUBLINE_RESERVE)
+        .max(ERROR_SUBLINE_RESERVE);
+    (1 + steps.len() + SUBLINE_RESERVE.max(error_rows) + ctx_rows).max(RESERVE_MIN)
 }
 
 /// The cursor step: the running one, else the failure, else none. Sub-lines
@@ -84,7 +92,7 @@ fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLin
     if step.state == StepState::Failed {
         let err = step.detail.clone().unwrap_or_else(|| "failed".into());
         let red = chrome::theme_color(thegn_core::theme::RED);
-        for line in wrap(&err, width, ERROR_SUBLINE_RESERVE) {
+        for line in wrap(&err, width, usize::MAX) {
             out.push(SubLine {
                 segs: vec![(line, red)],
             });
@@ -258,7 +266,12 @@ pub(crate) fn draw_body(
         y += 1;
         if cur == Some(i) {
             let lines = sublines(step, accent, sub_w);
-            for j in 0..SUBLINE_RESERVE {
+            let reserve = if step.state == StepState::Failed {
+                lines.len().max(ERROR_SUBLINE_RESERVE)
+            } else {
+                SUBLINE_RESERVE
+            };
+            for j in 0..reserve {
                 if y >= bottom {
                     break;
                 }
@@ -384,9 +397,32 @@ fn truncate(s: &str, width: usize) -> String {
 /// Greedy word-wrap into at most `max_lines` lines of `width` columns; the
 /// last line is truncated if the text keeps going.
 fn wrap(s: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in s.split_whitespace() {
+        if UnicodeWidthStr::width(word) > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut part = String::new();
+            for ch in word.chars() {
+                let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+                if !part.is_empty() && UnicodeWidthStr::width(part.as_str()) + ch_width > width {
+                    lines.push(std::mem::take(&mut part));
+                }
+                part.push(ch);
+            }
+            if !part.is_empty() {
+                lines.push(part);
+            }
+            if lines.len() >= max_lines {
+                return lines.into_iter().take(max_lines).collect();
+            }
+            continue;
+        }
         let need = if cur.is_empty() { 0 } else { 1 } + UnicodeWidthStr::width(word);
         if !cur.is_empty() && UnicodeWidthStr::width(cur.as_str()) + need > width {
             lines.push(std::mem::take(&mut cur));
@@ -401,11 +437,6 @@ fn wrap(s: &str, width: usize, max_lines: usize) -> Vec<String> {
     }
     if !cur.is_empty() && lines.len() < max_lines {
         lines.push(cur);
-    }
-    if let Some(last) = lines.last_mut()
-        && UnicodeWidthStr::width(last.as_str()) > width
-    {
-        *last = truncate(last, width);
     }
     lines
 }
@@ -643,5 +674,18 @@ mod tests {
         let t = truncate("a-very-long-label-that-overflows", 10);
         assert!(UnicodeWidthStr::width(t.as_str()) <= 10);
         assert!(t.ends_with(crate::caps::active_glyphs().ellipsis));
+    }
+
+    #[test]
+    fn narrow_error_wrap_keeps_the_recovery_tail() {
+        let message = "no Lead listener: daemon was started before [lead] was added; run thegn daemon stop, then reopen thegn";
+        let wrapped = wrap(message, 12, usize::MAX);
+        assert!(wrapped.len() > 6);
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 12)
+        );
+        assert!(wrapped.join(" ").contains("reopen thegn"));
     }
 }

@@ -40,7 +40,11 @@ agents chapter (`l`) open the same flow.
    file, keeping the rest of it.
 5. **Daemon.** The daemon must restart to carry the Lead's control listener.
    The flow counts the daemon's live sessions and confirms first, saying how
-   many would end (terminals, agent runs and Lead tabs it hosts).
+   many would end (terminals, agent runs and Lead tabs it hosts). If an
+   existing Lead tab has lost its listener, selecting Lead routes here and
+   offers **restart the daemon and retry the Lead**. Confirming runs
+   `thegn daemon stop` off the UI loop, waits for it to finish, then reopens
+   the Lead so its attach starts the daemon with the listener.
 6. **Login.** Opens a tab running `thegn lead login` (see "Log in"), so it keeps
    every isolation guarantee of that verb. Type `/login` there, exit, then press
    `Alt i` again.
@@ -100,6 +104,9 @@ every workspace, and shows "Lead — Enter to start" until it is first opened (o
 "Lead — set up" while no `[lead]` is configured).
 The first jump creates the group; later jumps focus it. The Lead is global:
 it stays listed when you switch workspace and survives detach and reattach.
+If the sidebar row says it is disabled, the one-line reason names the missing
+channel support or host prerequisite; press `Alt i` to open setup and resolve
+it.
 
 Each tab in the Lead group is a **separate conversation**: open another tab
 with the normal new-tab key and it starts its own Lead process.

@@ -18,3 +18,26 @@ pub(crate) mod wake;
 pub(crate) fn enabled(cfg: &thegn_core::config::Config) -> bool {
     cfg.lead.is_some()
 }
+
+/// One-line explanation shown on the sidebar when Lead cannot be launched.
+/// Stable's explicit preview marker is the documented exception to the
+/// channel registry's dev-only gate.
+pub(crate) fn disabled_reason(cfg: &thegn_core::config::Config) -> Option<String> {
+    let channel = crate::channel_state::current();
+    let preview = cfg.lead.as_ref().is_some_and(|lead| lead.preview);
+    if !thegn_core::channel::Feature::Lead.allowed_in(channel)
+        && !(channel == thegn_core::channel::Channel::Stable && preview)
+    {
+        return Some("disabled on stable; press Alt i to set up the preview".into());
+    }
+    if !thegn_core::lead_sandbox::bwrap_available() {
+        return Some("disabled: install bubblewrap, then press Alt i".into());
+    }
+    if !thegn_core::lead_net::pasta_available() {
+        return Some("disabled: install pasta, then press Alt i".into());
+    }
+    if !enabled(cfg) {
+        return None;
+    }
+    None
+}

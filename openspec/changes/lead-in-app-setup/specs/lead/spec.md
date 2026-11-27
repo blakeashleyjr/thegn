@@ -59,3 +59,39 @@ its restart confirm SHALL state how many live daemon sessions would end.
 
 - **WHEN** the user chooses to restart the daemon with 3 live sessions
 - **THEN** the confirm says 3 live daemon sessions would end before anything is stopped
+
+### Requirement: Lead startup failures remain readable and recoverable
+
+The Lead startup screen SHALL wrap the complete failure detail at narrow widths. A cold-switch
+panel load SHALL replace its skeleton with panel content or an explicit error and retry instruction;
+it SHALL NOT leave a skeleton after its worker exits without a panel result.
+Jumping to an existing Lead whose listener is unavailable SHALL open the setup flow, which offers
+the documented daemon restart path. Confirming SHALL run `thegn daemon stop` off the event loop,
+wait for the stop to finish, and reopen the Lead so its next attach starts a daemon with the listener.
+When the current channel or host prerequisites prevent launch, the sidebar Lead entry SHALL show a
+one-line reason and route to setup rather than launching a failing Lead.
+
+#### Scenario: Narrow startup error
+
+- **WHEN** the Lead startup screen has a failure message wider than its subline at a narrow terminal
+- **THEN** the complete message, including its recovery instructions, is wrapped below the failed step
+
+#### Scenario: Panel hydration fails
+
+- **WHEN** a cold-switch panel worker cannot load the selected path or database
+- **THEN** the panel replaces its skeleton with an error and tells the user how to retry
+
+#### Scenario: Existing Lead lost its listener
+
+- **WHEN** the user jumps to an existing Lead whose daemon has no Lead listener
+- **THEN** the setup flow offers to restart the daemon and retry the Lead
+
+#### Scenario: Restart retries Lead
+
+- **WHEN** the user confirms restart from the setup flow
+- **THEN** the UI waits for `thegn daemon stop` to finish and reopens the Lead
+
+#### Scenario: Lead launch is unavailable
+
+- **WHEN** the current channel or host lacks a Lead requirement
+- **THEN** the sidebar entry shows the reason and opens setup instead of launching Lead

@@ -191,8 +191,6 @@ pub(crate) trait Host {
     fn write_config(&mut self, plan: &Plan, f: &Facts) -> Result<(), String>;
     /// Remove the `[lead]` section.
     fn reset_config(&mut self) -> Result<(), String>;
-    /// Stop the daemon (it restarts on the next attach).
-    fn stop_daemon(&mut self) -> Result<(), String>;
     /// argv for a thegn verb, run in a pane (`["lead","login"]`), with this
     /// process's channel carried over (never forced). `None` when the
     /// executable is unknown.
@@ -221,6 +219,8 @@ pub(crate) enum Job {
     Doctor(Plan),
     /// Count the daemon's live sessions before a restart.
     Sessions(Plan),
+    /// Stop the daemon off the event loop before retrying Lead.
+    Restart(Plan),
 }
 
 /// A finished [`Job`], delivered through the event loop's refresh channel.
@@ -230,6 +230,11 @@ pub(crate) enum Async {
     Doctor { plan: Plan, lines: Vec<String> },
     /// Live daemon sessions (`None`: the count failed).
     Sessions { plan: Plan, live: Option<usize> },
+    /// Daemon stop result; success means the caller can reopen Lead.
+    Restarted {
+        plan: Plan,
+        result: Result<(), String>,
+    },
 }
 
 impl Applied {
@@ -281,6 +286,18 @@ pub(crate) fn begin(host: &dyn Host) -> MenuOverlay {
     )
 }
 
+/// Continue setup after a confirmed daemon stop without offering the same
+/// restart again. In particular, an unauthenticated Lead must finish login
+/// before the retry can open it.
+pub(crate) fn after_restart(host: &dyn Host) -> MenuOverlay {
+    let facts = host.facts();
+    let plan = Plan {
+        restarted: true,
+        ..Plan::from_facts(&facts)
+    };
+    step_menu(&facts, &plan)
+}
+
 /// The menu for `plan` given fresh facts.
 pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
     match next_step(f, plan) {
@@ -327,7 +344,11 @@ pub(crate) fn step_menu(f: &Facts, plan: &Plan) -> MenuOverlay {
              The next screen says how many sessions would end.",
             TAG,
             vec![
-                row('y', "restart the daemon", arg("restartask", plan, "")),
+                row(
+                    'y',
+                    "restart the daemon and retry the Lead",
+                    arg("restartask", plan, ""),
+                ),
                 row('s', "skip: I will restart it later", arg("skip", plan, "")),
                 cancel(),
             ],
@@ -464,6 +485,12 @@ pub(crate) fn async_menu(host: &dyn Host, done: Async) -> MenuOverlay {
             arg("restart", &plan, ""),
             true,
         ),
+        Async::Restarted { .. } => choice_menu(
+            TITLE,
+            "The daemon restart did not reopen Lead. Press Alt i to continue setup.",
+            TAG,
+            vec![cancel()],
+        ),
     }
 }
 
@@ -496,6 +523,28 @@ pub(crate) fn spawn_job(
                     None => Some(0),
                 };
                 Async::Sessions { plan, live }
+            }
+            Job::Restart(plan) => {
+                let result = tokio::task::spawn_blocking(|| {
+                    let exe = thegn_core::util::self_exe_path()
+                        .ok_or_else(|| "cannot find the thegn executable".to_string())?;
+                    let status = std::process::Command::new(exe)
+                        .args(["daemon", "stop"])
+                        .env("THEGN_CHANNEL", crate::channel_state::current().as_str())
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map_err(|error| format!("could not run `thegn daemon stop`: {error}"))?;
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("`thegn daemon stop` exited with {status}"))
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("daemon stop worker failed: {error}")));
+                Async::Restarted { plan, result }
             }
         };
         if tx
@@ -561,19 +610,10 @@ pub(crate) fn apply(host: &mut dyn Host, arg_str: &str) -> Applied {
             job: Some(Job::Sessions(plan)),
             ..Applied::default()
         },
-        "restart" => match host.stop_daemon() {
-            Ok(()) => {
-                let plan = Plan {
-                    restarted: true,
-                    ..plan
-                };
-                Applied {
-                    status: Some("daemon stopping; it restarts on the next attach".into()),
-                    menu: menu_now(host, &plan),
-                    ..Applied::default()
-                }
-            }
-            Err(e) => Applied::status(format!("daemon not restarted: {e}")),
+        "restart" => Applied {
+            status: Some("stopping the daemon; Lead will reopen when it has stopped…".into()),
+            job: Some(Job::Restart(plan)),
+            ..Applied::default()
         },
         "skip" => {
             let plan = Plan {
@@ -769,21 +809,6 @@ impl Host for RealHost<'_> {
             .map_err(|e| format!("{e:#}"))
     }
 
-    fn stop_daemon(&mut self) -> Result<(), String> {
-        let exe = thegn_core::util::self_exe_path().ok_or("cannot find the thegn executable")?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.args(["daemon", "stop"])
-            .env("THEGN_CHANNEL", crate::channel_state::current().as_str())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if crate::actions::spawn_detached_reaped(cmd) {
-            Ok(())
-        } else {
-            Err("could not start `thegn daemon stop`".into())
-        }
-    }
-
     fn pane_argv(&self, verb: &[&str]) -> Option<Vec<String>> {
         let exe = thegn_core::util::self_exe_path()?;
         let dev = crate::channel_state::current() == thegn_core::channel::Channel::Dev;
@@ -814,7 +839,6 @@ mod tests {
         facts: Facts,
         wrote: Vec<(Plan, Facts)>,
         resets: usize,
-        stops: usize,
         fail_write: bool,
     }
 
@@ -835,10 +859,6 @@ mod tests {
         fn reset_config(&mut self) -> Result<(), String> {
             self.resets += 1;
             self.facts.file_agent = None;
-            Ok(())
-        }
-        fn stop_daemon(&mut self) -> Result<(), String> {
-            self.stops += 1;
             Ok(())
         }
         fn pane_argv(&self, verb: &[&str]) -> Option<Vec<String>> {
@@ -998,7 +1018,6 @@ mod tests {
         };
         let p = plan(&host.facts);
         let asked = apply(&mut host, &arg("restartask", &p, ""));
-        assert_eq!(host.stops, 0, "asking must not stop the daemon");
         assert_eq!(asked.job, Some(Job::Sessions(p.clone())));
         assert!(asked.menu.is_none());
         let menu = async_menu(
@@ -1017,8 +1036,9 @@ mod tests {
         );
         let confirm = first_arg(&menu);
         assert!(confirm.starts_with("restart;"), "{confirm}");
-        apply(&mut host, &confirm);
-        assert_eq!(host.stops, 1);
+        let restart = apply(&mut host, &confirm);
+        assert_eq!(restart.job, Some(Job::Restart(p)));
+        assert!(restart.menu.is_none());
     }
 
     #[test]
@@ -1233,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_stops_the_daemon_once_and_moves_on() {
+    fn restart_runs_off_loop_and_retries_only_after_stop_completes() {
         let mut f = ready();
         f.listener_up = false;
         f.logged_in = false;
@@ -1244,12 +1264,26 @@ mod tests {
         let p = plan(&host.facts);
         assert_eq!(step_menu(&host.facts, &p).title, "Restart the daemon?");
         let out = apply(&mut host, &arg("restart", &p, ""));
-        assert_eq!(host.stops, 1);
-        assert_eq!(out.menu.expect("login").title, "Log the Lead's agent in");
+        assert_eq!(out.job, Some(Job::Restart(p.clone())));
+        assert!(out.menu.is_none());
         // Skipping moves on without stopping it.
         let out = apply(&mut host, &arg("skip", &p, ""));
-        assert_eq!(host.stops, 1);
         assert_eq!(out.menu.expect("login").title, "Log the Lead's agent in");
+    }
+
+    #[test]
+    fn post_restart_continues_to_login_without_offering_another_stop() {
+        let mut facts = ready();
+        facts.listener_up = false;
+        facts.logged_in = false;
+        let host = Fake {
+            facts,
+            ..Fake::default()
+        };
+
+        let menu = after_restart(&host);
+
+        assert_eq!(menu.title, "Log the Lead's agent in");
     }
 
     #[test]
