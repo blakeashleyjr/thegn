@@ -7,6 +7,28 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.141] — 2026-11-27
+
+Agent launches can fail over between accounts and harnesses, and Lead, the pane keys hint and idle CPU use are fixed.
+
+### Added
+
+- Agent launches can fail over to another configured account or harness (for example, a second Claude profile, Codex or pi) when one reaches its usage limit. The cooldown is remembered until the reported reset time.
+
+### Changed
+
+- The pane keys hint uses the theme, with the action on the left in bold and its key on the right.
+- The self-hosted CI runner archive and its bootstrap inputs are pinned by version, digest and size, and verified before install.
+
+### Fixed
+
+- Opening Lead starts its sandbox and enters Lead, instead of dropping into a worktree of the current project.
+- Idle hosts do less background polling across many worktrees.
+- Runtime socket reservations use randomized private names, closing a predictable-name race.
+- A sandbox network allowlist that cannot be enforced fails closed.
+- A sandbox policy that Compose cannot enforce still tries the remaining sandbox backends, and never falls back to running on the host.
+- Removed a stale DNS filter reference from configuration resolution.
+
 ## [0.1.0-alpha.140] — 2026-11-26
 
 The macOS release build links again, and trackpad scrolling no longer switches views under load.
