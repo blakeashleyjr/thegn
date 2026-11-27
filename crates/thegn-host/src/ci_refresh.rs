@@ -13,8 +13,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
-#[cfg(test)]
-use thegn_core::store::WorkspaceStore;
 
 use crate::ci_flight::{CiFlight, FlightAdmission, FlightKey, FlightKind, FlightToken};
 
