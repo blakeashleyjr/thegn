@@ -1,11 +1,13 @@
 //! `[merge_queue] gate_sandbox` (THE-2200): whether the merge gate's
-//! commands run on the host (`off`, today's gate) or inside the repo's
-//! sealed sandbox (`sealed`). Kept out of the ratcheted `config.rs`; the
-//! field lives on `MergeQueueConfig` and is re-exported from `config`.
+//! commands may run inside the repo's sealed sandbox (`sealed`). `off` is
+//! retained for compatibility but refuses candidate code execution. Kept out
+//! of the ratcheted `config.rs`; the field lives on `MergeQueueConfig` and is
+//! re-exported from `config`.
 //!
-//! Lowering it is a security change, so it is honoured only from the global
-//! config, a trusted profile, or the trusted `[workspace.<slug>.merge_queue]`
-//! layer, and that per-repo layer may only RAISE it ([`effective_gate_sandbox`]).
+//! A sealed runner is required for trusted gates. The default `off` setting
+//! fails closed. The setting is read from global config, a trusted profile, or
+//! the trusted `[workspace.<slug>.merge_queue]` layer; that per-repo layer may
+//! only raise `off` to `sealed` ([`effective_gate_sandbox`]).
 //! Repo-authored `.thegn.*` files have no `merge_queue` table at all.
 
 use crate::config::{config_enum, config_warn};
@@ -13,7 +15,7 @@ use crate::config::{config_enum, config_warn};
 config_enum! {
     /// `[merge_queue] gate_sandbox` — where the gate's commands run.
     ///
-    /// - `Off` (default): on the host, as before.
+    /// - `Off` (default): refuse candidate code execution; host gates are not trusted.
     /// - `Sealed`: `gate_setup_command`, `gate_command` and
     ///   `regenerate_command` run inside the repo's sealed sandbox (network
     ///   `none`, no credentials, no control sockets).

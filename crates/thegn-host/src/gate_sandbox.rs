@@ -1,7 +1,7 @@
 //! Where the merge gate's commands run (THE-2200): `[merge_queue]
-//! gate_sandbox = "off"` keeps today's host gate; `"sealed"` runs
-//! `gate_setup_command`, `gate_command` and `regenerate_command` through the
-//! repo's sealed sandbox.
+//! gate_sandbox = "sealed"` runs `gate_setup_command`, `gate_command` and
+//! `regenerate_command` through the repo's sealed sandbox. `"off"` remains a
+//! configuration value for compatibility, but cannot admit candidate code.
 //!
 //! A sealed gate never falls back to the host: when the sealed spec cannot be
 //! resolved (no runtime, a profile below the sealed floor, an unreadable
@@ -60,9 +60,16 @@ impl GateExec {
 /// unattended validation does.
 pub(crate) fn resolve(full: &Config, repo_root: &Path) -> Result<GateExec, String> {
     match full.repo_merge_queue(repo_root).gate_sandbox {
-        GateSandbox::Off => Ok(GateExec::Host),
+        GateSandbox::Off => Err(needs_sealed()),
         GateSandbox::Sealed => sealed_spec(full, repo_root),
     }
+}
+
+fn needs_sealed() -> String {
+    format!(
+        "{}; host execution cannot produce a trusted gate result",
+        NEEDS_SEALED
+    )
 }
 
 /// The sealed spec for `repo_root`, or the refusal. Blocking (it ensures the
@@ -312,7 +319,8 @@ pub(crate) fn scrub_sealed_env(command: &mut std::process::Command, keep: &[(Str
 /// [`resolve_for_gate`] with the config loader and sealed resolver injected
 /// (tests prove `off` never loads config). `mode` is authoritative: a
 /// `sealed` gate stays sealed even if the reloaded config reads `off`.
-/// `require_sealed` (an unattended land approved as isolated) refuses `off`.
+/// Candidate-derived commands always require the sealed boundary; the
+/// unattended flag remains an explicit second check at the drain boundary.
 fn resolve_for_gate_with(
     repo_root: &Path,
     mode: GateSandbox,
@@ -320,13 +328,12 @@ fn resolve_for_gate_with(
     load: impl FnOnce() -> Result<Config, String>,
     sealed: impl FnOnce(&Config, &Path) -> Result<GateExec, String>,
 ) -> Result<GateExec, String> {
-    if require_sealed && mode == GateSandbox::Off {
-        return Err("this unattended land requires the sealed merge gate, but \
-                    [merge_queue] gate_sandbox is off for this repo"
-            .into());
-    }
     match mode {
-        GateSandbox::Off => Ok(GateExec::Host),
+        GateSandbox::Off if require_sealed => Err(
+            "this unattended land requires the sealed merge gate, but [merge_queue] gate_sandbox is off for this repo"
+                .into(),
+        ),
+        GateSandbox::Off => Err(needs_sealed()),
         GateSandbox::Sealed => {
             let full = load()?;
             sealed(&full, repo_root)
@@ -938,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn off_never_loads_config() {
+    fn off_refuses_without_loading_config() {
         let loaded = Cell::new(false);
         let resolved = resolve_for_gate_with(
             Path::new("/nonexistent"),
@@ -950,7 +957,9 @@ mod tests {
             },
             |_, _| panic!("off never resolves a sealed spec"),
         );
-        assert!(matches!(resolved, Ok(GateExec::Host)));
+        assert!(resolved.as_ref().is_err_and(|why| {
+            why.contains("host execution cannot produce a trusted gate result")
+        }));
         assert!(!loaded.get());
     }
 
@@ -1005,9 +1014,8 @@ mod tests {
     #[test]
     fn resolve_follows_the_full_config_mode() {
         let root = Path::new("/nonexistent");
-        assert!(matches!(
-            resolve(&Config::default(), root),
-            Ok(GateExec::Host)
-        ));
+        assert!(resolve(&Config::default(), root).is_err_and(|why| {
+            why.contains("host execution cannot produce a trusted gate result")
+        }));
     }
 }
