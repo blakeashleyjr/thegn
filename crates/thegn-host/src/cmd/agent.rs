@@ -429,7 +429,10 @@ fn backend_cooldown_until_in(
     let Some(value) = db.get_ui_state(BACKEND_COOLDOWN_SCOPE, &key)? else {
         return Ok(None);
     };
-    #[expect(clippy::manual_ok_err, reason = "the ignored-result ratchet rejects a bare `.ok()` here")]
+    #[expect(
+        clippy::manual_ok_err,
+        reason = "the ignored-result ratchet rejects a bare `.ok()` here"
+    )]
     let reset = match value.parse::<i64>() {
         Ok(reset) => Some(reset),
         Err(_) => None,

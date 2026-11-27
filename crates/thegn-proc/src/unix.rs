@@ -541,9 +541,7 @@ fn macos_group_has_live_members(
             // libproc can return a PID that exited after enumeration. ESRCH
             // means that member is gone; other failures remain live/unknown
             // so an inaccessible process cannot be mistaken for an empty group.
-            if got == 0
-                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            if got == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                 return false;
             }
             // The member may have raced with exit or may be unobservable. Either
