@@ -5193,11 +5193,11 @@ mod pr_cas_tests {
     }
 }
 
-struct RepoPrBranchPolls(std::sync::Mutex<std::collections::HashMap<String, i64>>);
+struct RepoPrBranchPolls(std::sync::Mutex<std::collections::BTreeMap<String, i64>>);
 
 impl RepoPrBranchPolls {
     const fn new() -> Self {
-        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+        Self(std::sync::Mutex::new(std::collections::BTreeMap::new()))
     }
 
     fn claim(&self, repo_root: &str, now: i64, ttl_secs: u64) -> bool {
