@@ -1316,6 +1316,7 @@ pub(crate) fn gate_isolated(sandbox: thegn_core::config::GateSandbox) -> bool {
     sandbox == thegn_core::config::GateSandbox::Sealed
 }
 
+#[cfg(test)]
 pub(crate) fn gate_result_label(sandbox: thegn_core::config::GateSandbox) -> Option<&'static str> {
     (!gate_isolated(sandbox)).then_some(UNTRUSTED_GATE_LABEL)
 }

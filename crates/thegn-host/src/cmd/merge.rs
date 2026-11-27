@@ -1354,12 +1354,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         // `deferred` also includes conflicts and unreachable worktrees, while
         // `gate_error` means the gate never produced a verdict. Only mark
         // isolation when this drain actually has a gate result.
-        let isolated = gate_result_isolated(
-            mq.gate_on,
-            &mq.gate_command,
-            mq.gate_sandbox,
-            &out,
-        );
+        let isolated = gate_result_isolated(mq.gate_on, &mq.gate_command, mq.gate_sandbox, &out);
         let mut doc = drain_json(&target, &out, isolated);
         if push_mode {
             doc["pushed"] = serde_json::json!(pushed);
@@ -1496,7 +1491,10 @@ fn gate_result_isolated(
     let gate_configured = gate_on && !gate_command.trim().is_empty();
     let gate_result = gate_configured
         && (!out.ready.is_empty()
-            || out.gate_verdicts.iter().any(|verdict| verdict.verdict == "failed")
+            || out
+                .gate_verdicts
+                .iter()
+                .any(|verdict| verdict.verdict == "failed")
             || !out.landed.is_empty());
     gate_result.then_some(integrate::gate_isolated(gate_sandbox))
 }
@@ -1878,7 +1876,7 @@ mod progress_tests {
 
 #[cfg(test)]
 mod gate_verdict_tests {
-    use super::{drain_json, gate_result_isolated, integrate, progress_line, MqStatus};
+    use super::{MqStatus, drain_json, gate_result_isolated, integrate, progress_line};
     use crate::merge_driver::{DriveOutcome, GateVerdictReport};
 
     #[test]
@@ -1959,13 +1957,15 @@ mod gate_verdict_tests {
             ready: vec!["feature".into()],
             ..Default::default()
         };
-        assert!(gate_result_isolated(
-            false,
-            "cargo test",
-            thegn_core::config::GateSandbox::Off,
-            &ungated,
-        )
-        .is_none());
+        assert!(
+            gate_result_isolated(
+                false,
+                "cargo test",
+                thegn_core::config::GateSandbox::Off,
+                &ungated,
+            )
+            .is_none()
+        );
     }
 }
 
