@@ -88,6 +88,29 @@ class DevLiveTests(unittest.TestCase):
         binary.unlink()
         self.assertFalse(live.up_to_date(record, stamp, binary))
 
+    def test_build_scopes_cargo_outputs_to_each_worktree(self):
+        worktrees = [self.root / "worktree-a", self.root / "worktree-b"]
+        for worktree in worktrees:
+            worktree.mkdir()
+        ambient = {
+            "CARGO_TARGET_DIR": "/shared/cargo-target",
+            "CARGO_BUILD_BUILD_DIR": "/shared/cargo-intermediate",
+            "RUSTC_WRAPPER": "sccache",
+        }
+        with patch.object(live.subprocess, "run") as run:
+            binaries = [live.build(worktree, ambient) for worktree in worktrees]
+
+        expected_targets = [worktree / "target" / live.LIVE_CACHE for worktree in worktrees]
+        self.assertEqual(binaries, [target / "release" / "thegn" for target in expected_targets])
+        self.assertNotEqual(expected_targets[0], expected_targets[1])
+        self.assertEqual(run.call_count, 2)
+        for call, target in zip(run.call_args_list, expected_targets):
+            build_env = call.kwargs["env"]
+            self.assertEqual(build_env["CARGO_TARGET_DIR"], str(target))
+            self.assertEqual(build_env["CARGO_BUILD_BUILD_DIR"], str(target / "intermediate"))
+            self.assertEqual(build_env["RUSTC_WRAPPER"], "")
+            self.assertEqual(call.kwargs["cwd"], target.parent.parent)
+
     def test_main_builds_once_then_rebuilds_after_input_edit(self):
         self.make_repo()
         home = self.root / "home"
