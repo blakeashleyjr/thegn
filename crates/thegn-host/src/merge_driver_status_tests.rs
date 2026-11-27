@@ -1370,7 +1370,9 @@ fn unchanged_agent_result_exhausts_only_remaining_budget_for_conflict_and_red_ga
                 assert!(saved.conflict_paths.is_none());
                 assert_eq!(
                     saved.error_detail.as_deref(),
-                    Some("breaks build\nprivate-red-gate: compilation failed")
+                    Some(
+                        "breaks build — untrusted: ran on host, not isolated\nprivate-red-gate: compilation failed"
+                    )
                 );
             }
         }
