@@ -4707,3 +4707,20 @@ mod apps_tests {
         }
     }
 }
+
+#[test]
+fn network_allowlist_parses_with_aliases_and_fails_closed() {
+    for spelling in ["allowlist", "filtered", "egress-proxy"] {
+        let cfg: Config =
+            toml::from_str(&format!("[sandbox]\nnetwork = \"{spelling}\"\n")).unwrap();
+        assert_eq!(cfg.sandbox.network, Network::Allowlist, "{spelling}");
+        assert_eq!(cfg.sandbox.network.resolved(), Network::None, "{spelling}");
+    }
+    assert_eq!(Network::Nat.resolved(), Network::Nat);
+    assert_eq!(Network::Host.resolved(), Network::Host);
+    assert_eq!(Network::None.resolved(), Network::None);
+    assert_eq!(
+        crate::sandbox::lower_universal_deny(Network::Allowlist, &[]),
+        Network::None
+    );
+}

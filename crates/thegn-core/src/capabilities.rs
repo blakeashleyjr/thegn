@@ -123,7 +123,7 @@ pub fn egress_for(i: &EgressInputs<'_>) -> EgressKind {
         };
     }
     match i.network {
-        Network::None => offline_or_unmanaged(i.backend, i.placement),
+        Network::None | Network::Allowlist => offline_or_unmanaged(i.backend, i.placement),
         Network::Nat | Network::Host => match i.plan {
             Some(plan) => plan_kind(i.backend, plan),
             None => EgressKind::Unmanaged,

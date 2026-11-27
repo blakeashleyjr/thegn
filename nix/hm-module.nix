@@ -85,7 +85,7 @@ self: {
         description = "OCI image. Empty = host-toolchain mode (bwrap/systemd). Unset (null) = the binary's default.";
       };
       network = lib.mkOption {
-        type = lib.types.nullOr (lib.types.enum ["nat" "host" "none"]);
+        type = lib.types.nullOr (lib.types.enum ["nat" "host" "none" "allowlist"]);
         default = null;
         description = "Sandbox network mode (agents need egress). Unset (null) = the binary's default.";
       };

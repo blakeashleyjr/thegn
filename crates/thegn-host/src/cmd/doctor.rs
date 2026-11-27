@@ -6241,12 +6241,18 @@ fn rules_line(
     }
     if thegn_core::sandbox::lower_universal_deny(network, block)
         == thegn_core::config::Network::None
-        && network != thegn_core::config::Network::None
+        && network.resolved() != thegn_core::config::Network::None
     {
         return Some("network_block contains `*` — launches are offline (network = none)".into());
     }
-    thegn_core::sandbox::hostname_rules_note_for(network, allow, block, backend, placement)
-        .map(|note| note.trim_start_matches("sandbox ").to_string())
+    thegn_core::sandbox::hostname_rules_note_for(
+        network.resolved(),
+        allow,
+        block,
+        backend,
+        placement,
+    )
+    .map(|note| note.trim_start_matches("sandbox ").to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

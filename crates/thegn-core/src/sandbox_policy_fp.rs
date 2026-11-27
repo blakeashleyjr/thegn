@@ -62,6 +62,9 @@ pub fn policy_fingerprint(spec: &SandboxSpec, vpn_join: bool) -> String {
     }
 
     field(&mut encoded, "network", spec.network.as_str());
+    if spec.egress_requested {
+        field(&mut encoded, "egress_requested", "true");
+    }
     field(
         &mut encoded,
         "vpn_join",
@@ -245,6 +248,27 @@ mod tests {
         assert_ne!(
             policy_fingerprint(&original, false),
             policy_fingerprint(&changed, false)
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_only_when_egress_requested() {
+        let original = spec();
+        let requested = SandboxSpec {
+            egress_requested: true,
+            ..original.clone()
+        };
+        assert_ne!(
+            policy_fingerprint(&original, false),
+            policy_fingerprint(&requested, false)
+        );
+        let unset = SandboxSpec {
+            egress_requested: false,
+            ..requested
+        };
+        assert_eq!(
+            policy_fingerprint(&original, false),
+            policy_fingerprint(&unset, false)
         );
     }
 

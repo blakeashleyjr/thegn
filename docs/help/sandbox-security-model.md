@@ -158,7 +158,8 @@ Further tiers (Landlock, Seatbelt, MXC, microVMs, WSL) are not available yet. Se
 - Allow and block lists are advisory, except on Sprites and Vercel, which
   translate them to their own policy APIs.
 - A VPN sidecar is not an exclusive route.
-- ⚠ There is no allowlist proxy yet.
+- ⚠ There is no allowlist proxy yet. `network = "allowlist"` launches offline,
+  as `none`, until one exists.
 
 See [[sandbox-network]].
 

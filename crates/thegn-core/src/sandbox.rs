@@ -555,6 +555,8 @@ pub struct SandboxSpec {
     /// to swap a master key for a scoped virtual key.
     pub env_block: Vec<String>,
     pub network: Network,
+    /// The config requested allowlist egress, which is currently lowered to `none`.
+    pub egress_requested: bool,
     /// Advisory hostname allow-list (not enforced by any local backend; empty
     /// = allow all non-blocked).
     pub network_allow: Vec<String>,
@@ -628,9 +630,9 @@ pub struct SandboxSpec {
     pub hidden_paths: Vec<String>,
     /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
     pub volume_owners: Vec<(String, String)>,
-    /// The launch's egress plan: the ONLY egress field on the spec (B11).
-    /// Added by WS00-P1-03 and always `None` until WS04-P2-08 sets it (and
-    /// fingerprints it, policy fingerprint v3, when it first does).
+    /// The launch's resolved egress plan. Added by WS00-P1-03 and always `None`
+    /// until WS04-P2-08 sets it (and fingerprints it, policy fingerprint v3,
+    /// when it first does). `egress_requested` separately records allowlist intent.
     pub egress: Option<crate::egress::plan::EgressPlan>,
     /// A sealed launch's object-store refusal from
     /// `sandbox_floor::git_integrity_gate` (alternates, symlinks in
@@ -662,6 +664,7 @@ impl Default for SandboxSpec {
             env_overrides: std::collections::HashMap::new(),
             env_block: Vec::new(),
             network: Network::default(),
+            egress_requested: false,
             network_allow: Vec::new(),
             network_block: Vec::new(),
             read_only_root: false,
@@ -1119,7 +1122,7 @@ pub(crate) fn network_unexpressible_refusal(spec: &SandboxSpec) -> Option<String
         return None;
     }
     let message = match spec.network {
-        Network::None => format!(
+        Network::None | Network::Allowlist => format!(
             "the `{}` backend cannot express `network = \"none\"`: Apple's internal network still reaches your Mac's services, so thegn cannot honour `network = \"none\"` on apple; use podman or docker, whose `--network none` has no interface",
             spec.backend.label()
         ),
@@ -1399,7 +1402,10 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
         || spec.pids_limit.is_some()
         || !spec.drop_capabilities.is_empty()
         || spec.seal_home.is_some()
-        || matches!(spec.network, Network::Host | Network::None)
+        || matches!(
+            spec.network,
+            Network::Host | Network::None | Network::Allowlist
+        )
         || !spec.network_allow.is_empty()
         || !spec.network_block.is_empty()
         || spec.egress.is_some()
@@ -1444,12 +1450,12 @@ pub fn lower_universal_deny(network: Network, block: &[String]) -> Network {
     if block.iter().any(|rule| rule.trim() == "*") {
         Network::None
     } else {
-        network
+        network.resolved()
     }
 }
 
 pub fn hostname_rules_active(network: Network, allow: &[String], block: &[String]) -> bool {
-    network != Network::None && (!allow.is_empty() || !block.is_empty())
+    network.resolved() != Network::None && (!allow.is_empty() || !block.is_empty())
 }
 
 pub fn hostname_rules_note_for(
@@ -2827,6 +2833,7 @@ fn resolve_placed_with(
             },
             &cfg.network_block,
         ),
+        egress_requested: cfg.network == Network::Allowlist,
         network_allow: cfg.network_allow.clone(),
         network_block: cfg.network_block.clone(),
         read_only_root: profile.read_only_root(),
@@ -2867,7 +2874,7 @@ fn resolve_placed_with(
         name: name.to_string(),
         vpn: {
             if cfg.vpn.is_enabled()
-                && cfg.network == Network::Host
+                && cfg.network.resolved() == Network::Host
                 && !profile.forces_no_network()
                 && !universal_deny
             {
@@ -6035,9 +6042,12 @@ fn oci_create_opts_in(
             // composed, so emit nothing here rather than attach to a network
             // called `none` or invent a `host` network. A direct caller stays
             // on Apple's default NAT network.
-            Network::Host | Network::None if spec.backend == Backend::Apple => {}
+            Network::Host | Network::None | Network::Allowlist
+                if spec.backend == Backend::Apple => {}
             Network::Host => v.extend(["--network".into(), "host".into()]),
-            Network::None => v.extend(["--network".into(), "none".into()]),
+            Network::None | Network::Allowlist => {
+                v.extend(["--network".into(), "none".into()]);
+            }
             Network::Nat => {}
         }
     }

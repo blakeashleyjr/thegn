@@ -308,6 +308,15 @@
       "summary": "Daemon-only native inbox (IMAP, Todoist, command), sanitized untrusted items, secret-ref credentials, baseline first poll, inbox_item rules and producers.status; live verification open."
     },
     {
+      "change": "add-network-allowlist-fail-closed",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [],
+      "untracked_rationale": "Linear THE-2119 (Sandbox & Remote 04, WS04-P1-04) owns this, but that project is outside the checked-in delivery inventory, so it is not mapped here.",
+      "summary": "`network = \"allowlist\"` parses and fails closed as `none` until an egress datapath exists; the spec records the request.",
+      "delivered_at": "2026-11-26"
+    },
+    {
       "change": "add-observability-dashboards",
       "lifecycle": "active",
       "disposition": "strategic-unstarted",
