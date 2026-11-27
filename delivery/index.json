@@ -1522,6 +1522,19 @@
       "summary": "THE-2148 (WS11-P3-02) pins objects/info/alternates and http-alternates read-only under [sandbox.git] and probes the object store at launch (alternates, symlinks in objects/, an outside commondir): sealed and sealed-tunnel refuse, other profiles warn; remote build and tests remain unchecked."
     },
     {
+      "change": "poll-open-pr-feed-once-per-repo-ttl",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2775",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Share the repository-wide open-PR feed poll across focused worktrees for the configured PR interval.",
+      "delivered_at": "2026-11-27"
+    },
+    {
       "change": "preserve-config-validation-severity",
       "archive_path": "openspec/changes/archive/2026-10-19-preserve-config-validation-severity/",
       "lifecycle": "archived",
