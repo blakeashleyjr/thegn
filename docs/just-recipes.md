@@ -66,7 +66,8 @@ list --json`, else "all open <instance> panes"). `--yes` skips the prompt;
   (status) lists such daemons. The state database schema only moves forward.
 - **Dev** goes through `scripts/dev_live.py --prebuilt <binary>`, so the new binary is
   validated against the dev config before it replaces `~/.thegn-devel/bin/thegn`.
-  `release[=VERSION]` (default) uses the same verified download. `main`, `checkout`
+  `release[=VERSION]` (default) uses the same verified download and refuses an older
+  version or a reinstall of the current version unless `--force` is passed. `main`, `checkout`
   (current branch; refuses a dirty worktree) and `<branch>` build on the remote Mac
   builder (`THEGN_REMOTE_BUILD`, default `~/.local/share/thegn-devbox/rbuild.sh`, optional).
   If that is missing or fails it asks `Mac build failed (<reason>). Build locally
