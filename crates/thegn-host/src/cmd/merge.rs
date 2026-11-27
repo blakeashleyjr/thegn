@@ -1351,11 +1351,15 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     }
 
     if json {
-        let gate_result = !out.ready.is_empty()
-            || !out.landed.is_empty()
-            || !out.deferred.is_empty()
-            || !out.gate_error.is_empty();
-        let isolated = (gate_result && !integrate::gate_isolated(mq.gate_sandbox)).then_some(false);
+        // `deferred` also includes conflicts and unreachable worktrees, while
+        // `gate_error` means the gate never produced a verdict. Only mark
+        // isolation when this drain actually has a gate result.
+        let isolated = gate_result_isolated(
+            mq.gate_on,
+            &mq.gate_command,
+            mq.gate_sandbox,
+            &out,
+        );
         let mut doc = drain_json(&target, &out, isolated);
         if push_mode {
             doc["pushed"] = serde_json::json!(pushed);
@@ -1481,6 +1485,20 @@ fn drain_json(
             "bookkeeping_failed": out.bookkeeping_failed.len(),
         },
     })
+}
+
+fn gate_result_isolated(
+    gate_on: bool,
+    gate_command: &str,
+    gate_sandbox: thegn_core::config::GateSandbox,
+    out: &merge_driver::DriveOutcome,
+) -> Option<bool> {
+    let gate_configured = gate_on && !gate_command.trim().is_empty();
+    let gate_result = gate_configured
+        && (!out.ready.is_empty()
+            || out.gate_verdicts.iter().any(|verdict| verdict.verdict == "failed")
+            || !out.landed.is_empty());
+    gate_result.then_some(integrate::gate_isolated(gate_sandbox))
 }
 
 /// First line of a multi-line status detail (the rest is the retained gate log).
@@ -1860,7 +1878,7 @@ mod progress_tests {
 
 #[cfg(test)]
 mod gate_verdict_tests {
-    use super::drain_json;
+    use super::{drain_json, gate_result_isolated, integrate, progress_line, MqStatus};
     use crate::merge_driver::{DriveOutcome, GateVerdictReport};
 
     #[test]
@@ -1882,6 +1900,72 @@ mod gate_verdict_tests {
         assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
         assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
         assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
+    }
+
+    #[test]
+    fn host_gate_result_is_labeled_in_cli_and_json_but_sealed_is_not() {
+        let host = DriveOutcome {
+            ready: vec!["feature".into()],
+            ..Default::default()
+        };
+        let host_detail = format!(
+            "gated green — awaiting land\n{}",
+            integrate::UNTRUSTED_GATE_LABEL
+        );
+        assert!(
+            progress_line(MqStatus::Ready, "feature", &host_detail)
+                .unwrap()
+                .contains(integrate::UNTRUSTED_GATE_LABEL)
+        );
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &host,
+        );
+        assert_eq!(drain_json("main", &host, isolated)["isolated"], false);
+
+        let sealed_detail = "gated green — awaiting land";
+        assert!(
+            !progress_line(MqStatus::Ready, "feature", sealed_detail)
+                .unwrap()
+                .contains(integrate::UNTRUSTED_GATE_LABEL)
+        );
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Sealed,
+            &host,
+        );
+        assert_eq!(drain_json("main", &host, isolated)["isolated"], true);
+    }
+
+    #[test]
+    fn no_gate_verdict_does_not_claim_host_isolation() {
+        let outcome = DriveOutcome {
+            gate_error: vec!["feature".into()],
+            deferred: vec!["unreachable".into()],
+            ..Default::default()
+        };
+        let isolated = gate_result_isolated(
+            true,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &outcome,
+        );
+        assert!(drain_json("main", &outcome, isolated)["isolated"].is_null());
+
+        let ungated = DriveOutcome {
+            ready: vec!["feature".into()],
+            ..Default::default()
+        };
+        assert!(gate_result_isolated(
+            false,
+            "cargo test",
+            thegn_core::config::GateSandbox::Off,
+            &ungated,
+        )
+        .is_none());
     }
 }
 
