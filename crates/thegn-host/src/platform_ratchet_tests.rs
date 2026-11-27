@@ -366,12 +366,10 @@ fn indirect_thread_names_fit_the_comm_limit() {
         let source = std::fs::read_to_string(&path).unwrap();
         for captures in constant.captures_iter(&source) {
             if let (Some(key), Some(value)) = (captures.get(1), captures.get(2)) {
-                // Constants holding other `thegn-` identifiers (signing key names, socket and
-                // file names) are not thread names; only those used as names are validated.
-                let not_a_thread_name = ["KEY", "SOCK", "FILE", "PATH", "PREFIX"]
-                    .iter()
-                    .any(|marker| key.as_str().contains(marker));
-                if value.as_str().starts_with("thegn-") && !not_a_thread_name {
+                // Many `thegn-` constants are not thread names (markers, tags, signing keys,
+                // fixtures). Validate the ones named as thread names here; constants passed to a
+                // spawner are validated through `uses` below.
+                if value.as_str().starts_with("thegn-") && key.as_str().contains("THREAD") {
                     // Validate every named thread constant, including ones
                     // passed through a helper or injected spawner rather than
                     // directly to a spawn_named call.

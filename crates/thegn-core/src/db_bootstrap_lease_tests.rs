@@ -110,7 +110,7 @@ fn older_schema_holder_still_gets_the_old_schema_refusal() {
     let message = error.to_string();
 
     assert!(
-        message.contains("still using the old schema"),
+        message.contains("an older thegn process holds its schema"),
         "existing older schema must keep its refusal, got: {message}"
     );
     assert!(
@@ -130,7 +130,9 @@ fn existing_schema_conflict_keeps_the_immediate_refusal() {
 
     let error = try_exclusive_lock(&file, &path).unwrap_err();
     assert!(
-        error.to_string().contains("still using the old schema"),
+        error
+            .to_string()
+            .contains("an older thegn process holds its schema"),
         "positive control must preserve the immediate refusal, got: {error}"
     );
 }
