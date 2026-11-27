@@ -447,7 +447,7 @@ fn group_confirmed_after_reap(_pid: libc::pid_t) -> bool {
 pub fn group_has_live_members(pgid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return macos_group_has_live_members(pgid as libc::pid_t, None);
+        macos_group_has_live_members(pgid as libc::pid_t, None)
     }
     #[cfg(target_os = "linux")]
     {
