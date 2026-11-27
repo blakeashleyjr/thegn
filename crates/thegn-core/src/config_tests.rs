@@ -2190,7 +2190,23 @@ fn malformed_toml_falls_back_to_defaults() {
 
 #[test]
 fn path_is_under_xdg_config() {
-    assert!(Config::path().ends_with("thegn/config.toml"));
+    // Hermetic against the caller's THEGN_*: pin THEGN_CONFIG_DIR here instead of
+    // inheriting it. A dev instance exports THEGN_CONFIG_DIR (~/.config/thegn-dev),
+    // so asserting only the default shape failed for anyone running the suite
+    // inside that instance's own pane.
+    {
+        let _env = crate::testenv::EnvGuard::unset(&[util::THEGN_CONFIG_DIR_ENV]);
+        assert_eq!(
+            Config::path(),
+            util::xdg_config_home().join("thegn").join("config.toml")
+        );
+        assert!(Config::path().ends_with("thegn/config.toml"));
+    }
+    // The dev-instance override is asserted explicitly, not left to chance.
+    let dev = std::env::temp_dir().join("thegn-dev-config");
+    let dev_str = dev.to_str().expect("temp dir is UTF-8");
+    let _env = crate::testenv::EnvGuard::set(&[(util::THEGN_CONFIG_DIR_ENV, dev_str)]);
+    assert_eq!(Config::path(), dev.join("config.toml"));
 }
 
 #[test]
@@ -3045,7 +3061,15 @@ fn profile_overlay_path_none_for_default_some_for_named() {
     assert!(Config::profile_overlay_path(&FakeEnv(None)).is_none());
     assert!(Config::profile_overlay_path(&FakeEnv(Some("default".into()))).is_none());
     let p = Config::profile_overlay_path(&FakeEnv(Some("work".into()))).unwrap();
-    assert!(p.ends_with("thegn/profiles/work/config.toml"));
+    // Compared against the resolver, not a literal shape: a dev instance
+    // relocates the whole config dir with THEGN_CONFIG_DIR.
+    assert_eq!(
+        p,
+        util::thegn_config_dir()
+            .join("profiles")
+            .join("work")
+            .join("config.toml")
+    );
 }
 
 #[test]
