@@ -366,6 +366,12 @@ fn indirect_thread_names_fit_the_comm_limit() {
         let source = std::fs::read_to_string(&path).unwrap();
         for captures in constant.captures_iter(&source) {
             if let (Some(key), Some(value)) = (captures.get(1), captures.get(2)) {
+                if value.as_str().starts_with("thegn-") {
+                    // Validate every named thread constant, including ones
+                    // passed through a helper or injected spawner rather than
+                    // directly to a spawn_named call.
+                    names.push((path.clone(), value.as_str().to_owned()));
+                }
                 definitions.insert(
                     key.as_str().to_owned(),
                     (path.clone(), value.as_str().to_owned()),
@@ -390,20 +396,6 @@ fn indirect_thread_names_fit_the_comm_limit() {
             .unwrap_or_else(|| panic!("spawn_named constant {name} has no literal definition"));
         names.push((path.clone(), value.clone()));
     }
-    // The monitor worker receives its constant through an injected spawner;
-    // it has no direct `spawn_named` call at the point where it is selected.
-    let monitor = std::path::Path::new(MANIFEST).join("src/monitor_sampler.rs");
-    let monitor_source = std::fs::read_to_string(&monitor).unwrap();
-    let monitor_name = constant
-        .captures_iter(&monitor_source)
-        .find(|captures| {
-            captures
-                .get(1)
-                .is_some_and(|name| name.as_str() == "THREAD_NAME")
-        })
-        .unwrap_or_else(|| panic!("monitor sampler thread-name constant is missing"));
-    names.push((monitor, monitor_name[2].to_owned()));
-
     assert!(!names.is_empty(), "expected to find thread-name constants");
     for (path, name) in names {
         assert!(
