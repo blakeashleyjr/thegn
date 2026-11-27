@@ -95,7 +95,10 @@ masked inside the Lead.
 ## Open it
 
 Press `Alt i` (**Jump to the Lead**, `jump-lead`, or run "lead" from the
-palette). The `LEAD` section is pinned at the very top of the sidebar, above
+palette), or click the Lead row. Both use the same entry path: the Lead tab is
+focused when it starts, setup opens when the Lead is not ready, and a launch
+failure leaves its recovery action on the Lead tab. The `LEAD` section is
+pinned at the very top of the sidebar, above
 every workspace, and shows "Lead — Enter to start" until it is first opened (or
 "Lead — set up" while no `[lead]` is configured).
 The first jump creates the group; later jumps focus it. The Lead is global:
