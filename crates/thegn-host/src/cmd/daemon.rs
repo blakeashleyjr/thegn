@@ -450,7 +450,7 @@ mod tests {
             thegn_svc::control::client::discover(&db, "/state", 1_000).expect("daemon socket");
         drop(db);
         match discovered {
-            ControlAddr::Unix(path) => assert_eq!(path, socket),
+            thegn_svc::control::client::ControlAddr::Unix(path) => assert_eq!(path, socket),
             _ => panic!("expected a local unix socket"),
         }
     }
