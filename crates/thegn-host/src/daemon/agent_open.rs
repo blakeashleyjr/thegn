@@ -137,6 +137,7 @@ fn config_with_backend(cfg: &Config, agent: &str, backend_name: &str) -> Result<
         .filter(|h| h.headless_template().is_some())
         .with_context(|| format!("backend {backend_name:?} has an unavailable harness"))?;
     entry.command = harness.interactive_command().to_string();
+    entry.provider = Some(backend.harness.clone());
     entry.harness = Some(backend.harness.clone());
     entry.model = backend.model.clone();
     entry.env.extend(backend.env.clone());
@@ -1249,6 +1250,7 @@ mod tests {
             .find(|entry| entry.name == "pipeline-coder")
             .expect("role");
         assert_eq!(role.harness.as_deref(), Some("codex"));
+        assert_eq!(role.provider.as_deref(), Some("codex"));
         assert_eq!(role.model.as_deref(), Some("gpt-6-luna"));
         assert_eq!(
             role.env.get("CODEX_HOME").map(String::as_str),
