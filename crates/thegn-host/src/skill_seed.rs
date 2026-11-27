@@ -1135,6 +1135,7 @@ mod tests {
 
     fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
         thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: command.into(),
             hints: Vec::new(),

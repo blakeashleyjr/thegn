@@ -199,6 +199,7 @@ mod tests {
         thegn_core::msg::set_tui_active(true);
         let cfg = Config {
             agents: vec![NamedCommand {
+                backends: Vec::new(),
                 name: "codex".into(),
                 command: "codex".into(),
                 hints: Vec::new(),

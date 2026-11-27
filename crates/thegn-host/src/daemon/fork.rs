@@ -267,6 +267,7 @@ pub(crate) fn run<'a>(
                     worktree: worktree.clone(),
                     agent: Some(thegn_svc::control::AgentLaunch {
                         agent: agent.clone(),
+                        backend: None,
                         prompt: String::new(),
                         headless: Some(false),
                         bind_worktree: false,

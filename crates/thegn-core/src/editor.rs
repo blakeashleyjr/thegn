@@ -761,6 +761,7 @@ mod tests {
         assert!(editor.caps().external && editor.caps().column);
 
         cfg.tools.push(crate::config::NamedCommand {
+            backends: Vec::new(),
             name: "editor".into(),
             command: "hx .".into(),
             hints: Vec::new(),

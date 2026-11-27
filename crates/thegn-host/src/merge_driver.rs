@@ -3642,6 +3642,7 @@ mod tests {
             let (_fixture, root, feat_wt) = conflicting_repo("byname");
             let full = Config {
                 agents: vec![thegn_core::config::NamedCommand {
+                    backends: Vec::new(),
                     name: "fixer".into(),
                     command: FIXER.into(),
                     hints: Vec::new(),

@@ -66,6 +66,22 @@ pub(crate) fn resolve(
     launch: &AgentLaunch,
     branch: Option<String>,
 ) -> Result<LaunchSpec> {
+    if launch.backend.is_some() {
+        anyhow::ensure!(
+            !launch.fork
+                && launch.resume.as_deref().is_none_or(str::is_empty)
+                && !launch.continue_last
+                && launch.stage.is_none(),
+            "a named backend can only be selected for a fresh, non-stage launch"
+        );
+    }
+    let backend_cfg;
+    let cfg = if let Some(backend_name) = launch.backend.as_deref() {
+        backend_cfg = config_with_backend(cfg, launch.agent.trim(), backend_name)?;
+        &backend_cfg
+    } else {
+        cfg
+    };
     if let Some(stage) = launch
         .stage
         .as_deref()
@@ -100,6 +116,48 @@ pub(crate) fn resolve(
         checked.map_err(anyhow::Error::new)?;
     }
     resolve_inner(cfg, db, spec, launch, None, branch)
+}
+
+/// Apply one named backend to a cloned role config. The daemon still resolves
+/// all credential and sandbox behavior through the ordinary launch path.
+fn config_with_backend(cfg: &Config, agent: &str, backend_name: &str) -> Result<Config> {
+    let mut selected = cfg.clone();
+    let entry = selected
+        .agents
+        .iter_mut()
+        .find(|entry| entry.name == agent)
+        .context("--backend requires a configured agent role")?;
+    let backend = entry
+        .backends
+        .iter()
+        .find(|backend| backend.name == backend_name)
+        .cloned()
+        .with_context(|| format!("unknown backend {backend_name:?} for agent role {agent:?}"))?;
+    let harness = thegn_core::harness::harness(&backend.harness)
+        .filter(|h| h.headless_template().is_some())
+        .with_context(|| format!("backend {backend_name:?} has an unavailable harness"))?;
+    entry.command = harness.interactive_command().to_string();
+    entry.provider = Some(backend.harness.clone());
+    entry.harness = Some(backend.harness.clone());
+    entry.model = backend.model.clone();
+    entry.env.extend(backend.env.clone());
+    if let Some(account) = backend
+        .account
+        .as_deref()
+        .map(thegn_core::util::expand_tilde)
+        .filter(|account| std::path::Path::new(account).is_absolute())
+    {
+        let key = match backend.harness.as_str() {
+            "claude" => "CLAUDE_CONFIG_DIR",
+            "codex" => "CODEX_HOME",
+            "pi" => "PI_CODING_AGENT_DIR",
+            _ => "",
+        };
+        if !key.is_empty() {
+            entry.env.insert(key.to_string(), account);
+        }
+    }
+    Ok(selected)
 }
 
 /// Resolve `tools.run` exclusively through a fresh trusted `[[tools]]` entry.
@@ -814,6 +872,7 @@ mod tests {
 
     fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
         thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: name.into(),
@@ -946,6 +1005,7 @@ mod tests {
     fn a_stage_model_lands_on_the_command() {
         let mut c = cfg();
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "worker".into(),
             command: "claude".into(),
             hints: Vec::new(),
@@ -1142,6 +1202,7 @@ mod tests {
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
+            backend: None,
             prompt: String::new(),
             headless: None,
             bind_worktree: false,
@@ -1159,9 +1220,49 @@ mod tests {
     }
 
     #[test]
+    fn named_backend_replaces_the_role_harness_model_and_account_home() {
+        let mut cfg = cfg();
+        cfg.agents.push(thegn_core::config::NamedCommand {
+            name: "pipeline-coder".into(),
+            command: "claude".into(),
+            provider: Some("claude".into()),
+            harness: Some("claude".into()),
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: None,
+            drawer_cwd: None,
+            hints: Vec::new(),
+            backends: vec![thegn_core::config::AgentBackend {
+                name: "codex-pro".into(),
+                harness: "codex".into(),
+                model: Some("gpt-6-luna".into()),
+                env: Default::default(),
+                account: Some("/tmp/codex-home".into()),
+            }],
+        });
+        let cfg = config_with_backend(&cfg, "pipeline-coder", "codex-pro").expect("backend");
+        let role = cfg
+            .agents
+            .iter()
+            .find(|entry| entry.name == "pipeline-coder")
+            .expect("role");
+        assert_eq!(role.harness.as_deref(), Some("codex"));
+        assert_eq!(role.provider.as_deref(), Some("codex"));
+        assert_eq!(role.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(
+            role.env.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/codex-home")
+        );
+    }
+
+    #[test]
     fn native_fork_requires_the_configured_agent_provider_to_match() {
         let mut c = cfg();
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),
@@ -1193,6 +1294,7 @@ mod tests {
         let mut env = std::collections::BTreeMap::new();
         env.insert("THEGN_TEST_FORK_AGENT_ENV".into(), "fresh-context".into());
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             drawer_scope: Default::default(),
             drawer_cwd: Default::default(),
             name: "worker".into(),
@@ -1214,6 +1316,7 @@ mod tests {
         };
         let launch = AgentLaunch {
             agent: "worker".into(),
+            backend: None,
             prompt: String::new(),
             headless: Some(false),
             bind_worktree: false,
@@ -1247,6 +1350,7 @@ mod tests {
     fn launch(agent: &str, prompt: &str) -> thegn_svc::control::AgentLaunch {
         thegn_svc::control::AgentLaunch {
             agent: agent.into(),
+            backend: None,
             prompt: prompt.into(),
             headless: None,
             bind_worktree: false,
@@ -1374,6 +1478,7 @@ mod tests {
         };
         let headless = AgentLaunch {
             agent: "claude".into(),
+            backend: None,
             prompt: "do it".into(),
             headless: None,
             bind_worktree: false,
@@ -1617,6 +1722,7 @@ mod tests {
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
+            backend: None,
             prompt: "x".repeat(200 * 1024),
             headless: Some(true),
             bind_worktree: true,
@@ -1716,6 +1822,7 @@ mod tests {
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
+            backend: None,
             prompt: "x".repeat(4 * 1024),
             headless: Some(true),
             bind_worktree: true,
@@ -1813,6 +1920,7 @@ mod tests {
         };
         let launch = AgentLaunch {
             agent: "filer".into(),
+            backend: None,
             prompt,
             headless: Some(true),
             bind_worktree: false,
@@ -1942,6 +2050,7 @@ mod tests {
         let mut c = cfg();
         c.sandbox.enabled = false;
         c.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             provider: Some("codex".into()),
             ..named("worker", "codex")
         });
@@ -1954,6 +2063,7 @@ mod tests {
         let limit = crate::agent_run::MAX_RENDERED_COMMAND_BYTES;
         let launch = AgentLaunch {
             agent: "worker".into(),
+            backend: None,
             prompt: "y".repeat(limit * 3),
             headless: Some(false),
             bind_worktree: false,

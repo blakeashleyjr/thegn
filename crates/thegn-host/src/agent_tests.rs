@@ -1557,6 +1557,7 @@ fn env_halt_reason_halts_on_a_selected_env_with_no_table() {
 fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
     let mut cfg = Config::default();
     let mk = |(n, c): &(&str, &str)| thegn_core::config::NamedCommand {
+        backends: Vec::new(),
         name: n.to_string(),
         command: c.to_string(),
         hints: Vec::new(),
@@ -1741,6 +1742,7 @@ fn resolve_command_maps_agent_tool_and_shell() {
     // …and a list the harness cannot grant REFUSES this path too, instead of
     // quietly launching the raw command under an unrequested policy.
     cfg.agents.push(thegn_core::config::NamedCommand {
+        backends: Vec::new(),
         permissions: vec!["Read".into()],
         ..cfg_with(&[("coder", "pi")], &[]).agents.remove(0)
     });

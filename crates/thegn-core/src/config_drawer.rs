@@ -381,6 +381,7 @@ mod tests {
 
     fn tool(name: &str, command: &str, scope: Option<DrawerScope>) -> NamedCommand {
         NamedCommand {
+            backends: Vec::new(),
             name: name.into(),
             command: command.into(),
             hints: Vec::new(),

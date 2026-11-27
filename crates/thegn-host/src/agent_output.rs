@@ -395,6 +395,7 @@ mod tests {
     fn known_agent_program_matches_a_configured_agent_command() {
         let cfg = thegn_core::config::Config {
             agents: vec![thegn_core::config::NamedCommand {
+                backends: Vec::new(),
                 name: "helper".into(),
                 command: "/opt/bin/my-helper --acp".into(),
                 hints: Vec::new(),

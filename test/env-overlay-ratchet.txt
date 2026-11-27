@@ -22,6 +22,8 @@
 # runner; a reviewed file choice, never an ambient launcher switch.
 # agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
 # list item, like `provider`; an env knob cannot address one entry of a list.
+# agents.backends — ordered structured choices per agent entry; a process
+# environment override cannot safely address one nested list item.
 # agents.drawer_* — structured per-entry drawer metadata; list entries have no
 # stable index-addressable THEGN_* environment override.
 # automations.* — trusted global/profile automation policy is intentionally
@@ -84,6 +86,7 @@ activity.red_requires_agent
 activity.resume_grace_secs
 activity.spawn_grace_secs
 activity.unsolicited_gap_secs
+agents.backends
 agents.command
 agents.drawer_cwd
 agents.drawer_scope

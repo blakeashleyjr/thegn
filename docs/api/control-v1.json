@@ -8,6 +8,13 @@
           "description": "An `[[agents]]`/`[[tools]]` name, or — when no entry is named that — a provider id from thegn's provider registry (`claude`, `codex`), so a supervisor need not know the operator's entry names. Anything else is an error rather than a guess.",
           "type": "string"
         },
+        "backend": {
+          "description": "Name of one configured backend on the selected agent role. When absent, the role's first backend with known usage headroom is selected by the caller; old clients leave this unset and keep the role's primary launch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "bind_worktree": {
           "default": false,
           "description": "Record this agent as the worktree's own (`worktrees.agent`), so resurrection relaunches it and the sidebar attributes its activity.",

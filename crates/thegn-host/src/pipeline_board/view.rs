@@ -367,7 +367,12 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     } else {
         Tok::Slot(S::Dim)
     };
-    let model = model_label(&r.model);
+    let model = r
+        .row
+        .selected_backend
+        .as_ref()
+        .map(|backend| format!("backend:{backend}"))
+        .unwrap_or_else(|| model_label(&r.model));
     let used = crate::seg::seg_width(&segs);
     let right_room = w.saturating_sub(used + 1);
     let age_prefix = format!("{tick} {}", r.row.age);
@@ -616,6 +621,7 @@ mod tests {
         stages[1].model = Some("opus".into());
         let mut cfg = config(&stages);
         cfg.agents.push(thegn_core::config::NamedCommand {
+            backends: Vec::new(),
             name: "worker".into(),
             command: "claude".into(),
             hints: Vec::new(),

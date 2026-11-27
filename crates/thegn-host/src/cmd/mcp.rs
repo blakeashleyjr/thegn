@@ -1300,6 +1300,7 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
 
     let agent = str_arg(args, "agent").map(|agent| AgentLaunch {
         agent: agent.to_string(),
+        backend: None,
         prompt: str_arg(args, "prompt").unwrap_or_default().to_string(),
         headless: args.get("headless").and_then(serde_json::Value::as_bool),
         bind_worktree: args

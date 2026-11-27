@@ -308,6 +308,11 @@ pub struct AgentLaunch {
     /// supervisor need not know the operator's entry names. Anything else is
     /// an error rather than a guess.
     pub agent: String,
+    /// Name of one configured backend on the selected agent role. When absent,
+    /// the role's first backend with known usage headroom is selected by the
+    /// caller; old clients leave this unset and keep the role's primary launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// The task to seed the first turn with. Empty ⇒ launch interactively.
     #[serde(default)]
     pub prompt: String,

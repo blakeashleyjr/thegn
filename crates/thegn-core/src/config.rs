@@ -1975,6 +1975,10 @@ impl McpConfig {
 pub struct NamedCommand {
     pub name: String,
     pub command: String,
+    /// Ordered alternate harness/account/model choices for this agent role.
+    /// An empty list preserves the historical single-backend launch shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<AgentBackend>,
     /// Optional list of hint overrides for the statusbar when this tool is focused.
     #[serde(default)]
     pub hints: Vec<CommandHint>,
@@ -2035,6 +2039,28 @@ pub struct NamedCommand {
     /// Optional scope-relative working directory for a drawer occupant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drawer_cwd: Option<String>,
+}
+
+/// One ordered backend offered by an agent role. `account` matches an
+/// AccountUsage key or credential-home path; omit it to match any account for
+/// the selected harness. Credentials remain in the harness's own env/config.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBackend {
+    /// Stable selector used by `thegn agent run --backend` in the full
+    /// failover path.
+    pub name: String,
+    /// Registered harness id (`claude`, `codex`, `pi`, …).
+    pub harness: String,
+    /// Optional harness model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-backend environment overlay, commonly a credential-home selector.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Optional account usage key or credential-home path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -6871,6 +6897,7 @@ impl Config {
         if self.agents.is_empty() {
             self.agents = vec![
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "claude".into(),
                     command: "claude".into(),
                     hints: vec![],
@@ -6885,6 +6912,7 @@ impl Config {
                     drawer_cwd: None,
                 },
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],
@@ -6903,6 +6931,7 @@ impl Config {
         if self.tools.is_empty() {
             self.tools = vec![
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "lazygit".into(),
                     command: "lazygit".into(),
                     hints: vec![],
@@ -6917,6 +6946,7 @@ impl Config {
                     drawer_cwd: None,
                 },
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "yazi".into(),
                     command: "yazi".into(),
                     hints: vec![],
@@ -6931,6 +6961,7 @@ impl Config {
                     drawer_cwd: None,
                 },
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "editor".into(),
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
@@ -6945,6 +6976,7 @@ impl Config {
                     drawer_cwd: None,
                 },
                 NamedCommand {
+                    backends: Vec::new(),
                     name: "diff".into(),
                     command: "git diff".into(),
                     hints: vec![],

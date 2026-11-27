@@ -619,6 +619,7 @@ mod tests {
     fn is_agent_choice_table() {
         let mut cfg = crate::config::Config::default();
         cfg.agents.push(crate::config::NamedCommand {
+            backends: Vec::new(),
             name: "__shell__".into(),
             command: "__shell__".into(),
             hints: Vec::new(),
@@ -633,6 +634,7 @@ mod tests {
             drawer_cwd: None,
         });
         cfg.agents.push(crate::config::NamedCommand {
+            backends: Vec::new(),
             name: "codex".into(),
             command: "codex".into(),
             hints: Vec::new(),
