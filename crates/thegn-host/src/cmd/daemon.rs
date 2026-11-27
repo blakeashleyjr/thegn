@@ -226,11 +226,19 @@ fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> R
 /// Open the state DB to find daemons. When an older daemon blocks migration (the
 /// upgrade case this verb exists to fix), read the registry without migrating.
 fn open_for_discovery() -> Result<thegn_core::db::Db> {
-    match thegn_core::db::Db::open() {
+    open_for_discovery_with(thegn_core::db::Db::open, || {
+        thegn_core::db::Db::open_read_only_wal_at(&thegn_core::db::state_db_path())
+    })
+}
+
+fn open_for_discovery_with(
+    open: impl FnOnce() -> Result<thegn_core::db::Db>,
+    open_read_only: impl FnOnce() -> Result<Option<thegn_core::db::Db>>,
+) -> Result<thegn_core::db::Db> {
+    match open() {
         Ok(db) => Ok(db),
         Err(error) if crate::stale_daemon::detect(&error).is_some() => {
-            thegn_core::db::Db::open_read_only_wal_at(&thegn_core::db::state_db_path())?
-                .ok_or(error)
+            open_read_only()?.ok_or(error)
         }
         Err(error) => Err(error),
     }
@@ -404,6 +412,48 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use thegn_core::config::{Config, DaemonConfig};
+
+    #[test]
+    fn stop_discovery_falls_back_to_read_only_when_schema_migration_is_blocked() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("thegn.db");
+        let socket = dir.path().join("daemon.sock");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE daemons (
+                daemon_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, scope TEXT NOT NULL,
+                endpoint TEXT NOT NULL, tcp_addr TEXT, control_origin TEXT,
+                hostname TEXT NOT NULL, version TEXT NOT NULL, started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL
+             );
+             CREATE INDEX idx_daemons_scope_heartbeat ON daemons(scope, heartbeat_at);
+             INSERT INTO daemons VALUES ('old', 1234, '/state', '{}', NULL, NULL,
+                                        'host', 'old', 1, 1000);
+             PRAGMA user_version = {};",
+            socket.display(),
+            thegn_core::db::SCHEMA_VERSION - 1,
+        ))
+        .unwrap();
+        drop(conn);
+
+        let db = super::open_for_discovery_with(
+            || {
+                Err(thegn_core::db::MigrationAccessError::OldSchemaInUse {
+                    database: path.clone(),
+                }
+                .into())
+            },
+            || thegn_core::db::Db::open_read_only_wal_at(&path),
+        )
+        .expect("the old-schema registry should remain readable");
+        let discovered =
+            thegn_svc::control::client::discover(&db, "/state", 1_000).expect("daemon socket");
+        drop(db);
+        match discovered {
+            ControlAddr::Unix(path) => assert_eq!(path, socket),
+            _ => panic!("expected a local unix socket"),
+        }
+    }
 
     #[test]
     fn stop_reports_an_unverified_listener_as_unknown_and_fails() {

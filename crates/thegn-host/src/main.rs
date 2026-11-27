@@ -1115,9 +1115,7 @@ fn main() -> std::process::ExitCode {
             };
             if let Some(stale) = stale_daemon::detect(&error) {
                 return match stale_daemon::report(&stale) {
-                    stale_daemon::Outcome::Stopped => {
-                        std::process::ExitCode::from(cmd::EXIT_RETRYABLE as u8)
-                    }
+                    stale_daemon::Outcome::Reran(code) => std::process::ExitCode::from(code),
                     stale_daemon::Outcome::NotStopped => {
                         std::process::ExitCode::from(cmd::EXIT_ERROR as u8)
                     }

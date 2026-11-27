@@ -367,7 +367,7 @@ impl std::fmt::Display for MigrationAccessError {
             ),
             Self::OldSchemaInUse { database } => write!(
                 f,
-                "refusing database schema migration for {}: another thegn process is still using the old schema. An older thegn (usually its background daemon, which keeps your panes alive) is still running after the upgrade. Run `{STOP_DAEMON_COMMAND}` (this ends that instance's panes), then start thegn again",
+                "cannot migrate {} while an older thegn process holds its schema; run `{STOP_DAEMON_COMMAND}` to stop it, then retry",
                 database.display()
             ),
         }

@@ -7,11 +7,13 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use thegn_core::db::{MigrationAccessError, STOP_DAEMON_COMMAND};
+use thegn_core::store::ControlStore;
 
 /// The refusal, as the host sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleDaemon {
     pub database: PathBuf,
+    pub holder_pid: Option<i64>,
 }
 
 /// Whether `error` (anywhere in its context chain) is the old-daemon refusal.
@@ -19,6 +21,17 @@ pub(crate) fn detect(error: &anyhow::Error) -> Option<StaleDaemon> {
     match error.downcast_ref::<MigrationAccessError>() {
         Some(MigrationAccessError::OldSchemaInUse { database }) => Some(StaleDaemon {
             database: database.clone(),
+            holder_pid: thegn_core::db::Db::open_read_only_wal_at(database)
+                .ok()
+                .flatten()
+                .and_then(|db| {
+                    db.daemons()
+                        .ok()?
+                        .into_iter()
+                        .filter(|row| crate::platform::pid_alive(row.pid))
+                        .max_by_key(|row| row.heartbeat_at)
+                        .map(|row| row.pid)
+                }),
         }),
         _ => None,
     }
@@ -26,18 +39,19 @@ pub(crate) fn detect(error: &anyhow::Error) -> Option<StaleDaemon> {
 
 /// Plain-words explanation shared by the CLI and the TUI banner.
 pub(crate) fn explanation(stale: &StaleDaemon) -> String {
+    let process = stale
+        .holder_pid
+        .map(|pid| format!("older thegn process {pid}"))
+        .unwrap_or_else(|| "older thegn process".into());
     format!(
-        "thegn was upgraded, but an older thegn is still running in the background (its daemon keeps your panes alive across quits). \
-         It is holding the state database ({}) on the old version, so this build cannot update it yet.",
+        "cannot migrate {} while {process} holds its schema. Run `{STOP_DAEMON_COMMAND}` to stop it, then retry.",
         stale.database.display()
     )
 }
 
 /// One-line TUI banner.
 pub(crate) fn banner() -> String {
-    format!(
-        "OLD DAEMON: an older thegn is still running; quit, run `{STOP_DAEMON_COMMAND}` (ends its panes), then restart thegn"
-    )
+    format!("OLD DAEMON: run `{STOP_DAEMON_COMMAND}`, then restart thegn")
 }
 
 /// What to do after explaining.
@@ -64,8 +78,8 @@ pub(crate) fn is_yes(answer: &str) -> bool {
 
 /// Outcome of handling the refusal at the CLI.
 pub(crate) enum Outcome {
-    /// The daemon was stopped; the user's command should simply be run again.
-    Stopped,
+    /// The daemon was stopped and the original command was re-executed.
+    Reran(u8),
     /// Nothing was changed.
     NotStopped,
 }
@@ -81,9 +95,7 @@ pub(crate) fn report(stale: &StaleDaemon) -> Outcome {
     eprintln!("thegn: {}", explanation(stale));
     match offer_for(interactive) {
         Offer::PrintCommand => {
-            eprintln!(
-                "To fix it, run:  {STOP_DAEMON_COMMAND}   (this ends that instance's panes), then run thegn again."
-            );
+            eprintln!("Next: run `{STOP_DAEMON_COMMAND}`, then retry the original command.");
             Outcome::NotStopped
         }
         Offer::Ask => {
@@ -105,8 +117,18 @@ pub(crate) fn report(stale: &StaleDaemon) -> Outcome {
                     .status()
             }) {
                 Ok(status) if status.success() => {
-                    eprintln!("Stopped. Run thegn again to finish the upgrade.");
-                    Outcome::Stopped
+                    eprintln!("Stopped. Restarting the original command to finish the upgrade.");
+                    match std::env::current_exe().and_then(|exe| {
+                        std::process::Command::new(exe)
+                            .args(std::env::args_os().skip(1))
+                            .status()
+                    }) {
+                        Ok(status) => Outcome::Reran(status.code().unwrap_or(1) as u8),
+                        Err(error) => {
+                            eprintln!("could not restart the original command: {error}");
+                            Outcome::Reran(1)
+                        }
+                    }
                 }
                 Ok(status) => {
                     eprintln!(
@@ -137,7 +159,8 @@ mod tests {
         assert_eq!(
             detect(&wrapped),
             Some(StaleDaemon {
-                database: PathBuf::from("/s/thegn.db")
+                database: PathBuf::from("/s/thegn.db"),
+                holder_pid: None,
             })
         );
     }
@@ -168,8 +191,13 @@ mod tests {
     fn explanation_and_banner_name_the_exact_command() {
         let stale = StaleDaemon {
             database: PathBuf::from("/s/thegn.db"),
+            holder_pid: Some(4812),
         };
-        assert!(explanation(&stale).contains("/s/thegn.db"));
+        let message = explanation(&stale);
+        assert!(message.contains("/s/thegn.db"));
+        assert!(message.contains("4812"));
+        assert!(message.contains("thegn daemon stop"));
         assert!(banner().contains("thegn daemon stop"));
+        assert!(banner().len() <= 80, "banner must fit on one launcher line");
     }
 }
