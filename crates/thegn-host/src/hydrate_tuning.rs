@@ -126,8 +126,9 @@ fn glyph_fingerprints()
 pub(crate) const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
 const DEFAULT_BG_BUSY_GLYPH_TTL_MS: u64 = 30_000;
 const DEFAULT_BG_SAFETY_GLYPH_TTL_MS: u64 = 600_000;
-/// Only the focused or recently used worktrees need live git status. Older
-/// rows keep their last-known glyphs until selected again.
+/// Focused and recently used worktrees are busy-window candidates. Hydration
+/// adds visible, pane-bearing, and agent-bearing paths before partitioning;
+/// other registered rows use the quiet safety window.
 pub(crate) const RECENT_GLYPH_ACTIVITY: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn include_glyph_path(
