@@ -744,13 +744,13 @@ impl Leader {
         };
         let group = -(child.id() as libc::pid_t);
         let mut group_result = self.signal_group(group);
-        // macOS and the BSDs fail kill(-pgid) with EPERM rather than ESRCH when
-        // every remaining member is a zombie, this exited-but-unreaped leader
-        // included. That means nothing is left to signal.
-        let zombie_group = group_result
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
-            && matches!(self.exited_without_reaping(), Ok(true));
+        // macOS can fail kill(-pgid) with EPERM for a zombie-only group. Verify
+        // every member before treating that result as an empty group.
+        let zombie_group = cfg!(target_os = "macos")
+            && group_result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+            && !thegn_proc::group_has_live_members(leader_pid as u32);
         if zombie_group {
             group_result = Err(io::Error::from_raw_os_error(libc::ESRCH));
         }
@@ -1328,6 +1328,38 @@ mod tests {
             );
             assert!(runtime.block_on(process.settle_pipes(Instant::now())));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_macos_eperm_for_zombie_group_is_gone_without_reaping_leader() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = Prepared::new().unwrap().spawn(command).unwrap();
+        drop(entered);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), process.leader.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        process.leader.signal_override =
+            Some(Box::new(|_| Err(io::Error::from_raw_os_error(libc::EPERM))));
+
+        process.leader.terminate().unwrap();
+
+        assert!(process.leader.reaped_status().is_none());
+        assert!(process.leader.reap().unwrap().success());
+        runtime.block_on(process.settle_pipes(Instant::now()));
     }
 
     #[cfg(target_os = "linux")]

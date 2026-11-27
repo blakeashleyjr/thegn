@@ -1,6 +1,7 @@
 - [x] Implement Darwin live-member inspection while preserving the unreaped leader pin.
 - [x] Add portable empty-group coverage and retain the generic live-descendant drain/termination regressions.
 - [x] Add deterministic Darwin zombie/live/unknown-state coverage.
+- [x] Classify Darwin `EPERM` as drained only after the group scan finds no live members; keep leader reaping tied to the owned child handle.
 - [ ] In the coordinator's native macOS worktree, run `cargo nextest run -p thegn-proc empty_group_after_leader_exit_is_drained_on_every_unix_target` and `cargo nextest run -p thegn-proc darwin_group_state_ignores_zombie_leader_but_keeps_live_members`.
 - [ ] Repeat the exact B192 fixture with the hash-verified `/etc/profiles/per-user/blakea/bin/git` 2.56.0; verify the identity probe returns the same 56-byte `--path-format=absolute --git-common-dir` output, leader reaped, stdout EOF, and `GroupState::Drained`.
 - [ ] Keep a live descendant holding stdout in the same fixture; verify it remains owned until bounded group termination and the identity probe fails closed.

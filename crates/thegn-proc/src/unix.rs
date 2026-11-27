@@ -428,24 +428,32 @@ fn group_confirmed_after_reap(pid: libc::pid_t) -> bool {
     session >= 0 && group_confirmed_in(Path::new("/proc"), pid, session)
 }
 
-/// Non-Linux never reaps the leader early (see [`own_group_live`]); refuse rather than signal an
+/// Non-Linux never reaps the leader early; refuse rather than signal an
 /// unpinned pgid should that ever change.
 #[cfg(not(target_os = "linux"))]
 fn group_confirmed_after_reap(_pid: libc::pid_t) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
-/// Return whether the process group has a live member using the cached `/proc`
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Return whether the process group has a live member using the platform
 /// liveness scan used by the supervisor.
 ///
 /// This is the fallback for a group whose leader the caller cannot reap (it is not the caller's
 /// child, e.g. a detached survivor group): its leader may be a zombie that keeps `killpg(pgid, 0)`
 /// succeeding, so emptiness needs the global `/proc` walk. A run's own group uses the cheaper
-/// reap-then-probe in `own_group_live`.
+/// reap-then-probe in `own_group_live`. macOS inspects libproc member states and treats
+/// zombie-only groups as drained; incomplete observations fail closed as live.
 pub fn group_has_live_members(pgid: u32) -> bool {
-    let mut scan = LivenessScan::default();
-    group_live_with_scan(Path::new("/proc"), pgid as libc::pid_t, &mut scan)
+    #[cfg(target_os = "macos")]
+    {
+        return macos_group_has_live_members(pgid as libc::pid_t, None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut scan = LivenessScan::default();
+        group_live_with_scan(Path::new("/proc"), pgid as libc::pid_t, &mut scan)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

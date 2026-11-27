@@ -233,6 +233,13 @@ through still-owned identity and SHALL NOT block the UI waiting for reaping.
 - **THEN** the session closes admission and starts bounded owned cleanup
 - **AND** an unbounded child wait cannot prevent termination admission
 
+#### Scenario: macOS reports EPERM for a zombie-only process group
+
+- **WHEN** bounded shutdown receives `EPERM` while signaling a resident plugin's group
+- **THEN** it treats the error like `ESRCH` only after libproc confirms the group has no live members
+- **AND** it reaps the leader only after observing exit through the owned child handle
+- **AND** unknown or live group members keep cleanup unresolved
+
 #### Scenario: Shutdown waiter is cancelled
 
 - **WHEN** a caller cancels a shutdown wait while the owner is still running

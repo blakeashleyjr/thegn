@@ -11,3 +11,8 @@ while the leader still pins the group.
 
 Linux keeps its reap-then-probe path unchanged. Other non-Linux Unix targets
 retain their existing conservative behavior.
+
+Resident plugin shutdown also treats `EPERM` like `ESRCH` only when the macOS
+libproc scan confirms that the process group has no live members. The owned
+leader remains unreaped until its child handle confirms exit; incomplete or
+live group observations retain the error.

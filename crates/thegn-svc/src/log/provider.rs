@@ -131,7 +131,14 @@ fn tail_file(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     watcher.as_ref().map(|(_, events, reset_requested)| {
-                        events.recv().map(|()| {
+                        let received = if cfg!(target_os = "macos") {
+                            events.recv_timeout(Duration::from_secs(1))
+                        } else {
+                            events
+                                .recv()
+                                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                        };
+                        received.map(|()| {
                             if reset_requested.swap(false, Ordering::AcqRel) {
                                 Wake::Closed
                             } else {
@@ -143,7 +150,12 @@ fn tail_file(
                 if let Some(wake) = wake {
                     match wake {
                         Ok(wake) => wake,
-                        Err(_) => Wake::Closed,
+                        Err(mpsc::RecvTimeoutError::Timeout) if cfg!(target_os = "macos") => {
+                            Wake::Retry
+                        }
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => Wake::Closed,
                     }
                 } else if watching {
                     Wake::Closed
@@ -552,7 +564,7 @@ mod tests {
             .unwrap();
         // FSEvents coalesces and delays delivery on a loaded Mac; keep appending until
         // one lands (any one append must nudge) instead of betting on a single write.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             file.write_all(b"appended\n").unwrap();
             file.flush().unwrap();
