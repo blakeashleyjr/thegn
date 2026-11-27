@@ -411,11 +411,8 @@ fn remote_compose_refusal_never_creates_or_execs_a_container() {
     let halt = error
         .downcast_ref::<crate::agent::SandboxHalt>()
         .expect("the chain refusal must surface as SandboxHalt");
-    // Auto-chain records the Compose policy refusal, then its remote-none guard
-    // supplies the returned halt reason after there are no more candidates.
     assert!(
-        halt.reason
-            .contains("no container runtime found on the remote host"),
+        halt.reason.contains("Compose cannot enforce"),
         "{}",
         halt.reason
     );

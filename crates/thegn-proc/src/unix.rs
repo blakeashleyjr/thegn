@@ -476,7 +476,7 @@ fn group_live(pid: libc::pid_t) -> bool {
     macos_group_has_live_members(pid, None)
 }
 
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 fn group_exists(pid: libc::pid_t) -> bool {
     match killpg(Pid::from_raw(pid), None) {
         Ok(()) => true,

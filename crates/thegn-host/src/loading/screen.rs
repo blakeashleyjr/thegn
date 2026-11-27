@@ -520,12 +520,13 @@ mod tests {
         let mut steps = plan_steps(1, false);
         steps[1].progress = Some((142_000_000, Some(380_000_000)));
         let l = draw(&steps, &[]);
-        // Active step on row 2 (gauge row 0, step rows from 1); bar on row 3.
+        // The fixed step rows follow the gauge; reserved sub-lines follow all
+        // step rows, so the bar remains below the active step.
         let g = crate::caps::active_glyphs();
-        assert!(l[3].contains(g.bar_fill), "bar fill: {:?}", l[3]);
-        assert!(l[3].contains(g.bar_empty), "bar empty: {:?}", l[3]);
-        assert!(l[3].contains("142 MB / 380 MB"), "bytes: {:?}", l[3]);
-        assert!(l[3].trim_start().starts_with(g.box_v), "rail: {:?}", l[3]);
+        assert!(l[5].contains(g.bar_fill), "bar fill: {:?}", l[5]);
+        assert!(l[5].contains(g.bar_empty), "bar empty: {:?}", l[5]);
+        assert!(l[5].contains("142 MB / 380 MB"), "bytes: {:?}", l[5]);
+        assert!(l[5].trim_start().starts_with(g.box_v), "rail: {:?}", l[5]);
     }
 
     #[test]
@@ -538,7 +539,11 @@ mod tests {
             "Clone repository (exit 128): Host key verification failed while reading from origin — retry",
         );
         let l = draw(&steps, &[]);
-        let detail = l[5..11].join(" ");
+        let detail = l[5..11]
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(detail.contains("Clone repository"), "{detail:?}");
         assert!(
             detail.contains("Host key verification failed"),
@@ -636,8 +641,8 @@ mod tests {
             let all = l.join("\n");
             // The information-loss regression: steps stay visible on ASCII.
             assert!(all.contains("image"), "step labels visible: {all}");
-            assert!(l[3].contains('='), "ascii bar fill: {:?}", l[3]);
-            assert!(l[3].contains('-'), "ascii bar empty");
+            assert!(l[5].contains('='), "ascii bar fill: {:?}", l[5]);
+            assert!(l[5].contains('-'), "ascii bar empty");
             assert!(!all.contains('▓') && !all.contains('│'), "no unicode leaks");
         });
     }
