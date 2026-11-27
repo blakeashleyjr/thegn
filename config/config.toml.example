@@ -4701,13 +4701,12 @@ gate_setup_timeout_secs = 1800 # maximum setup duration; defaults to 30 minutes.
 gate_timeout_secs = 3600      # maximum gate duration; defaults to one hour. 0 disables the
                               # deadline. A timeout is an infrastructure hold, never a red build.
 gate_on = true                # run gate_command before advancing main
-gate_sandbox = "off"          # where the gate runs. "off" = on the host (as before). "sealed" =
-                              # gate_setup_command, gate_command and regenerate_command run in
-                              # the repo's sealed sandbox: network none, no credentials, no
-                              # control sockets. A land that needs a download goes red; a
-                              # sandbox that cannot start is an infrastructure hold. Set it in
-                              # your own config: [workspace.<slug>.merge_queue] may only raise
-                              # it to "sealed", and repo .thegn.* files cannot set it.
+gate_sandbox = "sealed"       # gate setup, gate and regeneration run in a local isolated runner:
+                              # network none, no credentials, no control sockets. A land that
+                              # needs a download is held; a sandbox that cannot start is an
+                              # infrastructure hold. Effective user/workspace config must
+                              # select sealed; repo .thegn.* files cannot set it. "off" cannot
+                              # produce a trusted gate result.
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
