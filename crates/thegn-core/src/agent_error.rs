@@ -10,8 +10,6 @@
 pub enum AgentErrorKind {
     /// Matched a harness failure banner (usage limit, connection error, auth).
     HarnessBanner,
-    /// Matched a usage or quota limit that can justify trying another backend.
-    UsageLimit,
 }
 
 /// Config-listed substrings that classify as agent-level errors.
@@ -85,26 +83,6 @@ pub fn classify_error_line(line: &str, sig: &AgentErrorSignatures) -> Option<Age
         .map(|_| AgentErrorKind::HarnessBanner)
 }
 
-/// Classify a provider quota banner that can justify trying another backend.
-/// Connection and authentication failures remain ordinary harness failures;
-/// only limit-like responses are eligible for quota failover.
-pub fn classify_usage_limit_line(line: &str) -> Option<AgentErrorKind> {
-    let line = line.to_lowercase();
-    [
-        "weekly limit",
-        "rate limit",
-        "usage limit",
-        "limit reached",
-        "quota exceeded",
-        "out of credits",
-        "insufficient credits",
-        "credit balance",
-    ]
-    .iter()
-    .any(|signature| line.contains(signature))
-    .then_some(AgentErrorKind::UsageLimit)
-}
-
 /// Per-session error state cleared on next normal output.
 #[derive(Debug, Clone, Default)]
 pub struct AgentErrorState {
@@ -154,32 +132,6 @@ mod tests {
             classify_error_line("CONNECTION ERROR.", &signatures),
             Some(AgentErrorKind::HarnessBanner)
         );
-    }
-
-    #[test]
-    fn quota_banners_from_claude_codex_and_pi_are_failover_eligible() {
-        for line in [
-            "You've hit your weekly limit",
-            "OpenAI usage limit reached. Try again later.",
-            "Request failed: rate limit exceeded",
-        ] {
-            assert_eq!(
-                classify_usage_limit_line(line),
-                Some(AgentErrorKind::UsageLimit),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn transient_harness_errors_are_not_quota_limits() {
-        for line in [
-            "connection timed out",
-            "network request failed",
-            "authentication failed",
-        ] {
-            assert_eq!(classify_usage_limit_line(line), None, "{line}");
-        }
     }
 
     #[test]
