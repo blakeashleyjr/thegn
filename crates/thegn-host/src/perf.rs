@@ -1724,6 +1724,10 @@ mod tests {
         );
         assert_eq!(lp.switch_us.percentile_us(1.0), one);
         assert_eq!(lp.renders, 2);
+        let expected_p95 = lp.switch_us.percentile_us(0.95);
+        let snapshot = lp.rollup(Instant::now(), 0, 0, 0);
+        assert_eq!(snapshot.switch_samples, 1);
+        assert_eq!(snapshot.switch_p95_us, expected_p95);
         set_enabled(false);
     }
 

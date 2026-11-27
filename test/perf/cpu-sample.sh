@@ -789,8 +789,8 @@ THREAD_TABLE=""
 # Absent on darwin: none of these counters has a procfs-free equivalent, and
 # reporting an invented zero would read as "no leak" rather than "not measured".
 RES_JSON="null"
-# Same rule for memory: `ps -o rss=` is not part of the darwin branch's sample,
-# so an unmeasured RSS reports null rather than a fabricated zero.
+# RSS is sampled on both platforms. The Linux path uses procfs and the Darwin
+# path uses `ps -o rss=` through `proc_rss_kb` below.
 RSS_HOST_JSON="null"
 RSS_DAEMON_JSON="null"
 
@@ -1010,9 +1010,26 @@ else
   # /usr/bin/top explicitly: nix profiles on macOS can shadow `top` with procps'
   # Linux build, which has neither `-l` nor these `-stats`.
   sleep "$(awk "BEGIN{print $SETTLE_MS/1000}")"
+  # Sample RSS across the same settled window. proc_rss_kb uses `ps -o rss=`
+  # when procfs is unavailable, preserving the harness's peak-over-window
+  # semantics on macOS too.
+  RSS_SAMPLES="$(awk "BEGIN{ n = int(($WINDOW_MS + 999) / 1000); print (n < 1 ? 1 : n) }")"
+  rss_peak_sampler "$PID" "$RSS_SAMPLES" "$PERF_TMP/rss.host.peak" &
+  RSS_HOST_JOB=$!
+  if [ "$SCENARIO" = soak-daemon ] && [ -n "${DAEMON_LAUNCHER:-}" ]; then
+    DPID="$DAEMON_LAUNCHER"
+    rss_peak_sampler "$DPID" "$RSS_SAMPLES" "$PERF_TMP/rss.daemon.peak" &
+    RSS_DAEMON_JOB=$!
+  fi
   PCT="$(/usr/bin/top -l 2 -s "$(awk "BEGIN{printf \"%d\", ($WINDOW_S + 0.5)}")" \
     -pid "$PID" -stats cpu 2>/dev/null |
     awk '/^%CPU/ { seen = 1; next } seen && NF { last = $1 } END { print last }')"
+  wait "$RSS_HOST_JOB" 2>/dev/null || true
+  RSS_HOST_JSON="$(cat "$PERF_TMP/rss.host.peak" 2>/dev/null || echo null)"
+  if [ -n "${RSS_DAEMON_JOB:-}" ]; then
+    wait "$RSS_DAEMON_JOB" 2>/dev/null || true
+    RSS_DAEMON_JSON="$(cat "$PERF_TMP/rss.daemon.peak" 2>/dev/null || echo null)"
+  fi
   [ -n "$PCT" ] || PCT=0
   # Same rule as the /proc path: a process that died inside the window measured
   # nothing (top prints a stale/zero sample), so fail rather than report it.
