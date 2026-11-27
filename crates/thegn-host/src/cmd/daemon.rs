@@ -415,22 +415,44 @@ mod tests {
 
     #[test]
     fn stop_discovery_falls_back_to_read_only_when_schema_migration_is_blocked() {
-        let fallback_called = std::cell::Cell::new(false);
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("thegn.db");
+        let socket = dir.path().join("daemon.sock");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE daemons (
+                daemon_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, scope TEXT NOT NULL,
+                endpoint TEXT NOT NULL, tcp_addr TEXT, control_origin TEXT,
+                hostname TEXT NOT NULL, version TEXT NOT NULL, started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL
+             );
+             CREATE INDEX idx_daemons_scope_heartbeat ON daemons(scope, heartbeat_at);
+             INSERT INTO daemons VALUES ('old', 1234, '/state', '{}', NULL, NULL,
+                                        'host', 'old', 1, 1000);
+             PRAGMA user_version = {};",
+            socket.display(),
+            thegn_core::db::SCHEMA_VERSION - 1,
+        ))
+        .unwrap();
+        drop(conn);
+
         let db = super::open_for_discovery_with(
             || {
                 Err(thegn_core::db::MigrationAccessError::OldSchemaInUse {
-                    database: PathBuf::from("/tmp/thegn.db"),
+                    database: path.clone(),
                 }
                 .into())
             },
-            || {
-                fallback_called.set(true);
-                Ok(Some(thegn_core::db::Db::open_memory()?))
-            },
+            || thegn_core::db::Db::open_read_only_wal_at(&path),
         )
         .expect("the old-schema registry should remain readable");
+        let discovered =
+            thegn_svc::control::client::discover(&db, "/state", 1_000).expect("daemon socket");
         drop(db);
-        assert!(fallback_called.get());
+        match discovered {
+            ControlAddr::Unix(path) => assert_eq!(path, socket),
+            _ => panic!("expected a local unix socket"),
+        }
     }
 
     #[test]

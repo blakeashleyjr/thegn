@@ -594,11 +594,8 @@ def _install_dev(ctx: Ctx, target: str, dry_run: bool, no_attest: bool, passthro
                     "downgrade (use --force to reinstall an older release)"
                 )
             if order == 0 and not force:
-                if (not dry_run and any(p.replaced for p in instance_procs_of(ctx, instance(ctx, "dev")))):
-                    ctx.say(f"dev binary is already at {installed}; only restarting the stale daemon")
-                    return 0
                 ctx.say(f"dev is already at {installed}; nothing to install (--force reinstalls)")
-                return 0 if dry_run else restart_after_update(ctx, "dev", False, False)
+                return 0
         ctx.say(f"dev <- release {tag}: download+verify, then scripts/dev_live.py --prebuilt")
         if dry_run:
             ctx.say("dry-run: " + " ".join(dev_live_argv(ctx, Path("<verified-binary>"), passthrough)))

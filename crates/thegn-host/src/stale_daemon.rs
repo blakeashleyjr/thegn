@@ -28,6 +28,7 @@ pub(crate) fn detect(error: &anyhow::Error) -> Option<StaleDaemon> {
                     db.daemons()
                         .ok()?
                         .into_iter()
+                        .filter(|row| crate::platform::pid_alive(row.pid))
                         .max_by_key(|row| row.heartbeat_at)
                         .map(|row| row.pid)
                 }),
