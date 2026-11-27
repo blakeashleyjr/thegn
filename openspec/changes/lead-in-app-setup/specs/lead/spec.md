@@ -4,8 +4,9 @@
 
 ### Requirement: The Lead is set up from inside the app
 
-When the Lead jump key is pressed and `[lead]` is absent, or the Lead is not logged in, or the
-daemon's Lead listener is not up, thegn SHALL open a guided setup instead of opening the Lead. The
+When the Lead jump key is pressed or its sidebar row is clicked and `[lead]` is absent, or the Lead
+is not logged in, or the daemon's Lead listener is not up, thegn SHALL open a guided setup instead
+of opening the Lead. The
 setup SHALL check bubblewrap and pasta (both required; a missing pasta shows install hints and never
 a host-network option), preview the `[lead]` and `[daemon] enabled` lines before writing them with
 the config writer, confirm before restarting the daemon, run the agent and MCP logins by running
@@ -54,6 +55,11 @@ its restart confirm SHALL state how many live daemon sessions would end.
 
 - **WHEN** no `[lead]` is configured and the sidebar row is activated
 - **THEN** the setup flow opens and no Lead terminal is created
+
+#### Scenario: Click the Lead row while setup is needed
+
+- **WHEN** the Lead row is clicked while `[lead]` is absent or the Lead is not ready
+- **THEN** the guided setup opens instead of activating a project worktree
 
 #### Scenario: Counted restart
 

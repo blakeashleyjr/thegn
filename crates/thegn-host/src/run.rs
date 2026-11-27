@@ -8943,10 +8943,21 @@ async fn event_loop<T: Terminal>(
                     active_menu = Some(crate::lead::setup::begin(&crate::lead::setup::RealHost {
                         cfg: keymap.config(),
                     }));
+                    focus.zone = crate::focus::Zone::Center;
                 }
                 crate::lead::group::JumpOutcome::Activate(t) => {
+                    // Lead clicks used to pass through the sidebar activation
+                    // arm, which stamps the center switch for the renderer.
+                    // Keep that damage signal when routing them through the
+                    // shared jump path so the old worktree cannot remain on
+                    // screen after session focus changes.
+                    switch_at = Some((
+                        std::time::Instant::now(),
+                        crate::handlers::sidebar_activate::switch_kind(&t, &session.id),
+                    ));
                     let (hydrate, _pending) = activate_row!(t);
                     sb.focus_active_row(&mut model);
+                    focus.zone = crate::focus::Zone::Center;
                     if hydrate {
                         kick_model_hydration!();
                     }
@@ -19139,31 +19150,37 @@ async fn event_loop<T: Terminal>(
                                 target,
                                 force_center,
                             } => {
-                                // Stamp the switch like the keyboard `Activate`
-                                // arm: it is the render plan's `switch` damage
-                                // bit. An in-workspace hop is a pure focus move
-                                // that dirties nothing else, so without it this
-                                // arm's sidebar-only damage repainted the
-                                // highlight but left the center on the previous
-                                // worktree's panes.
-                                switch_at = Some((
-                                    std::time::Instant::now(),
-                                    crate::handlers::sidebar_activate::switch_kind(
-                                        &target,
-                                        &session.id,
-                                    ),
-                                ));
-                                let hydrate = activate_row!(target).0;
-                                // A switch from the sidebar keeps the user in
-                                // the center terminal if that's where they were
-                                // typing (matching keyboard NextTab/PrevTab);
-                                // a double-click commits focus to the center
-                                // regardless.
-                                if was_center || force_center {
+                                if crate::lead::group::is_lead_target(&target, &session) {
+                                    // Lead clicks share the jump key's readiness
+                                    // check and focus transition. Generic terminal
+                                    // activation can start a lazy restore without
+                                    // opening setup, and does not own the Lead's
+                                    // global entry semantics.
+                                    jump_lead!();
                                     focus.zone = crate::focus::Zone::Center;
-                                }
-                                if hydrate {
-                                    kick_model_hydration!();
+                                } else {
+                                    // Stamp the switch like the keyboard
+                                    // `Activate` arm: it is the render plan's
+                                    // `switch` damage bit. An in-workspace hop is
+                                    // a pure focus move that dirties nothing else.
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::handlers::sidebar_activate::switch_kind(
+                                            &target,
+                                            &session.id,
+                                        ),
+                                    ));
+                                    let hydrate = activate_row!(target).0;
+                                    // A switch from the sidebar keeps the user
+                                    // in the center terminal if that's where they
+                                    // were typing; a double-click always commits
+                                    // focus to the center.
+                                    if was_center || force_center {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    if hydrate {
+                                        kick_model_hydration!();
+                                    }
                                 }
                             }
                             crate::handlers::sidebar_mouse::PressOut::Outcome(out) => {
