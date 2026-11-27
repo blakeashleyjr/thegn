@@ -7,9 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.143] — 2026-11-27
+
+Merge gate results show when they ran unsandboxed, and pull request polling is shared per repository.
+
 ### Changed
 
-- Host-run merge gate results are labeled as untrusted; sealed gate results remain unlabeled.
+- Merge gate results that ran on the host are labeled `untrusted: ran on host, not isolated` in the merge queue panel, CLI output, land messages and notifications. `--json` output gains an `isolated` field. Results from a sealed gate are not labeled. The sandboxing help page explains how to opt in to `gate_sandbox = "sealed"`.
+- The open pull request feed is polled once per repository per refresh interval, not once per worktree.
+
+### Fixed
+
+- The sidebar status debug log uses the `worktrees=` field again, which the idle CPU harness relies on.
+- `test/perf/claim-run.sh` runs: it no longer passes flag-shaped patterns to `grep` unguarded, or requires a hyperfine flag that does not exist.
 
 ## [0.1.0-alpha.142] — 2026-11-27
 
