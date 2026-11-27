@@ -1,24 +1,24 @@
 //! The loading-screen BODY layout: gauge rule, timeline-rail step rows with a
-//! right-aligned elapsed column, floating progress/hint/error sub-lines, and
+//! right-aligned elapsed column, reserved progress/hint/error sub-lines, and
 //! the context block — everything below the wordmark while `load_steps` is
 //! non-empty. Pure surface painting: a function of (rect, steps, context,
 //! caps, ambient clock); the splash-scoped ticker merely causes repaints.
 //!
 //! Layout contract (the no-bounce guarantee, locked by tests): for a given
 //! plan the block height is CONSTANT — `steps.len()` rows plus a fixed
-//! [`SUBLINE_RESERVE`] that floats under the cursor step (progress bar,
-//! hint, or wrapped error) and renders blank otherwise. State transitions can
-//! never change the height, so the wordmark above never re-centers.
+//! fixed sub-line reserve after the steps (progress bar, hint, or wrapped
+//! error). State transitions can never change step positions or height, so the
+//! wordmark above never re-centers.
 //!
 //! ```text
 //! ─────────────── 3/5 · 0:41 ───────────────      gauge
 //! ✓ connect podman                     0.3s
 //! ✓ resolve image                      0.8s
 //! ◐ pull ghcr.io/blake/dev:latest       38s       ← cursor
-//! │   ▓▓▓▓▓▓▓░░░░░░░░░░  142 MB / 380 MB          ← floating sub-lines
-//! │   network-bound — a cold pull can …
 //! ◇ create container
 //! ◇ shell
+//! │   ▓▓▓▓▓▓▓░░░░░░░░░░  142 MB / 380 MB          ← reserved sub-lines
+//! │   network-bound — a cold pull can …
 //!
 //!   env        gpu-sprite                          context block
 //!   placement  provider:sprites
@@ -32,8 +32,7 @@ use crate::chrome::{self, LoadStep, S, StepState, col};
 use crate::compositor::Rect;
 use crate::loading::{catalog, plan};
 
-/// Rows always reserved for the cursor step's floating sub-lines (an active
-/// step's progress bar + live detail).
+/// Minimum sub-line rows for an active step's progress bar and live detail.
 pub(crate) const SUBLINE_RESERVE: usize = 2;
 /// A FAILED step wraps its full error, which is often long (a provider HTTP
 /// error like `machine0 mcp vm_list: HTTP 429 Too Many Requests: {…}` used to
@@ -70,8 +69,8 @@ pub(crate) fn reserved_rows(steps: &[LoadStep], ctx: &[(String, String)]) -> usi
     (1 + steps.len() + SUBLINE_RESERVE.max(error_rows) + ctx_rows).max(RESERVE_MIN)
 }
 
-/// The cursor step: the running one, else the failure, else none. Sub-lines
-/// float under it.
+/// The cursor step: the running one, else the failure, else none. Its detail
+/// is rendered in the fixed reserve after the step rows.
 fn cursor(steps: &[LoadStep]) -> Option<usize> {
     steps
         .iter()
@@ -79,14 +78,13 @@ fn cursor(steps: &[LoadStep]) -> Option<usize> {
         .or_else(|| steps.iter().position(|s| s.state == StepState::Failed))
 }
 
-/// One floating sub-line: colored segments drawn after the rail glyph.
+/// One sub-line: colored segments drawn after the rail glyph.
 struct SubLine {
     segs: Vec<(String, ColorAttribute)>,
 }
 
-/// The (up to [`SUBLINE_RESERVE`]) sub-lines for the cursor step: a failed
-/// step wraps its error in red; an active step shows its progress bar and its
-/// detail (falling back to the catalog's slow-step hint past the threshold).
+/// Sub-lines for the cursor step: a failed step wraps its error in red; an
+/// active step shows its progress bar and detail (or its slow-step hint).
 fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLine> {
     let mut out = Vec::new();
     if step.state == StepState::Failed {
@@ -126,8 +124,8 @@ fn sublines(step: &LoadStep, accent: ColorAttribute, width: usize) -> Vec<SubLin
             .map(str::to_string),
     };
     if let Some(t) = text {
-        // Wrap across the reserve rows still free under this step (the whole
-        // reserve when there's no progress bar) so a long escalation hint —
+        // Wrap across the active-step reserve still free after its progress
+        // bar (the whole reserve when there is no progress bar), so a hint —
         // "…it may be wedged; press Esc to cancel" — shows its actionable tail
         // instead of clipping to one truncated line.
         let remaining = SUBLINE_RESERVE.saturating_sub(out.len());
@@ -195,9 +193,9 @@ pub(crate) fn draw_body(
     let block_w = needed.min(cap);
     let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
     let label_budget = block_w.saturating_sub(2 + 2 + ELAPSED_W);
-    // Floating sub-lines hang under the cursor step's rail (`bx + 4`) and may
-    // run wider than the label column — out to a small right gutter, capped at
-    // SUBLINE_MAX — so a git error / slow hint wraps rather than clipping.
+    // Sub-lines start under the timeline rail (`bx + 4`) and may run wider than
+    // the label column — out to a small right gutter, capped at SUBLINE_MAX —
+    // so a git error / slow hint wraps rather than clipping.
     let sub_x = bx + 4;
     let sub_w = (rect.x + rect.cols)
         .saturating_sub(sub_x + 2)
@@ -235,10 +233,10 @@ pub(crate) fn draw_body(
         );
     }
 
-    // ── step rows + floating sub-lines ──────────────────────────────────
+    // ── fixed step rows + reserved sub-lines ────────────────────────────
     let cur = cursor(steps);
     let mut y = y0 + 1;
-    for (i, step) in steps.iter().enumerate() {
+    for step in steps {
         if y >= bottom {
             break;
         }
@@ -264,42 +262,35 @@ pub(crate) fn draw_body(
             chrome::draw_text(surface, bx + block_w - w, y, &e, fg, bg, w);
         }
         y += 1;
-        if cur == Some(i) {
-            let lines = sublines(step, accent, sub_w);
-            let reserve = if step.state == StepState::Failed {
-                lines.len().max(ERROR_SUBLINE_RESERVE)
-            } else {
-                SUBLINE_RESERVE
-            };
-            for j in 0..reserve {
-                if y >= bottom {
-                    break;
-                }
-                if let Some(line) = lines.get(j) {
-                    chrome::draw_text(surface, bx, y, g.box_v, col(S::Ghost), bg, 1);
-                    let mut x = sub_x;
-                    for (text, fg) in &line.segs {
-                        chrome::draw_text(
-                            surface,
-                            x,
-                            y,
-                            text,
-                            *fg,
-                            bg,
-                            (sub_x + sub_w).saturating_sub(x),
-                        );
-                        x += UnicodeWidthStr::width(text.as_str());
-                    }
-                }
-                y += 1;
-            }
+    }
+    let subline_start = y;
+    let detail_lines = cur
+        .map(|index| sublines(&steps[index], accent, sub_w))
+        .unwrap_or_default();
+    let reserve = SUBLINE_RESERVE
+        .max(ERROR_SUBLINE_RESERVE)
+        .max(detail_lines.len());
+    for (j, line) in detail_lines.iter().take(reserve).enumerate() {
+        let row = subline_start + j;
+        if row >= bottom {
+            break;
+        }
+        chrome::draw_text(surface, bx, row, g.box_v, col(S::Ghost), bg, 1);
+        let mut x = sub_x;
+        for (text, fg) in &line.segs {
+            chrome::draw_text(
+                surface,
+                x,
+                row,
+                text,
+                *fg,
+                bg,
+                (sub_x + sub_w).saturating_sub(x),
+            );
+            x += UnicodeWidthStr::width(text.as_str());
         }
     }
-    // No cursor (all pending / all done): the reserve rows sit blank at the
-    // block's end — same height either way.
-    if cur.is_none() {
-        y += SUBLINE_RESERVE;
-    }
+    y = subline_start + reserve;
 
     // ── context block ────────────────────────────────────────────────────
     if ctx.is_empty() {
@@ -540,28 +531,29 @@ mod tests {
     #[test]
     fn failure_wraps_error_into_the_reserve() {
         let mut steps = plan_steps(1, true);
-        // A long error wraps across the 2 reserve rows directly under the
-        // failed step (rows 3+4); overflow past the reserve is dropped, never a
-        // third row. The sub-line runs wider than the short label column, so a
-        // real git error isn't clipped mid-word.
+        // A long error wraps in the fixed reserve after the steps. The
+        // sub-line runs wider than the short label column, so a real git error
+        // isn't clipped mid-word.
         steps[1] = steps[1].clone().with_detail(
             "Clone repository (exit 128): Host key verification failed while reading from origin — retry",
         );
         let l = draw(&steps, &[]);
-        assert!(l[3].contains("Clone repository"), "{:?}", l[3]);
-        // The phrase survives across the two rows — it isn't clipped to the
-        // short label column (which was the reported truncation bug).
-        assert!(l[3].contains("Host key"), "row 1: {:?}", l[3]);
-        assert!(l[4].contains("verification failed"), "row 2: {:?}", l[4]);
-        // Exactly two rows: the tail beyond the reserve is dropped.
-        assert!(!l[5].contains("retry"), "no third error row: {:?}", l[5]);
+        let detail = l[5..11].join(" ");
+        assert!(detail.contains("Clone repository"), "{detail:?}");
+        assert!(
+            detail.contains("Host key verification failed"),
+            "{detail:?}"
+        );
+        assert!(
+            detail.contains("retry"),
+            "error tail was clipped: {detail:?}"
+        );
     }
 
     #[test]
     fn rows_below_the_cursor_hold_position_as_it_advances() {
-        // The sub-line reserve floats DOWN with the cursor, so a step that is
-        // still ahead of the cursor sits at the same row across ticks — the
-        // list reads as a stable timeline, not a shuffling one.
+        // The sub-line reserve follows the fixed step rows, so a pending step
+        // stays in the same place as the cursor advances.
         let find_step_row = |steps: &[LoadStep], label: &str| {
             draw(steps, &[])
                 .iter()
@@ -588,10 +580,10 @@ mod tests {
         ];
         let steps = plan_steps(1, false);
         let l = draw(&steps, &ctx);
-        // gauge(1) + steps(4) + reserve(2) + gap(1) = context at row 8.
-        assert!(l[8].contains("env"), "{:?}", l[8]);
-        assert!(l[8].contains("gpu-sprite"));
-        assert!(l[9].contains("placement"));
+        // gauge(1) + steps(4) + reserve(6) + gap(1) = context at row 12.
+        assert!(l[12].contains("env"), "{:?}", l[12]);
+        assert!(l[12].contains("gpu-sprite"));
+        assert!(l[13].contains("placement"));
     }
 
     #[test]

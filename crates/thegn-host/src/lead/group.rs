@@ -198,7 +198,7 @@ fn reset_lead_group(
 /// Whether activating `target` is the sidebar's "Lead — set up" row: the Lead
 /// group's target while no `[lead]` is configured.
 pub(crate) fn is_setup_target(target: &RowTarget, cfg: &thegn_core::config::Config) -> bool {
-    (!super::enabled(cfg) || super::disabled_reason(cfg).is_some())
+    !super::enabled(cfg)
         && matches!(
             target,
             RowTarget::Workspace { repo_path, group: Some(g) }
@@ -219,6 +219,17 @@ pub(crate) enum JumpOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ready_facts() -> super::super::setup::Facts {
+        super::super::setup::Facts {
+            dev_channel: true,
+            bwrap: true,
+            pasta: true,
+            logged_in: true,
+            listener_up: true,
+            ..Default::default()
+        }
+    }
 
     fn row(name: &str, kind: &str) -> TerminalRow {
         TerminalRow {
@@ -347,7 +358,7 @@ mod tests {
             active: 0,
         };
         assert_eq!(
-            plan(&cfg, &session, &[]),
+            plan_with_facts(&cfg, &session, &[], &ready_facts()),
             JumpPlan::Activate(RowTarget::Tab(1, 0))
         );
         let target = RowTarget::Tab(1, 0);
@@ -404,7 +415,10 @@ mod tests {
         // The error recovery click is another activation of the same row; the
         // jump plan resolves to the Lead tab that owns the failed launch.
         assert!(is_lead_target(&target, &session));
-        assert_eq!(plan(&cfg, &session, &[]), JumpPlan::Activate(target));
+        assert_eq!(
+            plan_with_facts(&cfg, &session, &[], &ready_facts()),
+            JumpPlan::Activate(target)
+        );
         assert_eq!(session.worktrees[1].name, LEAD_GROUP_NAME);
     }
 

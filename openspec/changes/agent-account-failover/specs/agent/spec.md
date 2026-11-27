@@ -1,7 +1,8 @@
 # Agent backends
 
 - `[[agents.backends]]` entries SHALL remain ordered, with unique names and a
-  launchable harness.
+  launchable harness; each backend env key SHALL be a valid environment
+  variable name, even when that backend's harness is invalid.
 - `thegn agent run --agent <role>` SHALL select the first configured backend
   with known usage headroom when the role has backends.
 - `thegn agent run --backend <name>` SHALL launch that named backend for the

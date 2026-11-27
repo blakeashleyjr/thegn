@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(roster[0].id, id);
         assert_eq!(
             roster[0].note.as_deref(),
-            Some("note body\nbackend selected: codex-pro")
+            Some("backend selected: codex-pro")
         );
         assert!(roster[0].report.is_none());
         assert_eq!(full[0].note.as_deref(), Some("note body"));

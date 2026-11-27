@@ -2139,7 +2139,7 @@ mod tests {
             backend("codex", "codex", None),
         ];
         assert_eq!(
-            backend_headroom(&backends[0], &[exhausted.clone()]),
+            backend_headroom(&backends[0], std::slice::from_ref(&exhausted)),
             BackendHeadroom::Exhausted
         );
         let account_rows = [exhausted, available];

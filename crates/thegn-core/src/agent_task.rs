@@ -1086,6 +1086,15 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
                         e.name, backend.name
                     ));
                 }
+                for k in backend.env.keys() {
+                    if !env_key_ok(k) {
+                        out.push(format!(
+                            "[[{section}]] {:?}.backends.{:?}.env: {k:?} is not an \
+                             environment variable name",
+                            e.name, backend.name
+                        ));
+                    }
+                }
                 let harness = backend.harness.trim();
                 let Some(adapter) = crate::harness::harness(harness)
                     .filter(|adapter| adapter.headless_template().is_some())
@@ -1108,15 +1117,6 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
                          model flag thegn knows",
                         e.name, backend.name
                     ));
-                }
-                for k in backend.env.keys() {
-                    if !env_key_ok(k) {
-                        out.push(format!(
-                            "[[{section}]] {:?}.backends.{:?}.env: {k:?} is not an \
-                             environment variable name",
-                            e.name, backend.name
-                        ));
-                    }
                 }
             }
         }
