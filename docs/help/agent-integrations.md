@@ -109,4 +109,7 @@ overlay; `account` can bind it to a usage key or credential-home path. The
 `agent list` command shows names and non-secret launch metadata, while
 `agent backends` reports current usage headroom and reset time. `agent run`
 selects the first backend with known headroom; `--backend <name>` pins one.
-Pipeline stages continue to use their configured single backend.
+With `agent run --wait`, a recognized Claude, Codex or Pi quota response
+retries once on the next configured backend with known headroom. A pinned
+backend is never switched. Pipeline stages continue to use their configured
+single backend.

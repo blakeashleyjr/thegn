@@ -180,10 +180,12 @@ pub fn backend_headroom(
     if known.is_empty() {
         return BackendHeadroom::Unknown;
     }
-    if known
-        .iter()
-        .any(|account| account.windows.iter().all(|window| window.used_percent < 100.0))
-    {
+    if known.iter().any(|account| {
+        account
+            .windows
+            .iter()
+            .all(|window| window.used_percent < 100.0)
+    }) {
         BackendHeadroom::Available
     } else {
         BackendHeadroom::Exhausted
@@ -199,6 +201,19 @@ pub fn select_backend<'a>(
     backends
         .iter()
         .find(|backend| backend_headroom(backend, accounts) == BackendHeadroom::Available)
+}
+
+/// Select in configured order while skipping backends already attempted in
+/// the current run.
+pub fn select_backend_excluding<'a>(
+    backends: &'a [crate::config::AgentBackend],
+    accounts: &[AccountUsage],
+    excluded: &[String],
+) -> Option<&'a crate::config::AgentBackend> {
+    backends.iter().find(|backend| {
+        !excluded.iter().any(|name| name == &backend.name)
+            && backend_headroom(backend, accounts) == BackendHeadroom::Available
+    })
 }
 
 impl AccountUsage {
@@ -2130,9 +2145,25 @@ mod tests {
             backend_headroom(&backends[0], &[exhausted.clone()]),
             BackendHeadroom::Exhausted
         );
+        let account_rows = [exhausted, available];
         assert_eq!(
-            select_backend(&backends, &[exhausted, available]).map(|b| b.name.as_str()),
+            select_backend(&backends, &account_rows).map(|b| b.name.as_str()),
             Some("codex")
+        );
+        let ordered = vec![
+            backend("codex-first", "codex", None),
+            backend("codex-second", "codex", None),
+        ];
+        let one_account = [AccountUsage::ok(
+            "codex",
+            "Codex",
+            None,
+            vec![UsageWindow::new("weekly", 20.0, Some(6_000))],
+        )];
+        assert_eq!(
+            select_backend_excluding(&ordered, &one_account, &["codex-first".into()])
+                .map(|b| b.name.as_str()),
+            Some("codex-second")
         );
         assert_eq!(
             backend_headroom(&backends[0], &[]),

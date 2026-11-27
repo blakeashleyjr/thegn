@@ -10,5 +10,12 @@
   harness credential-home behavior; it SHALL NOT copy credentials between
   accounts.
 - Roles without backends SHALL retain the existing single-backend behavior.
+- A waited `thegn agent run` SHALL retry once on the next ordered backend with
+  known headroom when the first run exits after a recognized Claude, Codex or
+  Pi quota response. A pinned backend SHALL not fail over.
+- Quota classification SHALL be harness-specific and SHALL ignore generic
+  connection, authentication, and tool errors.
+- A quota response SHALL mark its backend unavailable until the matched
+  provider usage window resets, including across later launches.
 - Pipeline stage launches SHALL keep their configured backend until pipeline
   failover attribution is implemented.

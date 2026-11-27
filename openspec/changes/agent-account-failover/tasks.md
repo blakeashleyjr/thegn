@@ -2,6 +2,7 @@
 - [x] Select a headroom backend or honor `agent run --backend`.
 - [x] Route the selected backend through the daemon launch resolver.
 - [x] Document config and CLI behavior; pin config keys in the ratchet.
-- [ ] Detect quota errors per harness and retry once on the next backend.
+- [x] Detect quota errors per harness and retry once on the next backend for waited CLI runs.
+- [ ] Persist limit-hit cooldowns until the matching usage window reset, and apply them to later runs.
 - [ ] Record and display selected backend in pipeline and lane views.
-- [ ] Add provider limit-detection and failover-order tests.
+- [x] Add provider limit-detection and failover-order tests.

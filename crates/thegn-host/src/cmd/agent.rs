@@ -306,6 +306,16 @@ pub(crate) fn choose_backend(
     agent: &str,
     pinned: Option<&str>,
 ) -> Result<Option<String>> {
+    choose_backend_excluding(cfg, agent, pinned, &[])
+}
+
+/// Choose the first headroom backend not already attempted by this run.
+pub(crate) fn choose_backend_excluding(
+    cfg: &Config,
+    agent: &str,
+    pinned: Option<&str>,
+    excluded: &[String],
+) -> Result<Option<String>> {
     let Some(role) = cfg.agents.iter().find(|entry| entry.name == agent) else {
         anyhow::ensure!(
             pinned.is_none(),
@@ -344,7 +354,7 @@ pub(crate) fn choose_backend(
         })
         .collect::<Vec<_>>();
     let accounts = thegn_svc::usage::gather_with(&cfg.usage, &configured_homes);
-    thegn_core::usage::select_backend(&role.backends, &accounts)
+    thegn_core::usage::select_backend_excluding(&role.backends, &accounts, excluded)
         .map(|backend| Some(backend.name.clone()))
         .ok_or_else(|| {
             anyhow::anyhow!(

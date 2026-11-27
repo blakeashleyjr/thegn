@@ -512,7 +512,8 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     if prompt.trim().is_empty() {
         anyhow::bail!("agent run needs a task: give a non-empty --prompt or --brief-file");
     }
-    let backend = {
+    let pinned_backend = backend.clone();
+    let mut backend = {
         let (cfg, agent) = (cfg.clone(), agent.clone());
         tokio::task::spawn_blocking(move || {
             super::agent::choose_backend(&cfg, &agent, backend.as_deref())
@@ -563,15 +564,15 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         thegn_core::msg::warn(&w);
     }
     let started = Instant::now();
-    let (info, row) = crate::cmd::session::open_plain(
+    let (mut info, row) = crate::cmd::session::open_plain(
         cfg,
         &client,
         crate::cmd::session::PlainOpen {
             agent: Some(agent),
             backend: backend.clone(),
             stage: None,
-            worktree: Some(worktree),
-            prompt,
+            worktree: Some(worktree.clone()),
+            prompt: prompt.clone(),
             headless: true,
             bind: true,
             adopt: false,
@@ -601,13 +602,78 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
         }
         return Ok(crate::cmd::EXIT_OK);
     }
-    let (status, raw) = observe_until_exit(
+    let tracked_session = info.id.clone();
+    let mut observed = observe_until_exit(
         &client,
         &info.id,
         Duration::from_secs(timeout_secs),
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     )
     .await?;
+    // A quota response is the only failure that triggers an automatic retry.
+    // Retry at most once and only on a distinct backend with known headroom;
+    // operator pins are authoritative and never silently switched.
+    if let (Some(current), Some(role)) = (
+        backend.as_deref(),
+        cfg.agents.iter().find(|entry| entry.name == agent),
+    ) {
+        let harness = role
+            .backends
+            .iter()
+            .find(|candidate| candidate.name == current)
+            .map(|candidate| candidate.harness.as_str());
+        let quota_hit = matches!(observed.0, WaitStatus::Exited(Some(code)) if code != 0)
+            && harness.is_some_and(|harness| {
+                thegn_core::agent_error::is_quota_error(harness, &output_tail(&observed.1))
+            });
+        if quota_hit && pinned_backend.is_none() {
+            let attempted = vec![current.to_string()];
+            let (cfg_for_select, agent_for_select) = (cfg.clone(), agent.clone());
+            let next = tokio::task::spawn_blocking(move || {
+                super::agent::choose_backend_excluding(
+                    &cfg_for_select,
+                    &agent_for_select,
+                    None,
+                    &attempted,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("agent failover selection task failed: {e}"))??;
+            if let Some(next_backend) = next {
+                thegn_core::msg::info(&format!(
+                    "agent run: quota limit on backend {current}; retrying once on {next_backend}"
+                ));
+                let (retry_info, _) = crate::cmd::session::open_plain(
+                    cfg,
+                    &client,
+                    crate::cmd::session::PlainOpen {
+                        agent: Some(agent),
+                        backend: Some(next_backend.clone()),
+                        stage: None,
+                        worktree: Some(worktree),
+                        prompt,
+                        headless: true,
+                        bind: true,
+                        adopt: false,
+                        track: None,
+                        permissions: Vec::new(),
+                        widen_permissions: false,
+                    },
+                )
+                .await?;
+                info = retry_info;
+                backend = Some(next_backend);
+                observed = observe_until_exit(
+                    &client,
+                    &info.id,
+                    Duration::from_secs(timeout_secs),
+                    std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                )
+                .await?;
+            }
+        }
+    }
+    let (status, raw) = observed;
     let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     let tail = output_tail(&raw);
     let hint = exit_hint(status.exit_code());
@@ -620,7 +686,7 @@ async fn run_async(cfg: &Config, args: RunArgs) -> Result<i32> {
     // agent's exit code.
     let row_close = match (row, status) {
         (Some(row), WaitStatus::Exited(code)) => {
-            let session = info.id.clone();
+            let session = tracked_session.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let db = Db::open()?;
                 close_tracked_row(&db, row, &session, code)

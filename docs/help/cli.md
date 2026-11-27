@@ -759,7 +759,11 @@ current usage headroom (`available`, `exhausted` or `unknown`) and the earliest
 reported reset time. `--json` emits a JSON array. Account paths are used for
 matching but are not included in the output. `thegn agent run --agent <role>`
 selects the first backend with known headroom; `--backend <name>` pins a backend
-for that run. Pipeline stages continue to use their configured backend.
+for that run. With `--wait`, a recognized Claude, Codex or Pi quota response
+retries once on the next configured backend with known headroom; explicit pins
+are never switched. Runs without `--wait` return the session immediately and
+cannot observe a later quota failure. Pipeline stages continue to use their
+configured backend.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.
@@ -858,5 +862,6 @@ does not run this prune.
 basename, and raises it in a running instance — the remote control.
 `thegn agent run --agent <role> --backend <name>` pins a configured backend
 for one run. Without `--backend`, a role with ordered backends uses the first
-one whose account has known usage headroom. See [[agent-integrations]] and
+one whose account has known usage headroom. `--wait` retries a recognized quota
+response once on the next eligible backend. See [[agent-integrations]] and
 [[configuration]].
