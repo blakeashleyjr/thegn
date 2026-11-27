@@ -102,6 +102,20 @@ impl WorktreeSlice {
         model.panel_pending = true;
         model.panel_error = None;
     }
+
+    /// A terminal has no worktree path from which to build the worktree panel.
+    /// Resolve its cold-switch placeholder immediately instead of waiting for
+    /// a panel worker that cannot be started.
+    pub(crate) fn clear_terminal(model: &mut FrameModel, name: &str) {
+        WorktreeSlice::default().apply(model);
+        model.panel_pending = false;
+        model.panel_error = Some(if crate::lead::group::is_lead_group(name) {
+            "The Lead has no worktree panel. Press Alt i to check setup and restart the daemon."
+                .into()
+        } else {
+            "Terminal tabs have no worktree panel. Switch to a worktree to see its changes.".into()
+        });
+    }
 }
 
 /// One prefetched / fast-filled worktree slice in flight.
@@ -326,6 +340,21 @@ mod tests {
         );
         assert!(!model.panel_pending);
         assert!(model.panel_error.as_deref().unwrap().contains("retry"));
+    }
+
+    #[test]
+    fn lead_terminal_resolves_the_panel_skeleton_to_a_recovery_error() {
+        let mut model = FrameModel {
+            panel_pending: true,
+            ..Default::default()
+        };
+
+        WorktreeSlice::clear_terminal(&mut model, crate::lead::group::LEAD_GROUP_NAME);
+
+        assert!(!model.panel_pending);
+        let error = model.panel_error.as_deref().expect("Lead panel error");
+        assert!(error.contains("Alt i"));
+        assert!(error.contains("restart the daemon"));
     }
 
     fn model_with(backend: &str, kind: Option<&str>, disk: Option<u64>) -> FrameModel {

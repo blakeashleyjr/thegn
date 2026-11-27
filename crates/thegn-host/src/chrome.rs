@@ -2400,7 +2400,11 @@ pub fn draw_panel(
                 rect.cols.saturating_sub(4),
             );
         }
-        let hint = "Switch away and back to retry";
+        let hint = if error.contains("Alt i") {
+            "Press Alt i to retry Lead setup"
+        } else {
+            "Switch away and back to retry"
+        };
         draw_text(
             surface,
             rect.x + 2,

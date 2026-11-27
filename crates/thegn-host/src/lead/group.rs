@@ -38,7 +38,7 @@ pub(crate) fn lead_choice() -> TerminalChoice {
 /// What the jump key should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JumpPlan {
-    /// `[lead]` is absent or the channel is stable: open the in-app setup.
+    /// Lead is unconfigured, unavailable, or not ready: open in-app setup.
     Disabled,
     /// The Lead exists (resident or registered): activate this target.
     Activate(RowTarget),
@@ -70,7 +70,11 @@ fn plan_with_facts(
     db_terminals: &[TerminalRow],
     facts: &super::setup::Facts,
 ) -> JumpPlan {
-    if !super::enabled(cfg) {
+    if !super::enabled(cfg)
+        || (!facts.dev_channel && !facts.file_preview)
+        || !facts.bwrap
+        || !facts.pasta
+    {
         return JumpPlan::Disabled;
     }
     // A registered or already-open Lead can outlive the daemon listener it
@@ -126,10 +130,37 @@ pub(crate) fn jump(
     }
 }
 
+/// Retry after the setup flow has waited for `thegn daemon stop` to finish.
+/// The normal jump checks the old listener to avoid a doomed launch; this
+/// path intentionally skips that stale-listener check because creating or
+/// restoring the terminal is what starts the daemon on its next attach.
+pub(crate) fn jump_after_restart(
+    cfg: &thegn_core::config::Config,
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::run::run_pending_db::PendingDbResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> JumpOutcome {
+    if !super::enabled(cfg) || super::disabled_reason(cfg).is_some() {
+        return JumpOutcome::Setup;
+    }
+    if let Some(i) = session
+        .worktrees
+        .iter()
+        .position(|w| w.name == LEAD_GROUP_NAME && w.kind == crate::session::GroupKind::Terminal)
+    {
+        return JumpOutcome::Activate(RowTarget::Tab(i, session.worktrees[i].active_tab));
+    }
+    let choice = lead_choice();
+    crate::handlers::terminal::persist(&choice, tx, waker);
+    crate::handlers::terminal::push_terminal_group(session, panes, &choice);
+    JumpOutcome::Created
+}
+
 /// Whether activating `target` is the sidebar's "Lead — set up" row: the Lead
 /// group's target while no `[lead]` is configured.
 pub(crate) fn is_setup_target(target: &RowTarget, cfg: &thegn_core::config::Config) -> bool {
-    !super::enabled(cfg)
+    (!super::enabled(cfg) || super::disabled_reason(cfg).is_some())
         && matches!(
             target,
             RowTarget::Workspace { repo_path, group: Some(g) }
