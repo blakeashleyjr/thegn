@@ -837,8 +837,8 @@ fn backoff_active(worktree: &str, now: i64) -> bool {
 // --- the refresh itself -----------------------------------------------------
 
 /// Everything the loop does on a CI tick, in one call (keeps `run.rs` lean):
-/// kick the off-loop cache refresh (+ the background sweep it carries) and
-/// re-poll an open live drill on a still-running run so it updates in place.
+/// kick the off-loop active-worktree cache refresh and re-poll an open live
+/// drill on a still-running run so it updates in place.
 pub(crate) fn on_ci_tick(
     session: &crate::session::Session,
     full: &thegn_core::config::Config,
