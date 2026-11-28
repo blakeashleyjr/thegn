@@ -1625,6 +1625,53 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_alt_worktree_move_updates_rendered_and_persisted_order() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("cursor-persist");
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_workspace(REPO, "app", "repo").unwrap();
+        for label in ["home", "alpha", "beta"] {
+            db.put_worktree(
+                &format!("app/{label}"),
+                REPO,
+                &format!("/tmp/app-{label}"),
+                label,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let mut session = app_session(&["home", "alpha", "beta"]);
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[("home", None), ("alpha", None), ("beta", None)],
+        );
+        let mut sb = focused(&mut model, &session);
+        cursor_on(&mut sb, &mut model, "beta");
+
+        assert!(sb.move_cursor_worktree(&mut model, &mut session, true));
+        let rendered = on_screen_paths(&model);
+        assert_eq!(
+            rendered,
+            vec![
+                "/tmp/app-home".to_string(),
+                "/tmp/app-beta".to_string(),
+                "/tmp/app-alpha".to_string(),
+            ]
+        );
+
+        let persisted: Vec<String> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect();
+        assert_eq!(persisted, rendered);
+    }
+
+    #[test]
     fn folders_reorder_and_carry_their_worktrees() {
         let _g = DbGuard::new("folder-move");
         let session = app_session(&["home", "alpha", "beta"]);
