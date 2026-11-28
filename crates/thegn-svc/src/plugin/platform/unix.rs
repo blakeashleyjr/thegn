@@ -765,6 +765,39 @@ impl Leader {
             // A leader already observed exited needs no signal; how a platform
             // reports signalling its zombie does not matter.
             .or_else(|error| if zombie_group { Ok(()) } else { Err(error) });
+        // macOS also answers EPERM for a group whose freshly spawned leader is
+        // still mid-exec, even though the leader itself was just signalled
+        // (THE-2774). Retry the group briefly: it settles once the exec
+        // completes or the SIGKILLed leader becomes a zombie.
+        if cfg!(target_os = "macos")
+            && leader_result.is_ok()
+            && !zombie_group
+            && group_result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+        {
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                match self.signal_group(group) {
+                    Ok(()) => {
+                        group_result = Ok(());
+                        break;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                        group_result = Err(error);
+                        break;
+                    }
+                    Err(error)
+                        if error.raw_os_error() == Some(libc::EPERM)
+                            && matches!(self.exited_without_reaping(), Ok(true)) =>
+                    {
+                        group_result = Err(io::Error::from_raw_os_error(libc::ESRCH));
+                        break;
+                    }
+                    Err(error) => group_result = Err(error),
+                }
+            }
+        }
         kill_tracked(&tracked);
         // macOS answers EPERM (not ESRCH) when signalling a group or pid whose only
         // member is an exited-but-unreaped zombie. The leader is unreaped here, so
@@ -1180,6 +1213,53 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(runtime.block_on(process.settle_pipes(Instant::now())));
     }
+
+    #[test]
+    fn resident_unix_mid_exec_group_eperm_is_retried_after_the_leader_is_signalled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = Prepared::new().unwrap().spawn(command).unwrap();
+        drop(entered);
+        // The first group signal sees a mid-exec group (EPERM); the retry lands.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        process.leader.signal_override = Some(Box::new(move |_| {
+            if observed.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            } else {
+                Ok(())
+            }
+        }));
+        let result = process.leader.terminate();
+        if cfg!(target_os = "macos") {
+            result.unwrap();
+            assert!(
+                calls.load(Ordering::Relaxed) >= 2,
+                "group signal was not retried"
+            );
+        } else {
+            // Only macOS reports a mid-exec group as EPERM; elsewhere it stays an error.
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), process.leader.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        process.leader.reap().unwrap();
+    }
+
     #[test]
     fn resident_unix_final_process_drop_terminates_owned_fixture_without_blocking() {
         let runtime = tokio::runtime::Builder::new_current_thread()
