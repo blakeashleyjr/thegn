@@ -270,7 +270,10 @@ fn glyph_scan_scope_limits_each_tick_to_in_scope_worktrees() {
     );
 
     assert_eq!(paths.len(), 3);
-    assert_eq!(to_scan, paths, "only the K in-scope uncached worktrees scan");
+    assert_eq!(
+        to_scan, paths,
+        "only the K in-scope uncached worktrees scan"
+    );
 }
 
 #[test]

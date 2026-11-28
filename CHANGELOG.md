@@ -7,6 +7,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.144] — 2026-11-27
+
+Idle hosts with many worktrees stay quiet, macOS log tailing works, and thegn tells you when a new release is out.
+
+### Added
+
+- Update notice: once a day thegn checks GitHub for a newer release, then shows a dismissible statusbar notice and a `thegn doctor` line with the right upgrade command for your install (Homebrew, Nix or `just update`). `[update] check` is on for stable builds and off for dev builds by default; set it to `true` or `false` to choose on any channel. The privacy help page describes the request.
+
+### Fixed
+
+- Idle CPU: the background git status pool now only scans worktrees that are visible, recently used or live. Previously every registered worktree was still queued, so a host with about 1,500 worktrees used 1 to 1.6 cores at idle.
+- macOS: the log view now follows appends. FSEvents does not report appends to a file the writer keeps open, so the tailer also checks the file once a second on macOS.
+- macOS: stopping a plugin that is already exiting no longer reports a termination failure. macOS answers "operation not permitted" for an exiting process, after the kill has already been delivered.
+- `thegn wt prune` skips a registered worktree whose directory no longer exists and reports it as `missing`, instead of aborting the whole run.
+- The open pull request feed is polled once per repository per refresh interval.
+
 ## [0.1.0-alpha.143] — 2026-11-27
 
 Merge gate results show when they ran unsandboxed, and pull request polling is shared per repository.
