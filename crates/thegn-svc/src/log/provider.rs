@@ -18,6 +18,27 @@ const MIN_READ_GAP: Duration = Duration::from_secs(1);
 // Missing log directories retry every 30 seconds; watching their nearest
 // existing ancestor is a follow-up for zero-wake fresh-state startup.
 const WATCH_RETRY: Duration = Duration::from_secs(30);
+// FSEvents (macOS) reports nothing for appends to a file the writer holds open,
+// flushed or fsynced; it reports on close (THE-2752, measured on macOS 26). Log
+// writers keep their file open, so on macOS the tailer also re-reads on this
+// slow timer. Each wake is one stat; reads are already capped by MIN_READ_GAP.
+const MACOS_APPEND_POLL: Duration = Duration::from_secs(1);
+
+fn append_poll_fallback() -> Option<Duration> {
+    (std::env::consts::OS == "macos").then_some(MACOS_APPEND_POLL)
+}
+
+/// Wait for the next watcher nudge, or, with a fallback interval, for that
+/// interval to pass, whichever comes first.
+fn recv_nudge(events: &Receiver<()>, fallback: Option<Duration>) -> Result<(), mpsc::RecvError> {
+    match fallback {
+        None => events.recv(),
+        Some(every) => match events.recv_timeout(every) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+        },
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Wake {
@@ -131,7 +152,7 @@ fn tail_file(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     watcher.as_ref().map(|(_, events, reset_requested)| {
-                        events.recv().map(|()| {
+                        recv_nudge(events, append_poll_fallback()).map(|()| {
                             if reset_requested.swap(false, Ordering::AcqRel) {
                                 Wake::Closed
                             } else {
@@ -532,15 +553,14 @@ mod tests {
 
     #[test]
     fn real_watcher_ignores_open_reads_and_nudges_on_append() {
-        // THE-2752: the macOS FSEvents watcher misses appends (still failing
-        // after a 120 s wait). A runtime skip keeps this file platform-cfg free.
-        if std::env::consts::OS == "macos" {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thegn.log");
         std::fs::write(&path, b"initial\n").unwrap();
         let (_watcher, events, _reset_requested) = watch_log_directory(&path).unwrap();
+        // FSEvents can deliver the setup write's events after the watch starts;
+        // drain them so only the read below is under test.
+        std::thread::sleep(Duration::from_millis(500));
+        while events.try_recv().is_ok() {}
 
         let mut file = std::fs::File::open(&path).unwrap();
         let mut contents = Vec::new();
@@ -555,17 +575,40 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        // FSEvents coalesces and delays delivery on a loaded Mac; keep appending until
-        // one lands (any one append must nudge) instead of betting on a single write.
+        // FSEvents coalesces and delays delivery on a loaded Mac, and never reports
+        // appends to this still-open file (THE-2752), so macOS wakes through the
+        // append poll the tailer uses. Keep appending until one wake lands.
+        let fallback = append_poll_fallback();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             file.write_all(b"appended\n").unwrap();
             file.flush().unwrap();
-            if events.recv_timeout(Duration::from_millis(500)).is_ok() {
+            let woke = match fallback {
+                Some(_) => recv_nudge(&events, fallback).is_ok(),
+                None => events.recv_timeout(Duration::from_millis(500)).is_ok(),
+            };
+            if woke {
                 break;
             }
             assert!(Instant::now() < deadline, "append never nudged the watcher");
         }
+    }
+
+    #[test]
+    fn append_poll_fallback_wakes_without_events_and_closes_on_disconnect() {
+        let (sender, events) = mpsc::sync_channel::<()>(1);
+        let started = Instant::now();
+        assert!(recv_nudge(&events, Some(Duration::from_millis(20))).is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        sender.try_send(()).unwrap();
+        assert!(recv_nudge(&events, None).is_ok());
+        drop(sender);
+        assert!(recv_nudge(&events, Some(Duration::from_millis(20))).is_err());
+        assert!(recv_nudge(&events, None).is_err());
+        assert_eq!(
+            append_poll_fallback().is_some(),
+            std::env::consts::OS == "macos"
+        );
     }
 
     #[test]
