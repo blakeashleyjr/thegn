@@ -10,9 +10,9 @@ thegn is a local terminal tool. This page describes what it writes on your
 machine and when thegn or a tool it starts can contact the network.
 
 No vendor telemetry was found: the source contains no analytics or crash-upload
-client. Stable builds check for new versions once per day by default. A first-run network trace script
-exists in the source tree (`scripts/first-run-net-trace.sh`, run with
-`just net-trace`). It traces the release binary's first frame with `strace` and
+client. Stable builds check for new versions once per day by default. A
+first-run network trace script exists in the source tree
+(`scripts/first-run-net-trace.sh`, run with `just net-trace`). It traces the release binary's first frame with `strace` and
 lists every `connect()` target. A trace of main commit `1c5b3de0ab` showed only
 local Unix-socket connects (the session bus was disabled and the user systemd
 socket is a Unix socket). It showed no TCP connection to loopback or elsewhere.

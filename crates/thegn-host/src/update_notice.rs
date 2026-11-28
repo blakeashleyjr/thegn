@@ -10,7 +10,7 @@ const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct Cache {
     checked_at: i64,
-    latest: String,
+    latest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,7 +87,7 @@ fn cache_fresh(cache: &Cache, now: i64) -> bool {
 fn latest_version<S: ReleaseSource>(source: &S, path: &Path, now: i64) -> Option<String> {
     let cached = read_cache(path);
     if let Some(cache) = cached.as_ref().filter(|cache| cache_fresh(cache, now)) {
-        return Some(cache.latest.clone());
+        return cache.latest.clone();
     }
     match source.latest() {
         Ok(latest) => {
@@ -95,12 +95,24 @@ fn latest_version<S: ReleaseSource>(source: &S, path: &Path, now: i64) -> Option
                 path,
                 &Cache {
                     checked_at: now,
-                    latest: latest.clone(),
+                    latest: Some(latest.clone()),
                 },
             );
             Some(latest)
         }
-        Err(()) => cached.map(|cache| cache.latest),
+        Err(()) => {
+            // Record failed attempts too, so an offline launch does not retry
+            // on every subsequent startup. Preserve the last known release.
+            let previous = cached.and_then(|cache| cache.latest);
+            write_cache(
+                path,
+                &Cache {
+                    checked_at: now,
+                    latest: previous.clone(),
+                },
+            );
+            previous
+        }
     }
 }
 
@@ -134,8 +146,10 @@ pub(crate) fn install_command(executable: &Path) -> String {
     if path.starts_with("/nix/store/") {
         "nix profile upgrade thegn".into()
     } else if path.starts_with("/opt/homebrew/")
+        || path.starts_with("/home/linuxbrew/.linuxbrew/")
         || path.starts_with("/usr/local/Cellar/")
         || path.starts_with("/usr/local/opt/")
+        || path.starts_with("/usr/local/bin/")
     {
         "brew upgrade thegn".into()
     } else {
@@ -170,13 +184,14 @@ pub(crate) fn dismiss() {
     guard.dismissed = true;
 }
 
-pub(crate) fn cached_notice() -> Option<Notice> {
-    if crate::channel_state::current() == thegn_core::channel::Channel::Dev {
+pub(crate) fn cached_notice(enabled: bool) -> Option<Notice> {
+    if !enabled || crate::channel_state::current() == thegn_core::channel::Channel::Dev {
         return None;
     }
     let cache = read_cache(&cache_path())?;
-    is_newer(&cache.latest, env!("CARGO_PKG_VERSION")).then(|| Notice {
-        version: cache.latest,
+    let latest = cache.latest?;
+    is_newer(&latest, env!("CARGO_PKG_VERSION")).then(|| Notice {
+        version: latest,
         command: std::env::current_exe()
             .ok()
             .map(|path| install_command(&path))
@@ -248,7 +263,7 @@ mod tests {
             &path,
             &Cache {
                 checked_at: 100,
-                latest: "1.2.3".into(),
+                latest: Some("1.2.3".into()),
             },
         );
         let source = Fake(AtomicUsize::new(0), Ok("9.9.9".into()));
@@ -265,9 +280,41 @@ mod tests {
     }
 
     #[test]
+    fn failed_attempt_is_cached_for_a_day_and_keeps_last_known_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.json");
+        write_cache(
+            &path,
+            &Cache {
+                checked_at: 100,
+                latest: Some("1.2.3".into()),
+            },
+        );
+        let source = Fake(AtomicUsize::new(0), Err(()));
+        assert_eq!(
+            latest_version(&source, &path, 100 + CACHE_TTL_SECS as i64).as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+        assert!(cache_fresh(
+            &read_cache(&path).unwrap(),
+            100 + CACHE_TTL_SECS as i64 + 1
+        ));
+        assert_eq!(
+            latest_version(&source, &path, 100 + CACHE_TTL_SECS as i64 + 1).as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn detects_brew_nix_and_manual_installs() {
         assert_eq!(
             install_command(Path::new("/opt/homebrew/bin/thegn")),
+            "brew upgrade thegn"
+        );
+        assert_eq!(
+            install_command(Path::new("/home/linuxbrew/.linuxbrew/bin/thegn")),
             "brew upgrade thegn"
         );
         assert_eq!(
