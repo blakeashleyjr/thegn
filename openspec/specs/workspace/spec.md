@@ -264,3 +264,16 @@ with diagnostics excluded from machine-readable output.
 - **WHEN** a compatibility alias is used with machine-readable output
 - **THEN** the documented JSON schema/fields are unchanged and no warning is
   mixed into the JSON stream
+
+### Requirement: Merged worktree pruning skips missing directories
+
+`thegn wt prune --merged` SHALL continue when a Git-registered worktree's
+directory is missing and report that worktree in `skipped` with reason
+`missing`. This SHALL apply to dry-run and apply output, including JSON output.
+
+#### Scenario: Registered worktree directory is gone
+
+- **WHEN** `thegn wt prune --merged` encounters a registered worktree whose
+  directory no longer exists
+- **THEN** the worktree is skipped with reason `missing`, remaining worktrees
+  are processed, and the command does not fail for the missing directory

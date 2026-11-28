@@ -115,25 +115,47 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
     };
     let root_s = root.to_string_lossy().into_owned();
     let mut branches: Vec<(String, String, Option<String>)> = Vec::new();
-    let facts: Vec<PruneFacts> = super::list::collect(cfg)?
-        .into_iter()
-        .filter(|w| w.repo == root_s && w.exists)
-        .map(|w| {
-            let tip = branch_tip(Path::new(&w.path), &w.branch)?;
-            branches.push((w.path.clone(), w.branch.clone(), tip));
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut facts: Vec<PruneFacts> = Vec::new();
+    for worktree in super::list::collect(cfg)? {
+        if worktree.repo != root_s {
+            continue;
+        }
+        if !worktree.exists || !Path::new(&worktree.path).is_dir() {
+            skipped.push((worktree.path, "missing".to_string()));
+            continue;
+        }
+        let gathered = (|| {
+            let tip = branch_tip(Path::new(&worktree.path), &worktree.branch)?;
             let provider_sandbox = !matches!(
-                crate::provider_git::bound_offline(cfg, &w.path),
+                crate::provider_git::bound_offline(cfg, &worktree.path),
                 Ok(crate::provider_git::OfflineBinding::Unbound)
             );
-            facts_for(&w.path, &w.branch, &target, &root, provider_sandbox)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            let facts = facts_for(
+                &worktree.path,
+                &worktree.branch,
+                &target,
+                &root,
+                provider_sandbox,
+            )?;
+            Ok::<_, anyhow::Error>((tip, facts))
+        })();
+        match gathered {
+            Ok((tip, worktree_facts)) => {
+                branches.push((worktree.path, worktree.branch, tip));
+                facts.push(worktree_facts);
+            }
+            Err(_) if !Path::new(&worktree.path).is_dir() => {
+                skipped.push((worktree.path, "missing".to_string()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let plan = wt_prune::plan(facts);
     let (removable, kept) = wt_prune::counts(&plan);
 
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut removed = 0usize;
-    let mut skipped: Vec<(String, String)> = Vec::new();
     if args.apply {
         let tips: HashMap<String, Option<String>> = branches
             .iter()
@@ -153,7 +175,7 @@ pub fn run(cfg: &Config, args: PruneArgs) -> Result<()> {
             &mut |path, del| super::wt::rm_with(cfg, path, del, true, !args.json),
         );
         removed = out.removed;
-        skipped = out.skipped;
+        skipped.extend(out.skipped);
         failed = out.failed;
     }
     let kept = kept + skipped.len();
@@ -237,6 +259,10 @@ fn apply_plan(
             continue;
         }
         let branch = branch_of.get(path.as_str()).copied().unwrap_or("");
+        if !Path::new(path).is_dir() {
+            out.skipped.push((path.clone(), "missing".to_string()));
+            continue;
+        }
         let provider_sandbox = !matches!(
             crate::provider_git::bound_offline(cfg, path),
             Ok(crate::provider_git::OfflineBinding::Unbound)
@@ -244,6 +270,10 @@ fn apply_plan(
         let fresh = match facts_for(path, branch, target, root, provider_sandbox) {
             Ok(fresh) => fresh,
             Err(error) => {
+                if !Path::new(path).is_dir() {
+                    out.skipped.push((path.clone(), "missing".to_string()));
+                    continue;
+                }
                 out.skipped.push((
                     path.clone(),
                     format!("could not recheck Git facts: {error:#}"),
@@ -597,6 +627,39 @@ mod tests {
             },
         );
         assert!(!called && out.skipped.len() == 1);
+    }
+
+    #[test]
+    fn missing_worktree_is_skipped_with_a_stable_reason() {
+        let _state = crate::testenv::IsolatedState::new();
+        let missing = tempfile::tempdir().unwrap();
+        let path = missing.path().join("removed-worktree");
+        let path = path.to_string_lossy().into_owned();
+        let plan = vec![(
+            path.clone(),
+            PruneDecision::Remove {
+                delete_branch: true,
+            },
+        )];
+        let tips = HashMap::from([(path.clone(), Some("planned-tip".to_string()))]);
+        let branch = "tg/missing";
+        let branch_of = HashMap::from([(path.as_str(), branch)]);
+        let mut called = false;
+        let out = apply_plan(
+            &plan,
+            &tips,
+            &branch_of,
+            &Config::default(),
+            "main",
+            Path::new("/nonexistent"),
+            &mut |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(!called);
+        assert_eq!(out.skipped, vec![(path, "missing".to_string())]);
+        assert!(out.failed.is_empty());
     }
 
     #[test]
