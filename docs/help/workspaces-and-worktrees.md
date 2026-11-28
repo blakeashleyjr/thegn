@@ -275,6 +275,8 @@ untracked files, has a process running inside it (Linux only). Live sessions and
 rows are not checked. Each worktree is re-checked just before its removal and
 skipped if it changed meanwhile. A removal that fails is reported and the rest continue; the exit
 status is non-zero if any failed.
+Git-registered worktrees whose directories are already gone are skipped with
+reason `missing` and do not stop the command.
 
 ## Info screen
 
