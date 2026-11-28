@@ -294,6 +294,10 @@ fn apply_plan(
         let current_tip = match branch_tip(Path::new(path), branch) {
             Ok(tip) => tip,
             Err(error) => {
+                if !Path::new(path).is_dir() {
+                    out.skipped.push((path.clone(), "missing".to_string()));
+                    continue;
+                }
                 out.skipped.push((
                     path.clone(),
                     format!("could not recheck branch tip: {error:#}"),
@@ -308,6 +312,9 @@ fn apply_plan(
         }
         match remove(path, delete_branch) {
             Ok(()) => out.removed += 1,
+            Err(_) if !Path::new(path).is_dir() => {
+                out.skipped.push((path.clone(), "missing".to_string()));
+            }
             Err(why) => out.failed.push((path.clone(), format!("{why:#}"))),
         }
     }
@@ -658,6 +665,30 @@ mod tests {
             },
         );
         assert!(!called);
+        assert_eq!(out.skipped, vec![(path, "missing".to_string())]);
+        assert!(out.failed.is_empty());
+    }
+
+    #[test]
+    fn worktree_removed_during_apply_is_skipped_as_missing() {
+        let _state = crate::testenv::IsolatedState::new();
+        let main = repo();
+        let wt = merged_lane(main.path(), "removed-during-apply");
+        let (plan, tips, branch) = one(main.path(), &wt, "removed-during-apply");
+        let path = wt.to_str().unwrap().to_string();
+        let branch_of = HashMap::from([(path.as_str(), branch.as_str())]);
+        let out = apply_plan(
+            &plan,
+            &tips,
+            &branch_of,
+            &Config::default(),
+            "main",
+            main.path(),
+            &mut |path, _| {
+                std::fs::remove_dir_all(path)?;
+                anyhow::bail!("worktree disappeared")
+            },
+        );
         assert_eq!(out.skipped, vec![(path, "missing".to_string())]);
         assert!(out.failed.is_empty());
     }
