@@ -5434,3 +5434,8 @@ heartbeat_secs = 10
 # metadata = { source = "example" }     # Optional string metadata map; default is empty.
 # caps = {}                             # Optional capability object; {} is empty; omit for null.
 # chord = "Ctrl+Alt+x"                  # Optional default key chord; omitted by default.
+
+# Release availability checks contact the unauthenticated GitHub releases API
+# once per day. Set false to disable the check and statusbar notice.
+[update]
+check = true

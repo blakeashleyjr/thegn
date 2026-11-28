@@ -2066,6 +2066,18 @@
       "summary": "Terminal history search scores an owned snapshot on a worker with generation-safe results, deferred Enter and failure fallback; live frame-time check open."
     },
     {
+      "change": "update-available-notice",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-2777",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Check stable GitHub releases daily and show a dismissible, install-specific upgrade notice."
+    },
+    {
       "change": "validate-sandbox-volume-sources",
       "lifecycle": "archived",
       "disposition": "alpha-delivery",

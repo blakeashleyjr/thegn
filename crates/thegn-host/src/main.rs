@@ -353,6 +353,7 @@ mod theme_store;
 mod toast;
 mod toolchain_ui;
 mod usage_budget;
+mod update_notice;
 mod vercel_bridge;
 mod vercel_login;
 mod vercel_pull_marker;

@@ -374,6 +374,8 @@ pub(crate) enum RefreshKind {
         kind: Box<RefreshKind>,
     },
     Model,
+    /// The update checker changed the statusbar notice.
+    UpdateNotice,
     Pr,
     /// Status-line text from an off-loop producer: a completed PR merge action,
     /// a launch-gate warning (`launch_notice`), or durable worktree bookkeeping

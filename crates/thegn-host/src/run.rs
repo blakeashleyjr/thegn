@@ -877,6 +877,7 @@ pub async fn main(
     // order is behavior-neutral: `refresh_rx` still moves into `event_loop` and
     // the ticker still receives its clone at its spawn site below.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
+    crate::update_notice::spawn(cfg.update.check, refresh_tx.clone(), waker.clone());
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
     crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
     crate::db_maintain::install_notice(refresh_tx.clone(), waker.clone());
@@ -15198,6 +15199,7 @@ async fn event_loop<T: Terminal>(
                 thegn_core::connectivity::current(),
             );
             match kind {
+                RefreshKind::UpdateNotice => bars_dirty = true,
                 RefreshKind::Model => {
                     want_model_refresh = true;
                     // O(1): a ref moved since the last heal that ran (its own
@@ -19037,7 +19039,11 @@ async fn event_loop<T: Terminal>(
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Statusbar;
                             model.statusbar_sel = idx;
-                            if matches!(&id, BarItemId::Widget(w) if w == "disk") {
+                            if matches!(&id, BarItemId::Widget(w) if w == "update") {
+                                crate::update_notice::dismiss();
+                                bar_detail = None;
+                                bars_dirty = true;
+                            } else if matches!(&id, BarItemId::Widget(w) if w == "disk") {
                                 bar_detail = None;
                                 open_worktree_disk(
                                     &mut session,
@@ -23438,6 +23444,12 @@ async fn event_loop<T: Terminal>(
                         };
                         if let Some((id, rect)) = hit {
                             if !focus.masthead()
+                                && matches!(&id, BarItemId::Widget(w) if w == "update")
+                            {
+                                crate::update_notice::dismiss();
+                                bar_detail = None;
+                                bars_dirty = true;
+                            } else if !focus.masthead()
                                 && matches!(&id, BarItemId::Widget(w) if w == "disk")
                             {
                                 open_worktree_disk(

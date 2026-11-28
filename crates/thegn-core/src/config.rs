@@ -3948,6 +3948,21 @@ pub struct DiagnosticsConfig {
     pub crash_sink: String,
 }
 
+/// `[update]` — automatic release notices. The release check is an
+/// unauthenticated request to the GitHub releases API and is cached daily.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Check GitHub once per day for a newer stable release and show a notice.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
+}
+
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         DiagnosticsConfig {
@@ -5529,6 +5544,8 @@ pub struct Config {
     /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
+    /// `[update]` release availability checks.
+    pub update: UpdateConfig,
     /// `[database]` — shared-schema migration authority and executable pin.
     pub database: DatabaseConfig,
     pub sandbox: SandboxConfig,
@@ -5784,6 +5801,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            update: UpdateConfig::default(),
             database: DatabaseConfig::default(),
             sandbox: SandboxConfig::default(),
             hooks: HooksConfig::default(),

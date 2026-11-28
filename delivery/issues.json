@@ -842,6 +842,13 @@
       "changes": [
         "poll-open-pr-feed-once-per-repo-ttl"
       ]
+    },
+    {
+      "issue": "THE-2777",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "update-available-notice"
+      ]
     }
   ]
 }
