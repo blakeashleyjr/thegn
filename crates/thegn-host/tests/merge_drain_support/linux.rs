@@ -1302,7 +1302,7 @@ fn exercise(case: Case) {
     );
     assert_eq!(
         ready.error_detail.as_deref(),
-        Some("gated green — awaiting land"),
+        Some("gated green — awaiting land\nuntrusted: ran on host, not isolated"),
         "recovered held row must report gated green, awaiting land"
     );
     assert_eq!(
