@@ -78,8 +78,10 @@ fn write_cache(path: &Path, cache: &Cache) {
     };
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, bytes).is_ok() {
-        // best-effort: the release cache is advisory; a failed rename keeps the old copy.
-        let _ = std::fs::rename(tmp, path);
+        // The release cache is advisory: a failed rename keeps the old copy.
+        if let Err(error) = std::fs::rename(tmp, path) {
+            tracing::debug!(target: "thegn::update", %error, "release cache rename failed");
+        }
     }
 }
 
@@ -225,6 +227,7 @@ pub(crate) fn spawn(
     drop(thegn_core::thread_name::spawn_named(
         "thegn-update",
         move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let notice = update_from(
                 &GithubRelease,
                 &cache_path(),
@@ -235,8 +238,10 @@ pub(crate) fn spawn(
             guard.notice = notice;
             drop(guard);
             if tx.send(crate::hydrate::RefreshKind::UpdateNotice).is_ok() {
-                // best-effort: a gone terminal needs no wake.
-                let _ = waker.wake();
+                // A gone terminal needs no wake.
+                if let Err(error) = waker.wake() {
+                    tracing::debug!(target: "thegn::update", ?error, "update notice wake failed");
+                }
             }
         },
     ));
