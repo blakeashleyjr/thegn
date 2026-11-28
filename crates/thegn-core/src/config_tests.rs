@@ -1319,11 +1319,16 @@ fn panel_collapse_on_escape_defaults_true_and_parses() {
 
 #[test]
 fn update_check_defaults_on_and_parses() {
-    assert!(UpdateConfig::default().check);
+    assert_eq!(UpdateConfig::default().check, None);
+    assert!(UpdateConfig::default().check_enabled(false));
+    assert!(!UpdateConfig::default().check_enabled(true));
+    let forced: Config = toml::from_str("[update]\ncheck = true\n").unwrap();
+    assert!(forced.update.check_enabled(true));
     let defaults: Config = toml::from_str("").unwrap();
-    assert!(defaults.update.check);
+    assert!(defaults.update.check_enabled(false));
     let disabled: Config = toml::from_str("[update]\ncheck = false\n").unwrap();
-    assert!(!disabled.update.check);
+    assert!(!disabled.update.check_enabled(false));
+    assert!(!disabled.update.check_enabled(true));
 }
 
 #[test]

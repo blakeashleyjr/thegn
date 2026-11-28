@@ -5436,6 +5436,7 @@ heartbeat_secs = 10
 # chord = "Ctrl+Alt+x"                  # Optional default key chord; omitted by default.
 
 # Release availability checks contact the unauthenticated GitHub releases API
-# once per day. Set false to disable the check and statusbar notice.
+# once per day and show a statusbar notice. Unset: on for stable builds, off
+# for dev builds. Set true or false to choose explicitly on every channel.
 [update]
-check = true
+# check = true

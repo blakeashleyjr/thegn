@@ -75,7 +75,7 @@ persist_registers = true` opts in to keeping it across restarts; turning it
   unauthenticated request reads the latest public release tag from the GitHub
   releases API for `blakeashleyjr/thegn`. The result is cached under
   `$XDG_STATE_HOME/thegn` for one day; no account credentials are sent. Set
-  `[update] check = false` to disable it. Dev-channel builds skip this check.
+  `[update] check = false` to disable it. Dev-channel builds skip this check unless `check = true` is set explicitly.
 
 - **Git fetches — `[git] auto_fetch = true`:** thegn runs background
   `git fetch --prune` against remotes already configured in a repository, using

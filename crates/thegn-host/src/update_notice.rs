@@ -73,7 +73,9 @@ fn write_cache(path: &Path, cache: &Cache) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(bytes) = serde_json::to_vec(cache) else { return };
+    let Ok(bytes) = serde_json::to_vec(cache) else {
+        return;
+    };
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(tmp, path);
@@ -185,7 +187,7 @@ pub(crate) fn dismiss() {
 }
 
 pub(crate) fn cached_notice(enabled: bool) -> Option<Notice> {
-    if !enabled || crate::channel_state::current() == thegn_core::channel::Channel::Dev {
+    if !enabled {
         return None;
     }
     let cache = read_cache(&cache_path())?;
@@ -215,7 +217,7 @@ pub(crate) fn spawn(
     tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
-    if !enabled || crate::channel_state::current() == thegn_core::channel::Channel::Dev {
+    if !enabled {
         return;
     }
     std::thread::spawn(move || {
@@ -322,8 +324,7 @@ mod tests {
             "nix profile upgrade thegn"
         );
         assert!(
-            install_command(Path::new("/home/user/bin/thegn"))
-                .starts_with("just update stable")
+            install_command(Path::new("/home/user/bin/thegn")).starts_with("just update stable")
         );
     }
 }

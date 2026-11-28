@@ -3415,7 +3415,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "runtime_exposure": super::doctor_exposure::json(cfg),
         "identification": identification_json(cfg),
         "channel": channel_json(),
-        "update": crate::update_notice::cached_notice(cfg.update.check).map(|notice| serde_json::json!({
+        "update": crate::update_notice::cached_notice(cfg.update.check_enabled(crate::channel_state::current() == thegn_core::channel::Channel::Dev)).map(|notice| serde_json::json!({
             "available": format!("thegn {} is available", notice.version),
             "version": notice.version,
             "upgrade": notice.command,
@@ -3939,7 +3939,10 @@ pub fn run(
     repo_context: Option<std::path::PathBuf>,
     cli_overrides: &[String],
 ) -> Result<()> {
-    if cfg.update.check && crate::channel_state::current() != thegn_core::channel::Channel::Dev {
+    if cfg
+        .update
+        .check_enabled(crate::channel_state::current() == thegn_core::channel::Channel::Dev)
+    {
         // `thegn doctor` may refresh the same daily cache; the request is
         // bounded and failures are intentionally silent.
         let _ = crate::update_notice::check_now();
@@ -3978,7 +3981,10 @@ pub fn run(
         outln!("  {k:<13} {}", v.map(String::as_str).unwrap_or("(unset)"));
     };
     instance_report(cfg);
-    if let Some(notice) = crate::update_notice::cached_notice(cfg.update.check) {
+    if let Some(notice) = crate::update_notice::cached_notice(
+        cfg.update
+            .check_enabled(crate::channel_state::current() == thegn_core::channel::Channel::Dev),
+    ) {
         outln!("thegn {} is available", notice.version);
         outln!("  upgrade: {}", notice.command);
     }

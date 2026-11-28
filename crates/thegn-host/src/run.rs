@@ -877,7 +877,12 @@ pub async fn main(
     // order is behavior-neutral: `refresh_rx` still moves into `event_loop` and
     // the ticker still receives its clone at its spawn site below.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
-    crate::update_notice::spawn(cfg.update.check, refresh_tx.clone(), waker.clone());
+    crate::update_notice::spawn(
+        cfg.update
+            .check_enabled(crate::channel_state::current() == thegn_core::channel::Channel::Dev),
+        refresh_tx.clone(),
+        waker.clone(),
+    );
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
     crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
     crate::db_maintain::install_notice(refresh_tx.clone(), waker.clone());

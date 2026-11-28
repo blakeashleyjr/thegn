@@ -3953,13 +3953,22 @@ pub struct DiagnosticsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct UpdateConfig {
-    /// Check GitHub once per day for a newer stable release and show a notice.
-    pub check: bool,
+    /// Check GitHub once per day for a newer release and show a notice.
+    /// Unset: on for stable builds, off for dev builds. An explicit `true` or
+    /// `false` applies on every channel.
+    pub check: Option<bool>,
 }
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        Self { check: true }
+        Self { check: None }
+    }
+}
+
+impl UpdateConfig {
+    /// Whether the release check runs on this channel.
+    pub fn check_enabled(&self, dev_channel: bool) -> bool {
+        self.check.unwrap_or(!dev_channel)
     }
 }
 
