@@ -3415,6 +3415,11 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "runtime_exposure": super::doctor_exposure::json(cfg),
         "identification": identification_json(cfg),
         "channel": channel_json(),
+        "update": crate::update_notice::cached_notice().map(|notice| serde_json::json!({
+            "available": format!("thegn {} is available", notice.version),
+            "version": notice.version,
+            "upgrade": notice.command,
+        })),
         "completions": completions_json(),
         "core_deps": core_deps_json(),
         "env": {
@@ -3934,6 +3939,11 @@ pub fn run(
     repo_context: Option<std::path::PathBuf>,
     cli_overrides: &[String],
 ) -> Result<()> {
+    if cfg.update.check && crate::channel_state::current() != thegn_core::channel::Channel::Dev {
+        // `thegn doctor` may refresh the same daily cache; the request is
+        // bounded and failures are intentionally silent.
+        let _ = crate::update_notice::check_now();
+    }
     // THE-2682: doctor output gets pasted into issues, so identifying tailnet
     // detail (tailnet name, control URL) is opt-in via `--full`/`--unredacted`.
     let detail = if full {
@@ -3968,6 +3978,10 @@ pub fn run(
         outln!("  {k:<13} {}", v.map(String::as_str).unwrap_or("(unset)"));
     };
     instance_report(cfg);
+    if let Some(notice) = crate::update_notice::cached_notice() {
+        outln!("thegn {} is available", notice.version);
+        outln!("  upgrade: {}", notice.command);
+    }
     super::doctor_exposure::report(cfg);
     identification_report(cfg);
     let voice = super::voice::status(&cfg.voice);

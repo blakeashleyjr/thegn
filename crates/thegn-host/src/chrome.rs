@@ -1965,6 +1965,15 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_prq_badge(model, &mut items);
     crate::statusbar_badges::push_usage_badge(model, &mut items);
+    if let Some(notice) = crate::update_notice::current() {
+        items.push((
+            BarItemId::Widget("update".into()),
+            vec![Seg::chip(
+                Tok::Hue(thegn_core::theme::Hue::Amber),
+                format!(" ↑ thegn {} available × ", notice.version),
+            )],
+        ));
+    }
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
     // `[stats].disk_free_warn` free — amber at the warn line, red at/below
     // `disk_free_critical`. The badge selects into a detailed modal (free/used/

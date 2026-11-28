@@ -10,7 +10,7 @@ thegn is a local terminal tool. This page describes what it writes on your
 machine and when thegn or a tool it starts can contact the network.
 
 No vendor telemetry was found: the source contains no analytics or crash-upload
-client. thegn does not check for new versions. A first-run network trace script
+client. Stable builds check for new versions once per day by default. A first-run network trace script
 exists in the source tree (`scripts/first-run-net-trace.sh`, run with
 `just net-trace`). It traces the release binary's first frame with `strace` and
 lists every `connect()` target. A trace of main commit `1c5b3de0ab` showed only
@@ -70,6 +70,12 @@ persist_registers = true` opts in to keeping it across restarts; turning it
 ## What can leave the machine, and when
 
 ### On by default, when the matching local setup exists
+
+- **Release availability — `[update] check = true`:** a background,
+  unauthenticated request reads the latest public release tag from the GitHub
+  releases API for `blakeashleyjr/thegn`. The result is cached under
+  `$XDG_STATE_HOME/thegn` for one day; no account credentials are sent. Set
+  `[update] check = false` to disable it. Dev-channel builds skip this check.
 
 - **Git fetches — `[git] auto_fetch = true`:** thegn runs background
   `git fetch --prune` against remotes already configured in a repository, using

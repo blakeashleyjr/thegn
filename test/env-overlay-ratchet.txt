@@ -63,6 +63,8 @@
 # Voice is an explicit, structured consent surface. In particular, argv
 # arrays are config-only so a launcher cannot silently redirect microphone
 # audio or transcription through an environment alias.
+# update.check is a user preference for a once-daily network check, not a
+# launcher override that should vary between invocations.
 
 accounts.dir
 accounts.name
@@ -571,6 +573,7 @@ ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
 ui.tab_title_from_terminal
+update.check
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles

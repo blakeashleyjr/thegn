@@ -1318,6 +1318,15 @@ fn panel_collapse_on_escape_defaults_true_and_parses() {
 }
 
 #[test]
+fn update_check_defaults_on_and_parses() {
+    assert!(UpdateConfig::default().check);
+    let defaults: Config = toml::from_str("").unwrap();
+    assert!(defaults.update.check);
+    let disabled: Config = toml::from_str("[update]\ncheck = false\n").unwrap();
+    assert!(!disabled.update.check);
+}
+
+#[test]
 fn config_parses_mode_specific_keybinds() {
     let cfg: Config = toml::from_str(
             "[keybinds]\nnew-worktree = \"Alt w\"\n[keybinds.vim_normal]\nfocus-down = \"j\"\n[keybinds.emacs]\nquit = \"Ctrl x Ctrl c\"\n",
