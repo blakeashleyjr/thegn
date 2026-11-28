@@ -568,6 +568,7 @@ impl Prepared {
                 notice,
                 identity_lost,
                 status: None,
+                killed: false,
                 #[cfg(test)]
                 signal_override: None,
                 #[cfg(test)]
@@ -655,6 +656,10 @@ pub(crate) struct Leader {
     notice: ExitNotice,
     identity_lost: bool,
     status: Option<ExitStatus>,
+    /// A SIGKILL already reached this leader or its group. macOS answers EPERM
+    /// (not ESRCH) for a process that is exiting but not yet a zombie, so a
+    /// repeat terminate during that window has nothing left to do (THE-2774).
+    killed: bool,
     #[cfg(test)]
     signal_override: Option<Box<dyn FnMut(libc::pid_t) -> io::Result<()> + Send>>,
     #[cfg(test)]
@@ -765,38 +770,12 @@ impl Leader {
             // A leader already observed exited needs no signal; how a platform
             // reports signalling its zombie does not matter.
             .or_else(|error| if zombie_group { Ok(()) } else { Err(error) });
-        // macOS also answers EPERM for a group whose freshly spawned leader is
-        // still mid-exec, even though the leader itself was just signalled
-        // (THE-2774). Retry the group briefly: it settles once the exec
-        // completes or the SIGKILLed leader becomes a zombie.
-        if cfg!(target_os = "macos")
-            && leader_result.is_ok()
-            && !zombie_group
-            && group_result
-                .as_ref()
-                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
-        {
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                match self.signal_group(group) {
-                    Ok(()) => {
-                        group_result = Ok(());
-                        break;
-                    }
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                        group_result = Err(error);
-                        break;
-                    }
-                    Err(error)
-                        if error.raw_os_error() == Some(libc::EPERM)
-                            && matches!(self.exited_without_reaping(), Ok(true)) =>
-                    {
-                        group_result = Err(io::Error::from_raw_os_error(libc::ESRCH));
-                        break;
-                    }
-                    Err(error) => group_result = Err(error),
-                }
-            }
+        // A SIGKILL from an earlier terminate means the leader is dead or dying.
+        // macOS reports EPERM for a process that is exiting but not yet a
+        // zombie, so a repeat call in that window is not a failure (THE-2774).
+        let already_killed = self.killed;
+        if !zombie_group && (group_result.is_ok() || leader_result.is_ok()) {
+            self.killed = true;
         }
         kill_tracked(&tracked);
         // macOS answers EPERM (not ESRCH) when signalling a group or pid whose only
@@ -809,7 +788,9 @@ impl Leader {
             && saw_eperm
             && matches!(self.exited_without_reaping(), Ok(true));
         let eperm_is_gone = |error: &io::Error| {
-            cfg!(target_os = "macos") && leader_gone && error.raw_os_error() == Some(libc::EPERM)
+            cfg!(target_os = "macos")
+                && (leader_gone || already_killed)
+                && error.raw_os_error() == Some(libc::EPERM)
         };
         let group_result = match group_result {
             Err(error) if eperm_is_gone(&error) => Ok(()),
@@ -1215,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_unix_mid_exec_group_eperm_is_retried_after_the_leader_is_signalled() {
+    fn resident_unix_repeat_terminate_eperm_after_a_delivered_kill_is_not_an_error() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1229,27 +1210,17 @@ mod tests {
             .stderr(Stdio::piped());
         let mut process = Prepared::new().unwrap().spawn(command).unwrap();
         drop(entered);
-        // The first group signal sees a mid-exec group (EPERM); the retry lands.
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        process.leader.signal_override = Some(Box::new(move |_| {
-            if observed.fetch_add(1, Ordering::Relaxed) == 0 {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
-            } else {
-                Ok(())
-            }
-        }));
+        // An earlier terminate already delivered SIGKILL; macOS now answers
+        // EPERM for the exiting, not-yet-zombie group (THE-2774).
+        process.leader.killed = true;
+        process.leader.signal_override =
+            Some(Box::new(|_| Err(io::Error::from_raw_os_error(libc::EPERM))));
         let result = process.leader.terminate();
         if cfg!(target_os = "macos") {
             result.unwrap();
-            assert!(
-                calls.load(Ordering::Relaxed) >= 2,
-                "group signal was not retried"
-            );
         } else {
-            // Only macOS reports a mid-exec group as EPERM; elsewhere it stays an error.
+            // Only macOS reports an exiting process as EPERM; elsewhere it stays an error.
             assert!(result.is_err());
-            assert_eq!(calls.load(Ordering::Relaxed), 1);
         }
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), process.leader.wait_ready())
