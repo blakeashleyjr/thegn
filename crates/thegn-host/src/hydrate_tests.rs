@@ -240,6 +240,40 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
 }
 
 #[test]
+fn glyph_scan_scope_limits_each_tick_to_in_scope_worktrees() {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let candidates: Vec<String> = (0..12).map(|index| format!("/repo/wt-{index}")).collect();
+    let in_scope: HashSet<String> = candidates.iter().take(3).cloned().collect();
+    let paths = scoped_glyph_paths(&candidates, &in_scope);
+    let (to_scan, _, _) = partition_glyph_paths(
+        &paths,
+        &HashMap::new(),
+        &HashMap::new(),
+        GlyphPartitionConfig {
+            active_path: None,
+            busy_paths: &in_scope,
+            active_print_unchanged: false,
+            gate_remote_scans: false,
+            now: Instant::now(),
+            ttls: &crate::hydrate_tuning::glyph_ttls_from(
+                Some(60_000),
+                Some(120_000),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ),
+            since_active: &HashMap::new(),
+            fingerprint_changed: &HashSet::new(),
+            since_ref_move: None,
+        },
+    );
+
+    assert_eq!(paths.len(), 3);
+    assert_eq!(to_scan, paths, "only the K in-scope uncached worktrees scan");
+}
+
+#[test]
 fn glyph_location_lookup_failure_falls_back_to_local_scan_policy() {
     let path = "/repo/local";
     let on_lookup_error = may_live_scan_for_location(path, Err("database unavailable"), false);

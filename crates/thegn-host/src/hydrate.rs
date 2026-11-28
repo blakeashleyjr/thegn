@@ -181,6 +181,20 @@ fn may_live_scan_for_location<E: std::fmt::Display>(
     thegn_core::lifecycle::should_live_scan(remote, warm, is_active)
 }
 
+/// Limit git glyph work to paths that can affect the current sidebar view or
+/// have recent/live activity. The full registry remains available for cache
+/// retention and DB-backed badges, but quiet rows must not enter the scan loop.
+fn scoped_glyph_paths(
+    paths: &[String],
+    in_scope: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| in_scope.contains(*path))
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::type_complexity)]
 fn partition_glyph_paths(
     paths: &[String],
@@ -1977,16 +1991,16 @@ fn collect_sidebar_status(
         }
     }
 
-    // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
-    // full `git status` scan (50-150ms), so scanning every worktree every Model
-    // tick was the dominant hydration cost (cpu_hydrate scaled with worktree
-    // count). Busy rows use a shorter refresh window; other registered rows use
-    // the quiet safety TTL. The remaining scans fan out through the bounded
-    // pool; DB-keyed inserts (agent, PR counts) stay on this thread since `Db`
-    // isn't `Send`.
+    // git glyphs + agent + PR badge per distinct in-scope worktree path.
+    // `is_dirty` does a full `git status` scan (50-150ms), so the scan set is
+    // restricted to visible, recent, and live worktrees instead of growing with
+    // the full registry. Scans fan out through the bounded pool; DB-keyed
+    // inserts (agent, PR counts) stay on this thread since `Db` isn't `Send`.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
+    let live_agents = crate::agent_output::snapshot_live_agents();
+    let live_panes = crate::agent_output::snapshot_live_pane_worktrees();
     let mut seen = std::collections::HashSet::new();
-    let paths: Vec<String> = db_worktrees
+    let candidates: Vec<String> = db_worktrees
         .iter()
         .map(|wt| wt.worktree.clone())
         .chain(
@@ -1996,33 +2010,37 @@ fn collect_sidebar_status(
                 .filter(|g| !g.path.is_empty())
                 .map(|g| g.path.clone()),
         )
+        .chain(live_agents.iter().cloned())
+        .chain(live_panes.iter().cloned())
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
         .collect();
     // Visible session rows, recent activity, live panes (including parked
-    // workspaces), and real agents use the busy window. Other registered rows
-    // remain eligible on the quiet safety cadence.
-    let mut busy_glyph_paths: std::collections::HashSet<String> = paths
+    // workspaces), and real agents are the complete live scan scope. Other
+    // registered rows continue to render from the retained glyph cache.
+    let mut glyph_scope: std::collections::HashSet<String> = candidates
         .iter()
         .filter(|path| {
             crate::hydrate_tuning::include_glyph_path(path, active_path.as_deref(), &since_active)
         })
         .cloned()
         .collect();
-    busy_glyph_paths.extend(
+    glyph_scope.extend(
         session
             .worktrees
             .iter()
             .filter(|group| !group.path.is_empty())
             .map(|group| group.path.clone()),
     );
-    busy_glyph_paths.extend(
+    glyph_scope.extend(
         activity_agents
             .iter()
             .filter(|(_, is_agent)| **is_agent)
             .map(|(path, _)| path.clone()),
     );
-    busy_glyph_paths.extend(crate::agent_output::snapshot_live_agents());
-    busy_glyph_paths.extend(crate::agent_output::snapshot_live_pane_worktrees());
+    glyph_scope.extend(live_agents);
+    glyph_scope.extend(live_panes);
+    let paths = scoped_glyph_paths(&candidates, &glyph_scope);
+    let busy_glyph_paths = glyph_scope;
     // All registered worktree paths (every workspace) PLUS every known repo
     // root: the retain + seed passes below use them to keep/serve other
     // workspaces' glyphs across a switch. Repo roots matter because a dormant
