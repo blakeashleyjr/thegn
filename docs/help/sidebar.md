@@ -457,6 +457,11 @@ reading, it shows an amber `?`.
 
 ### Row detail
 
+Git status details refresh for visible, recently active, or live worktrees.
+Other worktree rows keep their last-known status until they become active or
+visible, so a large registered worktree list does not trigger background scans
+of every checkout.
+
 The richer detail line is configured by `sidebar_detail_when`,
 `sidebar_show_commits`, `sidebar_show_behind_base`, `sidebar_commit_badge`,
 `sidebar_behind_badge`, and `sidebar_detail_fields` in [[config-reference]]

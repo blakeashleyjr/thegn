@@ -4,19 +4,19 @@
 
 ### Requirement: Idle worktree status refresh is bounded
 
-The host SHALL use the busy background glyph refresh interval only for visible,
-recently touched, pane-bearing, or agent-bearing worktrees. Other registered
-worktrees SHALL use the quiet safety TTL and retain their last-known cached
-glyphs between scans. The default busy interval SHALL be 30 seconds and remain
-overridable with `THEGN_BG_MODEL_REFRESH_MS`. The process-wide glyph scan pool
-SHALL run at most two concurrent scans.
+The host SHALL scan git glyph status only for visible, recently touched,
+pane-bearing, or agent-bearing worktrees. Worktrees outside that scope SHALL
+keep their last-known cached glyphs and SHALL NOT enter periodic scan batches.
+The default busy interval SHALL be 30 seconds and remain overridable with
+`THEGN_BG_MODEL_REFRESH_MS`. The process-wide glyph scan pool SHALL run at most
+two concurrent scans.
 
 #### Scenario: Large dormant worktree registry
 
 - **WHEN** the host is idle with a registry containing 1,000 worktrees
-- **THEN** scans on the busy interval SHALL be limited to visible, recently
-  touched, pane-bearing, or agent-bearing worktrees
-- **AND** other registered worktrees SHALL wait for the quiet safety TTL
+- **THEN** every scan batch SHALL contain only visible, recently touched,
+  pane-bearing, or agent-bearing worktrees
+- **AND** other registered worktrees SHALL remain available from cached glyphs
 - **AND** concurrent status scans SHALL not exceed two
 
 ### Requirement: Periodic CI refresh is focused
