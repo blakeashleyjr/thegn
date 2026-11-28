@@ -162,6 +162,7 @@ pub const RELOAD_CLASSES: &[(&str, ReloadClass, ReloadHook)] = &[
     ("accounts", NextUse, H::None),
     // The pin strip is seeded at launch (unsure: Restart).
     ("pins", Restart, H::None),
+    ("update.*", Restart, H::None),
     ("tasks", NextUse, H::None),
     ("worktree_templates", NextUse, H::None),
     ("presets", NextUse, H::None),

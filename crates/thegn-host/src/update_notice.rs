@@ -78,6 +78,7 @@ fn write_cache(path: &Path, cache: &Cache) {
     };
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, bytes).is_ok() {
+        // best-effort: the release cache is advisory; a failed rename keeps the old copy.
         let _ = std::fs::rename(tmp, path);
     }
 }
@@ -120,7 +121,7 @@ fn latest_version<S: ReleaseSource>(source: &S, path: &Path, now: i64) -> Option
 
 /// Compare numeric stable / alpha versions in the form used by thegn releases.
 fn is_newer(latest: &str, running: &str) -> bool {
-    fn parse(value: &str) -> Option<(u64, u64, u64, Option<u64>)> {
+    fn parse(value: &str) -> Option<(u64, u64, u64, u64)> {
         let (base, pre) = value
             .split_once('-')
             .map_or((value, None), |(a, b)| (a, Some(b)));
@@ -131,9 +132,10 @@ fn is_newer(latest: &str, running: &str) -> bool {
         if parts.next().is_some() {
             return None;
         }
+        // A stable release outranks every prerelease of the same version.
         let alpha = match pre {
-            None => None,
-            Some(label) => Some(label.strip_prefix("alpha.")?.parse().ok()?),
+            None => u64::MAX,
+            Some(label) => label.strip_prefix("alpha.")?.parse().ok()?,
         };
         Some((major, minor, patch, alpha))
     }
@@ -220,20 +222,24 @@ pub(crate) fn spawn(
     if !enabled {
         return;
     }
-    std::thread::spawn(move || {
-        let notice = update_from(
-            &GithubRelease,
-            &cache_path(),
-            env!("CARGO_PKG_VERSION"),
-            thegn_core::util::now(),
-        );
-        let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
-        guard.notice = notice;
-        drop(guard);
-        if tx.send(crate::hydrate::RefreshKind::UpdateNotice).is_ok() {
-            let _ = waker.wake();
-        }
-    });
+    drop(thegn_core::thread_name::spawn_named(
+        "thegn-update",
+        move || {
+            let notice = update_from(
+                &GithubRelease,
+                &cache_path(),
+                env!("CARGO_PKG_VERSION"),
+                thegn_core::util::now(),
+            );
+            let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+            guard.notice = notice;
+            drop(guard);
+            if tx.send(crate::hydrate::RefreshKind::UpdateNotice).is_ok() {
+                // best-effort: a gone terminal needs no wake.
+                let _ = waker.wake();
+            }
+        },
+    ));
 }
 
 #[cfg(test)]

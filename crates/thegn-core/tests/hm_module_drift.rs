@@ -44,6 +44,7 @@ const OMITTED: &[(&str, &str)] = &[
         "per-medium network glyph table is not exposed",
     ),
     ("metrics", "metrics export is not exposed"),
+    ("update", "release-check preference is not exposed"),
     ("apps", "app ordering is not exposed"),
     ("observe", "Observe configuration is not exposed"),
     ("bars", "status bar configuration is not exposed"),

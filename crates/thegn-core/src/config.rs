@@ -3950,19 +3950,13 @@ pub struct DiagnosticsConfig {
 
 /// `[update]` — automatic release notices. The release check is an
 /// unauthenticated request to the GitHub releases API and is cached daily.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct UpdateConfig {
     /// Check GitHub once per day for a newer release and show a notice.
     /// Unset: on for stable builds, off for dev builds. An explicit `true` or
     /// `false` applies on every channel.
     pub check: Option<bool>,
-}
-
-impl Default for UpdateConfig {
-    fn default() -> Self {
-        Self { check: None }
-    }
 }
 
 impl UpdateConfig {
